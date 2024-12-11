@@ -1,0 +1,44 @@
+[
+    {
+        "content": "<p>abrown opened <a href=\"https://github.com/bytecodealliance/rfcs/pull/41\">PR #41</a> from <code>abrown:cranelift-assembler</code> to <code>bytecodealliance:main</code>:</p>\n<blockquote>\n<p><a href=\"https://github.com/abrown/bytecodealliance-rfcs/blob/cranelift-assembler/accepted/cranelift-assembler.md\">Rendered</a></p>\n</blockquote>",
+        "id": 487360419,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1733874839
+    },
+    {
+        "content": "<p>programmerjake submitted <a href=\"https://github.com/bytecodealliance/rfcs/pull/41#pullrequestreview-2494061501\">PR review</a>.</p>",
+        "id": 487995014,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1733879766
+    },
+    {
+        "content": "<p>programmerjake created <a href=\"https://github.com/bytecodealliance/rfcs/pull/41#discussion_r1879168537\">PR review comment</a>:</p>\n<blockquote>\n<p>I think it would be useful for these to be trait methods that way generic code isn't required to use the full <code>enum Inst</code> along with the probable code bloat (from having a match arm for every instruction even if we're only using one or a few) that implies.</p>\n</blockquote>",
+        "id": 487995015,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1733879766
+    },
+    {
+        "content": "<p>programmerjake edited <a href=\"https://github.com/bytecodealliance/rfcs/pull/41#discussion_r1879168537\">PR review comment</a>.</p>",
+        "id": 487995039,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1733879782
+    },
+    {
+        "content": "<p><strong>abrown</strong> has marked <a href=\"https://github.com/bytecodealliance/rfcs/pull/41\">PR #41</a> as ready for review.</p>",
+        "id": 487996989,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1733881001
+    },
+    {
+        "content": "<p>cfallin submitted <a href=\"https://github.com/bytecodealliance/rfcs/pull/41#pullrequestreview-2494102749\">PR review</a>:</p>\n<blockquote>\n<p>Thanks a ton for writing this up! It's been really neat to see the DSL come together; I think it's a very clean and powerful way of spec'ing the ISA we support, should reduce potential for errors, and will result in a more generic and reusable assembler library.</p>\n<p>I may have more thoughts later but I wanted to write out my thoughts on what I see as the most important point below:</p>\n</blockquote>",
+        "id": 487998080,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1733881712
+    },
+    {
+        "content": "<p>cfallin created <a href=\"https://github.com/bytecodealliance/rfcs/pull/41#discussion_r1879197632\">PR review comment</a>:</p>\n<blockquote>\n<p>This is a difficult problem to be sure. I want to write out our understanding (or at least \"my understanding of our understanding\") of the situation here, so the tradeoffs are clear at least:</p>\n<ul>\n<li>Cranelift lowers into an IR that looks <em>almost</em> like machine code, except for two aspects: register operands are virtual register numbers, and register operands are in SSA form. This is because our regalloc operates on SSA input with constraints (and this for good reasons -- e.g. it avoids the need for a \"defensive copy\" on every two-reg instruction's src/dst, which we hope is elided later).</li>\n<li>We call this pre-regalloc form \"VCode\" and, properly speaking, it is a separate IR -- not CLIF, not machine code. (Lowering takes CLIF to VCode and regalloc takes VCode to \"machine code\", which we represent in the <code>VCode</code> struct as well but that's not important here.)</li>\n<li>To avoid significant duplication, because VCode is so close to machine code (aside from those two differences above), we overload our current \"machine instruction\" definitions to (i) contain <code>Reg</code>s that can hold vregs or real regs, and (ii) always be in three-reg form, even on x86, with separate \"dest-side\" operands for R+W real operands. In other words, we've basically defined an IR that is a <em>union</em> of machine code and VCode so that we can use one representation.</li>\n<li>This union-based approach has performance advantages as well: because one IR is almost another, and because of the way the overloading is done (in individual operand slots), we can edit in place to turn one into another.</li>\n</ul>\n<p>So here's the difficulty (and here is where my analysis and opinion starts): an assembler library that wants to stay as close as possible to \"machine code\" will naturally not have an instruction representation that is a <em>superset</em> of machine code and VCode. But if we only have machine instructions, then Cranelift needs to keep VCode around with an instruction enum -- in other words, we aren't deleting any code, we're just adding another instruction representation to maintain, and a lowering step from one to the other, and the performance cost of that too. IMHO this is a nonstarter and means that we need to design the library to accomodate \"in-place representation\" of pre-regalloc state.</p>\n<p>There are two general paths here: generic and specific.</p>\n<ul>\n<li>\n<p>The generic path is to have a pluggable notion of operand, with a trait that allows the assembler library to get the physical register name out of it once it's in its final state. An operand for x86 might actually hold two vreg numbers (for a read-modify-write inst, i.e. one use for the \"input side\" and one def for the \"output side\", constrained together) or one; and will hold a sum type that is either a vreg or real reg. But that's the concern of the user of the library; someone else could equally plug in a <code>u8</code> with a stub trait impl and call it a day (and we can provide this default impl).</p>\n<p>The upside of this approach is that it is clean and keeps Cranelift/VCode/regalloc abstractions out of the assembler library, as you state here; and makes the library more reusable for others too. (E.g., Winch probably doesn't care about vreg numbers or SSA use/def distinction.) The downside is that it adds trait/type-param/constraint soup everywhere.</p>\n</li>\n<li>\n<p>Specific: choose one implementation (\"two <code>u32</code> vregs for R/W, one <code>u32</code> vreg otherwise\" seems OK). Basically this is the above but with one trait impl inlined in, if we decide the trouble isn't worth it.</p>\n</li>\n</ul>\n<p>Those are the two main options I see; I can't see how we are able to delete the existing VCode inst enum otherwise, since fundamentally we need to store the SSA representation of instructions somehow.</p>\n<p>I know we explored the generic thing earlier and decided it was getting a little gnarly, but as I write out the above I seem to be convincing myself down that path again -- maybe we could try it now that you've gotten over the hurdle of an initial PoC? Would be interested in what others think as well!</p>\n</blockquote>",
+        "id": 487998082,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1733881712
+    }
+]
