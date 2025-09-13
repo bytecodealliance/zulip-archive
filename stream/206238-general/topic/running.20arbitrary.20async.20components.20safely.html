@@ -1,0 +1,51 @@
+<html>
+<head><meta charset="utf-8"><title>running arbitrary async components safely · general · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/index.html">general</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html">running arbitrary async components safely</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="539001930"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/539001930" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> dakom <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#539001930">(Sep 12 2025 at 07:45)</a>:</h4>
+<p>Let's say I want to execute arbitrary components using <code>wasmtime</code>, and they may do things like long executions in an async task. </p>
+<p>One naive way to handle this could be to only execute components with <code>spawn_blocking</code>. Or, more explicitly, spawn a new thread for every component execution and give it its own tokio runtime like:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">std</span><span class="p">::</span><span class="n">thread</span><span class="p">::</span><span class="n">spawn</span><span class="p">(</span><span class="o">||</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">rt</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tokio</span><span class="p">::</span><span class="n">runtime</span><span class="p">::</span><span class="n">Builder</span><span class="p">::</span><span class="n">new_current_thread</span><span class="p">().</span><span class="n">enable_all</span><span class="p">().</span><span class="n">build</span><span class="p">().</span><span class="n">unwrap</span><span class="p">();</span>
+
+<span class="w">    </span><span class="n">rt</span><span class="p">.</span><span class="n">block_on</span><span class="p">(</span><span class="k">async</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">possibly_evil_component</span><span class="p">::</span><span class="n">execute</span><span class="p">().</span><span class="k">await</span><span class="p">;</span>
+<span class="w">    </span><span class="p">});</span>
+<span class="p">})</span>
+</code></pre></div>
+<p>Is this necessary, or does the component model/wasmtime guarantee that components cannot block eachother's tasks?</p>
+<p>If/how will this change with p3?</p>
+<p>Any advice on best practices is appreciated. Thanks!</p>
+
+
+
+<a name="539058620"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/539058620" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#539058620">(Sep 12 2025 at 12:57)</a>:</h4>
+<p>By default wasmtime does not prevent a guest that is actively using the CPU from blocking that thread. You may be interested in the epoch interruption feature: <a href="https://docs.rs/wasmtime/36.0.2/wasmtime/struct.Config.html#method.epoch_interruption">https://docs.rs/wasmtime/36.0.2/wasmtime/struct.Config.html#method.epoch_interruption</a></p>
+
+
+
+<a name="539082075"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/539082075" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#539082075">(Sep 12 2025 at 14:41)</a>:</h4>
+<p>EIther epochs or fuel are what we recommend to limit CPU consumption. Memory consumption can be achieved with <code>ResourceLimiter</code>. WASIp3 won't move the needle here at all, it's still the same solutions as before. With fuel or epochs you won't need to spawn a thread, you can use the same host threads</p>
+
+
+
+<a name="539272223"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/539272223" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Till Schneidereit <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#539272223">(Sep 13 2025 at 13:39)</a>:</h4>
+<p>For more details, you can look at the relevant chapters of the docs as well:<br>
+<a href="https://docs.wasmtime.dev/examples-deterministic-wasm-execution.html">https://docs.wasmtime.dev/examples-deterministic-wasm-execution.html</a><br>
+<a href="https://docs.wasmtime.dev/examples-interrupting-wasm.html">https://docs.wasmtime.dev/examples-interrupting-wasm.html</a></p>
+
+
+
+<hr><p>Last updated: Sep 13 2025 at 18:03 UTC</p>
+</html>
