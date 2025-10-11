@@ -1,0 +1,198 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #11826 Debugging: add an async debug-step-r... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311826.20Debugging.3A.20add.20an.20async.20debug-step-r.2E.2E.2E.html">wasmtime / PR #11826 Debugging: add an async debug-step-r...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="543888686"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311826%20Debugging%3A%20add%20an%20async%20debug-step-r.../near/543888686" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311826.20Debugging.3A.20add.20an.20async.20debug-step-r.2E.2E.2E.html#543888686">(Oct 09 2025 at 07:32)</a>:</h4>
+<p>cfallin opened <a href="https://github.com/bytecodealliance/wasmtime/pull/11826">PR #11826</a> from <code>cfallin:wasmtime-debug-traps</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>(Stacked on top of #11769.)</p>
+<p>As part of the new guest-debugging API, we want to allow the host to<br>
+execute the debugged guest code asynchronously, receiving its "debug<br>
+step" results each time a debugging-relevant event occurs. In the<br>
+fullness of time, this will include: traps, thrown exceptions,<br>
+breakpoints and watchpoints hit, single-steps, etc.</p>
+<p>As a first step, this PR adds:</p>
+<ul>
+<li>
+<p>A notion of running an asynchronous function call in a "debug<br>
+  session";</p>
+</li>
+<li>
+<p>An API on that debug session object (which owns the store while the<br>
+  function is running) that provides an async method to get the next<br>
+<code>DebugStepResult</code>;</p>
+</li>
+<li>
+<p>An implementation that transmutes traps into a debug-step result,<br>
+  allowing introspection of the guest state before the trap tears down<br>
+  its stack;</p>
+</li>
+<li>
+<p>Access to the stack introspection API provided by <a href="https://github.com/bytecodealliance/wasmtime/pull/11769">https://github.com/bytecodealliance/wasmtime/pull/11769</a>.</p>
+</li>
+</ul>
+<p>The implementation works by performing <em>call injection</em> from the signal<br>
+handler. The basic idea is that rather than perform an exception resume<br>
+from the signal handler, directly rewriting register state to unwind all<br>
+Wasm frames and return the error code to the host, we rewrite register<br>
+state to redirect to a handwritten assembly stub. This stub cannot<br>
+assume anything about register state (because we don't enforce any<br>
+constraints on register state at all the points that trapping signals<br>
+could occur); thus, it has to save every register. To allow this<br>
+trampoline to do anything at all, we inject a few parameters to it; the<br>
+original values of the parameter registers, as well as the original PC<br>
+(location of the trap), are saved to the store so they can be restored<br>
+into the register-save frame before the injected stub returns (if it<br>
+does).</p>
+<p>The injected stub can then call into the runtime to perform a<br>
+fiber-suspend, setting a "debug yield" value that indicates that a trap<br>
+occurred.</p>
+<p>A few notes on design constraints that forced my hand in several ways:</p>
+<ul>
+<li>
+<p>We need to inject a call by rewriting only register state, not pushing<br>
+  a new frame from within the stack handler, because it appears that<br>
+  Windows vectored exception handlers run on the same stack as the guest<br>
+  and so there is no room to push an additional frame.</p>
+</li>
+<li>
+<p>We need access to the store from the signal context now; we can get<br>
+  this from TLS if we add a raw backpointer from VMStoreContext to<br>
+  StoreOpaque. I <em>believe</em> we aren't committing any serious pointer<br>
+  provenance or aliasing-rules crimes here, because dynamically we are<br>
+  taking ownership of the store back when we're running within the<br>
+  signal context (it's as if it was passed as an argument, via a very<br>
+  circuitous route), but I could very well be wrong. I hope we can find<br>
+  another working approach if so!</p>
+</li>
+<li>
+<p>The trap suspend protocol looks a little like a resumable trap but<br>
+  only because we need to properly tear down the future (otherwise we<br>
+  get a panic on drop). Basically we resume back, and if the trap was a<br>
+  non-resumable trap, the assembly stub returns not to the original PC<br>
+  but the PC of <em>another</em> stub that does the original<br>
+  resume-to-entry-handler action.</p>
+</li>
+</ul>
+<p>Everything is set up here for resumable traps (e.g. for breakpoints) to<br>
+also work, but I haven't implemented that yet; that's the next PR (and<br>
+requires some other machinery, most notably a private copy of code<br>
+memory and the ability to edit and re-publish it; and metadata to<br>
+indicate where to patch in breaks; and a <code>pc += BREAK_SIZE</code> somewhere to<br>
+skip over on resume).</p>
+<p>This is a draft that works on Linux on x86-64; I still need to implement</p>
+<ul>
+<li>[ ] aarch64, riscv64, s390x assembly stubs</li>
+<li>[ ] Windows and macOS updates to trap handlers</li>
+<li>[ ] equivalent behavior on the <code>raise</code> libcall too, not just<br>
+      signal-based traps</li>
+</ul>
+<p>but I wanted to post it now to communicate the current direction and get<br>
+any early feedback.</p>
+</blockquote>
+
+
+
+<a name="543889158"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311826%20Debugging%3A%20add%20an%20async%20debug-step-r.../near/543889158" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311826.20Debugging.3A.20add.20an.20async.20debug-step-r.2E.2E.2E.html#543889158">(Oct 09 2025 at 07:35)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11826">PR #11826</a>.</p>
+
+
+
+<a name="543889608"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311826%20Debugging%3A%20add%20an%20async%20debug-step-r.../near/543889608" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311826.20Debugging.3A.20add.20an.20async.20debug-step-r.2E.2E.2E.html#543889608">(Oct 09 2025 at 07:38)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11826">PR #11826</a>.</p>
+
+
+
+<a name="543915258"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311826%20Debugging%3A%20add%20an%20async%20debug-step-r.../near/543915258" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311826.20Debugging.3A.20add.20an.20async.20debug-step-r.2E.2E.2E.html#543915258">(Oct 09 2025 at 09:45)</a>:</h4>
+<p>github-actions[bot] <a href="https://github.com/bytecodealliance/wasmtime/pull/11826#issuecomment-3385044185">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11826">PR #11826</a>:</p>
+<blockquote>
+<h4>Label Messager: wasmtime:config</h4>
+<p>It looks like you are changing Wasmtime's configuration options. Make sure to<br>
+complete this check list:</p>
+<ul>
+<li>
+<p>[ ] If you added a new <code>Config</code> method, you wrote extensive documentation for<br>
+      it.</p>
+<p>&lt;details&gt;</p>
+<p>Our documentation should be of the following form:</p>
+<p>```text<br>
+Short, simple summary sentence.</p>
+<p>More details. These details can be multiple paragraphs. There should be<br>
+information about not just the method, but its parameters and results as<br>
+well.</p>
+<p>Is this method fallible? If so, when can it return an error?</p>
+<p>Can this method panic? If so, when does it panic?</p>
+<h1>Example</h1>
+<p>Optional example here.<br>
+```</p>
+<p>&lt;/details&gt;</p>
+</li>
+<li>
+<p>[ ] If you added a new <code>Config</code> method, or modified an existing one, you<br>
+  ensured that this configuration is exercised by the fuzz targets.</p>
+<p>&lt;details&gt;</p>
+<p>For example, if you expose a new strategy for allocating the next instance<br>
+slot inside the pooling allocator, you should ensure that at least one of our<br>
+fuzz targets exercises that new strategy.</p>
+<p>Often, all that is required of you is to ensure that there is a knob for this<br>
+configuration option in [<code>wasmtime_fuzzing::Config</code>][fuzzing-config] (or one<br>
+of its nested <code>struct</code>s).</p>
+<p>Rarely, this may require authoring a new fuzz target to specifically test this<br>
+configuration. See [our docs on fuzzing][fuzzing-docs] for more details.</p>
+<p>&lt;/details&gt;</p>
+</li>
+<li>
+<p>[ ] If you are enabling a configuration option by default, make sure that it<br>
+  has been fuzzed for at least two weeks before turning it on by default.</p>
+</li>
+</ul>
+<p>[fuzzing-config]: <a href="https://github.com/bytecodealliance/wasmtime/blob/ca0e8d0a1d8cefc0496dba2f77a670571d8fdcab/crates/fuzzing/src/generators.rs#L182-L194">https://github.com/bytecodealliance/wasmtime/blob/ca0e8d0a1d8cefc0496dba2f77a670571d8fdcab/crates/fuzzing/src/generators.rs#L182-L194</a><br>
+[fuzzing-docs]: <a href="https://docs.wasmtime.dev/contributing-fuzzing.html">https://docs.wasmtime.dev/contributing-fuzzing.html</a></p>
+<hr>
+<p>&lt;details&gt;</p>
+<p>To modify this label's message, edit the &lt;code&gt;.github/label-messager/wasmtime-config.md&lt;/code&gt; file.</p>
+<p>To add new label messages or remove existing label messages, edit the<br>
+&lt;code&gt;.github/label-messager.json&lt;/code&gt; configuration file.</p>
+<p><a href="https://github.com/bytecodealliance/label-messager-action">Learn more.</a></p>
+<p>&lt;/details&gt;</p>
+</blockquote>
+
+
+
+<a name="544255202"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311826%20Debugging%3A%20add%20an%20async%20debug-step-r.../near/544255202" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311826.20Debugging.3A.20add.20an.20async.20debug-step-r.2E.2E.2E.html#544255202">(Oct 10 2025 at 22:08)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11826">PR #11826</a>.</p>
+
+
+
+<a name="544262141"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311826%20Debugging%3A%20add%20an%20async%20debug-step-r.../near/544262141" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311826.20Debugging.3A.20add.20an.20async.20debug-step-r.2E.2E.2E.html#544262141">(Oct 10 2025 at 23:14)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11826">PR #11826</a>.</p>
+
+
+
+<a name="544264093"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311826%20Debugging%3A%20add%20an%20async%20debug-step-r.../near/544264093" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311826.20Debugging.3A.20add.20an.20async.20debug-step-r.2E.2E.2E.html#544264093">(Oct 10 2025 at 23:37)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11826">PR #11826</a>.</p>
+
+
+
+<a name="544267367"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311826%20Debugging%3A%20add%20an%20async%20debug-step-r.../near/544267367" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311826.20Debugging.3A.20add.20an.20async.20debug-step-r.2E.2E.2E.html#544267367">(Oct 11 2025 at 00:13)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11826">PR #11826</a>.</p>
+
+
+
+<hr><p>Last updated: Oct 11 2025 at 20:03 UTC</p>
+</html>

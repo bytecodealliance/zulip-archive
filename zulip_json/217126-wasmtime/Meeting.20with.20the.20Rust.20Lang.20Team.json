@@ -1,0 +1,260 @@
+[
+    {
+        "content": "<p>Hey all, following up on my question a few weeks ago: the Rust lang team would be happy to meet to talk about limitations in the language that currently affect Wasmtime. The date they've proposed for that is <time datetime=\"2025-09-24T16:30:00Z\">2025-09-24T18:30:00+02:00</time>, scheduled for 90 mins.</p>",
+        "id": 533149826,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1754500920
+    },
+    {
+        "content": "<p>For Wasmtime maintainers: can y'all make this date?</p>",
+        "id": 533150548,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1754501201
+    },
+    {
+        "content": "<p>Once we confirm the date, I'm happy to take point on writing up a doc for the meeting. My hope for the outcome of this meeting is that the Rust language team can walk away with a healthy set of use cases and problems, which can then be used to motivate language features which resolve those limitations.</p>",
+        "id": 533150895,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1754501359
+    },
+    {
+        "content": "<p>I can make the date as well, and in the meantime I'm going to drop some loose notes here about what we can talk about. I'm a bit intimidated to take up 90m of the lang team's time just for us in the sense that I'm not sure our feedback is worth so much time, but I figure we can collect things first to better gauge if it'll be worth it. The things that I can think of are:</p>\n<h2><code>become</code></h2>\n<p>On the top of my head because I just saw it, but our Pulley interpreter in \"tail loop\" mode requires the <code>become</code> keyword. Right now we have a <code>#[cfg]</code> to switch between a \"match loop\" and a \"tail loop\" but it'd be nice to commit to just one. This isn't entirely on Rust though, we have what we need to evaluate <code>become</code> and we mostly just haven't put in all the legwork to say with confidence \"yep this is what we want\"</p>\n<h2>Non-overwritable <code>&amp;mut T</code></h2>\n<p>We have a problem where host functions get <code>&amp;mut Store&lt;T&gt;</code> more-or-less, but the problem is that it's not sound to do something like <code>*the_store = Store::new(some_ctor())</code>. To work around this we have our own type <code>StoreContextMut&lt;'_, T&gt;</code> which internally holds <code>&amp;mut Store&lt;T&gt;</code>. This has decent enough ergonomics for external users given enough trait impls, but it has pretty awful ergonomics internally within Wasmtime. It'd be much nicer to \"just use <code>&amp;mut Thing</code>\".</p>\n<h2>Read-only fields (unsafe fields?)</h2>\n<p>We're (ab)using <code>Pin</code> right now to make it unsafe to get a <code>&amp;mut vm::Instance</code> right now. It's not really about self-referential types at all, we just want to make it unsafe to get a <code>&amp;mut vm::Instance</code> because it's not safe to mutate some fields. This works well-enough but it's a roundabout solution for what we want which is to disallow mutation of a field after creation (or overwriting it?). Or maybe require unsafe access to a field which would disallow overwriting the whole structure? Unsure.</p>\n<h2>Pin ergonomics</h2>\n<p>Given above we're using <code>Pin</code> internally but the ergonomics are not great:</p>\n<ul>\n<li>Lots of <code>self.as_mut().thing(...)</code></li>\n<li><code>mut self: Pin&lt;&amp;mut Self&gt;</code> is a mouthful</li>\n<li>pin-projection requires <code>unsafe</code> or integration of foreign crates, just a bit awkward</li>\n</ul>\n<p>(I don't think any of this is news to the lang team)</p>\n<h2>Non-leakable types</h2>\n<p>For Rust-compiled-to-wasm the component model has async support now which is, if you squint enough, io-uring like in that you give a region of memory to the host and it fills it in later. Rust's \"any type is safe to leak\" forces safe bindings to always pass everything by ownership which is a bit of a bummer. Not that adding non-leak types is easy of course, but if we're listing out everything may as well list it out.</p>\n<h2><code>where F: AsyncFn(), F(..): Send</code></h2>\n<p>We more-or-less can't use <code>AsyncFn*</code> anywhere unless we can bound the return type. A well-known issue but we can add fuel to the fire maybe.</p>\n<h2><code>fn(T)</code> is not <code>'static</code> unless <code>T: 'static</code></h2>\n<p>Feels weird to us (shouldn't require <code>T: 'static</code>), but we don't know if it's intentional or not. Would be nice if it weren't the case, but it's also not the end of the world to us.</p>\n<h2>dyn-compatible <code>async fn</code></h2>\n<p>We've got a number of usages of <code>#[async_trait]</code> specifically for <code>dyn</code>-compatibility. Again not an easy ask by any means but like above maybe we can add fuel to the fire.</p>\n<h2>Esoteric reasons we still have C code in Wasmtime/wit-bindgen</h2>\n<ul>\n<li>AFAIK it's impossible to call <code>setjmp</code> in Rust safely</li>\n<li>Need to be able to define a symbol as \"weak\" (the defining half of weak linkage)</li>\n<li>Need to be able to optionally import a symbol (the declaring half of weak linkage) -- this is used much more rarely but still used in Wasmtime.</li>\n<li>Need to define \"dllexport\" symbols on Windows (we have a comment saying <code>#[export_name]</code> isn't sufficient)</li>\n</ul>\n<h2>Calling a <code>&amp;mut self</code> method with access to a subset of fields</h2>\n<p>We've got a giant <code>Store&lt;T&gt;</code> type which is passed everywhere internally within Wasmtime. More and more methods need simultaneous borrows to multiple fields in this type, but in an effort to keep the implementation details private we keep adding more and more methods for various permutations of fields. It'd be nice if we could call \"base methods\" where each method accesses a disjoint set of fields. Like many above this is a well-known problem in Rust I believe.</p>\n<h2>Wasm proc macros</h2>\n<p>Rustc should have more wasm in it <span aria-label=\"smiling face with horns\" class=\"emoji emoji-1f608\" role=\"img\" title=\"smiling face with horns\">:smiling_face_with_horns:</span></p>\n<p>(this is a joke, not a serious ask)</p>",
+        "id": 533192694,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1754523256
+    },
+    {
+        "content": "<p>that's at least what's on my head right now, and I'm not sure it'd make sense to explicitly talk about all of these during such a meeting. Some I think we could explain our use case more to help design (e.g. <code>&amp;mut self</code> and subsets of fields) but others are just a \"yep someone still wants this\" (e.g. <code>F(..): Send</code>).</p>\n<p>If we do move forward with this list I would also want to compile a similar list which is \"all the stuff added to Rust since Wasmtime started which we're very happy to be using\". I think it'd be worth outlining all the historical major features too</p>",
+        "id": 533192758,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1754523339
+    },
+    {
+        "content": "<blockquote>\n<p>I'm a bit intimidated to take up 90m of the lang team's time just for us in the sense that I'm not sure our feedback is worth so much time, but I figure we can collect things first to better gauge if it'll be worth it.</p>\n</blockquote>\n<p>Hah, so - I really wouldn't worry about that. Just from the conversations you and I have had, I know that the time spent with the lang team would be worth it.</p>",
+        "id": 533197673,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1754527041
+    },
+    {
+        "content": "<p>Thank you so much for the list so far btw! These are all great so far!</p>",
+        "id": 533197852,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1754527169
+    },
+    {
+        "content": "<p>Loving the idea of also calling out some of the bigger wins the language has provided - that kind of feedback is also quite rare</p>",
+        "id": 533197940,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1754527232
+    },
+    {
+        "content": "<p>I’m not sure where the whole “Send is infectious through the whole wasmtime API and we basically can’t stomach supporting non-Send embeddings, they just have to deal with it (usually by lying to the type checker” issue fits into Alex’s list but that’s the biggest one for me. I also don’t really feel like I know how to present that in a way that makes good use of their time. Alex can represent it better than me. I’d be grateful just to listen in.</p>",
+        "id": 533201421,
+        "sender_full_name": "Pat Hickey",
+        "timestamp": 1754529468
+    },
+    {
+        "content": "<p>Oh actually now that I look at the calendar for real I would be unable to make that slot as Fermyon has its off-site then, would it be possible to use the slot after?</p>\n<p>Also good point Pat that's a good one to include on the list</p>",
+        "id": 533209339,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1754536226
+    },
+    {
+        "content": "<p>will include!</p>",
+        "id": 533289480,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1754572105
+    },
+    {
+        "content": "<p>Messaged the lang team back; I think that means this is going to need to be bumped back to the next planning cycle.</p>",
+        "id": 533289703,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1754572192
+    },
+    {
+        "content": "<p>Writing down those prior thoughts:</p>\n<h3>Infectiousness of <code>Send</code> with <code>async</code></h3>\n<p>Wasmtime's current <code>async</code> support effectively ends up meaning that we require <code>Send</code> on pretty much everything. There's no way currently to use Wasmtime in a non-<code>Send</code> context or a single-threaded <code>async</code> executor. Unsure what a solution would look like, but it's something we've come up against.</p>\n<h3>Generic parameters in constant expressions</h3>\n<p>We've run into this not compiling:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"k\">trait</span><span class=\"w\"> </span><span class=\"n\">A</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">    </span><span class=\"k\">const</span><span class=\"w\"> </span><span class=\"n\">N</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"kt\">usize</span><span class=\"p\">;</span>\n\n<span class=\"w\">    </span><span class=\"k\">fn</span><span class=\"w\"> </span><span class=\"nf\">foo</span><span class=\"p\">(</span><span class=\"o\">&amp;</span><span class=\"bp\">self</span><span class=\"p\">,</span><span class=\"w\"> </span><span class=\"n\">slice</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"kp\">&amp;</span><span class=\"p\">[</span><span class=\"kt\">u8</span><span class=\"p\">;</span><span class=\"w\"> </span><span class=\"bp\">Self</span><span class=\"p\">::</span><span class=\"n\">N</span><span class=\"p\">]);</span>\n<span class=\"p\">}</span>\n</code></pre></div>\n<p>and it'd be a nice simplification of canonical ABI lifting/lowering if were were able to express this</p>",
+        "id": 533370148,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1754604830
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"253994\">Alex Crichton</span> <a href=\"#narrow/channel/217126-wasmtime/topic/Meeting.20with.20the.20Rust.20Lang.20Team/near/533209339\">said</a>:</p>\n<blockquote>\n<p>Oh actually now that I look at the calendar for real I would be unable to make that slot as Fermyon has its off-site then, would it be possible to use the slot after?</p>\n<p>Also good point Pat that's a good one to include on the list</p>\n</blockquote>\n<p>lang team seems happy to push the meeting by a week (still waiting on final confirmation tho) - are y'all able to make <time datetime=\"2025-10-01T16:30:00Z\">2025-10-01T18:30:00+02:00</time>?</p>",
+        "id": 533492669,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1754670082
+    },
+    {
+        "content": "<p>Works for me <span aria-label=\"+1\" class=\"emoji emoji-1f44d\" role=\"img\" title=\"+1\">:+1:</span></p>",
+        "id": 533494231,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1754670805
+    },
+    {
+        "content": "<p>works for me as well</p>",
+        "id": 533500142,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1754673343
+    },
+    {
+        "content": "<p>another thing to talk about: better language tools for bitpacking enums and arbitrary bit width integers</p>\n<p>see <code>CompileKey</code> (soon to be renamed to <code>FuncKey</code>) and wasmparser's <code>RefType</code> and <code>PackedIndex</code> and <code>UnpackedIndex</code> and cranelift_entity's <code>PackedOption</code></p>",
+        "id": 533535696,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1754692203
+    },
+    {
+        "content": "<blockquote>\n<p>bitpacking enums</p>\n</blockquote>\n<p>A few more examples that are interesting: <code>ValueData</code> in Cranelift's DFG, which is a four-way enum; and <code>Operand</code> in regalloc2, which has a bunch of fields and cannot just be divided into arbitrary bitwidth fields (steals bits from some fields when upper bits of the discriminant are in some states for more sub-discriminant)</p>\n<p>Also one more topic: representing ownership to avoid dynamic checks. We currently have a bunch of dynamic \"is same engine\" and \"is same store\" checks, out of necessity, because our index-based handles could otherwise lead to incorrectness. We would need \"generative\" or \"path-dependent\" or \"place-based\" types/lifetimes to statically encode, in the types, that e.g. an <code>Instance</code> is associated with a particular engine, and ensure only values from the same engine interact; Rust's type system today mostly can't do this. (Gankra's masters thesis contains a neat closure-trick that is technically generative within the scope of a closure, but would be completely unergonomic in our APIs.) I know the Rust community generally is thinking about this; and Niko has a <a href=\"https://smallcultfollowing.com/babysteps/blog/2024/06/02/the-borrow-checker-within/\">blog post</a> that mentions \"place-based lifetimes\" that is a step in the direction. I wrote up a random <a href=\"https://cfallin.org/blog/2024/06/12/rust-path-generics/\">idea</a> last year (but haven't seriously pursued it); in general I'd just be curious if this problem has further thoughts from the lang-team, and emphasize that it occurs in practice and leads to dynamic checks.</p>",
+        "id": 533814555,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1754924960
+    },
+    {
+        "content": "<p>Another thing to talk about: how to make Pulley and threads work with Rust's memory model</p>\n<ul>\n<li><a href=\"https://github.com/bytecodealliance/wasmtime/pull/9818\">https://github.com/bytecodealliance/wasmtime/pull/9818</a></li>\n<li><a href=\"https://rust-lang.zulipchat.com/#narrow/channel/213817-t-lang/topic/Writing.20a.20WebAssembly.20interpreter.20in.20Rust.20for.20wasm.20threads/near/488915886\">https://rust-lang.zulipchat.com/#narrow/channel/213817-t-lang/topic/Writing.20a.20WebAssembly.20interpreter.20in.20Rust.20for.20wasm.20threads/near/488915886</a></li>\n</ul>\n<div class=\"message_embed\"><a class=\"message_embed_image\" href=\"https://github.com/bytecodealliance/wasmtime/pull/9818\" style=\"background-image: url(&quot;https://uploads.zulipusercontent.net/bf371b2446304eb3ba8de7bfb4d01f764169fbf7/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f376633666234346261303033363836383131323865353938393865653636303733353234343830383366646638666535366266356532326637333235643637372f62797465636f6465616c6c69616e63652f7761736d74696d652f70756c6c2f39383138&quot;)\"></a><div class=\"data-container\"><div class=\"message_embed_title\"><a href=\"https://github.com/bytecodealliance/wasmtime/pull/9818\" title=\"pulley: Disable the WebAssembly `threads` proposal by alexcrichton · Pull Request #9818 · bytecodealliance/wasmtime\">pulley: Disable the WebAssembly `threads` proposal by alexcrichton · Pull Request #9818 · bytecodealliance/wasmtime</a></div><div class=\"message_embed_description\">Forcibly disable the threads proposal for Pulley. This is done because I don&#39;t believe there&#39;s any way that we can, in Rust, implement non-atomic loads and stores in a manner that isn&#39;t...</div></div></div><div class=\"message_embed\"><a class=\"message_embed_image\" href=\"https://rust-lang.zulipchat.com/#narrow/channel/213817-t-lang/topic/Writing.20a.20WebAssembly.20interpreter.20in.20Rust.20for.20wasm.20threads/near/488915886\" style=\"background-image: url(&quot;https://uploads.zulipusercontent.net/62a5be7c4dbb3d51af34a64dfbc026434727b1f6/68747470733a2f2f617661746172732e7a756c69702e636f6d2f343731352f7265616c6d2f69636f6e2e706e673f76657273696f6e3d32&quot;)\"></a><div class=\"data-container\"><div class=\"message_embed_title\"><a href=\"https://rust-lang.zulipchat.com/#narrow/channel/213817-t-lang/topic/Writing.20a.20WebAssembly.20interpreter.20in.20Rust.20for.20wasm.20threads/near/488915886\" title=\"Public view of rust-lang | Zulip team chat\">Public view of rust-lang | Zulip team chat</a></div><div class=\"message_embed_description\">Browse the publicly accessible channels in rust-lang without logging in.</div></div></div>",
+        "id": 535370378,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1755715022
+    },
+    {
+        "content": "<p>topic: x86_64-unknown-none softfloat abi is a problem, can we have an otherwise identical target with the \"regular\" float abi? or can we stabilize build-std?</p>",
+        "id": 536473610,
+        "sender_full_name": "Pat Hickey",
+        "timestamp": 1756318067
+    },
+    {
+        "content": "<p>Reminder for Wasmtime maintainers: the meeting with the Rust language team is this Wednesday at <time datetime=\"2025-10-01T16:30:00Z\">2025-10-01T18:30:00+02:00</time>. The meeting lasts 90 mins: the first 30 mins are spent reading a doc and writing out questions, which is then followed by 60 mins of discussion.</p>",
+        "id": 542005322,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1759143649
+    },
+    {
+        "content": "<p>I'll send through a hackmd doc later today, which will includes everything posted in this thread so far + other items from individual conversations.</p>",
+        "id": 542005584,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1759143712
+    },
+    {
+        "content": "<p>If anyone has any other items they haven't seen mentioned yet in this thread, you're welcome to share them! - We should have more than plenty to fill out an hour's worth of conversation already though. So don't feel like you have to.</p>",
+        "id": 542005943,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1759143781
+    },
+    {
+        "content": "<p>Looking forward to it! Also happy to help out with editing the doc too</p>",
+        "id": 542054301,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1759155722
+    },
+    {
+        "content": "<p>First pass of the doc is done: <a href=\"https://hackmd.io/@yoshuawuyts/HkW6fBd2le\">https://hackmd.io/@yoshuawuyts/HkW6fBd2le</a></p>",
+        "id": 542100783,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1759167364
+    },
+    {
+        "content": "<p>I think we could probably do with some more code examples and links</p>",
+        "id": 542100887,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1759167395
+    },
+    {
+        "content": "<p>I still need to reformat some things too</p>",
+        "id": 542100932,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1759167408
+    },
+    {
+        "content": "<p><span class=\"user-mention\" data-user-id=\"253992\">@Pat Hickey</span> if you have the time, can I ask you to elaborate on the softfloat target topic in the doc?</p>",
+        "id": 542101023,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1759167439
+    },
+    {
+        "content": "<p>thats more of a <span class=\"user-mention\" data-user-id=\"254389\">@Chris Fallin</span> / <span class=\"user-mention\" data-user-id=\"253990\">@fitzgen (he/him)</span> topic</p>",
+        "id": 542102255,
+        "sender_full_name": "Pat Hickey",
+        "timestamp": 1759167846
+    },
+    {
+        "content": "<p><span class=\"user-mention\" data-user-id=\"344849\">@Yosh Wuyts</span>  So the issue is that we embed Wasmtime in an x86-64 Linux process with very special requirements, namely that it cannot make syscalls; others embed Wasmtime in their own bespoke x86-64 environments with no OS or custom OS functionality. For all these cases, the usual approach would be to compile for <code>x86_64-unknown-none</code>, which is a <code>no_std</code> target. That's all well and good except that that target has an ABI that assumes <em>softfloat</em>: vector registers are not available at all and all FP values go through software implementations of operators. Usually in these environments we've done the legwork to be able to actually use the ordinary hardware float ABI.</p>\n<p>So it's a pretty simple mechanical plumbing thing, but basically we end up needing is a custom target.</p>\n<p>Where this gets weird/interesting is that custom targets are nightly-only, so our current plan is just to require a nightly compiler, but that sucks, especially in a corporate environment where new things are already seen as suspicious and unstable.</p>\n<p>The concrete ask for rustlang as a whole would be to stabilize <code>-Zbuild-std</code> so custom targets can work at the same level as built-in targets for <code>no_std</code> code that uses <code>core</code>/<code>alloc</code>. That may or may not be a lang-team thing but I guess Pat brought it up because it's a real impediment for adoption</p>",
+        "id": 542104203,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1759168454
+    },
+    {
+        "content": "<p>it is the kind of thing that Microsoft Corporate would like to see, certainly, if an example is required.....</p>",
+        "id": 542105862,
+        "sender_full_name": "Ralph",
+        "timestamp": 1759168878
+    },
+    {
+        "content": "<p>I added a paragraph to the doc, feel free to expand/edit it</p>",
+        "id": 542106278,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1759168978
+    },
+    {
+        "content": "<p>Did a pass and edited some things. Chris/Nick y'all might want to expand on the <a href=\"https://hackmd.io/qBBoEgNISROHUpLBlYLf8w?both#Bitpacking-Enums\">bitpacking part</a></p>",
+        "id": 542111016,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1759170329
+    },
+    {
+        "content": "<p>I also added this to the intro:</p>\n<blockquote>\n<p>Below is a listing of topics that the Wasmtime team has brainstormed about possible discussion points with T-lang. Most of these are centered around things we've run into when implementing Wasmtime itself in Rust. This is, however, also a great opportunity if T-lang would like to pick our own brains about wasm support and how it relates to Rust. We're of course willing to chat about anything related to wasm and development of the standard and such!</p>\n</blockquote>",
+        "id": 542111491,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1759170451
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"253994\">Alex Crichton</span> <a href=\"#narrow/channel/217126-wasmtime/topic/Meeting.20with.20the.20Rust.20Lang.20Team/near/542111016\">said</a>:</p>\n<blockquote>\n<p>Chris/Nick y'all might want to expand on the <a href=\"https://hackmd.io/qBBoEgNISROHUpLBlYLf8w?both#Bitpacking-Enums\">bitpacking part</a></p>\n</blockquote>\n<p>done</p>",
+        "id": 542123107,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1759174007
+    },
+    {
+        "content": "<p>Also, logistics-wise, how will we join?</p>",
+        "id": 542127127,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1759175224
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"253994\">Alex Crichton</span> <a href=\"#narrow/channel/217126-wasmtime/topic/Meeting.20with.20the.20Rust.20Lang.20Team/near/542127127\">said</a>:</p>\n<blockquote>\n<p>Also, logistics-wise, how will we join?</p>\n</blockquote>\n<p>At the meeting time, join <a href=\"https://meet.jit.si/ferris-rules\">https://meet.jit.si/ferris-rules</a></p>\n<div class=\"message_embed\"><a class=\"message_embed_image\" href=\"https://meet.jit.si/ferris-rules\" style=\"background-image: url(&quot;https://uploads.zulipusercontent.net/050c7e43c0fc5dfcc5ba4105d6e634252586c236/68747470733a2f2f6d6565742e6a69742e73692f696d616765732f6a697473696c6f676f2e706e673f763d31&quot;)\"></a><div class=\"data-container\"><div class=\"message_embed_title\"><a href=\"https://meet.jit.si/ferris-rules\" title=\"Jitsi Meet\">Jitsi Meet</a></div><div class=\"message_embed_description\">Join a WebRTC video conference powered by the Jitsi Videobridge</div></div></div>",
+        "id": 542141981,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1759180690
+    },
+    {
+        "content": "<p>(Will take a look at the updated doc tomorrow!)</p>",
+        "id": 542142037,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1759180711
+    },
+    {
+        "content": "<p><span class=\"user-mention\" data-user-id=\"253990\">@fitzgen (he/him)</span> could I ask you to expand a little on the Pulley + Atomics section? I'm reading the explainer and the links, and I'm missing:</p>\n<ul>\n<li>what does the ecmascript-atomics crate provide?</li>\n<li>what would a potential stable solution look like? new atomic instructions or orderings?</li>\n</ul>",
+        "id": 542320722,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1759249845
+    },
+    {
+        "content": "<p>oh I can take care of that b/c I added most of that</p>",
+        "id": 542320923,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1759249904
+    },
+    {
+        "content": "<p>ty ty!</p>",
+        "id": 542320956,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1759249913
+    },
+    {
+        "content": "<p>okay, finished reading over the doc! - tysm for all the changes and edits, I think this looks great, and will give us a lot to talk about tomorrow!</p>",
+        "id": 542321330,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1759250023
+    },
+    {
+        "content": "<p>I think the meeting went really well. Thank you all for joining!</p>",
+        "id": 542563614,
+        "sender_full_name": "Yosh Wuyts",
+        "timestamp": 1759345124
+    }
+]
