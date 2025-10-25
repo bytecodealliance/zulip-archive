@@ -1,0 +1,38 @@
+[
+    {
+        "content": "<p>alexcrichton opened <a href=\"https://github.com/bytecodealliance/wasmtime/pull/10880\">PR #10880</a> from <code>alexcrichton:refactor-vmctx-plus-offset</code> to <code>bytecodealliance:main</code>:</p>\n<blockquote>\n<p>This commit merges two helper methods to calculate an internal pointer with a <code>VMContext</code>. Historically these two methods mapped different levels of mutability but nowadays there's no need for this. The provenance/mutability of <code>VMContext</code> memory is independent of <code>&amp;self</code> meaning that it's safe to create/mutate through a <code>NonNull</code> in the vmctx area through a <code>&amp;self</code>-derived pointer.</p>\n<p>The purpose of this commit is to avoid needlessly requiring <code>&amp;mut self</code> throughout methods on <code>Instance</code>. Currently many of them require mutability to only create a pointer, and this mutability is a burden that need not be required.</p>\n<p>&lt;!--<br>\nPlease make sure you include the following information:</p>\n<ul>\n<li>\n<p>If this work has been discussed elsewhere, please include a link to that<br>\n  conversation. If it was discussed in an issue, just mention \"issue #...\".</p>\n</li>\n<li>\n<p>Explain why this change is needed. If the details are in an issue already,<br>\n  this can be brief.</p>\n</li>\n</ul>\n<p>Our development process is documented in the Wasmtime book:<br>\n<a href=\"https://docs.wasmtime.dev/contributing-development-process.html\">https://docs.wasmtime.dev/contributing-development-process.html</a></p>\n<p>Please ensure all communication follows the code of conduct:<br>\n<a href=\"https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md\">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>\n--&gt;</p>\n</blockquote>",
+        "id": 521383417,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1748646358
+    },
+    {
+        "content": "<p><strong>alexcrichton</strong> requested <a href=\"https://github.com/fitzgen\">fitzgen</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/10880\">PR #10880</a>.</p>",
+        "id": 521383419,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1748646358
+    },
+    {
+        "content": "<p><strong>alexcrichton</strong> requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers\">wasmtime-core-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/10880\">PR #10880</a>.</p>",
+        "id": 521383421,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1748646358
+    },
+    {
+        "content": "<p>alexcrichton <a href=\"https://github.com/bytecodealliance/wasmtime/pull/10880#issuecomment-2923699654\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/10880\">PR #10880</a>:</p>\n<blockquote>\n<p>Hm ok thinking more about this is mainly means that <code>Sync</code> is no longer correctly inferred, as <code>Instance</code> should no longer be <code>Sync</code>. I feel like we probably do want to keep it <code>Sync</code>, though, so now I'm souring a bit on this approach.</p>\n<p>I think I have an idea of how to tackle this, improve safety, and keep <code>Sync</code>, so converting this to a draft.</p>\n</blockquote>",
+        "id": 521384115,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1748646830
+    },
+    {
+        "content": "<p>alexcrichton updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/10880\">PR #10880</a>.</p>",
+        "id": 521394147,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1748654858
+    },
+    {
+        "content": "<p>alexcrichton edited <a href=\"https://github.com/bytecodealliance/wasmtime/pull/10880\">PR #10880</a>:</p>\n<blockquote>\n<p>Currently acquiring a mutable pointer to <code>VMContext</code> memory requires<br>\n<code>&amp;mut Instance</code> which for many methods is a tall ask. Some methods are<br>\nbasically just reading data structures and shuffling bits around, but<br>\nrequiring a mutable instance prohibits their use in some contexts. The<br>\ngeneral goal of this commit is to make it possible to read, but not<br>\nnecessarily manipulate data structures with <code>&amp;self</code> instead of requiring<br>\n<code>&amp;mut</code>.</p>\n<p>Specifically this commit redefines the preexisting<br>\n<code>vmctx_plus_offset{,_mut}</code> methods as returning a safe reference, not a<br>\nraw reference. This ensures that the lifetime of the returned reference<br>\nis scoped properly and it inherits the mutability of <code>self</code> to retain<br>\nbeing <code>Send</code> and <code>Sync</code> by default. To make up for lost ground though<br>\nthis commit additionally adds a new <code>vmctx_plus_offset_raw</code> method which<br>\nthese prior two methods delegate to. This new method returns a<br>\n<code>NonNull&lt;T&gt;</code> and is the primary way of acquiring a raw pointer to<br>\n<code>VMContext</code> fields. This new method notably takes <code>&amp;self</code> as an<br>\nargument.</p>\n<p>The end result is that small/quick mutations of a <code>VMContext</code> are able<br>\nto keep using <code>vmctx_plus_offset{,_mut}</code> with a little extra safety, but<br>\nmany callers have migrated to the <code>*_raw</code> variant which no longer<br>\nrequires <code>&amp;mut self</code>. This will end up being used in further commits and<br>\nmethods aren't switched over just yet.</p>\n<p>It's worth noting the relevance to <a href=\"https://github.com/advisories/GHSA-ch89-5g45-qwc7\">https://github.com/advisories/GHSA-ch89-5g45-qwc7</a> in this commit as<br>\nwell. Historically the acquisition of a mutable pointer from <code>&amp;self</code> led<br>\nto true undefined behavior at runtime resulting in incorrect execution.<br>\nThis is naively moving right back to such a model where a <code>&amp;self</code>-based<br>\nmethod is returning a pointer through which a mutation is happening, but<br>\nthis is crucially different in how the base <code>vmctx</code> pointer is created.<br>\nPreviously it was calculated as an offset from <code>&amp;self</code>, but now the<br>\n<em>address</em> is calculated from <code>&amp;self</code> but the <em>provenance</em> comes from a<br>\nknown-mutable pointer. This construction means that annotations on<br>\n<code>&amp;self</code> are not applicable to the <code>vmctx</code> pointer itself and thus not<br>\napplicable to the returned pointer. In the end this means that it should<br>\nbe safe to acquire mutable pointers to vmctx memory from <code>&amp;self</code> on an<br>\ninstance.</p>\n</blockquote>",
+        "id": 521394164,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1748654875
+    }
+]
