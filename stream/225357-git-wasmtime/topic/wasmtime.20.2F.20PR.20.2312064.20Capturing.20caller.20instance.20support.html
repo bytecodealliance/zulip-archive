@@ -1,0 +1,118 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #12064 Capturing caller instance support · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312064.20Capturing.20caller.20instance.20support.html">wasmtime / PR #12064 Capturing caller instance support</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="558610763"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312064%20Capturing%20caller%20instance%20support/near/558610763" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312064.20Capturing.20caller.20instance.20support.html#558610763">(Nov 21 2025 at 09:11)</a>:</h4>
+<p>gionut opened <a href="https://github.com/bytecodealliance/wasmtime/pull/12064">PR #12064</a> from <code>elasticproject-eu:component-attestation</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>Previous conversation about this pull request available at:<br>
+<a href="#narrow/channel/217126-wasmtime/topic/New.20functionality.20useful.20for.20attestation/with/553956315">https://bytecodealliance.zulipchat.com/#narrow/channel/217126-wasmtime/topic/New.20functionality.20useful.20for.20attestation/with/553956315</a></p>
+<p>Also there is a discussion about request of this feature available at:<br>
+<a href="#narrow/channel/217126-wasmtime/topic/Getting.20component.20information.20on.20host.20calls/with/558000999">https://bytecodealliance.zulipchat.com/#narrow/channel/217126-wasmtime/topic/Getting.20component.20information.20on.20host.20calls/with/558000999</a></p>
+<h3>Summary</h3>
+<p>We have modified Wasmtime to expose the identity of the caller identity to host function implementations, in order to support functionality such as remote attestation or component-specific access control policies.  This includes both the addition of an extended host function API for embedders that provides the caller identity, as well as analysis of components during compilation in order to capture enough structure to allow the caller to be identified within the application.  </p>
+<hr>
+<h3>Goal</h3>
+<p>To provide a supported way for embedders to identify which part of a multi-component Wasm application has called a host function. This can serve a number of purposes, but in our case the goal is to enable a platform to implement Wasm-aware _attestation_ functionality.</p>
+<p>Attestation allows one platform, the prover, to prove properties of its state to another platform, the verifier.  A common property to prove is the hashes of the code running on the platform, and to link them to e.g. a TLS handshake, that allows a client to obtain a guarantee such as "at the other end of this TLS connection is application X".</p>
+<p>Since WebAssembly provides individual sandboxes for each core module instance, we can meaningfully attest the identity of a piece of code at the granularity of a core module, rather than treating the application as a monolithic whole.  This allows for libraries and applications that use attestation to be transparently composed into larger systems while maintaining their individual identities.</p>
+<p>To achieve this, we require two main additions to Wasmtime, and this PR is oriented towards these two goals:</p>
+<ol>
+<li>
+<p>When a component is loaded, we need to extract enough information on its internal structure to allow the embedder to work out which part of the application called a host function.</p>
+</li>
+<li>
+<p>We need to extend the host function API to allow the implementation to identify the source of the function call, in a backwards-compatible manner.</p>
+</li>
+</ol>
+<hr>
+<h3>General implementation notes</h3>
+<ol>
+<li><strong>Component structure analysis</strong></li>
+</ol>
+<p>This is implemented in _crates/environ/src/component/dfg.rs_, _‎crates/environ/src/component/info.rs_, and _‎crates/environ/src/component/translate/inline.rs_. And the public API is at _‎crates/wasmtime/src/runtime/component/component.rs_.</p>
+<p>During component compilation/instantiation, we track the creation of core module instances and the resolution of their imports/exports.  These instances are named using a sequence of indices that uniquely identify its location relative to the top-level component (e.g. [5.1] is the first core module instance in the fifth component instantiated in the top-level component).</p>
+<p>In many applications, linking the caller back to this identifier will be enough, and probably we will end up minimising these changes down to this.  However, this ties the identity of part of the application to its location in the component hierarchy.  We might expect that some future applications may rearrange the component hierarchy, e.g. in order to optimise an application binary for size, or to distribute an application across several physical machines.  We therefore aim to represent the application at a lower level.</p>
+<p>For each imported core function, we record which core module instance it ultimately comes from, following the same resolution steps that the inliner uses.  The result is an <em>instantiation graph</em> whose nodes are core module instances and whose edges represent dependency and call relationships as resolved by Wasmtime.</p>
+<p>The result is an accurate graph of how core module instances are wired together at runtime inside a component (after linking, lowering, aliasing, etc.), along with identifiers that allow parts of the graph to be identified with their location in the component hierarchy, allowing comparison with a reference binary, even if its overall structure is completely different to a mangled binary loaded at runtime.</p>
+<p>The instantiation graph is exposed via a method _<code>Component::component_structure</code>_ that allows embedders (or tools) to obtain the instantiation graph structure of the runtime structure.</p>
+<ol start="2">
+<li><strong>Caller-aware host functions</strong></li>
+</ol>
+<p>This is implemented in _crates/wasmtime/src/runtime/component/linker.rs_ and _crates/wasmtime/src/runtime/component/func/host.rs‎_ and hidden behind the feature flag <code>caller</code>.</p>
+<p>We introduce new <code>func_wrap</code> variants (identified by the suffix <code>_caller</code>) in the component linker that allow a host function to receive not only its usual arguments, but also an identifier for the calling component/core module instance.</p>
+<p>We capture the runtime index OptionsIndex that, in combination with an <code>Instance</code>, identifies the core module in the <code>Store</code>. We then correlate this index with the identifier sequence described above.  It is important to note that the naming matches the components' index spaces used by wasmtime and present in WebAssembly Text Format (WAT). Using this we can correlate the calling instance with its instantiation in the component binary.</p>
+</blockquote>
+
+
+
+<a name="558610764"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312064%20Capturing%20caller%20instance%20support/near/558610764" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312064.20Capturing.20caller.20instance.20support.html#558610764">(Nov 21 2025 at 09:11)</a>:</h4>
+<p><strong>gionut</strong> requested <a href="https://github.com/alexcrichton">alexcrichton</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/12064">PR #12064</a>.</p>
+
+
+
+<a name="558610765"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312064%20Capturing%20caller%20instance%20support/near/558610765" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312064.20Capturing.20caller.20instance.20support.html#558610765">(Nov 21 2025 at 09:11)</a>:</h4>
+<p><strong>gionut</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/12064">PR #12064</a>.</p>
+
+
+
+<a name="558628481"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312064%20Capturing%20caller%20instance%20support/near/558628481" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312064.20Capturing.20caller.20instance.20support.html#558628481">(Nov 21 2025 at 10:41)</a>:</h4>
+<p>gionut updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12064">PR #12064</a>.</p>
+
+
+
+<a name="558633088"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312064%20Capturing%20caller%20instance%20support/near/558633088" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312064.20Capturing.20caller.20instance.20support.html#558633088">(Nov 21 2025 at 11:03)</a>:</h4>
+<p>gionut updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12064">PR #12064</a>.</p>
+
+
+
+<a name="558635661"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312064%20Capturing%20caller%20instance%20support/near/558635661" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312064.20Capturing.20caller.20instance.20support.html#558635661">(Nov 21 2025 at 11:17)</a>:</h4>
+<p>gionut updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12064">PR #12064</a>.</p>
+
+
+
+<a name="558666227"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312064%20Capturing%20caller%20instance%20support/near/558666227" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312064.20Capturing.20caller.20instance.20support.html#558666227">(Nov 21 2025 at 13:59)</a>:</h4>
+<p>gionut updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12064">PR #12064</a>.</p>
+
+
+
+<a name="558671057"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312064%20Capturing%20caller%20instance%20support/near/558671057" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312064.20Capturing.20caller.20instance.20support.html#558671057">(Nov 21 2025 at 14:20)</a>:</h4>
+<p>gionut updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12064">PR #12064</a>.</p>
+
+
+
+<a name="558672901"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312064%20Capturing%20caller%20instance%20support/near/558672901" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312064.20Capturing.20caller.20instance.20support.html#558672901">(Nov 21 2025 at 14:28)</a>:</h4>
+<p>gionut updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12064">PR #12064</a>.</p>
+
+
+
+<a name="558697694"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312064%20Capturing%20caller%20instance%20support/near/558697694" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312064.20Capturing.20caller.20instance.20support.html#558697694">(Nov 21 2025 at 16:08)</a>:</h4>
+<p>gionut updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12064">PR #12064</a>.</p>
+
+
+
+<a name="558821783"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312064%20Capturing%20caller%20instance%20support/near/558821783" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312064.20Capturing.20caller.20instance.20support.html#558821783">(Nov 22 2025 at 15:20)</a>:</h4>
+<p>gionut updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12064">PR #12064</a>.</p>
+
+
+
+<hr><p>Last updated: Nov 23 2025 at 05:03 UTC</p>
+</html>
