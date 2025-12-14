@@ -1,0 +1,103 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #12156 Cranelift: improve egraph cost fu... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312156.20Cranelift.3A.20improve.20egraph.20cost.20fu.2E.2E.2E.html">wasmtime / issue #12156 Cranelift: improve egraph cost fu...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="563264747"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312156%20Cranelift%3A%20improve%20egraph%20cost%20fu.../near/563264747" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312156.20Cranelift.3A.20improve.20egraph.20cost.20fu.2E.2E.2E.html#563264747">(Dec 11 2025 at 19:11)</a>:</h4>
+<p>fitzgen opened <a href="https://github.com/bytecodealliance/wasmtime/issues/12156">issue #12156</a>:</p>
+<blockquote>
+<p><em>Note: I am forking off a new issue from <a href="https://github.com/bytecodealliance/wasmtime/issues/12106">https://github.com/bytecodealliance/wasmtime/issues/12106</a>. See that issue's discussion for a description of the issue of enode cost saturating to infinity due to extraction not "understanding" shared structure and how this problem is equivalent to weighted-set cover and therefore NP-hard. +cc @cfallin @bongjunj</em></p>
+<p>Chris and I were talking about extraction again yesterday. A couple things came out of it, which I will note down for our future selves and posterity:</p>
+<ul>
+<li>
+<blockquote>
+<p><a href="https://github.com/bytecodealliance/wasmtime/issues/12106#issuecomment-3618298815">We could divide/amortize the cost by the number of users of any given value. ... This maintains the phased aspect</a></p>
+</blockquote>
+<p>I kind of tried to explain this point <a href="https://github.com/bytecodealliance/wasmtime/issues/12106#issuecomment-3618446995">earlier</a> but don't think I was very clear so I will try again: The problem with this algorithm is that the "number of users" == "number of incoming edges <em>in the (a)egraph</em>", and for this to be a good algorithm in practice, it must be the case that the number of incoming edges in the (a)egraph approximates the number of incoming edges <em>in the set of actually-extracted expressions</em> in practice. It is not clear to me that property is generally true. In fact, I suspect that the more we do "egraph-y" things like add more canonicalizations and neutral rewrites with the hope that they will unlock further rewrites that <em>are</em> beneficial, then the less this property will hold!</p>
+</li>
+<li>
+<p>I had the realization that <em>if we topo-sort values before computing best costs, then we will reach a fix point in a single iteration.</em> This has some nice implications for <a href="https://github.com/bytecodealliance/wasmtime/issues/12106#issuecomment-3618446995">the "If we aren't maintaining phasing" algorithm</a> I sketched above. Bear with me for a second.</p>
+<p>Our current algorithm to compute the best enode (specific value) for each eclass (canonical value) is a fixpoint loop that looks roughly like this</p>
+<p><code>rust
+fn compute_best_values() {
+    let mut keep_going = true;
+    while keep_going {
+        for value in dfg.all_values() {
+            let orig_best_value = best[value];
+            best[value] = best_value(value, dfg);
+            keep_going |= best[value] != orig_best_value;
+        }
+    }
+}
+</code></p>
+<p>It will do <code>n + 1</code> iterations before returning where <code>n</code> is the length of the longest chain of <code>vNN -&gt; vMM</code> edges in the dataflow graph where <code>NN &lt; MM</code> (and the <code>+ 1</code> is to determine that we did actually reach the fixpoint and nothing else is changing anymore).[^typical] Note that at most <code>n == len(values)</code> so we do a pass over all <code>n</code> values <code>n</code> times, leading to an <code>O(n^2)</code> worst case runtime. But at minimum, in the best case, it will do at least two passes over all <code>n</code> values: once to compute the best values and then another to verify that we reached the fixpoint and nothing else is changing.</p>
+<p>Topologically sorting the values based on the DFG is also one pass over all <code>n</code> values. And then we can do one iteration of the inner loop from the previous algorithm, which is also one pass over all <code>n</code> values, and in this case we know that we will have reached a fixedpoint immediately because (a) the DFG is acyclic (we don't look through block params) and (b) we are processing uses before defs. So this gives us an <code>O(n)</code> worst case (and best case) runtime algorithm. Strictly better (in terms of worst case runtime) than what we do today!</p>
+<p>```rust<br>
+fn compute_best_values() {<br>
+    let sorted = topo_sort_values(dfg);<br>
+    compute_best_values_already_sorted(sorted);<br>
+}</p>
+<p>fn compute_best_values_already_sorted(sorted) {<br>
+    for value in sorted {<br>
+        best[value] = best_value(value, dfg);<br>
+    }<br>
+}<br>
+```</p>
+<p>But, this now plays nicely with incrementally updating costs to reflect certain sub-expressions getting cheaper because we've already extracted them! The following brings us back to <code>O(n^2)</code> but I think should give us a much better extraction algorithm that "understands" shared subexpressions:</p>
+<p>```rust<br>
+let sorted = topo_sort_values(dfg);</p>
+<p>for inst in skeleton {<br>
+    // Compute the best values. If this is the first iteration of the loop,<br>
+    // it is equivalent to what we had before. Otherwise, it will update the<br>
+    // best values based the adjusted cost of values we have already<br>
+    // extracted. <br>
+    compute_best_values_already_sorted(sorted);</p>
+<div class="codehilite"><pre><span></span><code>// Elaborate this instruction, extracting the best values for its
+// operands and inserting their defining instructions back into the
+// CFG&#39;s basic blocks.
+elaborate_inst(inst);
+
+// Update the cost for each value we extracted. It is ~free (modulo
+// register pressure) to reuse this value, since we have already computed
+// it and it is now available. The next iteration of the outer loop will
+// recompute best values to reflect these updated costs.
+for value in transitive_values_used_by(inst) {
+    // Or could do something very low but non-zero, like `1`, to reflect
+    // the cost of additional register pressure. Worth experimenting
+    // with, but is also somewhat orthogonal...
+    let new_cost = 0;
+    set_cost(value, new_cost);
+}
+</code></pre></div>
+
+<p>}<br>
+```</p>
+<p>It could be that this is fast enough to just be what we do by default. If not, it might be something we only use when configured to higher optimization levels.</p>
+</li>
+</ul>
+<p>[^typical]: Typically <code>n</code> is fairly small; it is affected by how much we created new instructions  and spliced their definitions into the middle of the DFG after the CLIF-producer gave us the initial CLIF. That is something we generally don't do a ton of, except in our legalization pass and NaN canonicalization and neither of them do it too much.</p>
+</blockquote>
+
+
+
+<a name="563264748"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312156%20Cranelift%3A%20improve%20egraph%20cost%20fu.../near/563264748" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312156.20Cranelift.3A.20improve.20egraph.20cost.20fu.2E.2E.2E.html#563264748">(Dec 11 2025 at 19:11)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the cranelift label to <a href="https://github.com/bytecodealliance/wasmtime/issues/12156">Issue #12156</a>.</p>
+
+
+
+<a name="563264751"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312156%20Cranelift%3A%20improve%20egraph%20cost%20fu.../near/563264751" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312156.20Cranelift.3A.20improve.20egraph.20cost.20fu.2E.2E.2E.html#563264751">(Dec 11 2025 at 19:11)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the cranelift<span aria-label="goal" class="emoji emoji-1f945" role="img" title="goal">:goal:</span>optimize-speed label to <a href="https://github.com/bytecodealliance/wasmtime/issues/12156">Issue #12156</a>.</p>
+
+
+
+<hr><p>Last updated: Dec 14 2025 at 02:40 UTC</p>
+</html>
