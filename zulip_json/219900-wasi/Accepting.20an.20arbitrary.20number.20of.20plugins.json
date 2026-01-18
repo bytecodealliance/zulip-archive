@@ -1,0 +1,50 @@
+[
+    {
+        "content": "<p>I'm trying to design a toy system that supports plugins supplied by different authors. </p>\n<p>Based on my current understanding of the component model, a way to achieve this would be to define a world (<code>plugin</code>) and accept <code>.wasm</code> components that implement that world. I would then compose these together with the 'main' <code>.wasm</code> component to create my program. Unfortunately, I'm having difficulty finding a way to achieve this in practice.</p>\n<p>I can imagine rolling my own plugin registration system something like the following:</p>\n<div class=\"codehilite\" data-code-language=\"wit\"><pre><span></span><code>// There is a resource that defines the desired plugin API\nresource plugin-resource {\n  // ...methods...\n}\n\n// Plugin authors implement components that know how to initialize\n// their plugin-resource implementation.\nworld plugin {\n    init: func() -&gt; plugin-resource;\n}\n\n// At composition time, some external logic chains together the provided\n// plugins into one big component that satisfies this API.\nworld plugin-iterator {\n    next: func() -&gt; option&lt;plugin-resource&gt;;\n}\n</code></pre></div>\n<p>However, this feels pretty clunky. Before I go down that road, am I missing a supported way to achieve this? If there is no supported way to achieve this, is that a point-in-time limitation, or a design decision?</p>\n<p>Thanks!</p>",
+        "id": 544155419,
+        "sender_full_name": "zslayton",
+        "timestamp": 1760098690
+    },
+    {
+        "content": "<p>I think you'll run into a few limitations with this design. One is that, you're correct, dynamically composing a variable number of components to something that returns a list is not a simple <code>wac</code> command, for example, today. You'd have to have some sort of custom interposing component there.</p>\n<p>Another issue, however, is that if each plugin exports the <code>plugin-resource</code> type then despite having the same WIT type at runtime they all have distinct types and aren't interchangeable. That means that at a type-level you can't actually implement <code>plugin-iterator</code> because each plugin would return a uniquely-typed <code>plugin-resource</code>.</p>\n<p>What you might want instead is to have the host arbitrate this. The guest would import a single <code>plugin-resuorce</code> interface and would have a sort of \"lookup\" that the host would dispatch to other plugins. Basically \"host magic\"  to help do the dispatch</p>",
+        "id": 544185228,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1760107020
+    },
+    {
+        "content": "<blockquote>\n<p>Another issue, however, is that if each plugin exports the <code>plugin-resource</code> type then despite having the same WIT type at runtime they all have distinct types and aren't interchangeable. That means that at a type-level you can't actually implement <code>plugin-iterator</code> because each plugin would return a uniquely-typed <code>plugin-resource</code>.</p>\n</blockquote>\n<p>Oh, interesting. I had been thinking of resources as values using dynamic dispatch over their <code>resource {...}</code> methods. Thank you for pointing this out, it's important to know.</p>\n<blockquote>\n<p>What you might want instead is to have the host arbitrate this. The guest would import a single <code>plugin-resuorce</code> interface and would have a sort of \"lookup\" that the host would dispatch to other plugins. Basically \"host magic\" to help do the dispatch</p>\n</blockquote>\n<p>Sorry, I'm not quite sure what you mean. Could you give me an example?</p>",
+        "id": 544206300,
+        "sender_full_name": "zslayton",
+        "timestamp": 1760112688
+    },
+    {
+        "content": "<p>Effectively what you're imagining is dynamic dispatch could be implemented in the host. The component-model itself doesn't have that degree of dynamic dispatch but you on the host could have a trait which is implemented for each plugin. The guest would then import functionality that the host implements in terms of a list of trait objects. Or... something like that, not really an example per se as this is still pretty hand-wavy</p>",
+        "id": 544207175,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1760113002
+    },
+    {
+        "content": "<p>Ok, thanks! I'll do some experimenting and see what I can figure out. In the meantime, are there any WIT features coming in the future that might facilitate composing an arbitrary number of components?</p>",
+        "id": 544207964,
+        "sender_full_name": "zslayton",
+        "timestamp": 1760113300
+    },
+    {
+        "content": "<p>Not that I know of myself, no, unfortunately</p>",
+        "id": 544208216,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1760113395
+    },
+    {
+        "content": "<p>Some flavor of <a href=\"https://github.com/WebAssembly/component-model/issues/172\">WIT templates</a> would probably help here.</p>\n<div class=\"message_embed\"><a class=\"message_embed_image\" href=\"https://github.com/WebAssembly/component-model/issues/172\" style=\"background-image: url(&quot;https://uploads.zulipusercontent.net/d66c7da2a5c0d9b5ea555816b5e71b0a8ff74114/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f383331656464393965383133313965656664306262663064323364633866303532303532326465326639613735336536643966366163663939383739383338352f576562417373656d626c792f636f6d706f6e656e742d6d6f64656c2f6973737565732f313732&quot;)\"></a><div class=\"data-container\"><div class=\"message_embed_title\"><a href=\"https://github.com/WebAssembly/component-model/issues/172\" title=\"Sketch: allow a variable number of imports/exports of fixed type in Wit · Issue #172 · WebAssembly/component-model\">Sketch: allow a variable number of imports/exports of fixed type in Wit · Issue #172 · WebAssembly/component-model</a></div><div class=\"message_embed_description\">Motivation Let's say I'd like to build a component that consumes 3 configuration values a, b and c (which in a 12-factor app I'd take as 3 environment variables). I could define a component with ty...</div></div></div>",
+        "id": 544210306,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1760114080
+    },
+    {
+        "content": "<p>I had an idea for a possible workaround.</p>\n<p>Suppose a host application wants to load multiple plugins that use the same interface. The host could maintain multiple copies of that interface, each with a unique name (e.g., integer-suffixed interface names so they’re treated as distinct).</p>\n<p>Plugins themselves would be compiled against the “normal” interface (no suffixes). When loading a plugin, the host would select an unused interface copy and patch the plugin’s interface names so that they match, allowing composition/loading without conflicts.</p>\n<p>The main question is: <strong>is it feasible to do this kind of automated interface renaming on an already-compiled <code>.wasm</code> module?</strong></p>",
+        "id": 563720349,
+        "sender_full_name": "Zhefu",
+        "timestamp": 1765757426
+    }
+]
