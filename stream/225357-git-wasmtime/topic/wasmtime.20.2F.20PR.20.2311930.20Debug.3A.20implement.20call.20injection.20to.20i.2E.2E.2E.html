@@ -1,0 +1,101 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #11930 Debug: implement call injection to i... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311930.20Debug.3A.20implement.20call.20injection.20to.20i.2E.2E.2E.html">wasmtime / PR #11930 Debug: implement call injection to i...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="546790249"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311930%20Debug%3A%20implement%20call%20injection%20to%20i.../near/546790249" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311930.20Debug.3A.20implement.20call.20injection.20to.20i.2E.2E.2E.html#546790249">(Oct 24 2025 at 00:49)</a>:</h4>
+<p>cfallin opened <a href="https://github.com/bytecodealliance/wasmtime/pull/11930">PR #11930</a> from <code>cfallin:wasmtime-debug-signal-inject-calls</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>(Stacked on top of #11921)</p>
+<p>This repurposes the code from #11826 to "inject calls": when in a signal<br>
+handler, we can update the register state to redirect execution upon<br>
+signal-handler return to a special hand-written trampoline, and this<br>
+trampoline can save all registers and enter the host, just as if a<br>
+hostcall had occurred.</p>
+<p>As before, this is Linux-only in its current draft. I need to add macOS and Windows support, still. Putting this up to show how a few loose ends in #11921 get used.</p>
+</blockquote>
+
+
+
+<a name="546791222"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311930%20Debug%3A%20implement%20call%20injection%20to%20i.../near/546791222" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311930.20Debug.3A.20implement.20call.20injection.20to.20i.2E.2E.2E.html#546791222">(Oct 24 2025 at 01:03)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/11930#issuecomment-3440174125">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11930">PR #11930</a>:</p>
+<blockquote>
+<p>I'll note for brainstorming purposes that the current problem in front of me is how to rework macOS' Mach ports-based signal handler to work with this. To recap a bit what the requirements on each platform are, and how this "call injection" works:</p>
+<ul>
+<li>All three of our main platforms (Linux, macOS, Windows) give us the ability to catch traps and edit register state before resuming.</li>
+<li>Linux lets us do this in a "signal context" where we really shouldn't do much of anything if we can help it -- no allocation, etc. We run on a sigaltstack and we can push more to the guest stack if we want.</li>
+<li>Windows lets us do this in a vectored exception handler, where we run on the guest's stack and cannot push anything to the stack.</li>
+<li>macOS lets us do this from a separate thread reading exceptions from a Mach port, where we can do anything a normal thread can do, except we don't have the guest's TLS because we're a separate thread.</li>
+</ul>
+<p>The basic need is to inject enough state into the register context, along with redirecting PC, that a stub can take control, find the Store state, invoke any debug event handler, then restore all context and return to the guest if it's a resumable trap (which this PR doesn't have, but we will have in a few more PRs for breakpoints).</p>
+<p>One can see how this is a little tricky. The approach I've taken that is at least Windows and Linux-compatible is to update only registers, not the stack (because Windows); inject args into the registers; save off the original register values and PC to the <code>VMStoreContext</code> (which we have via TLS in the signal handler); then in the trampoline, save all regs to the stack, and copy the original values of the injected registers back from the store to the stack save-frame.</p>
+<p>macOS inverts most of the "can do" and "can't do" bits: we <em>can</em> push to the stack (unlike Windows) but we <em>can't</em> read TLS, so we have nowhere to save state that we clobber when redirecting other than to push it to the stack. So probably the best we can do is to push the original register values to the guest stack ourselves from the exception handler thread.</p>
+<p>Of course this means that we need a slightly different stub for macOS (for x86-64 and aarch64 both); and we'll need a slightly different stub for Windows/x86-64 too because of fastcall when we call the host code.</p>
+<p>One more thing about the riscv64 stub: it saves all of the V-extension state, because vector registers are separate from float registers, but unlike our other three architectures, we don't unconditionally assume that vector registers are present. So technically to run with V disabled with debugging enabled, if we care about that, we need an alternate riscv64 stub too that elides that bit. Note that we need to care because we have to save <em>everything</em>, not just the ABI callee-saves, because we're "interrupting" with no regalloc cooperation.</p>
+<p>All of this to say: I am starting to think that the efficiency advantage of "trap-based implicit hostcalls", with all that entails (breakpoints that are just break instructions we can patch in), may not be worth the complexity and maintenance burden. The alternative is to go with hostcall-based-traps universally. (We still do need the wonky raw <code>*mut dyn VMStore</code> for the Pulley case, because Pulley does seem to unconditionally rely on interpreter traps on at least the divide instruction.)</p>
+<p>Partly that would make me sad, but on the other hand, it would make me quite happy too: it would mean that we are one PR away from breakpoints if we go with the bitmask scheme, or two if we still patch in a call (self-modifying code but not trapping).</p>
+<p>I'm happy to go either way, and these stubs were quite fun to write, but with my "not impossible to maintain" hat on, I think I know the better answer...</p>
+<p>(cc @alexcrichton and @fitzgen for thoughts)</p>
+</blockquote>
+
+
+
+<a name="546793113"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311930%20Debug%3A%20implement%20call%20injection%20to%20i.../near/546793113" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311930.20Debug.3A.20implement.20call.20injection.20to.20i.2E.2E.2E.html#546793113">(Oct 24 2025 at 01:22)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/11930#issuecomment-3440237473">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11930">PR #11930</a>:</p>
+<blockquote>
+<p>Quick napkin math on efficiency if we abandon call injection on signals:</p>
+<ul>
+<li>Execution efficiency takes about a 1.5-2x hit mainly on explicit bounds-checking. (This on top of the ~2.5x for debug instrumentation.) That's tolerable if not great.</li>
+<li>Instead of a two-byte (<code>ud2</code> on x86-64) or four-byte (<code>brk</code> on aarch64) breakpoint, we can do patchable calls in five bytes (<code>call</code> + riprel32 on x86-64) or four bytes (<code>bl</code> + PCrel26 on aarch64). The key here is to define a new callconv that is all callee-save, and use our normal trampoline machinery to emit a trampoline for this. The call at the CLIF level would take <code>vmctx</code>. We'd use a new opcode <code>patchable_call</code> and the only difference from a normal call opcode would be that emission would place the byte range of the instruction and the instruction bytes themselves in metadata, and an equivalent length nop in code. This should have fairly small perf impact (fetch bandwidth but nothing more for nops; and vmctx will already likely be in the first-arg reg so no additional moves).</li>
+<li>For single-stepping, rather than the trap-on-null-load trick to enable all breakpoints that I described in yesterday's Cranelift weekly, I think I would go with the "enable all in func on entry to func" approach; and func entry/exit hostcalls themselves can be guarded by a flag to minimize that overhead.</li>
+</ul>
+<p>The upshot of all that is that it's much more portable and easier to reason about, and the latter at least is in short supply otherwise with everything else we're adding for debugging. One could see this as "hostcalls everywhere" as in debug RFC v1, except with SMC to avoid overhead until patched in.</p>
+</blockquote>
+
+
+
+<a name="546804667"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311930%20Debug%3A%20implement%20call%20injection%20to%20i.../near/546804667" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311930.20Debug.3A.20implement.20call.20injection.20to.20i.2E.2E.2E.html#546804667">(Oct 24 2025 at 03:48)</a>:</h4>
+<p>github-actions[bot] <a href="https://github.com/bytecodealliance/wasmtime/pull/11930#issuecomment-3440826107">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11930">PR #11930</a>:</p>
+<blockquote>
+<h4>Subscribe to Label Action</h4>
+<p>cc @fitzgen</p>
+<p>&lt;details&gt;<br>
+This issue or pull request has been labeled: "cranelift", "pulley", "wasmtime:api"</p>
+<p>Thus the following users have been cc'd because of the following labels:</p>
+<ul>
+<li>fitzgen: pulley</li>
+</ul>
+<p>To subscribe or unsubscribe from this label, edit the &lt;code&gt;.github/subscribe-to-label.json&lt;/code&gt; configuration file.</p>
+<p><a href="https://github.com/bytecodealliance/subscribe-to-label-action">Learn more.</a><br>
+&lt;/details&gt;</p>
+</blockquote>
+
+
+
+<a name="548328652"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311930%20Debug%3A%20implement%20call%20injection%20to%20i.../near/548328652" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311930.20Debug.3A.20implement.20call.20injection.20to.20i.2E.2E.2E.html#548328652">(Nov 01 2025 at 18:21)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/11930#issuecomment-3476647930">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11930">PR #11930</a>:</p>
+<blockquote>
+<p>Closing as this is pushed to "post-MVP debugging" due to all the above complexities; will keep the branch around for mining for the good bits later as needed.</p>
+</blockquote>
+
+
+
+<a name="548328654"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311930%20Debug%3A%20implement%20call%20injection%20to%20i.../near/548328654" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311930.20Debug.3A.20implement.20call.20injection.20to.20i.2E.2E.2E.html#548328654">(Nov 01 2025 at 18:21)</a>:</h4>
+<p>cfallin closed without merge <a href="https://github.com/bytecodealliance/wasmtime/pull/11930">PR #11930</a>.</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

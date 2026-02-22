@@ -1,0 +1,186 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #12238 Compiling SQL queries with Cranel... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312238.20Compiling.20SQL.20queries.20with.20Cranel.2E.2E.2E.html">wasmtime / issue #12238 Compiling SQL queries with Cranel...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="566060182"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312238%20Compiling%20SQL%20queries%20with%20Cranel.../near/566060182" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312238.20Compiling.20SQL.20queries.20with.20Cranel.2E.2E.2E.html#566060182">(Jan 02 2026 at 13:51)</a>:</h4>
+<p>espoal opened <a href="https://github.com/bytecodealliance/wasmtime/issues/12238">issue #12238</a>:</p>
+<blockquote>
+<p>I'm building a next generation distributed datastore and I would like to add the possibility of querying using a relational model. A few weeks ago I had the crazy idea of compiling SQL prepared statements instead of running them through a traditional query planner, before finding out I'm not the first one to use this approach.</p>
+<p>Right now I _transliterate_ the query to Rust before compiling it, but maybe there is a smarter approach. My questions are:</p>
+<ul>
+<li>Can Cranelift support this use case or is it too far from its original design?</li>
+<li>Could Cranelift help me skip the _transliteration_ step?</li>
+<li>Are you aware of anyone else using this same approach with Cranelift instead of LLVM?</li>
+</ul>
+<p><strong>More details:</strong> <br>
+Let's say I have a query in the form:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">SELECT</span>
+<span class="w">    </span><span class="n">ot</span><span class="p">.</span><span class="n">customer_ID</span><span class="p">,</span>
+<span class="w">    </span><span class="n">ct</span><span class="p">.</span><span class="n">customer_name</span><span class="p">,</span>
+<span class="w">    </span><span class="n">SUM</span><span class="p">(</span><span class="n">ot</span><span class="p">.</span><span class="n">order_total</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">total_amount</span><span class="p">,</span>
+<span class="w">    </span><span class="n">UDF</span><span class="p">.</span><span class="n">heavy_function</span><span class="p">(</span><span class="n">ot</span><span class="p">.</span><span class="n">order_total</span><span class="p">)</span><span class="w"> </span><span class="n">AS</span><span class="w"> </span><span class="n">processed_total</span>
+<span class="n">FROM</span><span class="w"> </span><span class="n">orders_table</span><span class="w"> </span><span class="n">AS</span><span class="w"> </span><span class="n">ot</span>
+<span class="n">JOIN</span>
+<span class="w">    </span><span class="n">customers_table</span><span class="w"> </span><span class="n">AS</span><span class="w"> </span><span class="n">ct</span><span class="w"> </span><span class="n">ON</span><span class="w"> </span><span class="n">ct</span><span class="p">.</span><span class="n">customer_ID</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ot</span><span class="p">.</span><span class="n">customer_ID</span>
+<span class="n">WHERE</span>
+<span class="w">    </span><span class="n">ot</span><span class="p">.</span><span class="n">customer_ID</span><span class="w"> </span><span class="n">IN</span><span class="w"> </span><span class="cp">$customers_array</span>
+<span class="n">AND</span>
+<span class="w">    </span><span class="n">ot</span><span class="p">.</span><span class="n">order_date</span><span class="w"> </span><span class="n">BETWEEN</span><span class="w"> </span><span class="cp">$start_date</span><span class="w"> </span><span class="n">AND</span><span class="w"> </span><span class="cp">$end_date</span>
+<span class="n">GROUP</span><span class="w"> </span><span class="n">BY</span>
+<span class="w">    </span><span class="n">ot</span><span class="p">.</span><span class="n">customer_ID</span><span class="p">,</span>
+<span class="w">    </span><span class="n">ct</span><span class="p">.</span><span class="n">customer_name</span><span class="p">;</span>
+</code></pre></div>
+<p>Right now the compilation looks like:</p>
+<ul>
+<li>The user register the SQL query before executing it</li>
+<li>I parse the query using an SQL parser</li>
+<li>I extract the parameters, these will enter in the signature of the Rust function representing the query</li>
+<li>I _transliterate_ to Rust using some very ugly code (a bunch of <code>match</code>, <code>if</code> and generic types)</li>
+<li>I run some compile time optimizations (using a cost based function, like the vulcano query planner)</li>
+<li>I compile the code</li>
+<li>I cache the compiled output</li>
+<li>I notify the user that the query is ready to use</li>
+</ul>
+<p>To run the query:</p>
+<ul>
+<li>The user calls the query and provide the inputs</li>
+<li>I search for the cached compiled output using an hash of the query</li>
+<li>I launch one thread for each shard</li>
+<li>I reduce the results and present it to the user</li>
+</ul>
+<p>Ideally I would like to run the query inside a WASM runtime.</p>
+<p>I apologize in advance if this question is off topic for this repo and for my noobishness. </p>
+</blockquote>
+
+
+
+<a name="566076536"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312238%20Compiling%20SQL%20queries%20with%20Cranel.../near/566076536" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312238.20Compiling.20SQL.20queries.20with.20Cranel.2E.2E.2E.html#566076536">(Jan 02 2026 at 16:31)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/12238#issuecomment-3705731886">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12238">issue #12238</a>:</p>
+<blockquote>
+<p>@espoal yes, it should be possible to use Cranelift as a JIT-compiler backend for SQL queries -- we are a fully general-purpose compiler and there's nothing too special about SQL once it's query-planned down to loops and loads and compares and the like, IIUC. (We have SIMD operators you'd likely want to use for scans as well.)</p>
+<p>That said, one point of clarification: you ask about <em>Cranelift</em> (which is an SSA IR to machine code compiler) but then say</p>
+<blockquote>
+<p>Ideally I would like to run the query inside a WASM runtime.</p>
+</blockquote>
+<p>which is a different thing -- to run Wasm (in our universe) one would typically use Wasmtime, which translates Wasm bytecode to Cranelift's IR then invokes Cranelift to compile that to machine code; and the resulting machine code calls into Wasmtime's runtime, so it's not a separable piece.</p>
+<p>Either generating machine code and invoking it directly (raw Cranelift JIT backend) or generating Wasm modules on the fly and loading/invoking them in Wasmtime are possible; the latter harder mainly because of the memory access question (does the Wasm module get the whole database in memory as its heap? compile-time builtins? something else?). Using just Cranelift and generating loads (and stores) to your native data structures would be the conventional and recommended approach.</p>
+<p>One other point: you ask if you could "skip the transliteration step", and I don't think you can no matter what you do, though you may be transliterating ("compiling"!) to a different target. Right now you're basically compiling SQL to Rust; instead you could compile SQL to Cranelift IR (CLIF). It's lower-level, so you'll have to implement e.g. match semantics yourself with raw if-else branches or branch tables, but very possible.</p>
+</blockquote>
+
+
+
+<a name="566089322"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312238%20Compiling%20SQL%20queries%20with%20Cranel.../near/566089322" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312238.20Compiling.20SQL.20queries.20with.20Cranel.2E.2E.2E.html#566089322">(Jan 02 2026 at 18:40)</a>:</h4>
+<p>espoal <a href="https://github.com/bytecodealliance/wasmtime/issues/12238#issuecomment-3706007964">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12238">issue #12238</a>:</p>
+<blockquote>
+<p>Dear @cfallin thank you for your polite reply and for engaging with my idea! I appreciate it a lot!</p>
+<p>So to repeat what I understood:</p>
+<ol>
+<li>I would parse the SQL and lower it to an AST </li>
+<li>I would perform query planning / some optimizations during this first lowering</li>
+<li>I would need to write a custom frontend that takes the AST and feeds it to Cranelift for lowering into CLIF  </li>
+<li>Linking external code via <code>cranelift-module</code> would happen here?</li>
+<li>I could feed the generated CLIF to Wasmtime, letting the pipeline deal with any further lowering</li>
+<li>Or I could lower the CLIF to machine code for native execution</li>
+</ol>
+<p>The situation gets a bit more complicated because I would like to let the user create UDFs in any language that is supported by Cranelift. This linking would happen at step 4 I guess? If the user writes a Rust/C++ UDF I would use the respective frontends to lower the code to CLIF, and then link the two representations using <code>cranelift-module</code>?</p>
+<p>I'm also a bit confused about AOT vs JIT in the Wasmtime pipeline, let me see if I got this right:</p>
+<ul>
+<li>I could do pure JIT, and do everything on the fly</li>
+<li>I could mix AOT/JIT by compiling the CLIF to WASM, and cache the textual representation</li>
+<li>I could do pure AOT by compiling CLIF to WAST, and cache the output</li>
+</ul>
+<p>With obvious tradeoffs in execution/compilation speed. Is this right?</p>
+<p>To further elaborate on my idea I took inspiration from <a href="https://www.hytradboi.com/2025/742be405-2e0b-4bc6-a8e0-ff1e0760e912-database-query-compilation-our-journey">this</a> presentation, where a JIT or AOT is picked based on some heuristics (slow vs fast queries, one time vs reusable queries). I also would like to improve the current compiling databases approaches by putting emphasis on parameterized queries which should enable better caching. Cranelift seems to be IDEAL to replicate the current body of academic research, without having to write custom LLVM patchsets like Umbra and <a href="https://www.vldb.org/pvldb/vol4/p539-neumann.pdf">Hyper</a> are doing. </p>
+<blockquote>
+<p>the latter harder mainly because of the memory access question (does the Wasm module get the whole database in memory as its heap? compile-time builtins? something else?)</p>
+</blockquote>
+<p>My datastore is architected as a distributed state machine with swizzled pointers, like:</p>
+<p><code>project@account/collectionName/tableName/columnName[:special_qualifier]</code></p>
+<p>At compile time the data requirements are analyzed and cached along the output. At runtime I would fetch the data before execution, so I could load it in the heap. I was thinking of exposing this via a <code>load_swz_ptr</code> syscall, possibly using the WASI specification if it's not overkill, very much like today normal <code>load</code> operations are used to load arbitrary records on the heap, or <code>read</code> is used to load an arbitrary opened file.</p>
+<p>The execution runs in stages, so for the query I used as an example I would:</p>
+<ul>
+<li>Detect the indexes (<code>customer_id</code> and <code>order_date</code>) needed to satisfy the <code>WHERE</code> clause and cache this requirement at compilation time</li>
+<li>At execution time I would fetch the live indexes before launching the first stage, one thread per shard</li>
+<li>The output of the first stage would be a list of <code>order_id</code>, which again would be fetched before starting the next stage</li>
+<li>The second stage would aggregate the results per shard and would <code>JOIN</code> the resulting rows</li>
+<li>The last stage would aggregate all the shards to a single output</li>
+</ul>
+<blockquote>
+<p>One other point: you ask if you could "skip the transliteration step", and I don't think you can no matter what you do, though you may be transliterating ("compiling"!) to a different target. Right now you're basically compiling SQL to Rust; instead you could compile SQL to Cranelift IR (CLIF). It's lower-level, so you'll have to implement e.g. match semantics yourself with raw if-else branches or branch tables, but very possible.</p>
+</blockquote>
+<p>You are totally right! My background is math, not CS, and I suffer a bit from impostor syndrome. What I meant by skipping _transliteration_ is the idea of using a real frontend to target CLIF, like a true CS PhD would do, instead of the very hacky approach I'm using right now.</p>
+</blockquote>
+
+
+
+<a name="566089514"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312238%20Compiling%20SQL%20queries%20with%20Cranel.../near/566089514" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312238.20Compiling.20SQL.20queries.20with.20Cranel.2E.2E.2E.html#566089514">(Jan 02 2026 at 18:43)</a>:</h4>
+<p>espoal edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/12238#issuecomment-3706007964">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12238">issue #12238</a>:</p>
+<blockquote>
+<p>Dear @cfallin thank you for your polite reply and for engaging with my idea! I appreciate it a lot!</p>
+<p>So to repeat what I understood:</p>
+<ol>
+<li>I would parse the SQL and lower it to an AST </li>
+<li>I would perform query planning / some optimizations during this first lowering</li>
+<li>I would need to write a custom frontend that takes the AST and feeds it to Cranelift for lowering into CLIF  </li>
+<li>Linking external code via <code>cranelift-module</code> would happen here?</li>
+<li>I could feed the generated CLIF to Wasmtime, letting the pipeline deal with any further lowering</li>
+<li>Or I could lower the CLIF to machine code for native execution</li>
+</ol>
+<p>The situation gets a bit more complicated because I would like to let the user create UDFs in any language that is supported by Cranelift. This linking would happen at step 4 I guess? If the user writes a Rust/C++ UDF I would use the respective frontends to lower the code to CLIF, and then link the two representations using <code>cranelift-module</code>? Also you can see why Wasmtime is beneficial for execution, since UDFs are user generated untrusted code and the sandboxing comes very useful.</p>
+<p>I'm also a bit confused about AOT vs JIT in the Wasmtime pipeline, let me see if I got this right:</p>
+<ul>
+<li>I could do pure JIT, and do everything on the fly</li>
+<li>I could mix AOT/JIT by compiling the CLIF to WASM, and cache the textual representation</li>
+<li>I could do pure AOT by compiling CLIF to WAST, and cache the output</li>
+</ul>
+<p>With obvious tradeoffs in execution/compilation speed. Is this right?</p>
+<p>To further elaborate on my idea I took inspiration from <a href="https://www.hytradboi.com/2025/742be405-2e0b-4bc6-a8e0-ff1e0760e912-database-query-compilation-our-journey">this</a> presentation, where a JIT or AOT is picked based on some heuristics (slow vs fast queries, one time vs reusable queries). I also would like to improve the current compiling databases approaches by putting emphasis on parameterized queries which should enable better caching. Cranelift seems to be IDEAL to replicate the current body of academic research, without having to write custom LLVM patchsets like Umbra and <a href="https://www.vldb.org/pvldb/vol4/p539-neumann.pdf">Hyper</a> are doing. </p>
+<blockquote>
+<p>the latter harder mainly because of the memory access question (does the Wasm module get the whole database in memory as its heap? compile-time builtins? something else?)</p>
+</blockquote>
+<p>My datastore is architected as a distributed state machine with swizzled pointers, like:</p>
+<p><code>project@account/collectionName/tableName/columnName[:special_qualifier]</code></p>
+<p>At compile time the data requirements are analyzed and cached along the output. At runtime I would fetch the data before execution, so I could load it in the heap. I was thinking of exposing this via a <code>load_swz_ptr</code> syscall, possibly using the WASI specification if it's not overkill, very much like today normal <code>load</code> operations are used to load arbitrary records on the heap, or <code>read</code> is used to load an arbitrary opened file.</p>
+<p>The execution runs in stages, so for the query I used as an example I would:</p>
+<ul>
+<li>Detect the indexes (<code>customer_id</code> and <code>order_date</code>) needed to satisfy the <code>WHERE</code> clause and cache this requirement at compilation time</li>
+<li>At execution time I would fetch the live indexes before launching the first stage, one thread per shard</li>
+<li>The output of the first stage would be a list of <code>order_id</code>, which again would be fetched before starting the next stage</li>
+<li>The second stage would aggregate the results per shard and would <code>JOIN</code> the resulting rows</li>
+<li>The last stage would aggregate all the shards to a single output</li>
+</ul>
+<blockquote>
+<p>One other point: you ask if you could "skip the transliteration step", and I don't think you can no matter what you do, though you may be transliterating ("compiling"!) to a different target. Right now you're basically compiling SQL to Rust; instead you could compile SQL to Cranelift IR (CLIF). It's lower-level, so you'll have to implement e.g. match semantics yourself with raw if-else branches or branch tables, but very possible.</p>
+</blockquote>
+<p>You are totally right! My background is math, not CS, and I suffer a bit from impostor syndrome. What I meant by skipping _transliteration_ is the idea of using a real frontend to target CLIF, like a true CS PhD would do, instead of the very hacky approach I'm using right now.</p>
+</blockquote>
+
+
+
+<a name="566114892"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312238%20Compiling%20SQL%20queries%20with%20Cranel.../near/566114892" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312238.20Compiling.20SQL.20queries.20with.20Cranel.2E.2E.2E.html#566114892">(Jan 03 2026 at 01:10)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/12238#issuecomment-3706563462">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12238">issue #12238</a>:</p>
+<blockquote>
+<p>You're on the right track! A few thoughts:</p>
+<ul>
+<li>One thing to make clear is that the Wasm-based path and the CLIF-based path are more or less disjoint. Wasmtime doesn't accept CLIF; it only accepts Wasm. (Think of CLIF and the Cranelift backend as an internal implementation detail of Wasmtime; in fact it has another compiler backend that doesn't use CLIF/Cranelift at all, which can be chosen at runtime.)</li>
+<li>Given that, if we scope the problem to <em>only</em> compiling SQL, it seems pretty clear to me that compiling directly to CLIF is the most straightforward route. In essence you are implementing your own sandbox by providing only safe capabilities/abstractions at the SQL semantic level. The tradeoff is that your SQL-to-CLIF compiler is part of the trusted base and bugs in that compiler might result in sandbox escapes at the database level. But it avoids the (IMHO fairly major) impedance mismatches inherent in trying to ship data into and back out of the Wasm sandbox in a performant way when doing large scans of in-memory cached data.</li>
+<li>The UDF problem is separate and fairly interesting. In fact I've heard of others using Wasm for exactly this use-case. In theory you could do a native SQL-to-CLIF compiler that, for apply-UDF nodes in your AST, compiles to a call back into host code that then invokes the UDF Wasm module via Wasmtime APIs.</li>
+</ul>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

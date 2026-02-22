@@ -1,0 +1,291 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #11328 Redesign function configuration in `... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html">wasmtime / PR #11328 Redesign function configuration in `...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="531004161"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531004161" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531004161">(Jul 26 2025 at 21:08)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/pull/11328">PR #11328</a> from <code>alexcrichton:refactor-bindgen</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>This commit is a redesign of how function-level configuration works in<br>
+Wasmtime's <code>bindgen!</code> macro. The main goal of this redesign is to<br>
+better support WASIp3 and component model async functions. Prior to this<br>
+redesign there was a mish mash of mechanisms to configure behavior of<br>
+imports/exports:</p>
+<ul>
+<li>
+<p>The <code>async</code> configuration could turn everything async, nothing async,<br>
+  only some imports async, or everything except some imports async.</p>
+</li>
+<li>
+<p>The <code>concurrent_{imports,exports}</code> keys were required to explicitly<br>
+  opt-in to component model async signatures and applied to all<br>
+  imports/exports.</p>
+</li>
+<li>
+<p>The <code>trappable_imports</code> configuration would indicate a list of imports<br>
+  allowed to trap and it had special configuration for everything,<br>
+  nothing, and only a certain list.</p>
+</li>
+<li>
+<p>The <code>tracing</code> and <code>verbose_tracing</code> keys could be applied to either<br>
+  nothing or all functions.</p>
+</li>
+</ul>
+<p>Overall the previous state of configuration in <code>bindgen!</code> was clearly a<br>
+hodgepodge of systems that organically grew over time. In my personal<br>
+opinion it was in dire need of a refresh to take into account how<br>
+component-model-async ended up being implemented as well as<br>
+consolidating the one-off systems amongst all of these configuration<br>
+keys. A major motivation of this redesign, for example, was to inherit<br>
+behavior from WIT files by default. An <code>async</code> function in WIT should<br>
+not require <code>concurrent_*</code> keys to be configured, but rather it should<br>
+generate correct bindings by default.</p>
+<p>In this commit, all of the above keys were removed. All keys have been<br>
+replaced with <code>imports</code> and <code>exports</code> configuration keys. Each behaves<br>
+the same way and looks like so:</p>
+<div class="codehilite"><pre><span></span><code>bindgen!({
+    // ...
+    imports: {
+        // enable tracing for just this function
+        &quot;my:local/interface/func&quot;: tracing,
+
+        // enable verbose tracing for just this function
+        &quot;my:local/interface/other-func&quot;: tracing | verbose_tracing,
+
+        // this is blocking in WIT, but generate async bindings for
+        // it
+        &quot;my:local/interface/[method]io.block&quot;: async,
+
+        // like above, but use &quot;concurrent&quot; bindings which have
+        // access to the store.
+        &quot;my:local/interface/[method]io.block-again&quot;: async | store,
+
+        // everything else is, by default, trappable
+        default: trappable,
+    },
+});
+</code></pre></div>
+
+<p>Effectively all the function-level configuration items are now bitflags.<br>
+These bitflags are by default inherited from the WIT files itself (e.g.<br>
+<code>async</code> functions are <code>async | store</code> by default). Further configuration<br>
+is then layered on top at the desires of the embedder. Supported keys are:</p>
+<ul>
+<li>
+<p><code>async</code> - this means that a Rust-level <code>async</code> function should be<br>
+  generated. This is either <code>CallStyle::Async</code> or<br>
+<code>CallStyle::Concurrent</code> as it was prior, depending on ...</p>
+</li>
+<li>
+<p><code>store</code> - this means that the generated function will have access to<br>
+  the store on the host. This is only implemented right now for <code>async |
+  store</code> functions which map to <code>CallStyle::Concurrent</code>. In the future<br>
+  I'd like to support just-<code>store</code> functions which means that you could<br>
+  define a synchronous function with access to the store in addition to<br>
+  an asynchronous function.</p>
+</li>
+<li>
+<p><code>trappable</code> - this means that the function returns a<br>
+<code>wasmtime::Result&lt;TheWitBindingType&gt;</code>. If <code>trappable_errors</code> is<br>
+  applicable then it means just a <code>Result&lt;TheWitOkType,
+  TrappableErrorType&gt;</code> is returned (like before)</p>
+</li>
+<li>
+<p><code>tracing</code> - this enables <code>tracing!</code> integration for this function.</p>
+</li>
+<li>
+<p><code>verbose_tracing</code> - this logs all argument values for this function<br>
+  (including lists).</p>
+</li>
+<li>
+<p><code>ignore_wit</code> - this ignores the WIT-level defaults of the function<br>
+  (e.g. ignoring WIT <code>async</code>).</p>
+</li>
+</ul>
+<p>The way this then works is all modeled is that for any WIT function<br>
+being generated there are a set of flags associated with that function.<br>
+To calculate the flags the algorithm looks like:</p>
+<ol>
+<li>
+<p>Find the first matching rule in the <code>imports</code> or <code>exports</code> map<br>
+   depending on if the function is imported or exported. If there is no<br>
+   matching rule then use the <code>default</code> rule if present. This is the<br>
+   initial set of flags for the function (or empty if nothing was<br>
+   found).</p>
+</li>
+<li>
+<p>If <code>ignore_wit</code> is present, return the flags from step 1. Otherwise<br>
+   add in <code>async | store</code> if the function is <code>async</code> in WIT.</p>
+</li>
+</ol>
+<p>The resulting set of flags are then used to control how everything is<br>
+generated. For example the same split traits of today are still<br>
+generated and it's controlled based on the flags. Note though that the<br>
+previous <code>HostConcurrent</code> trait was renamed to <code>HostWithStore</code> to make<br>
+space for synchronous functions in this trait in the future too.</p>
+<p>The end result of all these changes is that configuring imports/exports<br>
+now uses the exact same selection system as the <code>with</code> replacement map,<br>
+meaning there's only one system of selecting functions instead of 3.<br>
+WIT-level <code>async</code> is now respected by default meaning that bindings work<br>
+by default without further need to configure anything (unless more<br>
+functionality is desired).</p>
+<p>One final minor change made here as well is that auto-generated<br>
+<code>instantiate</code> methods are now always synchronous and an<br>
+<code>instantiate_async</code> method is unconditionally generated for async mode.<br>
+This means that bindings always generate both functions and it's up to<br>
+the embedder to choose the appropriate one.</p>
+<p>Closes <a href="https://github.com/bytecodealliance/wasmtime/issues/11246">https://github.com/bytecodealliance/wasmtime/issues/11246</a><br>
+Closes <a href="https://github.com/bytecodealliance/wasmtime/issues/11247">https://github.com/bytecodealliance/wasmtime/issues/11247</a></p>
+</blockquote>
+
+
+
+<a name="531004162"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531004162" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531004162">(Jul 26 2025 at 21:08)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-wasi-reviewers">wasmtime-wasi-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11328">PR #11328</a>.</p>
+
+
+
+<a name="531004165"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531004165" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531004165">(Jul 26 2025 at 21:08)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/pchickey">pchickey</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11328">PR #11328</a>.</p>
+
+
+
+<a name="531004166"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531004166" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531004166">(Jul 26 2025 at 21:08)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11328">PR #11328</a>.</p>
+
+
+
+<a name="531004169"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531004169" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531004169">(Jul 26 2025 at 21:08)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-default-reviewers">wasmtime-default-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11328">PR #11328</a>.</p>
+
+
+
+<a name="531399409"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531399409" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531399409">(Jul 28 2025 at 15:30)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11328">PR #11328</a>.</p>
+
+
+
+<a name="531399552"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531399552" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531399552">(Jul 28 2025 at 15:31)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/11328#issuecomment-3127779611">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11328">PR #11328</a>:</p>
+<blockquote>
+<p>One other large-ish change now here, <code>*WithStore</code> is always generated no matter what. That'll make the generated docs slightly more confusing but I think it's worth the tradeoff of enabling bindings to always assume the trait is there.</p>
+</blockquote>
+
+
+
+<a name="531417572"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531417572" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531417572">(Jul 28 2025 at 17:04)</a>:</h4>
+<p>pchickey submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11328#pullrequestreview-3063821967">PR review</a>:</p>
+<blockquote>
+<p>Thanks, this is a nice improvement!</p>
+</blockquote>
+
+
+
+<a name="531417801"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531417801" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531417801">(Jul 28 2025 at 17:05)</a>:</h4>
+<p>pchickey submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11328#pullrequestreview-3063821967">PR review</a>:</p>
+<blockquote>
+<p>Thanks, this is a nice improvement! In the future I'd probably like it to be <code>tracing</code> or <code>tracing(verbose)</code> instead of another keyword for verbose_tracing, but its not necessary to do that now.</p>
+</blockquote>
+
+
+
+<a name="531419351"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531419351" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531419351">(Jul 28 2025 at 17:14)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11328#pullrequestreview-3063811303">PR review</a>.</p>
+
+
+
+<a name="531419353"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531419353" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531419353">(Jul 28 2025 at 17:14)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11328#discussion_r2237290144">PR review comment</a>:</p>
+<blockquote>
+<p>Why is this one commented out?</p>
+</blockquote>
+
+
+
+<a name="531419354"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531419354" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531419354">(Jul 28 2025 at 17:14)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11328#discussion_r2237324791">PR review comment</a>:</p>
+<blockquote>
+<p>Did you intend to keep this comment-ed out code fragment?</p>
+</blockquote>
+
+
+
+<a name="531419355"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531419355" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531419355">(Jul 28 2025 at 17:14)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11328#discussion_r2237320174">PR review comment</a>:</p>
+<blockquote>
+<p><div class="codehilite" data-code-language="suggestion"><pre><span></span><code>        // it's otherwise not necessary to implement it manually.
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="531428969"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531428969" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531428969">(Jul 28 2025 at 18:06)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11328#pullrequestreview-3064078611">PR review</a>.</p>
+
+
+
+<a name="531428970"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531428970" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531428970">(Jul 28 2025 at 18:06)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11328#discussion_r2237480757">PR review comment</a>:</p>
+<blockquote>
+<p>Oops, meant to come back and dig in, but it's just unused so needed to be deleted.</p>
+</blockquote>
+
+
+
+<a name="531429046"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531429046" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531429046">(Jul 28 2025 at 18:06)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11328">PR #11328</a>.</p>
+
+
+
+<a name="531429065"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531429065" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531429065">(Jul 28 2025 at 18:06)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11328#pullrequestreview-3064080610">PR review</a>.</p>
+
+
+
+<a name="531429068"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531429068" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531429068">(Jul 28 2025 at 18:06)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11328#discussion_r2237481968">PR review comment</a>:</p>
+<blockquote>
+<p>Oops nah just a forgotten deletion.</p>
+</blockquote>
+
+
+
+<a name="531429087"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531429087" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531429087">(Jul 28 2025 at 18:06)</a>:</h4>
+<p>alexcrichton has enabled auto merge for <a href="https://github.com/bytecodealliance/wasmtime/pull/11328">PR #11328</a>.</p>
+
+
+
+<a name="531437024"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311328%20Redesign%20function%20configuration%20in%20%60.../near/531437024" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311328.20Redesign.20function.20configuration.20in.20.60.2E.2E.2E.html#531437024">(Jul 28 2025 at 18:55)</a>:</h4>
+<p>alexcrichton merged <a href="https://github.com/bytecodealliance/wasmtime/pull/11328">PR #11328</a>.</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

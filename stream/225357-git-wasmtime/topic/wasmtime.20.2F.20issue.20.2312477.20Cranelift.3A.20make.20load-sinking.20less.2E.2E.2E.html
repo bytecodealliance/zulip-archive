@@ -1,0 +1,275 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #12477 Cranelift: make load-sinking less... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312477.20Cranelift.3A.20make.20load-sinking.20less.2E.2E.2E.html">wasmtime / issue #12477 Cranelift: make load-sinking less...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="570911388"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312477%20Cranelift%3A%20make%20load-sinking%20less.../near/570911388" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312477.20Cranelift.3A.20make.20load-sinking.20less.2E.2E.2E.html#570911388">(Jan 29 2026 at 22:59)</a>:</h4>
+<p>cfallin opened <a href="https://github.com/bytecodealliance/wasmtime/issues/12477">issue #12477</a>:</p>
+<blockquote>
+<p>In <a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-vc8c-j3xm-xj73">CVE-2026-24116</a>, we saw that a load-sinking instruction lowering on x86-64 could result in a 64-bit load (<code>load.f64</code> Cranelift operator) becoming a memory operand on a 128-bit-wide SIMD instruction (<code>vandpd</code> / <code>vandnpd</code>). This resulted in a too-wide access to memory, hence a miscompilation and a CVE. (The issue also applies to 32-bit loads for <code>f32.copysign</code> equally, but we'll describe the 64-bit case only here for brevity.)</p>
+<p>The chain of logic that leads to the load-sinking is:</p>
+<ol>
+<li>
+<p>The <code>fcopysign</code> lowering takes <code>Value</code>s and feeds them to the helper constructors for <code>vandpd</code> and <code>vandnpd</code> [here]. These instructions perform operations on 128-bit XMM registers, and we rely on Cranelift's usual convention of storing narrower values (here an <code>f64</code>) in wider machine registers and ignoring the upper bits.</p>
+</li>
+<li>
+<p>These constructors take <code>XmmMem</code> arguments, which can represent a register or memory; when memory, the instructions perform a 128-bit load</p>
+</li>
+<li>
+<p><code>XmmMem</code> can be implicitly constructed from a <code>Value</code> by <code>put_in_xmm_mem</code>, which checks for a sinkable load [here]</p>
+</li>
+<li>
+<p>A load is sinkable if [conditions] are met that relate to code-motion, but the width of the to-be-sunk load operator is not explicitly checked against anything, because we do not know yet who will be consuming (incorporating) the sunk load.</p>
+</li>
+</ol>
+<p>In other words, we use a <code>Value</code> corresponding to an <code>f64</code> with an instruction that operates on XMM registers, and we sink loads into XMM operands. Both of these patterns occur in many places: e.g., an <code>fadd</code> lowers to an instruction that operates on XMM registers, and can sink a load, as well. The thing that makes <code>fcopysign</code> special is that its lowering uses instructions that operate on the full 128 bits while dealing with <code>f64</code>s; e.g., <code>fadd.f64</code> uses <code>addsd</code> (add single double) which, if using a memory operand, will load only 64 bits.</p>
+<p>The tricky bit here is that nothing about the lowering rule itself looks amiss -- it is essentially (simplified)</p>
+<div class="codehilite" data-code-language="Common Lisp"><pre><span></span><code><span class="p">(</span><span class="nv">rule</span><span class="w"> </span><span class="p">(</span><span class="nv">lower</span><span class="w"> </span><span class="p">(</span><span class="nv">has_type</span><span class="w"> </span><span class="nv">$F64</span><span class="w"> </span><span class="p">(</span><span class="nv">fcopysign</span><span class="w"> </span><span class="nv">a</span><span class="w"> </span><span class="nv">b</span><span class="p">)))</span>
+<span class="w">      </span><span class="p">(</span><span class="nv">simd_op</span>
+<span class="w">        </span><span class="p">(</span><span class="nv">simd_op</span><span class="w"> </span><span class="nv">a</span><span class="p">)</span>
+<span class="w">        </span><span class="p">(</span><span class="nv">simd_op</span><span class="w"> </span><span class="nv">b</span><span class="p">)))</span>
+</code></pre></div>
+<p>and only knowledge that (i) <code>a</code> and <code>b</code> are <code>f64</code>s and (ii) the <code>simd_op</code>s do 128 bits of work leads to seeing the bug.</p>
+<p>There are a few ways we could "break the chain" above and cause this mistake to be harder to make:</p>
+<ol>
+<li>
+<p>We could remove the implicit conversion from <code>Value</code> to <code>XmmMem</code>, i.e., force all sites where we want to support load-sinking to opt into that behavior.</p>
+<p>This is tempting from a point-of-view of explicitness and clarity when reading/auditing the code. It should be noted, however, that the ergonomics/implicitness of autoconversions go hand-in-hand with <em>completeness</em>, i.e., supporting load-sinking everywhere it is possible. In essence, this is admitting that the types don't fully capture the invariants, so we can't trust the type system, and we have to manually describe allowed behavior. As we know from experience with Rust, a type system that has accurate guardrails is freeing in many ways and allows for more optimizations.</p>
+<p>With @avanhatt and @fitzgen we did a quick experiment to see how many sites would need explicit opt-in or opt-out if we remove the <code>Value</code> to <code>XmmMem</code>-and-family conversions; 255 type errors resulted. That's a lot, but within the realm of a big refactor.</p>
+</li>
+<li>
+<p>We could keep the implicit conversions but somehow carry the width of the original value dynamically in the <code>XmmMem</code> (or more likely the underlying <code>Amode</code>), and assert that the instruction consuming the <code>Amode</code> will do a load of the expected width.</p>
+<p>This is also tempting, albeit with some dynamic cost (even if the assert itself is only a debug-assert, the extra field rides along in the <code>Amode</code>), and also relies on fuzzing rather than the type system to find errors.</p>
+</li>
+<li>
+<p>We could add another dimension to the newtype universe around registers, and have <code>XmmMem32</code>, <code>XmmMem64</code>, and <code>XmmMem128</code>; update instruction constructors to take only the appropriate width; and create autoconversions from <code>Value</code> to each of these that dynamically fails if the <code>Value</code> has a CLIF-level type with the wrong width.</p>
+<p>This is better than option 2 above because, though still dynamic, it puts more in the type system; and this is desirable for verification.</p>
+</li>
+<li>
+<p>(Idea from @avanhatt) We could mark the left-hand side bindings where sinking is acceptable syntactically, and then only for these, provide autoconversions; e.g., match on <code>(fcopysign (maybe_sink a) (maybe_sink b))</code> where <code>maybe_sink</code> gives us a <code>ValueMaybeSunk</code> and we have an autoconverter from <code>ValueMaybeSunk</code> to <code>XmmMem</code> (and then from <code>Value</code> only to <code>Xmm</code>, i.e. only the register form).</p>
+<p>This is nice because it addresses one difference between load-sinking cases and all other instruction selection rules: this is the only case where we <em>don't</em> write out the full pattern of CLIF operators that we are matching on and lowering on the left-hand side. In a sense, the current status quote is composing the usual LHS patterns with the loads-become-memory-operands sinking behavior, which allows for more compact and complete rulesets (we'd otherwise have to duplicate many of the backend rules in x64, and we might miss some) but hides this behavior.</p>
+</li>
+</ol>
+<p>I am starting to come to the opinion that option 4 is good regardless -- the discrepancy between load-sinking and all other kinds of multi-operator matching on left hand sides is odd -- but we should also try to do something like option 3, i.e. distinguish operands of different widths at the type level, because option 4 alone (denoting sinking sites) still relies on the rule author reasoning about operand width, and possibly getting it wrong (or a later refactor getting it wrong). To make it concrete with details from this CVE, something would have needed to know that <code>vandpd</code> has a 128-bit operand width, and that does not match the <code>Value</code>; that something is either the author reading the Intel manual, deciding yes or no, and adding <code>maybe_sink</code>, or types added in a principled way on both ends.</p>
+<p>cc @avanhatt @fitzgen for thoughts!<br>
+</p>
+</blockquote>
+
+
+
+<a name="571041968"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312477%20Cranelift%3A%20make%20load-sinking%20less.../near/571041968" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312477.20Cranelift.3A.20make.20load-sinking.20less.2E.2E.2E.html#571041968">(Jan 30 2026 at 14:23)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/12477#issuecomment-3824033562">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12477">issue #12477</a>:</p>
+<blockquote>
+<p>Reading over this I also quite like the <code>maybe_sink</code> idea. That feels like a lightweight-enough annotation to be easy enough to apply to what we have today while also making it much clearer when sinking is allowed or not. Right now we have a lot of <code>(a Xmm a)</code> which is a sufficient but non-obvious way to disallow sinking, and the omission of <code>maybe_sink</code> meaning "this can't be sunk" feels more clear.</p>
+<p>Inevitably we'll forget <code>maybe_sink</code> in places that it should be, but that seems like a better problem to have than the other way around.</p>
+<p>Also, to confirm, my assumption on that is that <code>Value</code> would still auto-convert to <code>XmmMem</code>, it'd just always be <code>Xmm</code> under the hood. The production of <code>(maybe_sink a)</code> would then do the auto-conversion we have today to <code>XmmMem</code> where it binds either <code>Xmm</code> or <code>Mem</code> as appropriate.</p>
+</blockquote>
+
+
+
+<a name="571075577"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312477%20Cranelift%3A%20make%20load-sinking%20less.../near/571075577" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312477.20Cranelift.3A.20make.20load-sinking.20less.2E.2E.2E.html#571075577">(Jan 30 2026 at 16:39)</a>:</h4>
+<p>cfallin edited <a href="https://github.com/bytecodealliance/wasmtime/issues/12477">issue #12477</a>:</p>
+<blockquote>
+<p>In <a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-vc8c-j3xm-xj73">CVE-2026-24116</a>, we saw that a load-sinking instruction lowering on x86-64 could result in a 64-bit load (<code>load.f64</code> Cranelift operator) becoming a memory operand on a 128-bit-wide SIMD instruction (<code>vandpd</code> / <code>vandnpd</code>). This resulted in a too-wide access to memory, hence a miscompilation and a CVE. (The issue also applies to 32-bit loads for <code>f32.copysign</code> equally, but we'll describe the 64-bit case only here for brevity.)</p>
+<p>The chain of logic that leads to the load-sinking is:</p>
+<ol>
+<li>
+<p>The <code>fcopysign</code> lowering takes <code>Value</code>s and feeds them to the helper constructors for <code>vandpd</code> and <code>vandnpd</code> [here]. These instructions perform operations on 128-bit XMM registers, and we rely on Cranelift's usual convention of storing narrower values (here an <code>f64</code>) in wider machine registers and ignoring the upper bits.</p>
+</li>
+<li>
+<p>These constructors take <code>XmmMem</code> arguments, which can represent a register or memory; when memory, the instructions perform a 128-bit load</p>
+</li>
+<li>
+<p><code>XmmMem</code> can be implicitly constructed from a <code>Value</code> by <code>put_in_xmm_mem</code>, which checks for a sinkable load <a href="https://github.com/bytecodealliance/wasmtime/blob/3e101ff44fe5f90949876623db1405cefaa15ec8/cranelift/codegen/src/machinst/lower.rs#L1534">here</a></p>
+</li>
+<li>
+<p>A load is sinkable if conditions are met that relate to code-motion, but the width of the to-be-sunk load operator is not explicitly checked against anything, because we do not know yet who will be consuming (incorporating) the sunk load.</p>
+</li>
+</ol>
+<p>In other words, we use a <code>Value</code> corresponding to an <code>f64</code> with an instruction that operates on XMM registers, and we sink loads into XMM operands. Both of these patterns occur in many places: e.g., an <code>fadd</code> lowers to an instruction that operates on XMM registers, and can sink a load, as well. The thing that makes <code>fcopysign</code> special is that its lowering uses instructions that operate on the full 128 bits while dealing with <code>f64</code>s; e.g., <code>fadd.f64</code> uses <code>addsd</code> (add single double) which, if using a memory operand, will load only 64 bits.</p>
+<p>The tricky bit here is that nothing about the lowering rule itself looks amiss -- it is essentially (simplified)</p>
+<div class="codehilite" data-code-language="Common Lisp"><pre><span></span><code><span class="p">(</span><span class="nv">rule</span><span class="w"> </span><span class="p">(</span><span class="nv">lower</span><span class="w"> </span><span class="p">(</span><span class="nv">has_type</span><span class="w"> </span><span class="nv">$F64</span><span class="w"> </span><span class="p">(</span><span class="nv">fcopysign</span><span class="w"> </span><span class="nv">a</span><span class="w"> </span><span class="nv">b</span><span class="p">)))</span>
+<span class="w">      </span><span class="p">(</span><span class="nv">simd_op</span>
+<span class="w">        </span><span class="p">(</span><span class="nv">simd_op</span><span class="w"> </span><span class="nv">a</span><span class="p">)</span>
+<span class="w">        </span><span class="p">(</span><span class="nv">simd_op</span><span class="w"> </span><span class="nv">b</span><span class="p">)))</span>
+</code></pre></div>
+<p>and only knowledge that (i) <code>a</code> and <code>b</code> are <code>f64</code>s and (ii) the <code>simd_op</code>s do 128 bits of work leads to seeing the bug.</p>
+<p>There are a few ways we could "break the chain" above and cause this mistake to be harder to make:</p>
+<ol>
+<li>
+<p>We could remove the implicit conversion from <code>Value</code> to <code>XmmMem</code>, i.e., force all sites where we want to support load-sinking to opt into that behavior.</p>
+<p>This is tempting from a point-of-view of explicitness and clarity when reading/auditing the code. It should be noted, however, that the ergonomics/implicitness of autoconversions go hand-in-hand with <em>completeness</em>, i.e., supporting load-sinking everywhere it is possible. In essence, this is admitting that the types don't fully capture the invariants, so we can't trust the type system, and we have to manually describe allowed behavior. As we know from experience with Rust, a type system that has accurate guardrails is freeing in many ways and allows for more optimizations.</p>
+<p>With @avanhatt and @fitzgen we did a quick experiment to see how many sites would need explicit opt-in or opt-out if we remove the <code>Value</code> to <code>XmmMem</code>-and-family conversions; 255 type errors resulted. That's a lot, but within the realm of a big refactor.</p>
+</li>
+<li>
+<p>We could keep the implicit conversions but somehow carry the width of the original value dynamically in the <code>XmmMem</code> (or more likely the underlying <code>Amode</code>), and assert that the instruction consuming the <code>Amode</code> will do a load of the expected width.</p>
+<p>This is also tempting, albeit with some dynamic cost (even if the assert itself is only a debug-assert, the extra field rides along in the <code>Amode</code>), and also relies on fuzzing rather than the type system to find errors.</p>
+</li>
+<li>
+<p>We could add another dimension to the newtype universe around registers, and have <code>XmmMem32</code>, <code>XmmMem64</code>, and <code>XmmMem128</code>; update instruction constructors to take only the appropriate width; and create autoconversions from <code>Value</code> to each of these that dynamically fails if the <code>Value</code> has a CLIF-level type with the wrong width.</p>
+<p>This is better than option 2 above because, though still dynamic, it puts more in the type system; and this is desirable for verification.</p>
+</li>
+<li>
+<p>(Idea from @avanhatt) We could mark the left-hand side bindings where sinking is acceptable syntactically, and then only for these, provide autoconversions; e.g., match on <code>(fcopysign (maybe_sink a) (maybe_sink b))</code> where <code>maybe_sink</code> gives us a <code>ValueMaybeSunk</code> and we have an autoconverter from <code>ValueMaybeSunk</code> to <code>XmmMem</code> (and then from <code>Value</code> only to <code>Xmm</code>, i.e. only the register form).</p>
+<p>This is nice because it addresses one difference between load-sinking cases and all other instruction selection rules: this is the only case where we <em>don't</em> write out the full pattern of CLIF operators that we are matching on and lowering on the left-hand side. In a sense, the current status quote is composing the usual LHS patterns with the loads-become-memory-operands sinking behavior, which allows for more compact and complete rulesets (we'd otherwise have to duplicate many of the backend rules in x64, and we might miss some) but hides this behavior.</p>
+</li>
+</ol>
+<p>I am starting to come to the opinion that option 4 is good regardless -- the discrepancy between load-sinking and all other kinds of multi-operator matching on left hand sides is odd -- but we should also try to do something like option 3, i.e. distinguish operands of different widths at the type level, because option 4 alone (denoting sinking sites) still relies on the rule author reasoning about operand width, and possibly getting it wrong (or a later refactor getting it wrong). To make it concrete with details from this CVE, something would have needed to know that <code>vandpd</code> has a 128-bit operand width, and that does not match the <code>Value</code>; that something is either the author reading the Intel manual, deciding yes or no, and adding <code>maybe_sink</code>, or types added in a principled way on both ends.</p>
+<p>cc @avanhatt @fitzgen for thoughts!<br>
+</p>
+</blockquote>
+
+
+
+<a name="571076868"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312477%20Cranelift%3A%20make%20load-sinking%20less.../near/571076868" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312477.20Cranelift.3A.20make.20load-sinking.20less.2E.2E.2E.html#571076868">(Jan 30 2026 at 16:44)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/12477#issuecomment-3824670176">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12477">issue #12477</a>:</p>
+<blockquote>
+<blockquote>
+<p>Also, to confirm, my assumption on that is that <code>Value</code> would still auto-convert to <code>XmmMem</code>, it'd just always be <code>Xmm</code> under the hood. The production of <code>(maybe_sink a)</code> would then do the auto-conversion we have today to <code>XmmMem</code> where it binds either <code>Xmm</code> or <code>Mem</code> as appropriate.</p>
+</blockquote>
+<p>Yes to the first -- the autoconversion would always force to a register. <code>(maybe_sink _)</code> as an extractor would produce a newtype wrapper around <code>Value</code> like <code>MaybeSinkableValue</code> (Alexa: your original name was <code>ValueMaybeSunk</code> but at this point it's not sunk yet); we'd have a <code>(convert MaybeSinkableValue XmmMem)</code> that does what <code>put_in_xmm_mem</code> does today.</p>
+<p>In other words, the check to see if something is sinkable happens in the constructor (right-hand side); we are only labeling it with a newtype on the left-hand side. That's important, because we don't know where the value is going to be used yet on the LHS, and we haven't committed to this rule yet when the LHS is evaluated. (I guess that's also why we have this distinction historically where we have a special mechanism to "look through" the sinkability boundary rather than using ordinary LHS matching: it requires a side-effect to actually commit to the sinking and make it real.)</p>
+<p>It's important to note here too that this alone doesn't protect us against the CVE issue, which is a mismatch-in-width issue; that requires either the newtypes for 32/64/128-bit-wide operands or a field in <code>Amode</code> indicating the expected load width that we assert on when the amode meets a particular instruction in an RHS instruction constructor (e.g. <code>vpandpd</code> asserts it's 128 bits, <code>mulsd</code> asserts it's 64 bits, <code>mulss</code> asserts it's 32 bits).</p>
+</blockquote>
+
+
+
+<a name="571076986"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312477%20Cranelift%3A%20make%20load-sinking%20less.../near/571076986" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312477.20Cranelift.3A.20make.20load-sinking.20less.2E.2E.2E.html#571076986">(Jan 30 2026 at 16:45)</a>:</h4>
+<p>cfallin edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/12477#issuecomment-3824670176">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12477">issue #12477</a>:</p>
+<blockquote>
+<blockquote>
+<p>Also, to confirm, my assumption on that is that <code>Value</code> would still auto-convert to <code>XmmMem</code>, it'd just always be <code>Xmm</code> under the hood. The production of <code>(maybe_sink a)</code> would then do the auto-conversion we have today to <code>XmmMem</code> where it binds either <code>Xmm</code> or <code>Mem</code> as appropriate.</p>
+</blockquote>
+<p>Yes to the first -- the autoconversion would always force to a register. <code>(maybe_sink _)</code> as an extractor would produce a newtype wrapper around <code>Value</code> like <code>MaybeSinkableValue</code> (Alexa: your original name was <code>ValueMaybeSunk</code> but at this point it's not sunk yet); we'd have a <code>(convert MaybeSinkableValue XmmMem)</code> that does what <code>put_in_xmm_mem</code> does today.</p>
+<p>In other words, the check to see if something is sinkable happens in the constructor (right-hand side); we are only labeling it with a newtype on the left-hand side. That's important, because we don't know where the value is going to be used yet on the LHS, and we haven't committed to this rule yet when the LHS is evaluated. (I guess that's also why we have this distinction historically where we have a special mechanism to "look through" the sinkability boundary rather than using ordinary LHS matching: it requires a side-effect to actually commit to the sinking and make it real.)</p>
+<p>It's important to note here too that this alone (option 4) doesn't protect us against the CVE issue, which is a mismatch-in-width issue; that requires either the newtypes for 32/64/128-bit-wide operands (option 3) or a field in <code>Amode</code> indicating the expected load width (option 2) that we assert on when the amode meets a particular instruction in an RHS instruction constructor (e.g. <code>vpandpd</code> asserts it's 128 bits, <code>mulsd</code> asserts it's 64 bits, <code>mulss</code> asserts it's 32 bits).</p>
+</blockquote>
+
+
+
+<a name="571083493"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312477%20Cranelift%3A%20make%20load-sinking%20less.../near/571083493" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312477.20Cranelift.3A.20make.20load-sinking.20less.2E.2E.2E.html#571083493">(Jan 30 2026 at 17:15)</a>:</h4>
+<p>avanhatt <a href="https://github.com/bytecodealliance/wasmtime/issues/12477#issuecomment-3824794187">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12477">issue #12477</a>:</p>
+<blockquote>
+<p>To add another reason why I like option 4 (possibly in addition to other changes): </p>
+<p>From the perspective of verification, we'd really like it if the LHS can be syntactically sufficient to recover the semantics of a snippet of Clif. </p>
+<p>E.g., without auto converters, if we wrote a version of this rule to explicitly match on a <code>load</code>ed arg with the LHS of roughly:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="p">(</span><span class="n">lower</span><span class="w"> </span><span class="p">(</span><span class="n">has_type</span><span class="w"> </span><span class="cp">$F64</span><span class="w"> </span><span class="p">(</span><span class="n">fcopysign</span><span class="w"> </span><span class="p">(</span><span class="n">load</span><span class="w"> </span><span class="n">a</span><span class="p">)</span><span class="w"> </span><span class="n">b</span><span class="p">)))</span>
+</code></pre></div>
+<p>We know that is equivalent to:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">v2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">load</span><span class="p">.</span><span class="kt">f64</span><span class="w"> </span><span class="n">v0</span>
+<span class="n">v3</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fcopysign</span><span class="w"> </span><span class="n">v2</span><span class="p">,</span><span class="w"> </span><span class="n">v1</span>
+</code></pre></div>
+<p>Which has the semantics of: load a 64-bit value from memory, then perform the pure operator <code>fcopysign</code>. </p>
+<p>The current status quo's LHS of:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="p">(</span><span class="n">lower</span><span class="w"> </span><span class="p">(</span><span class="n">has_type</span><span class="w"> </span><span class="cp">$F64</span><span class="w"> </span><span class="p">(</span><span class="n">fcopysign</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="n">b</span><span class="p">)))</span>
+</code></pre></div>
+<p>Is strange from this perspective: the type of <code>a</code> (and <code>b</code>) is <code>Value</code>, which we'd like to understand as "a value in Clif, which may have come from any other sequence of Clif instructions but should reside in an SSA virtual register". From a semantic perspective, this LHS looks _pure_ in that it should not touch memory.</p>
+<p>With the new proposed LHS: </p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="p">(</span><span class="n">lower</span><span class="w"> </span><span class="p">(</span><span class="n">has_type</span><span class="w"> </span><span class="cp">$F64</span><span class="w"> </span><span class="p">(</span><span class="n">fcopysign</span><span class="w"> </span><span class="p">(</span><span class="n">maybe_sunk</span><span class="w"> </span><span class="n">a</span><span class="p">)</span><span class="w"> </span><span class="n">b</span><span class="p">)))</span>
+</code></pre></div>
+<p>We can essentially split the semantics of the LHS into two possibilities: (1) that the first argument is indeed from a virtual register, with pure, non-memory-effecting semantics, or (2) that the first argument has equivalent semantics to a <code>load</code>, which is memory-effecting. </p>
+<hr>
+<p>On the point of whether to do option 3, I'm less inclined one way or the other at this point, but lean toward agreeing that it would be good. </p>
+<p>We need to be able to provide semantics to <code>XmmMem</code>, and again we will need to have cases: this type is either (1) a register with a width that (for verification) is determined during monomorphization before lowering to SMT, or (2) the result of a load with a specific width. Types like <code>XmmMem32</code> would make getting this specification right a bit easier, but I can't say at this point whether there are cases where monomorphization would fail without this.</p>
+<p>To @cfallin's point: 4 alone does not prevent the CVE in terms of an ISLE metacompiler error, but it may have caused the author to not write the rule with <code>maybe_sunk</code>, avoiding the CVE. That is, hope is that 4/<code>maybe_sunk</code> would force a rule-author to at least consider the possibility that the LHS they are matching on includes a load, raising mental (if not type-enforced) alarms if they then have RHS ops with known wider width. </p>
+</blockquote>
+
+
+
+<a name="571097405"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312477%20Cranelift%3A%20make%20load-sinking%20less.../near/571097405" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312477.20Cranelift.3A.20make.20load-sinking.20less.2E.2E.2E.html#571097405">(Jan 30 2026 at 18:26)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/12477#issuecomment-3825071256">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12477">issue #12477</a>:</p>
+<blockquote>
+<p>Personally I like the idea of sized XmmMem vales (and probably GprMem too). The raw instructions are already annotated with widths and so this would, in theory, largely be a matter of plumbing and type juggling.</p>
+<p>Doing both of these (also maybe_sink), to me, tackles the two major angles for how this bug arose</p>
+</blockquote>
+
+
+
+<a name="571100807"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312477%20Cranelift%3A%20make%20load-sinking%20less.../near/571100807" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312477.20Cranelift.3A.20make.20load-sinking.20less.2E.2E.2E.html#571100807">(Jan 30 2026 at 18:46)</a>:</h4>
+<p>avanhatt <a href="https://github.com/bytecodealliance/wasmtime/issues/12477#issuecomment-3825146038">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12477">issue #12477</a>:</p>
+<blockquote>
+<p>Just to be explicit: is our thinking that only the <code>*Mem</code> ISLE types get widths?</p>
+<p>That is, should <code>Xmm</code> always be understood to have width 128 (even if in certain cases, we only care about the low bits)?</p>
+<p>I could see an argument that this is a nice policy:</p>
+<ol>
+<li>ISLE types defined in the shared prelude (<code>Reg</code>, <code>WritableReg</code>, <code>VecReg</code>, etc) have polymorphic/dynamic widths. </li>
+<li>Backend-specific ISLE types should have specific widths (if not explicit in the name, at least inferable from context, though explicit names would make the verification team's job easier).</li>
+</ol>
+<p>But I'm not sure whether the second point is too strict of a distinction for x64. </p>
+</blockquote>
+
+
+
+<a name="571106145"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312477%20Cranelift%3A%20make%20load-sinking%20less.../near/571106145" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312477.20Cranelift.3A.20make.20load-sinking.20less.2E.2E.2E.html#571106145">(Jan 30 2026 at 19:14)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/12477#issuecomment-3825279453">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12477">issue #12477</a>:</p>
+<blockquote>
+<p>If we take option 2, I think it's a little clearer actually if we carry through the refactor to the reg-only kinds as well; otherwise the boundary between the two gets weird. For example, if I have an <code>Xmm</code>, can I autoconvert that to an <code>XmmMem64</code> too or only <code>XmmMem128</code>? (I guess if the width speaks only about the memory case, that's still viable, but it's subtle)</p>
+<p>So to be concrete, I'd imagine replacing <code>Xmm</code> with <code>Xmm32/64/128</code>, <code>XmmMem</code> with <code>XmmMem32/64/128</code>, etc. We have autoconverters from <code>Value</code> and <code>MaybeSinkableValue</code> for all of them that check the type on the <code>Value</code> and panic if wrong. This then does mean we'll need "widening" operators too, I think, for cases like <code>fcopysign</code> where we use an instruction that really does do 128 bits of work on a narrower value (as opposed to the scalar ops like <code>mulsd</code> etc).</p>
+<p>Then <code>fcopysign</code> could either be written something like</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="p">(</span><span class="n">rule</span><span class="w"> </span><span class="p">(</span><span class="n">lower</span><span class="w"> </span><span class="p">(</span><span class="n">has_type</span><span class="w"> </span><span class="cp">$F64</span><span class="w"> </span><span class="p">(</span><span class="n">fcopysign</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="n">b</span><span class="p">)))</span>
+<span class="w">      </span><span class="p">(</span><span class="n">simd_op</span>
+<span class="w">        </span><span class="p">(</span><span class="n">simd_op</span><span class="w"> </span><span class="p">(</span><span class="n">widen_64_128</span><span class="w"> </span><span class="n">a</span><span class="p">))</span>
+<span class="w">        </span><span class="p">(</span><span class="n">simd_op</span><span class="w"> </span><span class="p">(</span><span class="n">widen_64_128</span><span class="w"> </span><span class="n">b</span><span class="p">))))</span>
+</code></pre></div>
+<p>where <code>a</code> bound in the LHS has type <code>Value</code>, we have an autoconverter to <code>Xmm64</code> for the operand of <code>widen_64_128</code> (which has signature <code>Xmm64</code> -&gt; <code>Xmm128</code>; <em>not</em> <code>Mem</code>), we get an <code>Xmm128</code> out, that autoconverts to <code>XmmMem128</code> (but only ever has the <code>Reg</code> branch), and <code>simd_op</code> (e.g. <code>vpandpd</code>) is defined to take an <code>XmmMem128</code>.</p>
+<p>Or we could write it without those widen operators, and instead have an autoconverter for <code>Value</code> to <code>XmmMem128</code> that, for a value of the wrong type/width, only ever yields the register case. Maybe that's actually even cleaner: we finally are feeding the appropriate information into the sinkability logic (what is the load width wanting to use this amode) so that, as you (Alexa) had initially wanted, we can inhibit the behavior at that level. I actually very much like that!<br>
+</p>
+</blockquote>
+
+
+
+<a name="571343291"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312477%20Cranelift%3A%20make%20load-sinking%20less.../near/571343291" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312477.20Cranelift.3A.20make.20load-sinking.20less.2E.2E.2E.html#571343291">(Feb 02 2026 at 04:07)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/12477#issuecomment-3832803683">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12477">issue #12477</a>:</p>
+<blockquote>
+<p>If we could get away with tagging all registers with their width I'd agree that'd be really nice. I suspect that'd be quite a large refactoring to the backends, but we've had a number of subtle bugs in the past related to mismatching register widths that  this'd probably close off</p>
+</blockquote>
+
+
+
+<a name="571485647"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312477%20Cranelift%3A%20make%20load-sinking%20less.../near/571485647" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312477.20Cranelift.3A.20make.20load-sinking.20less.2E.2E.2E.html#571485647">(Feb 02 2026 at 17:14)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/12477#issuecomment-3836566119">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12477">issue #12477</a>:</p>
+<blockquote>
+<p>Regarding bit-width specific types, I want to reiterate my potential incremental migration plan from the discussion we had in/after the Cranelift meeting.</p>
+<p>First, we provide the following infrastructure:</p>
+<ul>
+<li>Define <code>{Reg,Gpr,Xmm}[Mem[Imm]]{8,16,32,..}</code> types that statically specify their bit width</li>
+<li>Additionally, make the plain <code>{Reg,Gpr,Xmm}[Mem[Imm]]</code> types without a static bit width dynamically track their bit width<ul>
+<li>Optionally only when <code>cfg(debug_assertions)</code>, but I'd try pretty hard to keep it on all the time, if possible</li>
+</ul>
+</li>
+<li>Auto convert from <code>Reg</code>/<code>Gpr</code>/<code>Xmm</code> to their static bit-width associated types (<code>Reg32</code>/<code>Gpr16</code>/<code>Xmm64</code>/etc...) with a dynamic assertion that the dynamic width matches the static type's width</li>
+<li>Also auto convert the other way, from e.g. <code>Gpr64</code> to <code>Gpr</code>, where the static bit width becomes the dynamic bit width.</li>
+</ul>
+<p>Then we start making more and more use of the static types:</p>
+<ul>
+<li>Make the assembler's codegen emit ISLE constructors that take static bit-width operands and produce static bit-width results</li>
+<li>Auto convert from <code>Value</code> to dynamically typed <code>Reg</code>/<code>Gpr</code>/<code>Xmm</code>, keeping track of the value's bit width as a dynamic parameter</li>
+<li>Auto convert from <code>Value</code> to statically typed <code>Reg8</code>/<code>Gpr16</code>/<code>Xmm32</code>/etc..., dynamically asserting that the value's dynamic bit width matches the result type's static width</li>
+<li>Start annotating rules with static bit widths</li>
+</ul>
+<p>This is effectively a combination of (2) and (3).</p>
+<p>(And it is also orthogonal from whether we do (1) or (4) or continue to have auto conversions between <code>Value</code> and <code>{Reg,Gpr,Xmm}Mem[Imm]</code>.)</p>
+<p>Final note regarding static types: we have a bunch of rules that work for many value widths, e.g. all values that fit in a single GPR. If we fully move to static types, we will need to "duplicate" these rules for each width (or introduce a generics/macro system...). So it may be desirable to have this hybrid dynamic+static approach not just as an incremental migration towards a fully-static system, but indefinitely.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

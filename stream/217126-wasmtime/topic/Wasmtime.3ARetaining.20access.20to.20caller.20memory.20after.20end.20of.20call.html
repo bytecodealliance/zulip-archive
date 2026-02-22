@@ -1,0 +1,98 @@
+<html>
+<head><meta charset="utf-8"><title>Wasmtime:Retaining access to caller memory after end of call · wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/index.html">wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Wasmtime.3ARetaining.20access.20to.20caller.20memory.20after.20end.20of.20call.html">Wasmtime:Retaining access to caller memory after end of call</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="509430966"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Wasmtime%3ARetaining%20access%20to%20caller%20memory%20after%20end%20of%20call/near/509430966" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Dylan <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Wasmtime.3ARetaining.20access.20to.20caller.20memory.20after.20end.20of.20call.html#509430966">(Apr 01 2025 at 11:55)</a>:</h4>
+<p>Apologies, accidentally put <a href="#narrow/channel/206238-general/topic/Wasmtime.3ARetaining.20access.20to.20caller.20memory.20after.20end.20of.20call/near/509428120">this</a> in the wrong channel:</p>
+<blockquote>
+<p>Hi there. I'm currently writing a WASM interface using Wasmtime wherein the host has a function that will:</p>
+<ol>
+<li>read message bytes from the WASM module's memory</li>
+<li>
+<p>spawn a future that will:<br>
+    a. action the message represented by those bytes<br>
+    b. write some bytes to the WASM module's memory in response<br>
+    c. call a WASM export to notify the module of completion</p>
+</li>
+<li>
+<p>return (before the future has completed)</p>
+</li>
+</ol>
+<p>However the problem is that writing to memory requires a context, and we can't use the caller's context as that is only valid for the lifetime of the original host function call. What should I use instead? Thanks.</p>
+</blockquote>
+
+
+
+<a name="509436408"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Wasmtime%3ARetaining%20access%20to%20caller%20memory%20after%20end%20of%20call/near/509436408" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> bjorn3 <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Wasmtime.3ARetaining.20access.20to.20caller.20memory.20after.20end.20of.20call.html#509436408">(Apr 01 2025 at 12:21)</a>:</h4>
+<p>How are you preventing the wasm export from being called by the future while code in the wasm module is already running? You can't enter wasm instances from multiple threads.</p>
+
+
+
+<a name="509436811"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Wasmtime%3ARetaining%20access%20to%20caller%20memory%20after%20end%20of%20call/near/509436811" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Dylan <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Wasmtime.3ARetaining.20access.20to.20caller.20memory.20after.20end.20of.20call.html#509436811">(Apr 01 2025 at 12:23)</a>:</h4>
+<p>Yeah I hadn't thought of that. I did some more looking around and it feels like what I want is to wrap the store in a mutex, which will also guarantee single access.</p>
+
+
+
+<a name="509437004"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Wasmtime%3ARetaining%20access%20to%20caller%20memory%20after%20end%20of%20call/near/509437004" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Dylan <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Wasmtime.3ARetaining.20access.20to.20caller.20memory.20after.20end.20of.20call.html#509437004">(Apr 01 2025 at 12:23)</a>:</h4>
+<p>Obviously that'll deadlock where I've got access to the caller, so I've essentially done something like:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">enum</span><span class="w"> </span><span class="nc">PluginFunctionsWasmInterface</span><span class="o">&lt;'</span><span class="na">a</span><span class="p">,</span><span class="w"> </span><span class="n">H</span><span class="p">:</span><span class="w"> </span><span class="nc">crate</span><span class="p">::</span><span class="n">Contract</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">Caller</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">caller</span><span class="p">:</span><span class="w"> </span><span class="nc">wasmtime</span><span class="p">::</span><span class="n">Caller</span><span class="o">&lt;'</span><span class="na">a</span><span class="p">,</span><span class="w"> </span><span class="k">crate</span><span class="p">::</span><span class="n">Address</span><span class="o">&lt;</span><span class="n">H</span><span class="o">&gt;&gt;</span><span class="p">,</span>
+<span class="w">        </span><span class="n">store</span><span class="p">:</span><span class="w"> </span><span class="nc">SharedStore</span><span class="o">&lt;</span><span class="n">H</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="n">Store</span><span class="p">(</span><span class="o">&amp;'</span><span class="na">a</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">wasmtime</span><span class="p">::</span><span class="n">Store</span><span class="o">&lt;</span><span class="k">crate</span><span class="p">::</span><span class="n">Address</span><span class="o">&lt;</span><span class="n">H</span><span class="o">&gt;&gt;</span><span class="p">),</span>
+<span class="p">}</span>
+
+<span class="k">impl</span><span class="o">&lt;'</span><span class="na">a</span><span class="p">,</span><span class="w"> </span><span class="n">H</span><span class="p">:</span><span class="w"> </span><span class="nc">crate</span><span class="p">::</span><span class="n">Contract</span><span class="o">&gt;</span><span class="w"> </span><span class="n">wasmtime</span><span class="p">::</span><span class="n">AsContext</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">PluginFunctionsWasmInterface</span><span class="o">&lt;'</span><span class="na">a</span><span class="p">,</span><span class="w"> </span><span class="n">H</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">type</span><span class="w"> </span><span class="nc">Data</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">crate</span><span class="p">::</span><span class="n">Address</span><span class="o">&lt;</span><span class="n">H</span><span class="o">&gt;</span><span class="p">;</span>
+<span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">as_context</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">wasmtime</span><span class="p">::</span><span class="n">StoreContext</span><span class="o">&lt;'</span><span class="nb">_</span><span class="p">,</span><span class="w"> </span><span class="bp">Self</span><span class="p">::</span><span class="n">Data</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">match</span><span class="w"> </span><span class="bp">self</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="bp">Self</span><span class="p">::</span><span class="n">Caller</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">caller</span><span class="p">,</span><span class="w"> </span><span class="o">..</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">caller</span><span class="p">.</span><span class="n">as_context</span><span class="p">(),</span>
+<span class="w">            </span><span class="bp">Self</span><span class="p">::</span><span class="n">Store</span><span class="p">(</span><span class="n">store</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">store</span><span class="p">.</span><span class="n">as_context</span><span class="p">(),</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">impl</span><span class="o">&lt;'</span><span class="na">a</span><span class="p">,</span><span class="w"> </span><span class="n">H</span><span class="p">:</span><span class="w"> </span><span class="nc">crate</span><span class="p">::</span><span class="n">Contract</span><span class="o">&gt;</span><span class="w"> </span><span class="n">wasmtime</span><span class="p">::</span><span class="n">AsContextMut</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">PluginFunctionsWasmInterface</span><span class="o">&lt;'</span><span class="na">a</span><span class="p">,</span><span class="w"> </span><span class="n">H</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">as_context_mut</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">wasmtime</span><span class="p">::</span><span class="n">StoreContextMut</span><span class="o">&lt;'</span><span class="nb">_</span><span class="p">,</span><span class="w"> </span><span class="bp">Self</span><span class="p">::</span><span class="n">Data</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">match</span><span class="w"> </span><span class="bp">self</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="bp">Self</span><span class="p">::</span><span class="n">Caller</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">caller</span><span class="p">,</span><span class="w"> </span><span class="o">..</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">caller</span><span class="p">.</span><span class="n">as_context_mut</span><span class="p">(),</span>
+<span class="w">            </span><span class="bp">Self</span><span class="p">::</span><span class="n">Store</span><span class="p">(</span><span class="n">store</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">store</span><span class="p">.</span><span class="n">as_context_mut</span><span class="p">(),</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+
+
+<a name="509467926"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Wasmtime%3ARetaining%20access%20to%20caller%20memory%20after%20end%20of%20call/near/509467926" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Wasmtime.3ARetaining.20access.20to.20caller.20memory.20after.20end.20of.20call.html#509467926">(Apr 01 2025 at 14:29)</a>:</h4>
+<p>I don't believe Wasmtime has utilities at this time to help you here and this'll be a Rust/embedding problem you'll have to solve</p>
+
+
+
+<a name="509474137"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Wasmtime%3ARetaining%20access%20to%20caller%20memory%20after%20end%20of%20call/near/509474137" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Dylan <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Wasmtime.3ARetaining.20access.20to.20caller.20memory.20after.20end.20of.20call.html#509474137">(Apr 01 2025 at 14:53)</a>:</h4>
+<p>Yeah... I was secretly hoping that wasmtime didn't care/had as much knowledge of threads as WASM itself does (obviously ignoring the WASM threading proposal) but I guess this is sensible from a host perspective as well. For now I'll just deal with my accesses to the WASM module being serialised using that mutex, as that seems to compile at least and there's no obvious deadlocks I can see so long as I use the <code>Caller</code> when available instead of the mutex-guarded <code>Store</code>.</p>
+
+
+
+<a name="509658586"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Wasmtime%3ARetaining%20access%20to%20caller%20memory%20after%20end%20of%20call/near/509658586" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Dylan <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Wasmtime.3ARetaining.20access.20to.20caller.20memory.20after.20end.20of.20call.html#509658586">(Apr 02 2025 at 10:34)</a>:</h4>
+<p>Just figured I'd follow up and say I managed to get this working satisfyingly enough :) I did end up using the above solution of "using caller if available, and if not wait until we acquire a mutex to the <code>Store</code>". I was keen not to have a dedicated OS thread at all times for the plugin (mainly to anticipate having lot of plugins), which is why I wanted to get this working so I could reuse the scheduling done by tokio. As a bonus I also made it so the plugin could spawn futures on the host runtime as well, so lots of fun shenanigans here. Fighting internally to get this open-sourced at some point.</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

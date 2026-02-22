@@ -1,0 +1,550 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #12076 Cranelift: Non-deterministic JIT ... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312076.20Cranelift.3A.20Non-deterministic.20JIT.20.2E.2E.2E.html">wasmtime / issue #12076 Cranelift: Non-deterministic JIT ...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="559040695"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312076%20Cranelift%3A%20Non-deterministic%20JIT%20.../near/559040695" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312076.20Cranelift.3A.20Non-deterministic.20JIT.20.2E.2E.2E.html#559040695">(Nov 24 2025 at 13:12)</a>:</h4>
+<p>darmie opened <a href="https://github.com/bytecodealliance/wasmtime/issues/12076">issue #12076</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p>JIT-compiled code execution on ARM64 macOS (Apple Silicon) fails non-deterministically, with approximately 44% failure rate in multi-threaded scenarios. The failures manifest as SIGBUS, incorrect results, or silent corruption.</p>
+<h2>Environment</h2>
+<ul>
+<li><strong>OS</strong>: macOS 14.x (Sonoma) or later</li>
+<li><strong>Architecture</strong>: ARM64 (Apple Silicon - M1/M2/M3)</li>
+<li><strong>Crate</strong>: <code>cranelift-jit</code></li>
+<li><strong>Rust version</strong>: 1.75+ (any recent stable)</li>
+</ul>
+<h2>Observed Behavior</h2>
+<p>In a real-world JIT compiler (Rayzor - a Haxe-to-native compiler using cranelift-jit), we observe:</p>
+<ul>
+<li><strong>Without MAP_JIT fix:</strong> ~56% success rate (50 runs)</li>
+<li><strong>With MAP_JIT fix:</strong> 100% success rate (50+ consecutive runs)</li>
+</ul>
+<p>The failures manifest as:</p>
+<ul>
+<li>SIGBUS (Bus error: 10)</li>
+<li>Incorrect computation results</li>
+<li>Segmentation fault</li>
+<li>Silent wrong values</li>
+</ul>
+<h3>Note on Minimal Reproduction</h3>
+<p>A simple test case may not reliably reproduce the issue because:</p>
+<ol>
+<li>The failure is <strong>non-deterministic</strong> and depends on timing, memory layout, and CPU scheduling</li>
+<li>Simple tests may not trigger the problematic code paths</li>
+<li>
+<p>The issue is more likely with:</p>
+<ul>
+<li>Complex JIT-compiled functions with multiple blocks</li>
+<li>Multiple functions compiled together</li>
+<li>Closures and captured variables passed to threads</li>
+<li>Runtime library functions called from JIT code</li>
+</ul>
+</li>
+</ol>
+<h3>Complex Reproduction (Rayzor Compiler)</h3>
+<p>The issue was observed and fixed in the <a href="https://github.com/darmie/rayzor">Rayzor compiler</a>, a Haxe-to-native compiler using cranelift-jit. The compiler:</p>
+<ul>
+<li>Compiles 50+ runtime functions using cranelift-jit</li>
+<li>Spawns threads that execute closures containing JIT function calls</li>
+<li>Uses channels and mutexes with JIT-compiled callback functions</li>
+</ul>
+<p><strong>E2E Test Case:</strong> <a href="https://github.com/darmie/rayzor/blob/main/compiler/examples/test_rayzor_stdlib_e2e.rs"><code>compiler/examples/test_rayzor_stdlib_e2e.rs</code></a></p>
+<p><strong>Commits for testing:</strong></p>
+<ul>
+<li><strong>Before fix (unstable):</strong> <a href="https://github.com/darmie/rayzor/commit/0eb9472"><code>0eb9472</code></a> - Uses upstream cranelift without MAP_JIT</li>
+<li><strong>After fix (stable):</strong> <a href="https://github.com/darmie/rayzor/commit/9a0e80e"><code>9a0e80e</code></a> - Uses fork with MAP_JIT + pthread_jit_write_protect_np</li>
+</ul>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code><span class="c1"># Test BEFORE fix (~56% success rate)</span>
+git<span class="w"> </span>clone<span class="w"> </span>https://github.com/darmie/rayzor
+<span class="nb">cd</span><span class="w"> </span>rayzor
+git<span class="w"> </span>checkout<span class="w"> </span>0eb9472
+cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w"> </span>--package<span class="w"> </span>compiler<span class="w"> </span>--example<span class="w"> </span>test_rayzor_stdlib_e2e
+
+<span class="c1"># Run stability test</span>
+<span class="nv">passed</span><span class="o">=</span><span class="m">0</span><span class="p">;</span><span class="w"> </span><span class="nv">failed</span><span class="o">=</span><span class="m">0</span>
+<span class="k">for</span><span class="w"> </span>i<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="o">{</span><span class="m">1</span>..50<span class="o">}</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span>timeout<span class="w"> </span><span class="m">120</span><span class="w"> </span>./target/release/examples/test_rayzor_stdlib_e2e<span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-q<span class="w"> </span><span class="s2">"All tests passed"</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">        </span><span class="nv">passed</span><span class="o">=</span><span class="k">$((</span><span class="nv">passed</span><span class="o">+</span><span class="m">1</span><span class="k">))</span>
+<span class="w">    </span><span class="k">else</span>
+<span class="w">        </span><span class="nb">echo</span><span class="w"> </span><span class="s2">"Run </span><span class="nv">$i</span><span class="s2">: FAILED"</span>
+<span class="w">        </span><span class="nv">failed</span><span class="o">=</span><span class="k">$((</span><span class="nv">failed</span><span class="o">+</span><span class="m">1</span><span class="k">))</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="k">done</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">"Before fix - Passed: </span><span class="nv">$passed</span><span class="s2">/50, Failed: </span><span class="nv">$failed</span><span class="s2">/50"</span>
+
+<span class="c1"># Test AFTER fix (100% success rate)</span>
+git<span class="w"> </span>checkout<span class="w"> </span>9a0e80e
+cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w"> </span>--package<span class="w"> </span>compiler<span class="w"> </span>--example<span class="w"> </span>test_rayzor_stdlib_e2e
+
+<span class="nv">passed</span><span class="o">=</span><span class="m">0</span><span class="p">;</span><span class="w"> </span><span class="nv">failed</span><span class="o">=</span><span class="m">0</span>
+<span class="k">for</span><span class="w"> </span>i<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="o">{</span><span class="m">1</span>..50<span class="o">}</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span>timeout<span class="w"> </span><span class="m">120</span><span class="w"> </span>./target/release/examples/test_rayzor_stdlib_e2e<span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-q<span class="w"> </span><span class="s2">"All tests passed"</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">        </span><span class="nv">passed</span><span class="o">=</span><span class="k">$((</span><span class="nv">passed</span><span class="o">+</span><span class="m">1</span><span class="k">))</span>
+<span class="w">    </span><span class="k">else</span>
+<span class="w">        </span><span class="nb">echo</span><span class="w"> </span><span class="s2">"Run </span><span class="nv">$i</span><span class="s2">: FAILED"</span>
+<span class="w">        </span><span class="nv">failed</span><span class="o">=</span><span class="k">$((</span><span class="nv">failed</span><span class="o">+</span><span class="m">1</span><span class="k">))</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="k">done</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">"After fix - Passed: </span><span class="nv">$passed</span><span class="s2">/50, Failed: </span><span class="nv">$failed</span><span class="s2">/50"</span>
+</code></pre></div>
+<p><strong>Results:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Commit</th>
+<th>Configuration</th>
+<th>Success Rate</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://github.com/darmie/rayzor/commit/0eb9472"><code>0eb9472</code></a></td>
+<td>Upstream cranelift (no MAP_JIT)</td>
+<td>~56% (28/50)</td>
+</tr>
+<tr>
+<td><a href="https://github.com/darmie/rayzor/commit/9a0e80e"><code>9a0e80e</code></a></td>
+<td><a href="https://github.com/darmie/wasmtime/tree/fix-plt-aarch64">darmie/wasmtime fix-plt-aarch64</a></td>
+<td><strong>100%</strong> (50/50)</td>
+</tr>
+</tbody>
+</table>
+<h3>Simple Test Case (May Not Reliably Fail)</h3>
+<p>For reference, here's a minimal test that exercises the same code paths:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">cranelift</span><span class="p">::</span><span class="n">prelude</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
+<span class="k">use</span><span class="w"> </span><span class="n">cranelift_jit</span><span class="p">::{</span><span class="n">JITBuilder</span><span class="p">,</span><span class="w"> </span><span class="n">JITModule</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">cranelift_module</span><span class="p">::{</span><span class="n">Linkage</span><span class="p">,</span><span class="w"> </span><span class="n">Module</span><span class="p">,</span><span class="w"> </span><span class="n">FuncId</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">thread</span><span class="p">;</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">define_function</span><span class="p">(</span><span class="n">module</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">JITModule</span><span class="p">,</span><span class="w"> </span><span class="n">name</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="kt">str</span><span class="p">,</span><span class="w"> </span><span class="n">op</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="kt">str</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">FuncId</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">sig</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">module</span><span class="p">.</span><span class="n">make_signature</span><span class="p">();</span>
+<span class="w">    </span><span class="n">sig</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="n">AbiParam</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">types</span><span class="p">::</span><span class="n">I64</span><span class="p">));</span>
+<span class="w">    </span><span class="n">sig</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="n">AbiParam</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">types</span><span class="p">::</span><span class="n">I64</span><span class="p">));</span>
+<span class="w">    </span><span class="n">sig</span><span class="p">.</span><span class="n">returns</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="n">AbiParam</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">types</span><span class="p">::</span><span class="n">I64</span><span class="p">));</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">func_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">module</span><span class="p">.</span><span class="n">declare_function</span><span class="p">(</span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">Linkage</span><span class="p">::</span><span class="n">Export</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">sig</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">module</span><span class="p">.</span><span class="n">make_context</span><span class="p">();</span>
+<span class="w">    </span><span class="n">ctx</span><span class="p">.</span><span class="n">func</span><span class="p">.</span><span class="n">signature</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">sig</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">builder_ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">FunctionBuilderContext</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">builder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">FunctionBuilder</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">ctx</span><span class="p">.</span><span class="n">func</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">builder_ctx</span><span class="p">);</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">block</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">builder</span><span class="p">.</span><span class="n">create_block</span><span class="p">();</span>
+<span class="w">        </span><span class="n">builder</span><span class="p">.</span><span class="n">append_block_params_for_function_params</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+<span class="w">        </span><span class="n">builder</span><span class="p">.</span><span class="n">switch_to_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+<span class="w">        </span><span class="n">builder</span><span class="p">.</span><span class="n">seal_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">builder</span><span class="p">.</span><span class="n">block_params</span><span class="p">(</span><span class="n">block</span><span class="p">)[</span><span class="mi">0</span><span class="p">];</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">b</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">builder</span><span class="p">.</span><span class="n">block_params</span><span class="p">(</span><span class="n">block</span><span class="p">)[</span><span class="mi">1</span><span class="p">];</span>
+
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">match</span><span class="w"> </span><span class="n">op</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="s">"add"</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">builder</span><span class="p">.</span><span class="n">ins</span><span class="p">().</span><span class="n">iadd</span><span class="p">(</span><span class="n">a</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">),</span>
+<span class="w">            </span><span class="s">"sub"</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">builder</span><span class="p">.</span><span class="n">ins</span><span class="p">().</span><span class="n">isub</span><span class="p">(</span><span class="n">a</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">),</span>
+<span class="w">            </span><span class="s">"mul"</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">builder</span><span class="p">.</span><span class="n">ins</span><span class="p">().</span><span class="n">imul</span><span class="p">(</span><span class="n">a</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">),</span>
+<span class="w">            </span><span class="n">_</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">builder</span><span class="p">.</span><span class="n">ins</span><span class="p">().</span><span class="n">iadd</span><span class="p">(</span><span class="n">a</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">),</span>
+<span class="w">        </span><span class="p">};</span>
+
+<span class="w">        </span><span class="n">builder</span><span class="p">.</span><span class="n">ins</span><span class="p">().</span><span class="n">return_</span><span class="p">(</span><span class="o">&amp;</span><span class="p">[</span><span class="n">result</span><span class="p">]);</span>
+<span class="w">        </span><span class="n">builder</span><span class="p">.</span><span class="n">finalize</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="n">module</span><span class="p">.</span><span class="n">define_function</span><span class="p">(</span><span class="n">func_id</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">ctx</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="w">    </span><span class="n">module</span><span class="p">.</span><span class="n">clear_context</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">ctx</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">func_id</span>
+<span class="p">}</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">flag_builder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">settings</span><span class="p">::</span><span class="n">builder</span><span class="p">();</span>
+<span class="w">    </span><span class="n">flag_builder</span><span class="p">.</span><span class="n">set</span><span class="p">(</span><span class="s">"use_colocated_libcalls"</span><span class="p">,</span><span class="w"> </span><span class="s">"false"</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="w">    </span><span class="n">flag_builder</span><span class="p">.</span><span class="n">set</span><span class="p">(</span><span class="s">"is_pic"</span><span class="p">,</span><span class="w"> </span><span class="s">"false"</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">isa_builder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cranelift_native</span><span class="p">::</span><span class="n">builder</span><span class="p">().</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">isa</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">isa_builder</span><span class="p">.</span><span class="n">finish</span><span class="p">(</span><span class="n">settings</span><span class="p">::</span><span class="n">Flags</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">flag_builder</span><span class="p">)).</span><span class="n">unwrap</span><span class="p">();</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">builder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">JITBuilder</span><span class="p">::</span><span class="n">with_isa</span><span class="p">(</span><span class="n">isa</span><span class="p">,</span><span class="w"> </span><span class="n">cranelift_module</span><span class="p">::</span><span class="n">default_libcall_names</span><span class="p">());</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">module</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">JITModule</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">builder</span><span class="p">);</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">add_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">define_function</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">module</span><span class="p">,</span><span class="w"> </span><span class="s">"add"</span><span class="p">,</span><span class="w"> </span><span class="s">"add"</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">sub_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">define_function</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">module</span><span class="p">,</span><span class="w"> </span><span class="s">"sub"</span><span class="p">,</span><span class="w"> </span><span class="s">"sub"</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">mul_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">define_function</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">module</span><span class="p">,</span><span class="w"> </span><span class="s">"mul"</span><span class="p">,</span><span class="w"> </span><span class="s">"mul"</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">module</span><span class="p">.</span><span class="n">finalize_definitions</span><span class="p">().</span><span class="n">unwrap</span><span class="p">();</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">add_fn</span><span class="p">:</span><span class="w"> </span><span class="nc">fn</span><span class="p">(</span><span class="kt">i64</span><span class="p">,</span><span class="w"> </span><span class="kt">i64</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">i64</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="p">::</span><span class="n">mem</span><span class="p">::</span><span class="n">transmute</span><span class="p">(</span><span class="n">module</span><span class="p">.</span><span class="n">get_finalized_function</span><span class="p">(</span><span class="n">add_id</span><span class="p">))</span>
+<span class="w">    </span><span class="p">};</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">sub_fn</span><span class="p">:</span><span class="w"> </span><span class="nc">fn</span><span class="p">(</span><span class="kt">i64</span><span class="p">,</span><span class="w"> </span><span class="kt">i64</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">i64</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="p">::</span><span class="n">mem</span><span class="p">::</span><span class="n">transmute</span><span class="p">(</span><span class="n">module</span><span class="p">.</span><span class="n">get_finalized_function</span><span class="p">(</span><span class="n">sub_id</span><span class="p">))</span>
+<span class="w">    </span><span class="p">};</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">mul_fn</span><span class="p">:</span><span class="w"> </span><span class="nc">fn</span><span class="p">(</span><span class="kt">i64</span><span class="p">,</span><span class="w"> </span><span class="kt">i64</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">i64</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="p">::</span><span class="n">mem</span><span class="p">::</span><span class="n">transmute</span><span class="p">(</span><span class="n">module</span><span class="p">.</span><span class="n">get_finalized_function</span><span class="p">(</span><span class="n">mul_id</span><span class="p">))</span>
+<span class="w">    </span><span class="p">};</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">handles</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="n">_</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="mi">0</span><span class="o">..</span><span class="mi">20</span><span class="p">).</span><span class="n">map</span><span class="p">(</span><span class="o">|</span><span class="n">thread_id</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">thread</span><span class="p">::</span><span class="n">spawn</span><span class="p">(</span><span class="k">move</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">for</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="mi">0</span><span class="o">..</span><span class="mi">5000</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="kd">let</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">thread_id</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1000</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">i</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">i64</span><span class="p">;</span>
+<span class="w">                </span><span class="kd">let</span><span class="w"> </span><span class="n">b</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">i</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">7</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">i64</span><span class="p">;</span>
+
+<span class="w">                </span><span class="fm">assert_eq!</span><span class="p">(</span><span class="n">add_fn</span><span class="p">(</span><span class="n">a</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">),</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">b</span><span class="p">,</span><span class="w"> </span><span class="s">"add failed"</span><span class="p">);</span>
+<span class="w">                </span><span class="fm">assert_eq!</span><span class="p">(</span><span class="n">sub_fn</span><span class="p">(</span><span class="n">a</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">),</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">b</span><span class="p">,</span><span class="w"> </span><span class="s">"sub failed"</span><span class="p">);</span>
+<span class="w">                </span><span class="fm">assert_eq!</span><span class="p">(</span><span class="n">mul_fn</span><span class="p">(</span><span class="n">a</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">),</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">b</span><span class="p">,</span><span class="w"> </span><span class="s">"mul failed"</span><span class="p">);</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">})</span>
+<span class="w">    </span><span class="p">}).</span><span class="n">collect</span><span class="p">();</span>
+
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="n">handle</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">handles</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">handle</span><span class="p">.</span><span class="n">join</span><span class="p">().</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"All tests passed!"</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+<p><strong>Cargo.toml:</strong></p>
+<div class="codehilite" data-code-language="TOML"><pre><span></span><code><span class="k">[package]</span>
+<span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"jit_repro"</span>
+<span class="n">version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"0.1.0"</span>
+<span class="n">edition</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"2021"</span>
+
+<span class="k">[dependencies]</span>
+<span class="n">cranelift</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">version</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"0.125"</span><span class="p">,</span><span class="w"> </span><span class="n">features</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"jit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"module"</span><span class="p">,</span><span class="w"> </span><span class="s2">"native"</span><span class="p">]</span><span class="w"> </span><span class="p">}</span>
+<span class="n">cranelift-jit</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"0.125"</span>
+<span class="n">cranelift-module</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"0.125"</span>
+<span class="n">cranelift-codegen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"0.125"</span>
+<span class="n">cranelift-frontend</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"0.125"</span>
+<span class="n">cranelift-native</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"0.125"</span>
+</code></pre></div>
+<h2>Root Cause Analysis</h2>
+<p>Two issues combine to cause this:</p>
+<h3>1. Missing MAP_JIT flag</h3>
+<p><code>cranelift-jit</code> allocates executable memory using the standard allocator (<code>alloc::alloc</code>), which doesn't set the <code>MAP_JIT</code> flag. On Apple Silicon, memory intended for JIT execution <strong>must</strong> be allocated with:</p>
+<div class="codehilite" data-code-language="C"><pre><span></span><code><span class="n">mmap</span><span class="p">(</span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">size</span><span class="p">,</span><span class="w"> </span><span class="n">PROT_READ</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">PROT_WRITE</span><span class="p">,</span><span class="w"> </span><span class="n">MAP_PRIVATE</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">MAP_ANON</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">MAP_JIT</span><span class="p">,</span><span class="w"> </span><span class="mi">-1</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+</code></pre></div>
+<p>Without <code>MAP_JIT</code> (0x0800), the kernel cannot properly track the memory for W^X enforcement.</p>
+<h3>2. Missing W^X mode switch for spawned threads</h3>
+<p>Apple Silicon enforces W^X (Write XOR Execute) at the hardware level. Each thread has an independent write/execute mode:</p>
+<ul>
+<li><code>pthread_jit_write_protect_np(0)</code> = write mode (can write JIT memory, cannot execute)</li>
+<li><code>pthread_jit_write_protect_np(1)</code> = execute mode (can execute JIT code, cannot write)</li>
+</ul>
+<p><strong>Threads inherit write mode by default.</strong> The current implementation doesn't switch spawned threads to execute mode before calling JIT code, causing crashes.</p>
+<h2>Proposed Solution</h2>
+<ol>
+<li><strong>Use <code>mmap</code> with <code>MAP_JIT</code></strong> for memory allocation on ARM64 macOS instead of the standard allocator</li>
+<li><strong>Call <code>pthread_jit_write_protect_np(1)</code></strong> after making memory executable to switch to execute mode</li>
+<li><strong>Add memory barriers</strong> (DSB SY + ISB SY) for proper icache coherency on Apple Silicon's heterogeneous cores</li>
+</ol>
+<h2>Technical References</h2>
+<ul>
+<li><a href="https://developer.apple.com/documentation/xcode/writing_arm64_code_for_apple_platforms">Apple: Writing ARM64 Code for Apple Platforms</a></li>
+<li><a href="https://developer.apple.com/documentation/apple-silicon/porting-just-in-time-compilers-to-apple-silicon">Porting Just-In-Time Compilers to Apple Silicon</a></li>
+<li>Apple Silicon has independent instruction caches per core (P-cores and E-cores), requiring explicit barriers</li>
+</ul>
+<h2>Related Issues</h2>
+<ul>
+<li>#2735 - Support PLT entries in <code>cranelift-jit</code> crate on aarch64</li>
+<li>#8852 - Cranelift: JIT assertion failure when using <code>ArgumentPurpose::StructArgument</code> on macOS (A64)</li>
+<li>#4000 - Cranelift: JIT relocations depend on system allocator behaviour<br>
+</li>
+</ul>
+</blockquote>
+
+
+
+<a name="559040700"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312076%20Cranelift%3A%20Non-deterministic%20JIT%20.../near/559040700" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312076.20Cranelift.3A.20Non-deterministic.20JIT.20.2E.2E.2E.html#559040700">(Nov 24 2025 at 13:12)</a>:</h4>
+<p><a href="https://github.com/darmie">darmie</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/12076">Issue #12076</a>.</p>
+
+
+
+<a name="559040702"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312076%20Cranelift%3A%20Non-deterministic%20JIT%20.../near/559040702" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312076.20Cranelift.3A.20Non-deterministic.20JIT.20.2E.2E.2E.html#559040702">(Nov 24 2025 at 13:12)</a>:</h4>
+<p><a href="https://github.com/darmie">darmie</a> added the cranelift label to <a href="https://github.com/bytecodealliance/wasmtime/issues/12076">Issue #12076</a>.</p>
+
+
+
+<a name="559044820"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312076%20Cranelift%3A%20Non-deterministic%20JIT%20.../near/559044820" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312076.20Cranelift.3A.20Non-deterministic.20JIT.20.2E.2E.2E.html#559044820">(Nov 24 2025 at 13:30)</a>:</h4>
+<p>bjorn3 <a href="https://github.com/bytecodealliance/wasmtime/issues/12076#issuecomment-3570804154">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12076">issue #12076</a>:</p>
+<blockquote>
+<blockquote>
+<p>Apple Silicon enforces W^X (Write XOR Execute) at the hardware level.</p>
+</blockquote>
+<p>It is enforced by the kernel and only when hardened runtime is enabled. You don't need MAP_JIT when hardened runtime is disabled for an application, as is the default outside of App Store apps.</p>
+</blockquote>
+
+
+
+<a name="561999687"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312076%20Cranelift%3A%20Non-deterministic%20JIT%20.../near/561999687" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312076.20Cranelift.3A.20Non-deterministic.20JIT.20.2E.2E.2E.html#561999687">(Dec 05 2025 at 00:35)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/12076#issuecomment-3614858183">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12076">issue #12076</a>:</p>
+<blockquote>
+<p>I'm going to close this in favor of <a href="https://github.com/bytecodealliance/wasmtime/issues/11989">https://github.com/bytecodealliance/wasmtime/issues/11989</a> since I think it's a duplicate</p>
+</blockquote>
+
+
+
+<a name="561999688"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312076%20Cranelift%3A%20Non-deterministic%20JIT%20.../near/561999688" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312076.20Cranelift.3A.20Non-deterministic.20JIT.20.2E.2E.2E.html#561999688">(Dec 05 2025 at 00:35)</a>:</h4>
+<p>alexcrichton closed <a href="https://github.com/bytecodealliance/wasmtime/issues/12076">issue #12076</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p>JIT-compiled code execution on ARM64 macOS (Apple Silicon) fails non-deterministically, with approximately 44% failure rate in multi-threaded scenarios. The failures manifest as SIGBUS, incorrect results, or silent corruption.</p>
+<h2>Environment</h2>
+<ul>
+<li><strong>OS</strong>: macOS 14.x (Sonoma) or later</li>
+<li><strong>Architecture</strong>: ARM64 (Apple Silicon - M1/M2/M3)</li>
+<li><strong>Crate</strong>: <code>cranelift-jit</code></li>
+<li><strong>Rust version</strong>: 1.75+ (any recent stable)</li>
+</ul>
+<h2>Observed Behavior</h2>
+<p>In a real-world JIT compiler (Rayzor - a Haxe-to-native compiler using cranelift-jit), we observe:</p>
+<ul>
+<li><strong>Without MAP_JIT fix:</strong> ~56% success rate (50 runs)</li>
+<li><strong>With MAP_JIT fix:</strong> 100% success rate (50+ consecutive runs)</li>
+</ul>
+<p>The failures manifest as:</p>
+<ul>
+<li>SIGBUS (Bus error: 10)</li>
+<li>Incorrect computation results</li>
+<li>Segmentation fault</li>
+<li>Silent wrong values</li>
+</ul>
+<h3>Note on Minimal Reproduction</h3>
+<p>A simple test case may not reliably reproduce the issue because:</p>
+<ol>
+<li>The failure is <strong>non-deterministic</strong> and depends on timing, memory layout, and CPU scheduling</li>
+<li>Simple tests may not trigger the problematic code paths</li>
+<li>
+<p>The issue is more likely with:</p>
+<ul>
+<li>Complex JIT-compiled functions with multiple blocks</li>
+<li>Multiple functions compiled together</li>
+<li>Closures and captured variables passed to threads</li>
+<li>Runtime library functions called from JIT code</li>
+</ul>
+</li>
+</ol>
+<h3>Complex Reproduction (Rayzor Compiler)</h3>
+<p>The issue was observed and fixed in the <a href="https://github.com/darmie/rayzor">Rayzor compiler</a>, a Haxe-to-native compiler using cranelift-jit. The compiler:</p>
+<ul>
+<li>Compiles 50+ runtime functions using cranelift-jit</li>
+<li>Spawns threads that execute closures containing JIT function calls</li>
+<li>Uses channels and mutexes with JIT-compiled callback functions</li>
+</ul>
+<p><strong>E2E Test Case:</strong> <a href="https://github.com/darmie/rayzor/blob/main/compiler/examples/test_rayzor_stdlib_e2e.rs"><code>compiler/examples/test_rayzor_stdlib_e2e.rs</code></a></p>
+<p><strong>Commits for testing:</strong></p>
+<ul>
+<li><strong>Before fix (unstable):</strong> <a href="https://github.com/darmie/rayzor/commit/0eb9472"><code>0eb9472</code></a> - Uses upstream cranelift without MAP_JIT</li>
+<li><strong>After fix (stable):</strong> <a href="https://github.com/darmie/rayzor/commit/9a0e80e"><code>9a0e80e</code></a> - Uses fork with MAP_JIT + pthread_jit_write_protect_np</li>
+</ul>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code><span class="c1"># Test BEFORE fix (~56% success rate)</span>
+git<span class="w"> </span>clone<span class="w"> </span>https://github.com/darmie/rayzor
+<span class="nb">cd</span><span class="w"> </span>rayzor
+git<span class="w"> </span>checkout<span class="w"> </span>0eb9472
+cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w"> </span>--package<span class="w"> </span>compiler<span class="w"> </span>--example<span class="w"> </span>test_rayzor_stdlib_e2e
+
+<span class="c1"># Run stability test</span>
+<span class="nv">passed</span><span class="o">=</span><span class="m">0</span><span class="p">;</span><span class="w"> </span><span class="nv">failed</span><span class="o">=</span><span class="m">0</span>
+<span class="k">for</span><span class="w"> </span>i<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="o">{</span><span class="m">1</span>..50<span class="o">}</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span>timeout<span class="w"> </span><span class="m">120</span><span class="w"> </span>./target/release/examples/test_rayzor_stdlib_e2e<span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-q<span class="w"> </span><span class="s2">"All tests passed"</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">        </span><span class="nv">passed</span><span class="o">=</span><span class="k">$((</span><span class="nv">passed</span><span class="o">+</span><span class="m">1</span><span class="k">))</span>
+<span class="w">    </span><span class="k">else</span>
+<span class="w">        </span><span class="nb">echo</span><span class="w"> </span><span class="s2">"Run </span><span class="nv">$i</span><span class="s2">: FAILED"</span>
+<span class="w">        </span><span class="nv">failed</span><span class="o">=</span><span class="k">$((</span><span class="nv">failed</span><span class="o">+</span><span class="m">1</span><span class="k">))</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="k">done</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">"Before fix - Passed: </span><span class="nv">$passed</span><span class="s2">/50, Failed: </span><span class="nv">$failed</span><span class="s2">/50"</span>
+
+<span class="c1"># Test AFTER fix (100% success rate)</span>
+git<span class="w"> </span>checkout<span class="w"> </span>9a0e80e
+cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w"> </span>--package<span class="w"> </span>compiler<span class="w"> </span>--example<span class="w"> </span>test_rayzor_stdlib_e2e
+
+<span class="nv">passed</span><span class="o">=</span><span class="m">0</span><span class="p">;</span><span class="w"> </span><span class="nv">failed</span><span class="o">=</span><span class="m">0</span>
+<span class="k">for</span><span class="w"> </span>i<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="o">{</span><span class="m">1</span>..50<span class="o">}</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span>timeout<span class="w"> </span><span class="m">120</span><span class="w"> </span>./target/release/examples/test_rayzor_stdlib_e2e<span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-q<span class="w"> </span><span class="s2">"All tests passed"</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">        </span><span class="nv">passed</span><span class="o">=</span><span class="k">$((</span><span class="nv">passed</span><span class="o">+</span><span class="m">1</span><span class="k">))</span>
+<span class="w">    </span><span class="k">else</span>
+<span class="w">        </span><span class="nb">echo</span><span class="w"> </span><span class="s2">"Run </span><span class="nv">$i</span><span class="s2">: FAILED"</span>
+<span class="w">        </span><span class="nv">failed</span><span class="o">=</span><span class="k">$((</span><span class="nv">failed</span><span class="o">+</span><span class="m">1</span><span class="k">))</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="k">done</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">"After fix - Passed: </span><span class="nv">$passed</span><span class="s2">/50, Failed: </span><span class="nv">$failed</span><span class="s2">/50"</span>
+</code></pre></div>
+<p><strong>Results:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Commit</th>
+<th>Configuration</th>
+<th>Success Rate</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://github.com/darmie/rayzor/commit/0eb9472"><code>0eb9472</code></a></td>
+<td>Upstream cranelift (no MAP_JIT)</td>
+<td>~56% (28/50)</td>
+</tr>
+<tr>
+<td><a href="https://github.com/darmie/rayzor/commit/9a0e80e"><code>9a0e80e</code></a></td>
+<td><a href="https://github.com/darmie/wasmtime/tree/fix-plt-aarch64">darmie/wasmtime fix-plt-aarch64</a></td>
+<td><strong>100%</strong> (50/50)</td>
+</tr>
+</tbody>
+</table>
+<h3>Simple Test Case (May Not Reliably Fail)</h3>
+<p>For reference, here's a minimal test that exercises the same code paths:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">cranelift</span><span class="p">::</span><span class="n">prelude</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
+<span class="k">use</span><span class="w"> </span><span class="n">cranelift_jit</span><span class="p">::{</span><span class="n">JITBuilder</span><span class="p">,</span><span class="w"> </span><span class="n">JITModule</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">cranelift_module</span><span class="p">::{</span><span class="n">Linkage</span><span class="p">,</span><span class="w"> </span><span class="n">Module</span><span class="p">,</span><span class="w"> </span><span class="n">FuncId</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">thread</span><span class="p">;</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">define_function</span><span class="p">(</span><span class="n">module</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">JITModule</span><span class="p">,</span><span class="w"> </span><span class="n">name</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="kt">str</span><span class="p">,</span><span class="w"> </span><span class="n">op</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="kt">str</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">FuncId</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">sig</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">module</span><span class="p">.</span><span class="n">make_signature</span><span class="p">();</span>
+<span class="w">    </span><span class="n">sig</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="n">AbiParam</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">types</span><span class="p">::</span><span class="n">I64</span><span class="p">));</span>
+<span class="w">    </span><span class="n">sig</span><span class="p">.</span><span class="n">params</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="n">AbiParam</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">types</span><span class="p">::</span><span class="n">I64</span><span class="p">));</span>
+<span class="w">    </span><span class="n">sig</span><span class="p">.</span><span class="n">returns</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="n">AbiParam</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">types</span><span class="p">::</span><span class="n">I64</span><span class="p">));</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">func_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">module</span><span class="p">.</span><span class="n">declare_function</span><span class="p">(</span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">Linkage</span><span class="p">::</span><span class="n">Export</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">sig</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">module</span><span class="p">.</span><span class="n">make_context</span><span class="p">();</span>
+<span class="w">    </span><span class="n">ctx</span><span class="p">.</span><span class="n">func</span><span class="p">.</span><span class="n">signature</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">sig</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">builder_ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">FunctionBuilderContext</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">builder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">FunctionBuilder</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">ctx</span><span class="p">.</span><span class="n">func</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">builder_ctx</span><span class="p">);</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">block</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">builder</span><span class="p">.</span><span class="n">create_block</span><span class="p">();</span>
+<span class="w">        </span><span class="n">builder</span><span class="p">.</span><span class="n">append_block_params_for_function_params</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+<span class="w">        </span><span class="n">builder</span><span class="p">.</span><span class="n">switch_to_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+<span class="w">        </span><span class="n">builder</span><span class="p">.</span><span class="n">seal_block</span><span class="p">(</span><span class="n">block</span><span class="p">);</span>
+
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">builder</span><span class="p">.</span><span class="n">block_params</span><span class="p">(</span><span class="n">block</span><span class="p">)[</span><span class="mi">0</span><span class="p">];</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">b</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">builder</span><span class="p">.</span><span class="n">block_params</span><span class="p">(</span><span class="n">block</span><span class="p">)[</span><span class="mi">1</span><span class="p">];</span>
+
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">match</span><span class="w"> </span><span class="n">op</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="s">"add"</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">builder</span><span class="p">.</span><span class="n">ins</span><span class="p">().</span><span class="n">iadd</span><span class="p">(</span><span class="n">a</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">),</span>
+<span class="w">            </span><span class="s">"sub"</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">builder</span><span class="p">.</span><span class="n">ins</span><span class="p">().</span><span class="n">isub</span><span class="p">(</span><span class="n">a</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">),</span>
+<span class="w">            </span><span class="s">"mul"</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">builder</span><span class="p">.</span><span class="n">ins</span><span class="p">().</span><span class="n">imul</span><span class="p">(</span><span class="n">a</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">),</span>
+<span class="w">            </span><span class="n">_</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">builder</span><span class="p">.</span><span class="n">ins</span><span class="p">().</span><span class="n">iadd</span><span class="p">(</span><span class="n">a</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">),</span>
+<span class="w">        </span><span class="p">};</span>
+
+<span class="w">        </span><span class="n">builder</span><span class="p">.</span><span class="n">ins</span><span class="p">().</span><span class="n">return_</span><span class="p">(</span><span class="o">&amp;</span><span class="p">[</span><span class="n">result</span><span class="p">]);</span>
+<span class="w">        </span><span class="n">builder</span><span class="p">.</span><span class="n">finalize</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="n">module</span><span class="p">.</span><span class="n">define_function</span><span class="p">(</span><span class="n">func_id</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">ctx</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="w">    </span><span class="n">module</span><span class="p">.</span><span class="n">clear_context</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">ctx</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">func_id</span>
+<span class="p">}</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">flag_builder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">settings</span><span class="p">::</span><span class="n">builder</span><span class="p">();</span>
+<span class="w">    </span><span class="n">flag_builder</span><span class="p">.</span><span class="n">set</span><span class="p">(</span><span class="s">"use_colocated_libcalls"</span><span class="p">,</span><span class="w"> </span><span class="s">"false"</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="w">    </span><span class="n">flag_builder</span><span class="p">.</span><span class="n">set</span><span class="p">(</span><span class="s">"is_pic"</span><span class="p">,</span><span class="w"> </span><span class="s">"false"</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">isa_builder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cranelift_native</span><span class="p">::</span><span class="n">builder</span><span class="p">().</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">isa</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">isa_builder</span><span class="p">.</span><span class="n">finish</span><span class="p">(</span><span class="n">settings</span><span class="p">::</span><span class="n">Flags</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">flag_builder</span><span class="p">)).</span><span class="n">unwrap</span><span class="p">();</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">builder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">JITBuilder</span><span class="p">::</span><span class="n">with_isa</span><span class="p">(</span><span class="n">isa</span><span class="p">,</span><span class="w"> </span><span class="n">cranelift_module</span><span class="p">::</span><span class="n">default_libcall_names</span><span class="p">());</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">module</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">JITModule</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">builder</span><span class="p">);</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">add_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">define_function</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">module</span><span class="p">,</span><span class="w"> </span><span class="s">"add"</span><span class="p">,</span><span class="w"> </span><span class="s">"add"</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">sub_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">define_function</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">module</span><span class="p">,</span><span class="w"> </span><span class="s">"sub"</span><span class="p">,</span><span class="w"> </span><span class="s">"sub"</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">mul_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">define_function</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">module</span><span class="p">,</span><span class="w"> </span><span class="s">"mul"</span><span class="p">,</span><span class="w"> </span><span class="s">"mul"</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">module</span><span class="p">.</span><span class="n">finalize_definitions</span><span class="p">().</span><span class="n">unwrap</span><span class="p">();</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">add_fn</span><span class="p">:</span><span class="w"> </span><span class="nc">fn</span><span class="p">(</span><span class="kt">i64</span><span class="p">,</span><span class="w"> </span><span class="kt">i64</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">i64</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="p">::</span><span class="n">mem</span><span class="p">::</span><span class="n">transmute</span><span class="p">(</span><span class="n">module</span><span class="p">.</span><span class="n">get_finalized_function</span><span class="p">(</span><span class="n">add_id</span><span class="p">))</span>
+<span class="w">    </span><span class="p">};</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">sub_fn</span><span class="p">:</span><span class="w"> </span><span class="nc">fn</span><span class="p">(</span><span class="kt">i64</span><span class="p">,</span><span class="w"> </span><span class="kt">i64</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">i64</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="p">::</span><span class="n">mem</span><span class="p">::</span><span class="n">transmute</span><span class="p">(</span><span class="n">module</span><span class="p">.</span><span class="n">get_finalized_function</span><span class="p">(</span><span class="n">sub_id</span><span class="p">))</span>
+<span class="w">    </span><span class="p">};</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">mul_fn</span><span class="p">:</span><span class="w"> </span><span class="nc">fn</span><span class="p">(</span><span class="kt">i64</span><span class="p">,</span><span class="w"> </span><span class="kt">i64</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">i64</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="p">::</span><span class="n">mem</span><span class="p">::</span><span class="n">transmute</span><span class="p">(</span><span class="n">module</span><span class="p">.</span><span class="n">get_finalized_function</span><span class="p">(</span><span class="n">mul_id</span><span class="p">))</span>
+<span class="w">    </span><span class="p">};</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">handles</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="n">_</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="mi">0</span><span class="o">..</span><span class="mi">20</span><span class="p">).</span><span class="n">map</span><span class="p">(</span><span class="o">|</span><span class="n">thread_id</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">thread</span><span class="p">::</span><span class="n">spawn</span><span class="p">(</span><span class="k">move</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">for</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="mi">0</span><span class="o">..</span><span class="mi">5000</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="kd">let</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">thread_id</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1000</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">i</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">i64</span><span class="p">;</span>
+<span class="w">                </span><span class="kd">let</span><span class="w"> </span><span class="n">b</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">i</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">7</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">i64</span><span class="p">;</span>
+
+<span class="w">                </span><span class="fm">assert_eq!</span><span class="p">(</span><span class="n">add_fn</span><span class="p">(</span><span class="n">a</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">),</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">b</span><span class="p">,</span><span class="w"> </span><span class="s">"add failed"</span><span class="p">);</span>
+<span class="w">                </span><span class="fm">assert_eq!</span><span class="p">(</span><span class="n">sub_fn</span><span class="p">(</span><span class="n">a</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">),</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">b</span><span class="p">,</span><span class="w"> </span><span class="s">"sub failed"</span><span class="p">);</span>
+<span class="w">                </span><span class="fm">assert_eq!</span><span class="p">(</span><span class="n">mul_fn</span><span class="p">(</span><span class="n">a</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">),</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">b</span><span class="p">,</span><span class="w"> </span><span class="s">"mul failed"</span><span class="p">);</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">})</span>
+<span class="w">    </span><span class="p">}).</span><span class="n">collect</span><span class="p">();</span>
+
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="n">handle</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">handles</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">handle</span><span class="p">.</span><span class="n">join</span><span class="p">().</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"All tests passed!"</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+<p><strong>Cargo.toml:</strong></p>
+<div class="codehilite" data-code-language="TOML"><pre><span></span><code><span class="k">[package]</span>
+<span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"jit_repro"</span>
+<span class="n">version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"0.1.0"</span>
+<span class="n">edition</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"2021"</span>
+
+<span class="k">[dependencies]</span>
+<span class="n">cranelift</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">version</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"0.125"</span><span class="p">,</span><span class="w"> </span><span class="n">features</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"jit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"module"</span><span class="p">,</span><span class="w"> </span><span class="s2">"native"</span><span class="p">]</span><span class="w"> </span><span class="p">}</span>
+<span class="n">cranelift-jit</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"0.125"</span>
+<span class="n">cranelift-module</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"0.125"</span>
+<span class="n">cranelift-codegen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"0.125"</span>
+<span class="n">cranelift-frontend</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"0.125"</span>
+<span class="n">cranelift-native</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"0.125"</span>
+</code></pre></div>
+<h2>Root Cause Analysis</h2>
+<p>Two issues combine to cause this:</p>
+<h3>1. Missing MAP_JIT flag</h3>
+<p><code>cranelift-jit</code> allocates executable memory using the standard allocator (<code>alloc::alloc</code>), which doesn't set the <code>MAP_JIT</code> flag. On Apple Silicon, memory intended for JIT execution <strong>must</strong> be allocated with:</p>
+<div class="codehilite" data-code-language="C"><pre><span></span><code><span class="n">mmap</span><span class="p">(</span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">size</span><span class="p">,</span><span class="w"> </span><span class="n">PROT_READ</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">PROT_WRITE</span><span class="p">,</span><span class="w"> </span><span class="n">MAP_PRIVATE</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">MAP_ANON</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">MAP_JIT</span><span class="p">,</span><span class="w"> </span><span class="mi">-1</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+</code></pre></div>
+<p>Without <code>MAP_JIT</code> (0x0800), the kernel cannot properly track the memory for W^X enforcement.</p>
+<h3>2. Missing W^X mode switch for spawned threads</h3>
+<p>Apple Silicon enforces W^X (Write XOR Execute) at the hardware level. Each thread has an independent write/execute mode:</p>
+<ul>
+<li><code>pthread_jit_write_protect_np(0)</code> = write mode (can write JIT memory, cannot execute)</li>
+<li><code>pthread_jit_write_protect_np(1)</code> = execute mode (can execute JIT code, cannot write)</li>
+</ul>
+<p><strong>Threads inherit write mode by default.</strong> The current implementation doesn't switch spawned threads to execute mode before calling JIT code, causing crashes.</p>
+<h2>Proposed Solution</h2>
+<ol>
+<li><strong>Use <code>mmap</code> with <code>MAP_JIT</code></strong> for memory allocation on ARM64 macOS instead of the standard allocator</li>
+<li><strong>Call <code>pthread_jit_write_protect_np(1)</code></strong> after making memory executable to switch to execute mode</li>
+<li><strong>Add memory barriers</strong> (DSB SY + ISB SY) for proper icache coherency on Apple Silicon's heterogeneous cores</li>
+</ol>
+<h2>Technical References</h2>
+<ul>
+<li><a href="https://developer.apple.com/documentation/xcode/writing_arm64_code_for_apple_platforms">Apple: Writing ARM64 Code for Apple Platforms</a></li>
+<li><a href="https://developer.apple.com/documentation/apple-silicon/porting-just-in-time-compilers-to-apple-silicon">Porting Just-In-Time Compilers to Apple Silicon</a></li>
+<li>Apple Silicon has independent instruction caches per core (P-cores and E-cores), requiring explicit barriers</li>
+</ul>
+<h2>Related Issues</h2>
+<ul>
+<li>#2735 - Support PLT entries in <code>cranelift-jit</code> crate on aarch64</li>
+<li>#8852 - Cranelift: JIT assertion failure when using <code>ArgumentPurpose::StructArgument</code> on macOS (A64)</li>
+<li>#4000 - Cranelift: JIT relocations depend on system allocator behaviour<br>
+</li>
+</ul>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

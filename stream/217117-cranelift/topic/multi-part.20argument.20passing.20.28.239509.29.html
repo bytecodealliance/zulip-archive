@@ -1,0 +1,58 @@
+<html>
+<head><meta charset="utf-8"><title>multi-part argument passing (#9509) · cranelift · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/index.html">cranelift</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/multi-part.20argument.20passing.20.28.239509.29.html">multi-part argument passing (#9509)</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="544660641"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/multi-part%20argument%20passing%20%28%239509%29/near/544660641" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> joshua you <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/multi-part.20argument.20passing.20.28.239509.29.html#544660641">(Oct 14 2025 at 05:09)</a>:</h4>
+<p>hi, i'm writing a C compiler at the moment and want to implement passing structs by value. i saw from discussion on reddit and on github (<a href="https://github.com/bytecodealliance/wasmtime/issues/9509">#9509</a>) that there is an issue with the way this is handled by cranelift currently</p>
+<p>to summarize: sometimes, the ABI (SysV) allows passing small structs in registers. however, other times, if the struct is larger than some size, it must be passed via the stack. </p>
+<p>currently, cranelift delegates this choice to frontend author - for big structs, they should use StructArgument purpose on a ptrsize-value param, and cranelift will generate a memcpy from the pointer given to Call IR instruction to the stack. </p>
+<p>however, there's an edge case when a small struct which would ordinarily be passed through registers instead has to be passed through stack due to lack of registers for <em>some</em> of its fields (or some other reason). in this case, SysV mandates that the entire struct go onto the stack, but if the frontend lowers a struct into multiple values, there's no way for Cranelift to reason about those values making up the struct as a group. </p>
+<p>it seems like you can get it to work by essentially doing all of the ABI calculations yourself, but this seems like a bit of a hack, and not really ideal. </p>
+<p>i'd like for my compiler to implement this properly, so i was hoping to get some input from maintainers about possible patch for cranelift</p>
+<p>from github: add some kind of AbiParamGroup abstraction to ir::Signature to say that multiple Values should be treated as a unit for the purposes of allocating argument-passing registers when passing small structs, keep StructArgument for larger structs. need to emit code to spill registers onto stack when doing Call, and to load from stack on the other side. </p>
+<p>i guess my thought is that this feels a bit confusing to have both StructArgument and this "AbiParamGroup" mechanism for frontend authors, but since they are expected to handle some ABI details anyways, maybe its ok?</p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/wasmtime/issues/9509" style="background-image: url(&quot;https://uploads.zulipusercontent.net/4e24a657f585afc7e889c8dae6cd872661d7b2a4/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f636337633961336164346535656162376539363664396165633930343836613839343933393436613063393331383062643739353562623166366635333438642f62797465636f6465616c6c69616e63652f7761736d74696d652f6973737565732f39353039&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/wasmtime/issues/9509" title="Cranelift: Correctly handle abi calculation for multi-part arguments · Issue #9509 · bytecodealliance/wasmtime">Cranelift: Correctly handle abi calculation for multi-part arguments · Issue #9509 · bytecodealliance/wasmtime</a></div><div class="message_embed_description">Feature When lowering a C or Rust type in a clif ir function signature, sometimes it is necessary to split it into multiple clif ir level parameters. For example #[repr(C)] struct F32Array { field0...</div></div></div>
+
+
+
+<a name="544798038"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/multi-part%20argument%20passing%20%28%239509%29/near/544798038" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/multi-part.20argument.20passing.20.28.239509.29.html#544798038">(Oct 14 2025 at 16:50)</a>:</h4>
+<p>I don't fully remember all the discussion here, but I also don't see anything in the issue you linked about</p>
+<blockquote>
+<p>keep StructArgument for larger structs</p>
+</blockquote>
+<p>and I suspect we actually wouldn't want to do that; rather we'd expect the caller to use a stackslot to put the struct somewhere on stack, then pass the pointer in. In other words, we want to give building blocks to allow you to build an implementation of the ABI without platform-specific knowledge (that's the param grouping and ISA-specific allocation algorithm over it) but not to bundle in too much extra.</p>
+
+
+
+<a name="544819313"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/multi-part%20argument%20passing%20%28%239509%29/near/544819313" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> joshua you <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/multi-part.20argument.20passing.20.28.239509.29.html#544819313">(Oct 14 2025 at 19:07)</a>:</h4>
+<p>wouldn't it still be necessary to have the StructArgument purpose though? even if you make the memcpy into callee's argument passing area explicit, you'd still have to tell cranelift what order that struct goes into the callee's argument passing area relative to implicit spills in function call from register pressure</p>
+
+
+
+<a name="544821184"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/multi-part%20argument%20passing%20%28%239509%29/near/544821184" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/multi-part.20argument.20passing.20.28.239509.29.html#544821184">(Oct 14 2025 at 19:19)</a>:</h4>
+<p>Ah, I may be misremembering the details of the ABI -- it's been a few years, sorry :-) If it has to be in a particular place, then yep, you're right. I seem to remember a pointer to the arg being passed in a reg and if that's the case and there are no restrictions where it actually lives, then we may not need it</p>
+
+
+
+<a name="544918030"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/multi-part%20argument%20passing%20%28%239509%29/near/544918030" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> bjorn3 <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/multi-part.20argument.20passing.20.28.239509.29.html#544918030">(Oct 15 2025 at 09:25)</a>:</h4>
+<blockquote>
+<p>I seem to remember a pointer to the arg being passed in a reg and if that's the case and there are no restrictions where it actually lives, then we may not need it</p>
+</blockquote>
+<p>That is on s390x and maybe on aarch64, where cg_clif would indeed not use StructArgument. On x86_64 you definitively need StructArgument however.</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

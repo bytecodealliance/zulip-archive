@@ -1,0 +1,246 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #10994 Cranelift: missed DCE / constant ... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310994.20Cranelift.3A.20missed.20DCE.20.2F.20constant.20.2E.2E.2E.html">wasmtime / issue #10994 Cranelift: missed DCE / constant ...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="523240466"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310994%20Cranelift%3A%20missed%20DCE%20/%20constant%20.../near/523240466" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310994.20Cranelift.3A.20missed.20DCE.20.2F.20constant.20.2E.2E.2E.html#523240466">(Jun 10 2025 at 08:57)</a>:</h4>
+<p>Simoffsky opened <a href="https://github.com/bytecodealliance/wasmtime/issues/10994">issue #10994</a>:</p>
+<blockquote>
+<p>Cranelift fails to eliminate a dead conditional branch in a case where the condition is statically known to be false due to constant folding.</p>
+<p><a href="https://godbolt.org/z/nMjvMcK1Y">godbolt link</a> (look at $process_rows).</p>
+<h2>Input WASM getted by using C++ Wasmtime API</h2>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$process_rows</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="k">block</span>
+      <span class="nb">i32.const</span> <span class="mi">0</span>
+      <span class="nb">i32.eqz</span>
+      <span class="nb">br_if</span> <span class="mi">0</span>
+      <span class="nb">local.get</span> <span class="mi">0</span>
+      <span class="nb">i32.const</span> <span class="mi">1</span>
+      <span class="nb">i32.shl</span>
+      <span class="nb">local.get</span> <span class="mi">0</span>
+      <span class="nb">i32.const</span> <span class="mi">1</span>
+      <span class="nb">i32.add</span>
+      <span class="nb">local.get</span> <span class="mi">0</span>
+      <span class="nb">i32.const</span> <span class="mi">2</span>
+      <span class="nb">i32.gt_s</span>
+      <span class="nb">select</span>
+      <span class="nb">local.get</span> <span class="mi">0</span>
+      <span class="nb">i32.add</span>
+      <span class="nb">local.set</span> <span class="mi">0</span>
+    <span class="k">end</span>
+    <span class="nb">local.get</span> <span class="mi">0</span>
+    <span class="nb">i32.const</span> <span class="mi">1</span>
+    <span class="nb">i32.add</span><span class="p">))</span>
+</code></pre></div>
+<h2>Expected behavior</h2>
+<p>Since <code>i32.const 0</code> is always equal to zero, the result of <code>i32.eqz</code> is always 1, and <code>br_if 0</code> is guaranteed to be taken unconditionally. Therefore, all code after the branch inside the block is dead and should be removed.</p>
+<div class="codehilite" data-code-language="GAS"><pre><span></span><code><span class="nf">xor</span><span class="w"> </span><span class="no">esi</span><span class="p">,</span><span class="w"> </span><span class="no">esi</span>
+<span class="nf">test</span><span class="w">    </span><span class="no">esi</span><span class="p">,</span><span class="w"> </span><span class="no">esi</span>
+<span class="nf">je</span><span class="w">  </span><span class="err">&lt;</span><span class="no">after_block</span><span class="err">&gt;</span><span class="w">       </span><span class="c1">; this is always false, should not exist</span>
+<span class="nf">mov</span><span class="w"> </span><span class="no">rax</span><span class="p">,</span><span class="w"> </span><span class="no">rdx</span><span class="w">            </span><span class="c1">; dead code</span>
+<span class="nf">shl</span><span class="w"> </span><span class="no">eax</span><span class="p">,</span><span class="w"> </span><span class="mi">0x1</span>
+<span class="nf">lea</span><span class="w"> </span><span class="no">edi</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="no">rdx</span><span class="w"> </span><span class="err">+</span><span class="w"> </span><span class="mi">0x1</span><span class="p">]</span>
+<span class="nf">cmp</span><span class="w"> </span><span class="no">edx</span><span class="p">,</span><span class="w"> </span><span class="mi">0x2</span>
+<span class="nf">cmovg</span><span class="w">   </span><span class="no">edi</span><span class="p">,</span><span class="w"> </span><span class="no">eax</span>
+<span class="nf">add</span><span class="w"> </span><span class="no">edx</span><span class="p">,</span><span class="w"> </span><span class="no">edi</span>
+<span class="nf">lea</span><span class="w"> </span><span class="no">eax</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="no">rdx</span><span class="w"> </span><span class="err">+</span><span class="w"> </span><span class="mi">0x1</span><span class="p">]</span>
+</code></pre></div>
+<h3>Versions and Environment</h3>
+<p>Cranelift version or commit: Wasmtime 22.0.0</p>
+<p>Operating system: macos, linux (debian)</p>
+<p>Architecture: (arm, x64)<br>
+</p>
+</blockquote>
+
+
+
+<a name="523240468"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310994%20Cranelift%3A%20missed%20DCE%20/%20constant%20.../near/523240468" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310994.20Cranelift.3A.20missed.20DCE.20.2F.20constant.20.2E.2E.2E.html#523240468">(Jun 10 2025 at 08:57)</a>:</h4>
+<p><a href="https://github.com/Simoffsky">Simoffsky</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/10994">Issue #10994</a>.</p>
+
+
+
+<a name="523240469"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310994%20Cranelift%3A%20missed%20DCE%20/%20constant%20.../near/523240469" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310994.20Cranelift.3A.20missed.20DCE.20.2F.20constant.20.2E.2E.2E.html#523240469">(Jun 10 2025 at 08:57)</a>:</h4>
+<p><a href="https://github.com/Simoffsky">Simoffsky</a> added the cranelift label to <a href="https://github.com/bytecodealliance/wasmtime/issues/10994">Issue #10994</a>.</p>
+
+
+
+<a name="523244155"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310994%20Cranelift%3A%20missed%20DCE%20/%20constant%20.../near/523244155" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310994.20Cranelift.3A.20missed.20DCE.20.2F.20constant.20.2E.2E.2E.html#523244155">(Jun 10 2025 at 09:14)</a>:</h4>
+<p>Simoffsky edited <a href="https://github.com/bytecodealliance/wasmtime/issues/10994">issue #10994</a>:</p>
+<blockquote>
+<p>Cranelift fails to eliminate a dead conditional branch in a case where the condition is statically known to be false due to constant folding.</p>
+<p><a href="https://godbolt.org/z/nMjvMcK1Y">godbolt link</a> (look at $process_rows).</p>
+<h2>Input WASM</h2>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$process_rows</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="k">block</span>
+      <span class="nb">i32.const</span> <span class="mi">0</span>
+      <span class="nb">i32.eqz</span>
+      <span class="nb">br_if</span> <span class="mi">0</span>
+      <span class="nb">local.get</span> <span class="mi">0</span>
+      <span class="nb">i32.const</span> <span class="mi">1</span>
+      <span class="nb">i32.shl</span>
+      <span class="nb">local.get</span> <span class="mi">0</span>
+      <span class="nb">i32.const</span> <span class="mi">1</span>
+      <span class="nb">i32.add</span>
+      <span class="nb">local.get</span> <span class="mi">0</span>
+      <span class="nb">i32.const</span> <span class="mi">2</span>
+      <span class="nb">i32.gt_s</span>
+      <span class="nb">select</span>
+      <span class="nb">local.get</span> <span class="mi">0</span>
+      <span class="nb">i32.add</span>
+      <span class="nb">local.set</span> <span class="mi">0</span>
+    <span class="k">end</span>
+    <span class="nb">local.get</span> <span class="mi">0</span>
+    <span class="nb">i32.const</span> <span class="mi">1</span>
+    <span class="nb">i32.add</span><span class="p">))</span>
+</code></pre></div>
+<h2>Expected behavior</h2>
+<p>Since <code>i32.const 0</code> is always equal to zero, the result of <code>i32.eqz</code> is always 1, and <code>br_if 0</code> is guaranteed to be taken unconditionally. Therefore, all code after the branch inside the block is dead and should be removed.</p>
+<div class="codehilite" data-code-language="GAS"><pre><span></span><code><span class="nf">xor</span><span class="w"> </span><span class="no">esi</span><span class="p">,</span><span class="w"> </span><span class="no">esi</span>
+<span class="nf">test</span><span class="w">    </span><span class="no">esi</span><span class="p">,</span><span class="w"> </span><span class="no">esi</span>
+<span class="nf">je</span><span class="w">  </span><span class="err">&lt;</span><span class="no">after_block</span><span class="err">&gt;</span><span class="w">       </span><span class="c1">; this is always false, should not exist</span>
+<span class="nf">mov</span><span class="w"> </span><span class="no">rax</span><span class="p">,</span><span class="w"> </span><span class="no">rdx</span><span class="w">            </span><span class="c1">; dead code</span>
+<span class="nf">shl</span><span class="w"> </span><span class="no">eax</span><span class="p">,</span><span class="w"> </span><span class="mi">0x1</span>
+<span class="nf">lea</span><span class="w"> </span><span class="no">edi</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="no">rdx</span><span class="w"> </span><span class="err">+</span><span class="w"> </span><span class="mi">0x1</span><span class="p">]</span>
+<span class="nf">cmp</span><span class="w"> </span><span class="no">edx</span><span class="p">,</span><span class="w"> </span><span class="mi">0x2</span>
+<span class="nf">cmovg</span><span class="w">   </span><span class="no">edi</span><span class="p">,</span><span class="w"> </span><span class="no">eax</span>
+<span class="nf">add</span><span class="w"> </span><span class="no">edx</span><span class="p">,</span><span class="w"> </span><span class="no">edi</span>
+<span class="nf">lea</span><span class="w"> </span><span class="no">eax</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="no">rdx</span><span class="w"> </span><span class="err">+</span><span class="w"> </span><span class="mi">0x1</span><span class="p">]</span>
+</code></pre></div>
+<h3>Versions and Environment</h3>
+<p>Cranelift version or commit: Wasmtime 22.0.0</p>
+<p>Operating system: macos, linux (debian)</p>
+<p>Architecture: (arm, x64)<br>
+</p>
+</blockquote>
+
+
+
+<a name="523247867"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310994%20Cranelift%3A%20missed%20DCE%20/%20constant%20.../near/523247867" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310994.20Cranelift.3A.20missed.20DCE.20.2F.20constant.20.2E.2E.2E.html#523247867">(Jun 10 2025 at 09:34)</a>:</h4>
+<p>cfallin closed <a href="https://github.com/bytecodealliance/wasmtime/issues/10994">issue #10994</a>:</p>
+<blockquote>
+<p>Cranelift fails to eliminate a dead conditional branch in a case where the condition is statically known to be false due to constant folding.</p>
+<p><a href="https://godbolt.org/z/nMjvMcK1Y">godbolt link</a> (look at $process_rows).</p>
+<h2>Input WASM</h2>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$process_rows</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="k">block</span>
+      <span class="nb">i32.const</span> <span class="mi">0</span>
+      <span class="nb">i32.eqz</span>
+      <span class="nb">br_if</span> <span class="mi">0</span>
+      <span class="nb">local.get</span> <span class="mi">0</span>
+      <span class="nb">i32.const</span> <span class="mi">1</span>
+      <span class="nb">i32.shl</span>
+      <span class="nb">local.get</span> <span class="mi">0</span>
+      <span class="nb">i32.const</span> <span class="mi">1</span>
+      <span class="nb">i32.add</span>
+      <span class="nb">local.get</span> <span class="mi">0</span>
+      <span class="nb">i32.const</span> <span class="mi">2</span>
+      <span class="nb">i32.gt_s</span>
+      <span class="nb">select</span>
+      <span class="nb">local.get</span> <span class="mi">0</span>
+      <span class="nb">i32.add</span>
+      <span class="nb">local.set</span> <span class="mi">0</span>
+    <span class="k">end</span>
+    <span class="nb">local.get</span> <span class="mi">0</span>
+    <span class="nb">i32.const</span> <span class="mi">1</span>
+    <span class="nb">i32.add</span><span class="p">))</span>
+</code></pre></div>
+<h2>Expected behavior</h2>
+<p>Since <code>i32.const 0</code> is always equal to zero, the result of <code>i32.eqz</code> is always 1, and <code>br_if 0</code> is guaranteed to be taken unconditionally. Therefore, all code after the branch inside the block is dead and should be removed.</p>
+<div class="codehilite" data-code-language="GAS"><pre><span></span><code><span class="nf">xor</span><span class="w"> </span><span class="no">esi</span><span class="p">,</span><span class="w"> </span><span class="no">esi</span>
+<span class="nf">test</span><span class="w">    </span><span class="no">esi</span><span class="p">,</span><span class="w"> </span><span class="no">esi</span>
+<span class="nf">je</span><span class="w">  </span><span class="err">&lt;</span><span class="no">after_block</span><span class="err">&gt;</span><span class="w">       </span><span class="c1">; this is always false, should not exist</span>
+<span class="nf">mov</span><span class="w"> </span><span class="no">rax</span><span class="p">,</span><span class="w"> </span><span class="no">rdx</span><span class="w">            </span><span class="c1">; dead code</span>
+<span class="nf">shl</span><span class="w"> </span><span class="no">eax</span><span class="p">,</span><span class="w"> </span><span class="mi">0x1</span>
+<span class="nf">lea</span><span class="w"> </span><span class="no">edi</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="no">rdx</span><span class="w"> </span><span class="err">+</span><span class="w"> </span><span class="mi">0x1</span><span class="p">]</span>
+<span class="nf">cmp</span><span class="w"> </span><span class="no">edx</span><span class="p">,</span><span class="w"> </span><span class="mi">0x2</span>
+<span class="nf">cmovg</span><span class="w">   </span><span class="no">edi</span><span class="p">,</span><span class="w"> </span><span class="no">eax</span>
+<span class="nf">add</span><span class="w"> </span><span class="no">edx</span><span class="p">,</span><span class="w"> </span><span class="no">edi</span>
+<span class="nf">lea</span><span class="w"> </span><span class="no">eax</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="no">rdx</span><span class="w"> </span><span class="err">+</span><span class="w"> </span><span class="mi">0x1</span><span class="p">]</span>
+</code></pre></div>
+<h3>Versions and Environment</h3>
+<p>Cranelift version or commit: Wasmtime 22.0.0</p>
+<p>Operating system: macos, linux (debian)</p>
+<p>Architecture: (arm, x64)<br>
+</p>
+</blockquote>
+
+
+
+<a name="523247871"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310994%20Cranelift%3A%20missed%20DCE%20/%20constant%20.../near/523247871" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310994.20Cranelift.3A.20missed.20DCE.20.2F.20constant.20.2E.2E.2E.html#523247871">(Jun 10 2025 at 09:34)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/10994#issuecomment-2958386854">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10994">issue #10994</a>:</p>
+<blockquote>
+<p>We don't have any branch-folding optimizations at the moment, so this result is expected. #6106 covers tracking this possible enhancement, I believe, so I'll close as a duplicate of that tracking issue.</p>
+</blockquote>
+
+
+
+<a name="523247962"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310994%20Cranelift%3A%20missed%20DCE%20/%20constant%20.../near/523247962" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310994.20Cranelift.3A.20missed.20DCE.20.2F.20constant.20.2E.2E.2E.html#523247962">(Jun 10 2025 at 09:35)</a>:</h4>
+<p>cfallin closed <a href="https://github.com/bytecodealliance/wasmtime/issues/10994">issue #10994</a>:</p>
+<blockquote>
+<p>Cranelift fails to eliminate a dead conditional branch in a case where the condition is statically known to be false due to constant folding.</p>
+<p><a href="https://godbolt.org/z/nMjvMcK1Y">godbolt link</a> (look at $process_rows).</p>
+<h2>Input WASM</h2>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$process_rows</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="k">block</span>
+      <span class="nb">i32.const</span> <span class="mi">0</span>
+      <span class="nb">i32.eqz</span>
+      <span class="nb">br_if</span> <span class="mi">0</span>
+      <span class="nb">local.get</span> <span class="mi">0</span>
+      <span class="nb">i32.const</span> <span class="mi">1</span>
+      <span class="nb">i32.shl</span>
+      <span class="nb">local.get</span> <span class="mi">0</span>
+      <span class="nb">i32.const</span> <span class="mi">1</span>
+      <span class="nb">i32.add</span>
+      <span class="nb">local.get</span> <span class="mi">0</span>
+      <span class="nb">i32.const</span> <span class="mi">2</span>
+      <span class="nb">i32.gt_s</span>
+      <span class="nb">select</span>
+      <span class="nb">local.get</span> <span class="mi">0</span>
+      <span class="nb">i32.add</span>
+      <span class="nb">local.set</span> <span class="mi">0</span>
+    <span class="k">end</span>
+    <span class="nb">local.get</span> <span class="mi">0</span>
+    <span class="nb">i32.const</span> <span class="mi">1</span>
+    <span class="nb">i32.add</span><span class="p">))</span>
+</code></pre></div>
+<h2>Expected behavior</h2>
+<p>Since <code>i32.const 0</code> is always equal to zero, the result of <code>i32.eqz</code> is always 1, and <code>br_if 0</code> is guaranteed to be taken unconditionally. Therefore, all code after the branch inside the block is dead and should be removed.</p>
+<div class="codehilite" data-code-language="GAS"><pre><span></span><code><span class="nf">xor</span><span class="w"> </span><span class="no">esi</span><span class="p">,</span><span class="w"> </span><span class="no">esi</span>
+<span class="nf">test</span><span class="w">    </span><span class="no">esi</span><span class="p">,</span><span class="w"> </span><span class="no">esi</span>
+<span class="nf">je</span><span class="w">  </span><span class="err">&lt;</span><span class="no">after_block</span><span class="err">&gt;</span><span class="w">       </span><span class="c1">; this is always false, should not exist</span>
+<span class="nf">mov</span><span class="w"> </span><span class="no">rax</span><span class="p">,</span><span class="w"> </span><span class="no">rdx</span><span class="w">            </span><span class="c1">; dead code</span>
+<span class="nf">shl</span><span class="w"> </span><span class="no">eax</span><span class="p">,</span><span class="w"> </span><span class="mi">0x1</span>
+<span class="nf">lea</span><span class="w"> </span><span class="no">edi</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="no">rdx</span><span class="w"> </span><span class="err">+</span><span class="w"> </span><span class="mi">0x1</span><span class="p">]</span>
+<span class="nf">cmp</span><span class="w"> </span><span class="no">edx</span><span class="p">,</span><span class="w"> </span><span class="mi">0x2</span>
+<span class="nf">cmovg</span><span class="w">   </span><span class="no">edi</span><span class="p">,</span><span class="w"> </span><span class="no">eax</span>
+<span class="nf">add</span><span class="w"> </span><span class="no">edx</span><span class="p">,</span><span class="w"> </span><span class="no">edi</span>
+<span class="nf">lea</span><span class="w"> </span><span class="no">eax</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="no">rdx</span><span class="w"> </span><span class="err">+</span><span class="w"> </span><span class="mi">0x1</span><span class="p">]</span>
+</code></pre></div>
+<h3>Versions and Environment</h3>
+<p>Cranelift version or commit: Wasmtime 22.0.0</p>
+<p>Operating system: macos, linux (debian)</p>
+<p>Architecture: (arm, x64)<br>
+</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

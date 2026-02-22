@@ -1,0 +1,215 @@
+<html>
+<head><meta charset="utf-8"><title>running arbitrary async components safely · general · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/index.html">general</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html">running arbitrary async components safely</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="539001930"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/539001930" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> dakom <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#539001930">(Sep 12 2025 at 07:45)</a>:</h4>
+<p>Let's say I want to execute arbitrary components using <code>wasmtime</code>, and they may do things like long executions in an async task. </p>
+<p>One naive way to handle this could be to only execute components with <code>spawn_blocking</code>. Or, more explicitly, spawn a new thread for every component execution and give it its own tokio runtime like:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">std</span><span class="p">::</span><span class="n">thread</span><span class="p">::</span><span class="n">spawn</span><span class="p">(</span><span class="o">||</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">rt</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tokio</span><span class="p">::</span><span class="n">runtime</span><span class="p">::</span><span class="n">Builder</span><span class="p">::</span><span class="n">new_current_thread</span><span class="p">().</span><span class="n">enable_all</span><span class="p">().</span><span class="n">build</span><span class="p">().</span><span class="n">unwrap</span><span class="p">();</span>
+
+<span class="w">    </span><span class="n">rt</span><span class="p">.</span><span class="n">block_on</span><span class="p">(</span><span class="k">async</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">possibly_evil_component</span><span class="p">::</span><span class="n">execute</span><span class="p">().</span><span class="k">await</span><span class="p">;</span>
+<span class="w">    </span><span class="p">});</span>
+<span class="p">})</span>
+</code></pre></div>
+<p>Is this necessary, or does the component model/wasmtime guarantee that components cannot block eachother's tasks?</p>
+<p>If/how will this change with p3?</p>
+<p>Any advice on best practices is appreciated. Thanks!</p>
+
+
+
+<a name="539058620"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/539058620" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#539058620">(Sep 12 2025 at 12:57)</a>:</h4>
+<p>By default wasmtime does not prevent a guest that is actively using the CPU from blocking that thread. You may be interested in the epoch interruption feature: <a href="https://docs.rs/wasmtime/36.0.2/wasmtime/struct.Config.html#method.epoch_interruption">https://docs.rs/wasmtime/36.0.2/wasmtime/struct.Config.html#method.epoch_interruption</a></p>
+
+
+
+<a name="539082075"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/539082075" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#539082075">(Sep 12 2025 at 14:41)</a>:</h4>
+<p>EIther epochs or fuel are what we recommend to limit CPU consumption. Memory consumption can be achieved with <code>ResourceLimiter</code>. WASIp3 won't move the needle here at all, it's still the same solutions as before. With fuel or epochs you won't need to spawn a thread, you can use the same host threads</p>
+
+
+
+<a name="539272223"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/539272223" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Till Schneidereit <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#539272223">(Sep 13 2025 at 13:39)</a>:</h4>
+<p>For more details, you can look at the relevant chapters of the docs as well:<br>
+<a href="https://docs.wasmtime.dev/examples-deterministic-wasm-execution.html">https://docs.wasmtime.dev/examples-deterministic-wasm-execution.html</a><br>
+<a href="https://docs.wasmtime.dev/examples-interrupting-wasm.html">https://docs.wasmtime.dev/examples-interrupting-wasm.html</a></p>
+
+
+
+<a name="539579100"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/539579100" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> dakom <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#539579100">(Sep 15 2025 at 14:45)</a>:</h4>
+<p>Thanks! Got it that I want to limit the resource consumption <span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span>  </p>
+<p>Followup question... <span class="user-mention" data-user-id="253994">@Alex Crichton</span> can you please elaborate more on "With fuel or epochs you won't need to spawn a thread" ?</p>
+<p>In other words, if I start executing one component, I don't want to wait for it to complete before starting another component... are you suggesting that wasmtime comes with some ability to juggle this out of the box?</p>
+
+
+
+<a name="539579809"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/539579809" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#539579809">(Sep 15 2025 at 14:48)</a>:</h4>
+<p>When you use <code>call_async</code> + <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Store.html#method.epoch_deadline_async_yield_and_update">epochs</a>/<a href="https://docs.rs/wasmtime/latest/wasmtime/struct.Store.html#method.fuel_async_yield_interval">fuel</a> with <code>Store</code>-level configuration the future returned will periodically yield at a configured interval, meaning that an infinite loop in wasm isn't actually an infinite loop on the host but rather one with defined "await points" where you can work on something else, spawn more futures, drop the computation, etc</p>
+
+
+
+<a name="539589205"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/539589205" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> dakom <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#539589205">(Sep 15 2025 at 15:27)</a>:</h4>
+<p>oh, that is super cool! So I can just throw them all into a <code>FuturesUnordered</code> and it's fine, they'll all make progress without blocking eachother?</p>
+
+
+
+<a name="539589293"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/539589293" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#539589293">(Sep 15 2025 at 15:27)</a>:</h4>
+<p>that's the idea yeah</p>
+
+
+
+<a name="540012707"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/540012707" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> dakom <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#540012707">(Sep 17 2025 at 13:18)</a>:</h4>
+<p>is it okay to have both epochs and fuel yielding? e.g. to handle components that:</p>
+<ol>
+<li>may be running for a long time but somehow aren't consuming fuel</li>
+<li>aren't necessarily running for a long time, but are heavily consuming fuel and should be periodically interrupted</li>
+</ol>
+<p>?</p>
+
+
+
+<a name="540021562"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/540021562" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#540021562">(Sep 17 2025 at 13:52)</a>:</h4>
+<blockquote>
+<p>may be running for a long time but somehow aren't consuming fuel</p>
+</blockquote>
+<p>This depends on what you mean by "running":</p>
+<ul>
+<li>If you mean "actively using the CPU" then this scenario should be impossible by design for both epochs and fuel; the "await points" are carefully selected to make it impossible to run indefinitely without hitting one (at least as long as you don't allow infinitely large wasm binaries <span aria-label="slight smile" class="emoji emoji-1f642" role="img" title="slight smile">:slight_smile:</span>).</li>
+<li>If you mean "waiting on I/O" then you don't need epochs or fuel; a "normal" e.g. <a href="https://docs.rs/tokio/1.47.1/tokio/time/fn.timeout.html"><code>tokio::time::timeout</code></a> wrapping your wasm entrypoint should be able to interrupt asynchronous operations.</li>
+</ul>
+
+
+
+<a name="540040437"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/540040437" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> dakom <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#540040437">(Sep 17 2025 at 15:07)</a>:</h4>
+<p>fair point - but does <code>std::thread::sleep()</code>consume fuel while it sleeps? (I may be doing something wrong but it seems this doesn't block other components either...)</p>
+
+
+
+<a name="540040590"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/540040590" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#540040590">(Sep 17 2025 at 15:07)</a>:</h4>
+<p>The wasm future won't be running during the sleep, it'd be suspended, so you could drop the future at any time (or do other work)</p>
+
+
+
+<a name="540043718"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/540043718" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> dakom <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#540043718">(Sep 17 2025 at 15:20)</a>:</h4>
+<p>more of just a curiosity/learning question - with that in mind, is there effectively a difference between <code>std::thread::sleep()</code> and <code>wstd::runtime::block_on(wstd::task::sleep())</code>, or should I think of these as roughly the same idea as "wasmtime sees it as a suspended future and other tasks aren't blocked" ?</p>
+
+
+
+<a name="540044090"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/540044090" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#540044090">(Sep 17 2025 at 15:22)</a>:</h4>
+<p>those should behave pretty similarly yeah, although <code>std::thread::sleep</code> blocks everything for the guest where <code>wstd::block_on</code> will make progress on other sibling rust tasks while it's waiting for the sleep</p>
+
+
+
+<a name="540074105"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/540074105" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> dakom <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#540074105">(Sep 17 2025 at 18:02)</a>:</h4>
+<p>any tips on tuning <code>epoch_deadline_async_yield_and_update()</code>?</p>
+<p>fwiw, I've setup a test with one component doing a hot loop and seeing that it doesn't block another</p>
+<p>when I <code>increment_epoch()</code> every millisecond and <code>epoch_deadline_async_yield_and_update()</code> with a value of <code>1</code> or <code>10</code> the test passes, but with <code>100</code> it fails</p>
+<p>in other words, anecdotally, I assume it's not going to actually yield every 100 units of whenever <code>increment_epoch()</code> is called, or in my case - I can't assume it's even _near_ 100, may be some kind of scaling where the change from 1 to 10 to 100 isn't a multiple, drift is felt more strongly at the higher number?</p>
+
+
+
+<a name="540075477"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/540075477" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> dakom <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#540075477">(Sep 17 2025 at 18:10)</a>:</h4>
+<p>oh... I think maybe I get what's going on... when it's epoch and not fuel based, it has to insert checks in certain segments, not everytime an instruction is run - so my loop is running and not letting it progress to check the epoch?</p>
+<p>though, if that's the case, I don't get why lowering the delta helps...</p>
+
+
+
+<a name="540075803"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/540075803" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#540075803">(Sep 17 2025 at 18:12)</a>:</h4>
+<p>Epoch instrumentation checks for a new epoch on loop backedges as well; as mentioned above there should be no circumstance in which Wasm can run indefinitely when an epoch change should interrupt it. I haven't read all the thread details above but I would suspect some other deadlock in the way your system is combining futures and blocking...</p>
+
+
+
+<a name="540077299"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/540077299" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> dakom <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#540077299">(Sep 17 2025 at 18:21)</a>:</h4>
+<p>Interesting... though, merely changing the <code>epoch_deadline_async_yield_and_update()</code> duration from <code>10</code> to <code>100</code> could cause a deadlock?</p>
+<p>the test is pretty straightforward - I have been tinkering with this in different forms today, so I don't have something I can cleanly cut and paste right now, but it's really just spawning the component executions onto a single-threaded tokio runtime and sending into oneshot channels when they finish.</p>
+
+
+
+<a name="540077453"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/540077453" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> dakom <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#540077453">(Sep 17 2025 at 18:22)</a>:</h4>
+<p>if there isn't a known explanation for why the tuning would change things so drastically, I could try to reproduce in a standalone repo tomm... wrapping up for the day</p>
+
+
+
+<a name="540077808"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/540077808" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#540077808">(Sep 17 2025 at 18:25)</a>:</h4>
+<p>is <code>increment_epoch</code> happening in a separate thread?</p>
+
+
+
+<a name="540155469"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/540155469" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> dakom <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#540155469">(Sep 18 2025 at 06:35)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="253994">Alex Crichton</span> <a href="#narrow/channel/206238-general/topic/running.20arbitrary.20async.20components.20safely/near/540077808">said</a>:</p>
+<blockquote>
+<p>is <code>increment_epoch</code> happening in a separate thread?</p>
+</blockquote>
+<p>yes:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="n">engine_ticker</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">engine</span><span class="p">.</span><span class="n">weak</span><span class="p">();</span>
+<span class="n">std</span><span class="p">::</span><span class="n">thread</span><span class="p">::</span><span class="n">spawn</span><span class="p">(</span><span class="k">move</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="k">loop</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">engine_ticker</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">engine_ticker</span><span class="p">.</span><span class="n">upgrade</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">engine_ticker</span><span class="p">.</span><span class="n">increment_epoch</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">break</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">std</span><span class="p">::</span><span class="n">thread</span><span class="p">::</span><span class="n">sleep</span><span class="p">(</span><span class="n">Duration</span><span class="p">::</span><span class="n">from_millis</span><span class="p">(</span><span class="mi">1</span><span class="p">));</span>
+<span class="p">});</span>
+</code></pre></div>
+
+
+
+<a name="540195542"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/540195542" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> dakom <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#540195542">(Sep 18 2025 at 10:07)</a>:</h4>
+<p>I made a standalone repo, bumping to latest version of dependencies too, problem is reproducible: <a href="https://github.com/dakom/debug-wasmtime-concurrency">https://github.com/dakom/debug-wasmtime-concurrency</a></p>
+<p>(though, of course, it may be a bug on my side - and I'd appreciate the insight if so <span aria-label="pray" class="emoji emoji-1f64f" role="img" title="pray">:pray:</span> )</p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/dakom/debug-wasmtime-concurrency" style="background-image: url(&quot;https://uploads.zulipusercontent.net/6e2804329508942ebf7306c86b03ea6488d9bbe1/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f313163356637643661303832303138383039333233613037336631393565383832363532643763373461376232626162343666646630396363666231326434662f64616b6f6d2f64656275672d7761736d74696d652d636f6e63757272656e6379&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/dakom/debug-wasmtime-concurrency" title="GitHub - dakom/debug-wasmtime-concurrency">GitHub - dakom/debug-wasmtime-concurrency</a></div><div class="message_embed_description">Contribute to dakom/debug-wasmtime-concurrency development by creating an account on GitHub.</div></div></div>
+
+
+
+<a name="540250536"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/540250536" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#540250536">(Sep 18 2025 at 14:37)</a>:</h4>
+<p>Looks like you're running into <a href="https://github.com/bytecodealliance/wasmtime/issues/10667">this issue</a> which you can fix with:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="w">        </span><span class="n">store</span><span class="p">.</span><span class="n">epoch_deadline_callback</span><span class="p">(</span><span class="k">move</span><span class="w"> </span><span class="o">|</span><span class="n">_</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nb">Ok</span><span class="p">(</span><span class="n">wasmtime</span><span class="p">::</span><span class="n">UpdateDeadline</span><span class="p">::</span><span class="n">YieldCustom</span><span class="p">(</span>
+<span class="w">                </span><span class="n">yield_period_ms</span><span class="p">,</span>
+<span class="w">                </span><span class="nb">Box</span><span class="p">::</span><span class="n">pin</span><span class="p">(</span><span class="n">tokio</span><span class="p">::</span><span class="n">task</span><span class="p">::</span><span class="n">yield_now</span><span class="p">()),</span>
+<span class="w">            </span><span class="p">))</span>
+<span class="w">        </span><span class="p">});</span>
+</code></pre></div>
+<p>instead of <code>epoch_deadline_async_yield_and_update</code>. This has to do with how Wasmtime's implementation of <a href="https://github.com/bytecodealliance/wasmtime/blob/370042d0bc84908815d34c0675f4f2bb1d49c965/crates/wasmtime/src/runtime/vm/async_yield.rs#L20-L35">yielding the future</a> doesn't play well with Tokio's scheduling. We're not really sure of much which can be done about that other than using <code>UpdateDeadline::YieldCustom</code> to specifically integrate with tokio</p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/wasmtime/issues/10667" style="background-image: url(&quot;https://uploads.zulipusercontent.net/9d7308fa9db748767f2577a5813b2513ac8b603d/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f393735383031613934383664646265333937646566633861653635396263316538613732376563383730393135666362326539633132333761613361666432312f62797465636f6465616c6c69616e63652f7761736d74696d652f6973737565732f3130363637&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/wasmtime/issues/10667" title="Async Yield may immediately reschedule when using Tokio · Issue #10667 · bytecodealliance/wasmtime">Async Yield may immediately reschedule when using Tokio · Issue #10667 · bytecodealliance/wasmtime</a></div><div class="message_embed_description">Credit to @aturon for the discovery... Today, the async_yield_impl behavior triggered an epoch deadline is hit or we run out of fuel does not match that of tokio::task::yield_now. They are mostly t...</div></div></div><div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/wasmtime/blob/370042d0bc84908815d34c0675f4f2bb1d49c965/crates/wasmtime/src/runtime/vm/async_yield.rs#L20-L35" style="background-image: url(&quot;https://uploads.zulipusercontent.net/af8d7ef5f7136fdfcb40951e86b5696a194917c9/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f373666623233343063653766326261333633616132646365316530623462313266393637653738333236376166356465376333306464356336353639313137332f62797465636f6465616c6c69616e63652f7761736d74696d65&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/wasmtime/blob/370042d0bc84908815d34c0675f4f2bb1d49c965/crates/wasmtime/src/runtime/vm/async_yield.rs#L20-L35" title="wasmtime/crates/wasmtime/src/runtime/vm/async_yield.rs at 370042d0bc84908815d34c0675f4f2bb1d49c965 · bytecodealliance/wasmtime">wasmtime/crates/wasmtime/src/runtime/vm/async_yield.rs at 370042d0bc84908815d34c0675f4f2bb1d49c965 · bytecodealliance/wasmtime</a></div><div class="message_embed_description">A lightweight WebAssembly runtime that is fast, secure, and standards-compliant - bytecodealliance/wasmtime</div></div></div>
+
+
+
+<a name="540265613"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/running%20arbitrary%20async%20components%20safely/near/540265613" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> dakom <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/running.20arbitrary.20async.20components.20safely.html#540265613">(Sep 18 2025 at 15:40)</a>:</h4>
+<p>Awesome, that did the trick! Updated the repo, thanks again!!</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

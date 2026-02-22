@@ -1,0 +1,123 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #11437 c-api: component-model: Resources · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311437.20c-api.3A.20component-model.3A.20Resources.html">wasmtime / issue #11437 c-api: component-model: Resources</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="534637221"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311437%20c-api%3A%20component-model%3A%20Resources/near/534637221" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311437.20c-api.3A.20component-model.3A.20Resources.html#534637221">(Aug 15 2025 at 11:21)</a>:</h4>
+<p>MangoPeachGrape opened <a href="https://github.com/bytecodealliance/wasmtime/issues/11437">issue #11437</a>:</p>
+<blockquote>
+<p>(Part of the outstanding items of the component model: <a href="https://github.com/bytecodealliance/wasmtime/issues/8036#issuecomment-3129666977">https://github.com/bytecodealliance/wasmtime/issues/8036#issuecomment-3129666977</a>)</p>
+<p>See previous comments: <a href="https://github.com/bytecodealliance/wasmtime/pull/11055#issue-3151376309">https://github.com/bytecodealliance/wasmtime/pull/11055#issue-3151376309</a>, <a href="https://github.com/bytecodealliance/wasmtime/pull/11055#issuecomment-2980677120">https://github.com/bytecodealliance/wasmtime/pull/11055#issuecomment-2980677120</a></p>
+<hr>
+<p>My current limited understanding is that there should be a type that holds the resource's <code>ForeignData</code>, which is then inserted to the <code>ResourceTable</code>. Lets call this type <code>CApiResource</code>.</p>
+<p>When a function is called, we get a <code>ResourceAny</code>, that can be then <code>res.try_into_resource::&lt;CApiResource&gt;(&amp;mut store)</code>, and then <code>store.data().table.get(&amp;capi_res)</code>.</p>
+<p>But that brings up the question: What should be passed to C?</p>
+<ul>
+<li>Should it be the <code>ResourceAny</code> somehow boxed into a C type?</li>
+<li>Should it be the contents of the <code>CApiResource</code> already fetched from the <code>ResourceTable</code>, so the data pointer to data, and the embedder specified resource type integer?</li>
+<li>Should it just be the resource representation <code>u32</code> index?</li>
+<li>Something else?</li>
+</ul>
+<p>The same question exists in the reverse direction, when the C API wants to return a new resource.</p>
+<p>I also seem to read that <code>ResourceAny::resource_drop()</code> must be called at the end. Does this mean after calling the embedder's callback, we have to iterate the arguments, match if resource, and call this?</p>
+<p>Please note that I don't know much about working with resources, so I might be going at this at the wrong way.</p>
+</blockquote>
+
+
+
+<a name="534671335"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311437%20c-api%3A%20component-model%3A%20Resources/near/534671335" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311437.20c-api.3A.20component-model.3A.20Resources.html#534671335">(Aug 15 2025 at 15:26)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/11437#issuecomment-3191802805">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11437">issue #11437</a>:</p>
+<blockquote>
+<p>Fair warning on this: resources are subtle and tricky in ways that don't often become apparent until later. I unfortunately don't have time to champion/design a full implementation here but I can try to help out where I can with thoughts/feedback. This'll likely be both a learning process for both you and me as we figure out how best to represent this in the C API and it may require some adjustments over time. Basically I don't think that the Rust API as-is today is perfect for providing a reasonable C API and may need changes, but I'm not sure exactly how. I'll also admit that I'm re-paging-in all this context too, so apologies if this is a bit verbose.</p>
+<p>Today there are two ways to represent a resource in the Rust API of Wasmtime: <code>Resource&lt;T&gt;</code> and <code>ResourceAny</code>. Both are glorified wrappers over a 32-bit index which is "guarded" with type information.  The use case of each though is somewhat subtle.</p>
+<p><code>Resource&lt;T&gt;</code> is ubiquitously used for host bindings in WASI impementations and <code>bindgen!</code>-generated bindings. The <code>T</code> type is only used for a <code>TypeId</code> and is pretty arbitrary, but in wasmtime-wasi it's often used to match the type of something stored in a <code>ResourceTable</code>. They need not necessarily be equivalent, however. The other assertion of <code>Resource&lt;T&gt;</code> is "I'm the host and I know what I'm doing" in particular around destructors. It's assume that the host knows how to "destroy" the resource (which is, after all, just an index). More-or-less <code>Resource&lt;T&gt;</code> is a free-floating 32-bit index which is almost entirely disconnected from Wasmtime's state management meaning the host can do whatever it wants and has no destructor requirement.</p>
+<p><code>ResourceAny</code> is used, as the name might imply, to represent any possible resource. This notably includes guest-defined resources in addition to host-defined resources. The reason this has a destructor requirement is for the guest-defined case. This also has a destructor requirement as <code>ResourceAny</code> has some indexes/connection to host-defined state within Wasmtime (e.g. the "host tables"). This state is severed with <code>Resource&lt;T&gt;</code> but still present with <code>ResourceAny</code>.</p>
+<p>IMO neither of these are perfectly suitable for usage in the C API:</p>
+<ul>
+<li><code>Resource&lt;T&gt;</code> isn't great because <code>T</code> has to be defined statically. This means that the C API would only be able to define one type of resource which I don't think is suitable because then there's no protection about using the correct type of resource. </li>
+<li><code>Resource&lt;T&gt;</code> is good, however, in that it's "just an index" disconnected from other bits. I like this aspect because hosts don't have to worry about destructors or anything like that, so I think we do want something like <code>Resource&lt;T&gt;</code>.</li>
+<li><code>ResourceAny</code> isn't great as it's too general. It represents any possible resource, including guest resources, which has the burdensome requirement of needing a destructor to fully clean up after itself.</li>
+</ul>
+<p>After thinking about this for a bit I think we need some Rust API changes and careful modeling in C API. What I'm imagining looks like:</p>
+<ol>
+<li><code>wasmtime_component_valunion_t</code> is extended with a resource field which is more-or-less <code>ResourceAny</code>. This would be some sort of opaque structure and boxed up <code>ResourceAny</code> most likely. This would indeed have a requirement that it must be operated on to be properly cleaned up (beyond <code>*_delete</code> to avoid host memory leaks).</li>
+<li><code>wasmtime_component_resource_any_t</code>, let's say, would be C bindings for the <code>ResourceAny</code> type. This notably includes the <code>owned</code> and <code>resource_drop</code> methods. Eventually could bind <code>ty</code> too, but that's ok to not dig in too deeply at this time.</li>
+<li>
+<p>A new API will be added to the Rust crate to support multiple types of resources in the C API:</p>
+<ul>
+<li>A new <code>fn ResourceType::runtime_typed(i: u32) -&gt; ResourceType</code> will be added. This is similar to <code>ResourceType::Host(TypeId)</code> but it'll just be <code>ResourceType::RuntimeTyped(u32)</code>.</li>
+<li>This new resource type will be used to represent C API resources defined with a 32-bit integer as their "type", in an RTTI-like fashion.</li>
+<li>A new <code>ResourceRuntimeTyped</code> will be added. This'll more-or-less be an exact copy of <code>Resource&lt;T&gt;</code> except that type-checks look for <code>ResourceType::RuntimeTyped</code> instead of <code>ResourceType::Host</code></li>
+<li><code>ResourceAny</code> will have new conversion between <code>ResourceRuntimeTyped</code> in the same manner as <code>Resource&lt;T&gt;</code></li>
+<li>This effectively means that <code>ResourceAny</code> sort of has two subclasses of <code>Resource&lt;T&gt;</code> and <code>ResourceRuntimeTyped</code> in a sense.</li>
+<li>The naming "runtime typed" probably wants bikeshedding...</li>
+</ul>
+</li>
+<li>
+<p><code>wasmtime_component_resource_any_t</code> will have conversions to/from <code>wasmtime_component_resource_t</code> which would be a binding to <code>ResourceRuntimeTyped</code> in Rust. These conversions would take the type as an argument for example to say "I'm asserting that this <code>ResourceAny</code> is of runtime type 4". Conversion to <code>wasmtime_component_resource_t</code> would "consume" the original <code>ResourceAny</code> and release the host from its destructor requirement in the exact same way as <code>Resource&lt;T&gt;</code>.</p>
+</li>
+<li><code>wasmtime_component_resource_t</code> would have index/type accessors both operating on 32-bit integers, and then the embedding host would be able to do whatever it wants at that point.</li>
+<li><code>wasmtime_component_linker_instance_add_resource</code> would be added taking a 32-bit integer which would call <code>LinkerInstance::resource</code> with <code>ResourceType::runtime_typed(...)</code>. That would define the host destructor for a resource as well as the type information.</li>
+<li>Host functions in C would almost always convert <code>wasmtime_component_resource_any_t</code> to <code>wasmtime_component_resource_t</code> and could then do whatever indexing they want.</li>
+<li>Host embeddings in C could use <code>wasmtime_component_resource_any_t</code> when they invoke a wasm function to handle the case that the resource may be owned by wasm and thus needs to behave and operate like <code>ResourceAny</code>.</li>
+</ol>
+<hr>
+<p>Ok that's a lot of words and I didn't necessarily directly answer any of your questions. How's that all sound though? I realize this may be pretty opaque if you're new to resources (it took me a long time to get comfortable, and I still need time to "boot back up"). I'm more than happy to help explain anything else too.</p>
+</blockquote>
+
+
+
+<a name="535590186"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311437%20c-api%3A%20component-model%3A%20Resources/near/535590186" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311437.20c-api.3A.20component-model.3A.20Resources.html#535590186">(Aug 21 2025 at 22:59)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasmtime:c-api label to <a href="https://github.com/bytecodealliance/wasmtime/issues/11437">Issue #11437</a>.</p>
+
+
+
+<a name="535590187"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311437%20c-api%3A%20component-model%3A%20Resources/near/535590187" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311437.20c-api.3A.20component-model.3A.20Resources.html#535590187">(Aug 21 2025 at 22:59)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasm-proposal:component-model label to <a href="https://github.com/bytecodealliance/wasmtime/issues/11437">Issue #11437</a>.</p>
+
+
+
+<a name="545802309"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311437%20c-api%3A%20component-model%3A%20Resources/near/545802309" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311437.20c-api.3A.20component-model.3A.20Resources.html#545802309">(Oct 19 2025 at 04:45)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/11437#issuecomment-3419211112">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11437">issue #11437</a>:</p>
+<blockquote>
+<p>My step (3) from above, a relatively meaty step, is done in #11885. I'll be trying to tackle this in the near future next.</p>
+</blockquote>
+
+
+
+<a name="546569590"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311437%20c-api%3A%20component-model%3A%20Resources/near/546569590" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311437.20c-api.3A.20component-model.3A.20Resources.html#546569590">(Oct 23 2025 at 00:04)</a>:</h4>
+<p>fitzgen closed <a href="https://github.com/bytecodealliance/wasmtime/issues/11437">issue #11437</a>:</p>
+<blockquote>
+<p>(Part of the outstanding items of the component model: <a href="https://github.com/bytecodealliance/wasmtime/issues/8036#issuecomment-3129666977">https://github.com/bytecodealliance/wasmtime/issues/8036#issuecomment-3129666977</a>)</p>
+<p>See previous comments: <a href="https://github.com/bytecodealliance/wasmtime/pull/11055#issue-3151376309">https://github.com/bytecodealliance/wasmtime/pull/11055#issue-3151376309</a>, <a href="https://github.com/bytecodealliance/wasmtime/pull/11055#issuecomment-2980677120">https://github.com/bytecodealliance/wasmtime/pull/11055#issuecomment-2980677120</a></p>
+<hr>
+<p>My current limited understanding is that there should be a type that holds the resource's <code>ForeignData</code>, which is then inserted to the <code>ResourceTable</code>. Lets call this type <code>CApiResource</code>.</p>
+<p>When a function is called, we get a <code>ResourceAny</code>, that can be then <code>res.try_into_resource::&lt;CApiResource&gt;(&amp;mut store)</code>, and then <code>store.data().table.get(&amp;capi_res)</code>.</p>
+<p>But that brings up the question: What should be passed to C?</p>
+<ul>
+<li>Should it be the <code>ResourceAny</code> somehow boxed into a C type?</li>
+<li>Should it be the contents of the <code>CApiResource</code> already fetched from the <code>ResourceTable</code>, so the data pointer to data, and the embedder specified resource type integer?</li>
+<li>Should it just be the resource representation <code>u32</code> index?</li>
+<li>Something else?</li>
+</ul>
+<p>The same question exists in the reverse direction, when the C API wants to return a new resource.</p>
+<p>I also seem to read that <code>ResourceAny::resource_drop()</code> must be called at the end. Does this mean after calling the embedder's callback, we have to iterate the arguments, match if resource, and call this?</p>
+<p>Please note that I don't know much about working with resources, so I might be going at this at the wrong way.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

@@ -1,0 +1,67 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #11869 Async libcalls &quot;block&quot; the store ... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html">wasmtime / issue #11869 Async libcalls &quot;block&quot; the store ...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="545132224"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311869%20Async%20libcalls%20%22block%22%20the%20store%20.../near/545132224" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html#545132224">(Oct 15 2025 at 21:45)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/issues/11869">issue #11869</a>:</p>
+<blockquote>
+<p>At this time the implementation of async libcalls in Wasmtime all use the <code>block_on</code> helper internally in the implementation. This has the property, though, that the store is "locked" while the libcall is waiting on the result meaning that in a component-model-async world it's not possible to make progress on anything else in the store while this is happening. This notably affects <code>Store::run_concurrent</code> as well where any select-ed async computation won't make progress because the wasm is locking up everything.</p>
+<p>To fix this it will require async libcalls to be refactored/reimplemented to not close over the store for the duration of their execution. Instead something like <code>Accessor</code> will be required where mutable access to a store can be temporarily granted but otherwise it's not held across <code>await</code> points. In implementing this it'll fix <code>run_concurrent</code> to correctly and actually run various computations in the provided closure concurrently. This will also enable other concurrent tasks within the store to make progress while a libcall is blocked.</p>
+</blockquote>
+
+
+
+<a name="545132227"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311869%20Async%20libcalls%20%22block%22%20the%20store%20.../near/545132227" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html#545132227">(Oct 15 2025 at 21:45)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasm-proposal:component-model-async label to <a href="https://github.com/bytecodealliance/wasmtime/issues/11869">Issue #11869</a>.</p>
+
+
+
+<a name="571349914"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311869%20Async%20libcalls%20%22block%22%20the%20store%20.../near/571349914" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html#571349914">(Feb 02 2026 at 05:29)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/11869#issuecomment-3832992306">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11869">issue #11869</a>:</p>
+<blockquote>
+<p>I talked with Luke and Joel about this a bit ago and wanted to write down some notes. Async libcalls right now are:</p>
+<ul>
+<li>Things that trigger an async limiter<ul>
+<li>table growth (all kinds)</li>
+<li>memory growth</li>
+</ul>
+</li>
+<li>Things that may trigger GC (async nature of GC, async limiter, etc)<ul>
+<li>table initialization</li>
+<li>growing the gc heap</li>
+<li>gc allocation</li>
+<li>array new/init data/elem</li>
+</ul>
+</li>
+<li>Fuel running out</li>
+<li>Epochs changing</li>
+</ul>
+<p>All of these libcalls fall into the category of "the wasm is stuck between two plain/normal wasm instructions". It would be a violation of runtime semantics if Wasmtime were to allow something else to interleave between instructions. For example during an epoch yield it's not valid for Wasmtime to run some other wasm within the store as that could have visible side effects.</p>
+<p>Put another way Wasmtime will need to enforce a "lock" where when these async situations are hit it prevents all wasm from continuing to execute. My rough idea for this is that the store, with concurrency enabled, will grow an async-recursive-mutex-of-sorts (probably not literally). This lock will be "bounced on" whenever wasm is entered via the host call or exited via a hostcall returning. The lock is then held across the async operation of an epoch/fuel/async limiters/gc/etc from above. The rough idea is that this is a <code>Option&lt;Vec&lt;Waker&gt;&gt;</code> in the store. If that's <code>None</code>, the lock isn't held. If it's <code>Some</code>, then the lock is held. When the lock is "dropped" then all the wakers are woken (if any).</p>
+<p>This'll likely require refactoring some various points within Wasmtime to instrument more entries/exits with <code>async</code> in Rust. Ideally the lock acquisition/bounce/etc are all native <code>async</code> functions. This'll probably require some finesse.</p>
+<p>The main learning from this is we can't simply start using <code>run_concurrent</code> (ish) within these libcalls. If we were to do that then we would accidentally allow the situation we don't want, which is executing wasm instructions between other instructions that don't allow interleaving. This means that to fully avoid blocking the store we'll have to add infrastructure, as opposed to just removing a limitation.</p>
+</blockquote>
+
+
+
+<a name="573930457"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311869%20Async%20libcalls%20%22block%22%20the%20store%20.../near/573930457" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html#573930457">(Feb 14 2026 at 22:31)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/11869#issuecomment-3902685168">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11869">issue #11869</a>:</p>
+<blockquote>
+<p>Another thought that occurs to me borne out of thoughts/discussion from <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">https://github.com/bytecodealliance/wasmtime/pull/12587</a> -- preventing wasm execution during an async libcall is not enough, we have to prevent mutation of the entire store. This includes things like executing wasm, but it extends to host-initiated modifications of tables/globals as well. That's a needle I don't know how to thread...</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

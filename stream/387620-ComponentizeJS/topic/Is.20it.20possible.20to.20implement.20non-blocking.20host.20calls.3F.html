@@ -1,0 +1,80 @@
+<html>
+<head><meta charset="utf-8"><title>Is it possible to implement non-blocking host calls? · ComponentizeJS · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/387620-ComponentizeJS/index.html">ComponentizeJS</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/387620-ComponentizeJS/topic/Is.20it.20possible.20to.20implement.20non-blocking.20host.20calls.3F.html">Is it possible to implement non-blocking host calls?</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="560331770"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/387620-ComponentizeJS/topic/Is%20it%20possible%20to%20implement%20non-blocking%20host%20calls%3F/near/560331770" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Marcin Kasprowicz <a href="https://bytecodealliance.github.io/zulip-archive/stream/387620-ComponentizeJS/topic/Is.20it.20possible.20to.20implement.20non-blocking.20host.20calls.3F.html#560331770">(Nov 26 2025 at 08:36)</a>:</h4>
+<p>I am building a Wasm component using componentize-js running on a Rust host. I provide a kv (key value db) capabilities interface to the guest where get and set perform outbound database calls on the host side.</p>
+<p>Here is a part of the wit:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="c1">// kv store interface - host provides these capabilities</span>
+<span class="n">interface</span><span class="w"> </span><span class="n">kv</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="c1">// Get value from kv store, returns none if key not found</span>
+<span class="w">  </span><span class="n">get</span><span class="p">:</span><span class="w"> </span><span class="nc">func</span><span class="p">(</span><span class="n">key</span><span class="p">:</span><span class="w"> </span><span class="nc">string</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">option</span><span class="o">&lt;</span><span class="n">string</span><span class="o">&gt;</span><span class="p">;</span>
+<span class="w">  </span><span class="c1">// Set value in kv store</span>
+<span class="w">  </span><span class="n">set</span><span class="p">:</span><span class="w"> </span><span class="nc">func</span><span class="p">(</span><span class="n">key</span><span class="p">:</span><span class="w"> </span><span class="nc">string</span><span class="p">,</span><span class="w"> </span><span class="n">value</span><span class="p">:</span><span class="w"> </span><span class="nc">string</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Is there any way to expose these functions as non-blocking so they do not freeze the js event loop?<br>
+I understand from the README that async imports are not yet supported. I experimented with the pollable pattern, but it appeared to still block execution. I would prefer to keep the db logic in the host rather than moving it to js.</p>
+<p>Am I missing a specific pattern or workaround to achieve behavior similar to <code>fetch</code>?</p>
+
+
+
+<a name="560345928"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/387620-ComponentizeJS/topic/Is%20it%20possible%20to%20implement%20non-blocking%20host%20calls%3F/near/560345928" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/387620-ComponentizeJS/topic/Is.20it.20possible.20to.20implement.20non-blocking.20host.20calls.3F.html#560345928">(Nov 26 2025 at 09:46)</a>:</h4>
+<p>I think at present with what is available in P2, you need to write the machinery to do the checking on your own here, with <code>wasi:io</code> and friends (and then on the JS side add the appropriate <code>Promise</code>s, <code>setTimeout</code>s, etc to play nicely with the StarlingMonkey event loop). This would mean changing the types that are returned from the interface itself rather than "simply" making the whole operation async in a way that JS could natively understand.</p>
+<p>Preview3 work introduces structured concurrency but it's very much focused on host implementation now (which is still not done just yet on the Jco side) -- the guest-side work (i.e. changes to ComponentizeJS/StarlingMonkey) that might make this kind of async-aware interop automatic I don't think are close to completion just yet.</p>
+<p>Once P3 work is in the JS guest ecosystem, you should be able to write <code>future&lt;t&gt;</code>  and <code>stream&lt;t&gt;</code> classes that will turn into <code>Promise</code>s and <code>Stream</code>s and be much easier to use without blocking on the guest side naturally. </p>
+<p>Like i said though, you can write these abstractions around the <code>wasi:io</code> bits now if you'd like.</p>
+
+
+
+<a name="560346123"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/387620-ComponentizeJS/topic/Is%20it%20possible%20to%20implement%20non-blocking%20host%20calls%3F/near/560346123" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/387620-ComponentizeJS/topic/Is.20it.20possible.20to.20implement.20non-blocking.20host.20calls.3F.html#560346123">(Nov 26 2025 at 09:47)</a>:</h4>
+<p>There's a basic example that you can use/build upon in <code>jco-std</code>:</p>
+<p><a href="https://github.com/bytecodealliance/jco/blob/main/packages/jco-std/src/wasi/0.2.x/http/types/request.ts#L58">https://github.com/bytecodealliance/jco/blob/main/packages/jco-std/src/wasi/0.2.x/http/types/request.ts#L58</a></p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/jco/blob/main/packages/jco-std/src/wasi/0.2.x/http/types/request.ts#L58" style="background-image: url(&quot;https://uploads.zulipusercontent.net/723ce8dcb0ca9235c4ec5c11f61b913cf98b2fb9/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f376634323562313232393230366231653639376364393264303366383163643736613862616365393438323065356331346139323335653363613164383565332f62797465636f6465616c6c69616e63652f6a636f&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/jco/blob/main/packages/jco-std/src/wasi/0.2.x/http/types/request.ts#L58" title="jco/packages/jco-std/src/wasi/0.2.x/http/types/request.ts at main · bytecodealliance/jco">jco/packages/jco-std/src/wasi/0.2.x/http/types/request.ts at main · bytecodealliance/jco</a></div><div class="message_embed_description">JavaScript toolchain for working with WebAssembly Components - bytecodealliance/jco</div></div></div>
+
+
+
+<a name="561179319"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/387620-ComponentizeJS/topic/Is%20it%20possible%20to%20implement%20non-blocking%20host%20calls%3F/near/561179319" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Marcin Kasprowicz <a href="https://bytecodealliance.github.io/zulip-archive/stream/387620-ComponentizeJS/topic/Is.20it.20possible.20to.20implement.20non-blocking.20host.20calls.3F.html#561179319">(Dec 01 2025 at 14:41)</a>:</h4>
+<p>Thanks <span class="user-mention" data-user-id="598440">@Victor Adossi</span> for the reply. I have implemented some machinery as you suggested but I think it doesn't play well... So I have used WASI pollable for that, my client is returning futures, guest side polls for a result, parallel operations works. The total execution time looks almost identical as the version with a client on a guest side. The problem is event loop starvation, I need to experiment more...</p>
+
+
+
+<a name="561275747"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/387620-ComponentizeJS/topic/Is%20it%20possible%20to%20implement%20non-blocking%20host%20calls%3F/near/561275747" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Marcin Kasprowicz <a href="https://bytecodealliance.github.io/zulip-archive/stream/387620-ComponentizeJS/topic/Is.20it.20possible.20to.20implement.20non-blocking.20host.20calls.3F.html#561275747">(Dec 01 2025 at 21:15)</a>:</h4>
+<p>I dig more and It wasn't event loop starvation, what I have observed was blocking nature of the poll.<br>
+When I do <code>await Promise.all([kv1, kv2, ...]) </code> it blocks event loop till the first resolve. The difference with fetch is that it blocks in small chunks. kv operation is atomic, where fetch has different granularity: dns done, connect done, body chunk...</p>
+
+
+
+<a name="574670161"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/387620-ComponentizeJS/topic/Is%20it%20possible%20to%20implement%20non-blocking%20host%20calls%3F/near/574670161" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Marcin Kasprowicz <a href="https://bytecodealliance.github.io/zulip-archive/stream/387620-ComponentizeJS/topic/Is.20it.20possible.20to.20implement.20non-blocking.20host.20calls.3F.html#574670161">(Feb 19 2026 at 08:21)</a>:</h4>
+<p>I have returned to this after some time and found much cleaner solution. That doesn't block and is required much less glue.<br>
+Just use fetch() to communicate with a hos and intercept http calls on a host side, then route them to virtual hosts.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">send_request</span><span class="p">(</span>
+<span class="w">        </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">,</span>
+<span class="w">        </span><span class="n">request</span><span class="p">:</span><span class="w"> </span><span class="nc">hyper</span><span class="p">::</span><span class="n">Request</span><span class="o">&lt;</span><span class="n">wasmtime_wasi_http</span><span class="p">::</span><span class="n">body</span><span class="p">::</span><span class="n">HyperOutgoingBody</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="w">        </span><span class="n">config</span><span class="p">:</span><span class="w"> </span><span class="nc">wasmtime_wasi_http</span><span class="p">::</span><span class="n">types</span><span class="p">::</span><span class="n">OutgoingRequestConfig</span><span class="p">,</span>
+<span class="w">    </span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">wasmtime_wasi_http</span><span class="p">::</span><span class="n">HttpResult</span><span class="o">&lt;</span><span class="n">wasmtime_wasi_http</span><span class="p">::</span><span class="n">types</span><span class="p">::</span><span class="n">HostFutureIncomingResponse</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="n">virtual_host</span><span class="p">::</span><span class="n">is_virtual_host</span><span class="p">(</span><span class="o">&amp;</span><span class="n">request</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nb">Ok</span><span class="p">(</span><span class="n">virtual_host</span><span class="p">::</span><span class="n">handle_request</span><span class="p">())</span>
+<span class="w">        </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nb">Ok</span><span class="p">(</span><span class="n">wasmtime_wasi_http</span><span class="p">::</span><span class="n">types</span><span class="p">::</span><span class="n">default_send_request</span><span class="p">(</span><span class="n">request</span><span class="p">,</span><span class="w"> </span><span class="n">config</span><span class="p">))</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+</code></pre></div>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

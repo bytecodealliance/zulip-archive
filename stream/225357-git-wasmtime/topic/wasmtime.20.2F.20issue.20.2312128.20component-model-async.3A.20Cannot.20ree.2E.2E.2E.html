@@ -1,0 +1,342 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #12128 component-model-async: Cannot ree... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312128.20component-model-async.3A.20Cannot.20ree.2E.2E.2E.html">wasmtime / issue #12128 component-model-async: Cannot ree...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="562136079"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312128%20component-model-async%3A%20Cannot%20ree.../near/562136079" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312128.20component-model-async.3A.20Cannot.20ree.2E.2E.2E.html#562136079">(Dec 05 2025 at 16:05)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/issues/12128">issue #12128</a>:</p>
+<blockquote>
+<p>This test case:</p>
+<div class="codehilite" data-code-language="wasm"><pre><span></span><code>(component
+  (component $a
+    (core module $a
+      (import "" "yield" (func $yield (result i32)))
+
+      (func (export "yield-loop") (result i32)
+        ;; simulate `waitable-set.poll` with a yield loop
+        (loop
+          call $yield
+          drop
+          br 0
+        )
+        unreachable
+      )
+
+      ;; not reached
+      (func (export "callback") (param i32 i32 i32) (result i32) unreachable)
+
+      (func (export "noop"))
+    )
+    (core func $yield (canon thread.yield))
+    (core instance $a (instantiate $a
+      (with "" (instance
+        (export "yield" (func $yield))
+      ))
+    ))
+    (func (export "yield-loop")
+      (canon lift
+        (core func $a "yield-loop")
+        async
+        (callback (func $a "callback"))
+      )
+    )
+    (func (export "noop") (canon lift (core func $a "noop")))
+  )
+  (instance $a (instantiate $a))
+
+  (component $b
+    (import "yield-loop" (func $yield-loop))
+    (import "noop" (func $noop))
+
+    (core func $yield-loop (canon lower (func $yield-loop) async))
+    (core func $noop (canon lower (func $noop)))
+
+    (core module $b
+      (import "" "yield-loop" (func $yield-loop (result i32)))
+      (import "" "noop" (func $noop))
+
+      (func (export "run")
+        ;; call `yield-loop`, double-check it's in the "started" state.
+        call $yield-loop
+        i32.const 0xf
+        i32.and
+        i32.const 1
+        i32.ne
+        if unreachable end
+
+        ;; now try to reenter the other component with some other function.
+        call $noop
+      )
+    )
+    (core instance $b (instantiate $b
+      (with "" (instance
+        (export "yield-loop" (func $yield-loop))
+        (export "noop" (func $noop))
+      ))
+    ))
+    (func (export "run") (canon lift (core func $b "run")))
+  )
+  (instance $b (instantiate $b
+    (with "yield-loop" (func $a "yield-loop"))
+    (with "noop" (func $a "noop"))
+  ))
+  (export "run" (func $b "run"))
+)
+
+(assert_return (invoke "run"))
+</code></pre></div>
+<p>fails with:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">WASMTIME_BACKTRACE_DETAILS</span><span class="o">=</span><span class="mi">1</span><span class="w"> </span><span class="n">wasmtime</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="n">foo</span><span class="p">.</span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">W</span><span class="w"> </span><span class="n">component</span><span class="o">-</span><span class="n">model</span><span class="o">-</span><span class="k">async</span>
+<span class="n">Error</span><span class="p">:</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="n">script</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="o">'</span><span class="na">foo</span><span class="p">.</span><span class="n">wast</span><span class="o">'</span>
+
+<span class="n">Caused</span><span class="w"> </span><span class="n">by</span><span class="p">:</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">:</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">directive</span><span class="w"> </span><span class="n">on</span><span class="w"> </span><span class="n">foo</span><span class="p">.</span><span class="n">wast</span><span class="p">:</span><span class="mi">77</span>
+<span class="w">    </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="nc">error</span><span class="w"> </span><span class="k">while</span><span class="w"> </span><span class="n">executing</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">wasm</span><span class="w"> </span><span class="n">backtrace</span><span class="p">:</span>
+<span class="w">           </span><span class="mi">0</span><span class="p">:</span><span class="w">    </span><span class="mh">0x185</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="o">&lt;</span><span class="n">unknown</span><span class="o">&gt;!&lt;</span><span class="n">wasm</span><span class="w"> </span><span class="n">function</span><span class="w"> </span><span class="mi">8</span><span class="o">&gt;</span>
+<span class="w">           </span><span class="mi">1</span><span class="p">:</span><span class="w">    </span><span class="mh">0x333</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">wasm</span><span class="o">-</span><span class="n">function</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span>
+<span class="w">                           </span><span class="n">at</span><span class="w"> </span><span class="p">.</span><span class="o">/</span><span class="n">foo</span><span class="p">.</span><span class="n">wast</span><span class="p">:</span><span class="mi">59</span><span class="p">:</span><span class="mi">9</span>
+<span class="w">    </span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="nc">wasm</span><span class="w"> </span><span class="n">trap</span><span class="p">:</span><span class="w"> </span><span class="nc">wasm</span><span class="w"> </span><span class="err">`</span><span class="n">unreachable</span><span class="err">`</span><span class="w"> </span><span class="n">instruction</span><span class="w"> </span><span class="n">executed</span>
+</code></pre></div>
+<p>Specifically <code>$yield-loop</code> is, well, yielding, and then the second call to <code>$noop</code> I believe is dying in the fused adapter. My best guess is due to component reentrance, but I'm not 100% certain since errors from the fused adapter are pretty opaque.</p>
+<p>Is this intended behavior? Accidental behavior?</p>
+</blockquote>
+
+
+
+<a name="562136080"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312128%20component-model-async%3A%20Cannot%20ree.../near/562136080" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312128.20component-model-async.3A.20Cannot.20ree.2E.2E.2E.html#562136080">(Dec 05 2025 at 16:05)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasm-proposal:component-model-async label to <a href="https://github.com/bytecodealliance/wasmtime/issues/12128">Issue #12128</a>.</p>
+
+
+
+<a name="562182515"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312128%20component-model-async%3A%20Cannot%20ree.../near/562182515" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312128.20component-model-async.3A.20Cannot.20ree.2E.2E.2E.html#562182515">(Dec 05 2025 at 21:02)</a>:</h4>
+<p>alexcrichton edited <a href="https://github.com/bytecodealliance/wasmtime/issues/12128">issue #12128</a>:</p>
+<blockquote>
+<p>This test case:</p>
+<div class="codehilite" data-code-language="wasm"><pre><span></span><code>(component
+  (component $a
+    (core module $a
+      (import "" "yield" (func $yield (result i32)))
+
+      (func (export "yield-loop") (result i32)
+        ;; simulate `waitable-set.poll` with a yield loop
+        (loop
+          call $yield
+          drop
+          br 0
+        )
+        unreachable
+      )
+
+      ;; not reached
+      (func (export "callback") (param i32 i32 i32) (result i32) unreachable)
+
+      (func (export "noop"))
+    )
+    (core func $yield (canon thread.yield))
+    (core instance $a (instantiate $a
+      (with "" (instance
+        (export "yield" (func $yield))
+      ))
+    ))
+    (func (export "yield-loop") async
+      (canon lift
+        (core func $a "yield-loop")
+        async
+        (callback (func $a "callback"))
+      )
+    )
+    (func (export "noop") (canon lift (core func $a "noop")))
+  )
+  (instance $a (instantiate $a))
+
+  (component $b
+    (import "yield-loop" (func $yield-loop async))
+    (import "noop" (func $noop))
+
+    (core func $yield-loop (canon lower (func $yield-loop) async))
+    (core func $noop (canon lower (func $noop)))
+
+    (core module $b
+      (import "" "yield-loop" (func $yield-loop (result i32)))
+      (import "" "noop" (func $noop))
+
+      (func (export "run")
+        ;; call `yield-loop`, double-check it's in the "started" state.
+        call $yield-loop
+        i32.const 0xf
+        i32.and
+        i32.const 1
+        i32.ne
+        if unreachable end
+
+        ;; now try to reenter the other component with some other function.
+        call $noop
+      )
+    )
+    (core instance $b (instantiate $b
+      (with "" (instance
+        (export "yield-loop" (func $yield-loop))
+        (export "noop" (func $noop))
+      ))
+    ))
+    (func (export "run") async (canon lift (core func $b "run")))
+  )
+  (instance $b (instantiate $b
+    (with "yield-loop" (func $a "yield-loop"))
+    (with "noop" (func $a "noop"))
+  ))
+  (export "run" (func $b "run"))
+)
+
+(assert_return (invoke "run"))
+</code></pre></div>
+<p>fails with:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">WASMTIME_BACKTRACE_DETAILS</span><span class="o">=</span><span class="mi">1</span><span class="w"> </span><span class="n">wasmtime</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="n">foo</span><span class="p">.</span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">W</span><span class="w"> </span><span class="n">component</span><span class="o">-</span><span class="n">model</span><span class="o">-</span><span class="k">async</span>
+<span class="n">Error</span><span class="p">:</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="n">script</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="o">'</span><span class="na">foo</span><span class="p">.</span><span class="n">wast</span><span class="o">'</span>
+
+<span class="n">Caused</span><span class="w"> </span><span class="n">by</span><span class="p">:</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">:</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">directive</span><span class="w"> </span><span class="n">on</span><span class="w"> </span><span class="n">foo</span><span class="p">.</span><span class="n">wast</span><span class="p">:</span><span class="mi">77</span>
+<span class="w">    </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="nc">error</span><span class="w"> </span><span class="k">while</span><span class="w"> </span><span class="n">executing</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">wasm</span><span class="w"> </span><span class="n">backtrace</span><span class="p">:</span>
+<span class="w">           </span><span class="mi">0</span><span class="p">:</span><span class="w">    </span><span class="mh">0x185</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="o">&lt;</span><span class="n">unknown</span><span class="o">&gt;!&lt;</span><span class="n">wasm</span><span class="w"> </span><span class="n">function</span><span class="w"> </span><span class="mi">8</span><span class="o">&gt;</span>
+<span class="w">           </span><span class="mi">1</span><span class="p">:</span><span class="w">    </span><span class="mh">0x333</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">wasm</span><span class="o">-</span><span class="n">function</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span>
+<span class="w">                           </span><span class="n">at</span><span class="w"> </span><span class="p">.</span><span class="o">/</span><span class="n">foo</span><span class="p">.</span><span class="n">wast</span><span class="p">:</span><span class="mi">59</span><span class="p">:</span><span class="mi">9</span>
+<span class="w">    </span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="nc">wasm</span><span class="w"> </span><span class="n">trap</span><span class="p">:</span><span class="w"> </span><span class="nc">wasm</span><span class="w"> </span><span class="err">`</span><span class="n">unreachable</span><span class="err">`</span><span class="w"> </span><span class="n">instruction</span><span class="w"> </span><span class="n">executed</span>
+</code></pre></div>
+<p>Specifically <code>$yield-loop</code> is, well, yielding, and then the second call to <code>$noop</code> I believe is dying in the fused adapter. My best guess is due to component reentrance, but I'm not 100% certain since errors from the fused adapter are pretty opaque.</p>
+<p>Is this intended behavior? Accidental behavior?</p>
+</blockquote>
+
+
+
+<a name="562182578"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312128%20component-model-async%3A%20Cannot%20ree.../near/562182578" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312128.20component-model-async.3A.20Cannot.20ree.2E.2E.2E.html#562182578">(Dec 05 2025 at 21:03)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/12128#issuecomment-3618596235">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12128">issue #12128</a>:</p>
+<blockquote>
+<p>Ok in discussion with @lukewagner the conclusion is:</p>
+<ul>
+<li>Prior to #12043 this test should block forever. Notably the <code>noop</code> call sould be blocked on backpressure being turned on as part of <code>yield-loop</code></li>
+<li>Post-#12043 this test should pass (with some minor <code>async</code> edits I've applied to the OP now)</li>
+</ul>
+<p>With #12043 as-is this test still traps in pretty much the same place, so this is something we'll want to fix.</p>
+</blockquote>
+
+
+
+<a name="562182582"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312128%20component-model-async%3A%20Cannot%20ree.../near/562182582" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312128.20component-model-async.3A.20Cannot.20ree.2E.2E.2E.html#562182582">(Dec 05 2025 at 21:03)</a>:</h4>
+<p>alexcrichton assigned dicej to <a href="https://github.com/bytecodealliance/wasmtime/issues/12128">issue #12128</a>.</p>
+
+
+
+<a name="568094575"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312128%20component-model-async%3A%20Cannot%20ree.../near/568094575" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312128.20component-model-async.3A.20Cannot.20ree.2E.2E.2E.html#568094575">(Jan 14 2026 at 22:51)</a>:</h4>
+<p>dicej closed <a href="https://github.com/bytecodealliance/wasmtime/issues/12128">issue #12128</a>:</p>
+<blockquote>
+<p>This test case:</p>
+<div class="codehilite" data-code-language="wasm"><pre><span></span><code>(component
+  (component $a
+    (core module $a
+      (import "" "yield" (func $yield (result i32)))
+
+      (func (export "yield-loop") (result i32)
+        ;; simulate `waitable-set.poll` with a yield loop
+        (loop
+          call $yield
+          drop
+          br 0
+        )
+        unreachable
+      )
+
+      ;; not reached
+      (func (export "callback") (param i32 i32 i32) (result i32) unreachable)
+
+      (func (export "noop"))
+    )
+    (core func $yield (canon thread.yield))
+    (core instance $a (instantiate $a
+      (with "" (instance
+        (export "yield" (func $yield))
+      ))
+    ))
+    (func (export "yield-loop") async
+      (canon lift
+        (core func $a "yield-loop")
+        async
+        (callback (func $a "callback"))
+      )
+    )
+    (func (export "noop") (canon lift (core func $a "noop")))
+  )
+  (instance $a (instantiate $a))
+
+  (component $b
+    (import "yield-loop" (func $yield-loop async))
+    (import "noop" (func $noop))
+
+    (core func $yield-loop (canon lower (func $yield-loop) async))
+    (core func $noop (canon lower (func $noop)))
+
+    (core module $b
+      (import "" "yield-loop" (func $yield-loop (result i32)))
+      (import "" "noop" (func $noop))
+
+      (func (export "run")
+        ;; call `yield-loop`, double-check it's in the "started" state.
+        call $yield-loop
+        i32.const 0xf
+        i32.and
+        i32.const 1
+        i32.ne
+        if unreachable end
+
+        ;; now try to reenter the other component with some other function.
+        call $noop
+      )
+    )
+    (core instance $b (instantiate $b
+      (with "" (instance
+        (export "yield-loop" (func $yield-loop))
+        (export "noop" (func $noop))
+      ))
+    ))
+    (func (export "run") async (canon lift (core func $b "run")))
+  )
+  (instance $b (instantiate $b
+    (with "yield-loop" (func $a "yield-loop"))
+    (with "noop" (func $a "noop"))
+  ))
+  (export "run" (func $b "run"))
+)
+
+(assert_return (invoke "run"))
+</code></pre></div>
+<p>fails with:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">WASMTIME_BACKTRACE_DETAILS</span><span class="o">=</span><span class="mi">1</span><span class="w"> </span><span class="n">wasmtime</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="n">foo</span><span class="p">.</span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">W</span><span class="w"> </span><span class="n">component</span><span class="o">-</span><span class="n">model</span><span class="o">-</span><span class="k">async</span>
+<span class="n">Error</span><span class="p">:</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="n">script</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="o">'</span><span class="na">foo</span><span class="p">.</span><span class="n">wast</span><span class="o">'</span>
+
+<span class="n">Caused</span><span class="w"> </span><span class="n">by</span><span class="p">:</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">:</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">directive</span><span class="w"> </span><span class="n">on</span><span class="w"> </span><span class="n">foo</span><span class="p">.</span><span class="n">wast</span><span class="p">:</span><span class="mi">77</span>
+<span class="w">    </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="nc">error</span><span class="w"> </span><span class="k">while</span><span class="w"> </span><span class="n">executing</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">wasm</span><span class="w"> </span><span class="n">backtrace</span><span class="p">:</span>
+<span class="w">           </span><span class="mi">0</span><span class="p">:</span><span class="w">    </span><span class="mh">0x185</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="o">&lt;</span><span class="n">unknown</span><span class="o">&gt;!&lt;</span><span class="n">wasm</span><span class="w"> </span><span class="n">function</span><span class="w"> </span><span class="mi">8</span><span class="o">&gt;</span>
+<span class="w">           </span><span class="mi">1</span><span class="p">:</span><span class="w">    </span><span class="mh">0x333</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">wasm</span><span class="o">-</span><span class="n">function</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span>
+<span class="w">                           </span><span class="n">at</span><span class="w"> </span><span class="p">.</span><span class="o">/</span><span class="n">foo</span><span class="p">.</span><span class="n">wast</span><span class="p">:</span><span class="mi">59</span><span class="p">:</span><span class="mi">9</span>
+<span class="w">    </span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="nc">wasm</span><span class="w"> </span><span class="n">trap</span><span class="p">:</span><span class="w"> </span><span class="nc">wasm</span><span class="w"> </span><span class="err">`</span><span class="n">unreachable</span><span class="err">`</span><span class="w"> </span><span class="n">instruction</span><span class="w"> </span><span class="n">executed</span>
+</code></pre></div>
+<p>Specifically <code>$yield-loop</code> is, well, yielding, and then the second call to <code>$noop</code> I believe is dying in the fused adapter. My best guess is due to component reentrance, but I'm not 100% certain since errors from the fused adapter are pretty opaque.</p>
+<p>Is this intended behavior? Accidental behavior?</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

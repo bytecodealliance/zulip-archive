@@ -1,0 +1,201 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #10897 Refactor the representation of `Func` · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html">wasmtime / PR #10897 Refactor the representation of `Func`</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="521816959"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310897%20Refactor%20the%20representation%20of%20%60Func%60/near/521816959" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html#521816959">(Jun 02 2025 at 18:34)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/fitzgen">fitzgen</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/10897">PR #10897</a>.</p>
+
+
+
+<a name="521816975"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310897%20Refactor%20the%20representation%20of%20%60Func%60/near/521816975" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html#521816975">(Jun 02 2025 at 18:34)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/pull/10897">PR #10897</a> from <code>alexcrichton:refactor-func-representation</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>This commit rewrites the internals of <code>wasmtime::Func</code>. The <code>Stored</code> type is no longer used meaning that it's now free to create a <code>wasmtime::Func</code> at any time. It is effectively a store-tagged <code>NonNull&lt;VMFuncRef&gt;</code>. This required a few internal changes to how functions are passed around:</p>
+<ul>
+<li>
+<p>Previously the insertion of a <code>wasm_call</code>-less <code>VMFuncRef</code> was deferred until the raw pointer was loaded. Now the insertion happens immediately as soon as the function is placed within a store. This is done to ensure that a <code>Func</code> corresponds to one exact <code>VMFuncRef</code> and that's it, and lazily filled in versions within the store are still lazily filled in but they're more eagerly allocated. This isn't expected to have much of an impact perf-wise since all these lazily allocated functions were already almost guaranteed to get lazily allocated anyway.</p>
+</li>
+<li>
+<p>Filling in "holes" in <code>VMFuncRef</code>, notably the <code>wasm_call</code> field, no longer happens lazily when the <code>VMFuncRef</code> is demanded. Instead during instantiation a pass is made to fill in holes with the new module being instantiated (after registration). Additionally when a lazily-allocated <code>VMFuncRef</code> is created the module registry is checked immediately. This means that all store-local <code>VMFuncRef</code> values are either filled in immediately or filled in during instantiation. This notably means that the previous logic in <code>Func::vmimport</code> is now "just" an <code>.unwrap()</code> with a lot of comments saying why the unwrap shouldn't panic.</p>
+</li>
+<li>
+<p>To implement this commit a previous optimization for the <code>Func</code> API was removed as well, namely <code>Func::call</code> will become slower after this commit. The <code>Func::call</code> API is a dynamically-typed API which requires run-time type-checking of arguments. Previously a <code>FuncType</code> was loaded into a cache once-per-<code>Func</code> which helped amortize the cost of using <code>Func::call</code> repeatedly. Now, though, there's no natural place to put such a cache since <code>Func</code> no longer has dedicated storage within a <code>Store</code>. Historically this optimization was added for the C API before the <code>*_call_unchecked</code> APIs existed, but nowadays the <code>*_call_unchecked</code> APIs should suffice for performance-critical applications where needed. In the future it might also be possible to have a hash map in the <code>Store</code> of a <code>VMSharedTypeIndex</code> to <code>FuncType</code> which is lazily populated based on calls to <code>Func::call</code>, but that feels a bit overkill nowadays for a possibly rarely-used map.</p>
+</li>
+<li>
+<p>The no-longer-necessary <code>RootedHostFunc</code> type is now gone as its unsafety and various contracts are subsumed by other preexisting <code>unsafe</code> blocks.</p>
+</li>
+<li>
+<p>The specific drop order between <code>StoreOpaque::store_data</code> and <code>StoreOpaque::rooted_host_funcs</code> is removed. The <code>rooted_host_funcs</code> field now lives in the <code>func_refs</code> field and the <code>FuncKind</code> type, where the destructors came from before, is no more.</p>
+</li>
+<li>
+<p>The <code>func_refs</code> field has grown storage locations for a variety of "keep this thing alive as long as the store" related to functions and such.</p>
+</li>
+</ul>
+<p>Closes #10868</p>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+</blockquote>
+
+
+
+<a name="521816979"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310897%20Refactor%20the%20representation%20of%20%60Func%60/near/521816979" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html#521816979">(Jun 02 2025 at 18:34)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/10897">PR #10897</a>.</p>
+
+
+
+<a name="521817017"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310897%20Refactor%20the%20representation%20of%20%60Func%60/near/521817017" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html#521817017">(Jun 02 2025 at 18:34)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/10897#issuecomment-2931976684">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/10897">PR #10897</a>:</p>
+<blockquote>
+<p>I'll also note that this is split out of <a href="https://github.com/bytecodealliance/wasmtime/pull/10870/commits/b228b9718ab0c7e405ff98f62207d63f0e8484a7">https://github.com/bytecodealliance/wasmtime/pull/10870/commits/b228b9718ab0c7e405ff98f62207d63f0e8484a7</a></p>
+</blockquote>
+
+
+
+<a name="521817470"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310897%20Refactor%20the%20representation%20of%20%60Func%60/near/521817470" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html#521817470">(Jun 02 2025 at 18:36)</a>:</h4>
+<p>alexcrichton edited a <a href="https://github.com/bytecodealliance/wasmtime/pull/10897#issuecomment-2931976684">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/10897">PR #10897</a>:</p>
+<blockquote>
+<p>I'll also note that this is split out of <a href="https://github.com/bytecodealliance/wasmtime/pull/10870">https://github.com/bytecodealliance/wasmtime/pull/10870</a></p>
+</blockquote>
+
+
+
+<a name="521817866"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310897%20Refactor%20the%20representation%20of%20%60Func%60/near/521817866" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html#521817866">(Jun 02 2025 at 18:39)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/10897">PR #10897</a>.</p>
+
+
+
+<a name="521846076"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310897%20Refactor%20the%20representation%20of%20%60Func%60/near/521846076" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html#521846076">(Jun 02 2025 at 21:19)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/10897#discussion_r2122170281">PR review comment</a>:</p>
+<blockquote>
+<p>Kind of an aside but should all of these assertions actually live in the <code>wasmtime-c-api</code> crate so that we don't need to have a dummy struct which itself needs to be kept in sync with the struct that we actually care about? We've removed one syncing problem but added another, so we haven't really changed anything. I guess the only assertion that would remain in the <code>wasmtime</code> crate would be the one for the offset of the <code>store</code> field.</p>
+</blockquote>
+
+
+
+<a name="521846077"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310897%20Refactor%20the%20representation%20of%20%60Func%60/near/521846077" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html#521846077">(Jun 02 2025 at 21:19)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/10897#discussion_r2122161442">PR review comment</a>:</p>
+<blockquote>
+<p><div class="codehilite" data-code-language="suggestion"><pre><span></span><code>/// Attempts to fill the `wasm_call` field of `func_ref` given `modules`
+/// registered and returns `true` if the field was filled, `false` otherwise.
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="521846078"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310897%20Refactor%20the%20representation%20of%20%60Func%60/near/521846078" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html#521846078">(Jun 02 2025 at 21:19)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/10897#discussion_r2122171072">PR review comment</a>:</p>
+<blockquote>
+<p>Sooooooo nice to get rid of <code>FuncKind</code></p>
+</blockquote>
+
+
+
+<a name="521846079"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310897%20Refactor%20the%20representation%20of%20%60Func%60/near/521846079" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html#521846079">(Jun 02 2025 at 21:19)</a>:</h4>
+<p>fitzgen submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/10897#pullrequestreview-2889945496">PR review</a>:</p>
+<blockquote>
+<p>Very nice!!</p>
+</blockquote>
+
+
+
+<a name="521846080"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310897%20Refactor%20the%20representation%20of%20%60Func%60/near/521846080" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html#521846080">(Jun 02 2025 at 21:19)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/10897#discussion_r2122175266">PR review comment</a>:</p>
+<blockquote>
+<p>Just to clarify, since there isn't any <code>assert!</code> here:</p>
+<p><div class="codehilite" data-code-language="suggestion"><pre><span></span><code>                // Note that this is a load-bearing `unwrap` here, but is
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="521859658"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310897%20Refactor%20the%20representation%20of%20%60Func%60/near/521859658" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html#521859658">(Jun 02 2025 at 23:03)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/10897">PR #10897</a>.</p>
+
+
+
+<a name="521859665"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310897%20Refactor%20the%20representation%20of%20%60Func%60/near/521859665" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html#521859665">(Jun 02 2025 at 23:03)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/10897">PR #10897</a>.</p>
+
+
+
+<a name="521859841"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310897%20Refactor%20the%20representation%20of%20%60Func%60/near/521859841" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html#521859841">(Jun 02 2025 at 23:04)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/10897#pullrequestreview-2890160718">PR review</a>.</p>
+
+
+
+<a name="521859842"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310897%20Refactor%20the%20representation%20of%20%60Func%60/near/521859842" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html#521859842">(Jun 02 2025 at 23:04)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/10897#discussion_r2122307373">PR review comment</a>:</p>
+<blockquote>
+<p>Oh I think you might be assuming there's a <code>struct wasmtime_func_t { ... }</code> in Rust in <code>crates/c-api</code> but that doesn't exist. In that sense this <code>struct C</code> is the only C-version-written-in-Rust anywhere in the codebase, and I figured here was a good as place as any to test things out.</p>
+</blockquote>
+
+
+
+<a name="521859850"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310897%20Refactor%20the%20representation%20of%20%60Func%60/near/521859850" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html#521859850">(Jun 02 2025 at 23:04)</a>:</h4>
+<p>alexcrichton has enabled auto merge for <a href="https://github.com/bytecodealliance/wasmtime/pull/10897">PR #10897</a>.</p>
+
+
+
+<a name="521861914"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310897%20Refactor%20the%20representation%20of%20%60Func%60/near/521861914" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html#521861914">(Jun 02 2025 at 23:23)</a>:</h4>
+<p>fitzgen submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/10897#pullrequestreview-2890184472">PR review</a>.</p>
+
+
+
+<a name="521861915"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310897%20Refactor%20the%20representation%20of%20%60Func%60/near/521861915" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html#521861915">(Jun 02 2025 at 23:23)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/10897#discussion_r2122324643">PR review comment</a>:</p>
+<blockquote>
+<p>Ah, I was indeed</p>
+</blockquote>
+
+
+
+<a name="521868389"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310897%20Refactor%20the%20representation%20of%20%60Func%60/near/521868389" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310897.20Refactor.20the.20representation.20of.20.60Func.60.html#521868389">(Jun 03 2025 at 00:18)</a>:</h4>
+<p>alexcrichton merged <a href="https://github.com/bytecodealliance/wasmtime/pull/10897">PR #10897</a>.</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

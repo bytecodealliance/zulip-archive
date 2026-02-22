@@ -1,0 +1,425 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #11321 Cranelift: support dynamic contexts ... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html">wasmtime / PR #11321 Cranelift: support dynamic contexts ...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="530646315"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530646315" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530646315">(Jul 24 2025 at 21:02)</a>:</h4>
+<p><strong>cfallin</strong> requested <a href="https://github.com/fitzgen">fitzgen</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11321">PR #11321</a>.</p>
+
+
+
+<a name="530646317"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530646317" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530646317">(Jul 24 2025 at 21:02)</a>:</h4>
+<p>cfallin opened <a href="https://github.com/bytecodealliance/wasmtime/pull/11321">PR #11321</a> from <code>cfallin:cranelift-exception-dynamic-context</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>In #11285, we realized that Wasm semantics require us to match on dynamic instances of exception tags, rather than static tag types. This fundamentally requires the unwinder to be able to resolve the current Wasm instance for each Wasm frame on the stack that has any handlers, and our frame format does not provide this today.</p>
+<p>We discussed many options, some of which solve the more general problem (Wasm vmctx for any frame), but ultimately landed on a notion of "dynamic context for evaluating tags", specific to Cranelift's exception-catch metadata; and storing that context and carrying it through to a place that is named in the unwind metadata. The reasoning is fairly straightforward: we cannot afford a more general approach that stores vmctx in every frame (I measured this at 20% overhead for a recursive-Fibonacci benchmark that is call-intensive); and inlining means that we may have <em>multiple</em> contexts at any given program point, each associated with a different slice of the handler tags; so we need a mechanism that, <em>just for a try-call</em>, intersperses contexts with tags (or puts a context on each tag) and stores these somewhere that the exception-unwind ABI doesn't clobber (e.g., on the stack).</p>
+<p>This PR implements "option 4" from that issue, namely, <em>dynamic exception contexts</em>. The idea is that this is the dual to exception payload: while payload lets the unwinder communicate state <em>to</em> the catching code, context lets the unwinder take state <em>from</em> the catching code that lets it decide whether the tag is a match. Because of inlining, we need to either associate (optional) context with every tag, or intersperse context-updates with handler tags. I've opted for the latter for efficiency at the CLIF level (in most cases there will be multiple tags per context), though they are isomorphic.</p>
+<p>The new tag-matching semantics are: when walking up the stack, upon reaching a <code>try_call</code>, evaluate catch-clauses in listed order. A <code>context</code> clause sets the current context. A <code>tagN: block(...)</code> clause attempts to match the throwing exception against <code>tagN</code>, <em>evaluated in the current context</em>, and branches to the named block if it matches. A <code>default: block(...)</code> always branches to the named block.</p>
+<p>Note that this lets us assume less about tags than before, and this particularly manifests in the changes to the inliner. Whereas before, <code>tagN</code> is <code>tagN</code> and an inner handler for that tag shadows an outer handler (that is, tags always alias if identical indices); and whereas before, <code>tagN</code> is not <code>tagM</code> and so we can order the tags arbitrarily (that is, tags never alias if non-identical indices); now any two static tag indices may or may not alias depending on the dynamic context of each. Or, even in the same context, two may alias, because we leave the match-predicate as an unspecified (user-chosen) algorithm during unwinding. (This mirrors the reality that, for example, a Wasm instance may import two tags, and dynamically these tags may be equal or different at runtime, even instantiation-to-instantiation.) Cranelift's only job is to faithfully carry the list of contexts and tags through to the compiled-code metadata; and to ensure that they remain in the order they were specified in the CLIF.</p>
+<p>This PR introduces the Cranelift-level feature, and it will be used in a subsequent PR that introduces Wasm exception handling. Because of that, I've opted not to update the clif-utils runtest "runtime" to read out contexts and do something with them -- we will have plenty of test coverage via a bunch of Wasm tests for corner cases such as the above. This PR does include filetests that show that contexts are carried through to spillslots and those appear in the metadata.</p>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+</blockquote>
+
+
+
+<a name="530646318"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530646318" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530646318">(Jul 24 2025 at 21:02)</a>:</h4>
+<p><strong>cfallin</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11321">PR #11321</a>.</p>
+
+
+
+<a name="530646325"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530646325" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530646325">(Jul 24 2025 at 21:02)</a>:</h4>
+<p><strong>cfallin</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11321">PR #11321</a>.</p>
+
+
+
+<a name="530646412"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530646412" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530646412">(Jul 24 2025 at 21:02)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11321">PR #11321</a>.</p>
+
+
+
+<a name="530646440"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530646440" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530646440">(Jul 24 2025 at 21:03)</a>:</h4>
+<p>cfallin edited <a href="https://github.com/bytecodealliance/wasmtime/pull/11321">PR #11321</a>:</p>
+<blockquote>
+<p>In #11285, we realized that Wasm semantics require us to match on dynamic instances of exception tags, rather than static tag types. This fundamentally requires the unwinder to be able to resolve the current Wasm instance for each Wasm frame on the stack that has any handlers, and our frame format does not provide this today.</p>
+<p>We discussed many options, some of which solve the more general problem (Wasm vmctx for any frame), but ultimately landed on a notion of "dynamic context for evaluating tags", specific to Cranelift's exception-catch metadata; and storing that context and carrying it through to a place that is named in the unwind metadata. The reasoning is fairly straightforward: we cannot afford a more general approach that stores vmctx in every frame (I measured this at 20% overhead for a recursive-Fibonacci benchmark that is call-intensive); and inlining means that we may have <em>multiple</em> contexts at any given program point, each associated with a different slice of the handler tags; so we need a mechanism that, <em>just for a try-call</em>, intersperses contexts with tags (or puts a context on each tag) and stores these somewhere that the exception-unwind ABI doesn't clobber (e.g., on the stack).</p>
+<p>This PR implements "option 4" from that issue, namely, <em>dynamic exception contexts</em>. The idea is that this is the dual to exception payload: while payload lets the unwinder communicate state <em>to</em> the catching code, context lets the unwinder take state <em>from</em> the catching code that lets it decide whether the tag is a match. Because of inlining, we need to either associate (optional) context with every tag, or intersperse context-updates with handler tags. I've opted for the latter for efficiency at the CLIF level (in most cases there will be multiple tags per context), though they are isomorphic.</p>
+<p>The new tag-matching semantics are: when walking up the stack, upon reaching a <code>try_call</code>, evaluate catch-clauses in listed order. A <code>context</code> clause sets the current context. A <code>tagN: block(...)</code> clause attempts to match the throwing exception against <code>tagN</code>, <em>evaluated in the current context</em>, and branches to the named block if it matches. A <code>default: block(...)</code> always branches to the named block.</p>
+<p>Note that this lets us assume less about tags than before, and this particularly manifests in the changes to the inliner. Whereas before, <code>tagN</code> is <code>tagN</code> and an inner handler for that tag shadows an outer handler (that is, tags always alias if identical indices); and whereas before, <code>tagN</code> is not <code>tagM</code> and so we can order the tags arbitrarily (that is, tags never alias if non-identical indices); now any two static tag indices may or may not alias depending on the dynamic context of each. Or, even in the same context, two may alias, because we leave the match-predicate as an unspecified (user-chosen) algorithm during unwinding. (This mirrors the reality that, for example, a Wasm instance may import two tags, and dynamically these tags may be equal or different at runtime, even instantiation-to-instantiation.) Cranelift's only job is to faithfully carry the list of contexts and tags through to the compiled-code metadata; and to ensure that they remain in the order they were specified in the CLIF.</p>
+<p>This PR introduces the Cranelift-level feature, and it will be used in a subsequent PR that introduces Wasm exception handling. Because of that, I've opted not to update the clif-utils runtest "runtime" to read out contexts and do something with them -- we will have plenty of test coverage via a bunch of Wasm tests for corner cases such as the above. This PR does include filetests that show that contexts are carried through to spillslots and those appear in the metadata.</p>
+<p>Fixes #11285.</p>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+</blockquote>
+
+
+
+<a name="530646594"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530646594" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530646594">(Jul 24 2025 at 21:04)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11321">PR #11321</a>.</p>
+
+
+
+<a name="530647671"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530647671" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530647671">(Jul 24 2025 at 21:11)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11321">PR #11321</a>.</p>
+
+
+
+<a name="530648218"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530648218" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530648218">(Jul 24 2025 at 21:15)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11321">PR #11321</a>.</p>
+
+
+
+<a name="530650630"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530650630" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530650630">(Jul 24 2025 at 21:33)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11321">PR #11321</a>.</p>
+
+
+
+<a name="530651492"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530651492" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530651492">(Jul 24 2025 at 21:40)</a>:</h4>
+<p>bjorn3 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#pullrequestreview-3053436729">PR review</a>.</p>
+
+
+
+<a name="530651494"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530651494" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530651494">(Jul 24 2025 at 21:40)</a>:</h4>
+<p>bjorn3 created <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#discussion_r2229640543">PR review comment</a>:</p>
+<blockquote>
+<p>Is this using the same numbering scheme as DWARF debuginfo? If so can this reuse the enum we use for variable location debuginfo? If not what numbering scheme is used?</p>
+</blockquote>
+
+
+
+<a name="530652038"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530652038" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530652038">(Jul 24 2025 at 21:45)</a>:</h4>
+<p>cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#pullrequestreview-3053444890">PR review</a>.</p>
+
+
+
+<a name="530652040"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530652040" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530652040">(Jul 24 2025 at 21:45)</a>:</h4>
+<p>cfallin created <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#discussion_r2229647024">PR review comment</a>:</p>
+<blockquote>
+<p>Right now it's a little ad-hoc -- it propagates through whatever numbering scheme we use in <code>PReg</code>, which on x86 is the ISA encoding's numbering (<a href="https://github.com/bytecodealliance/wasmtime/blob/88079b4f3f47e11c1263bde10b9c30bcbe86cc86/winch/codegen/src/isa/x64/regs.rs#L7">here</a>) and on all others mirrors the GPR numbering directly (<code>N</code> is <code>xN</code> on aarch64, <code>xN</code> on riscv64, <code>rN</code> on s390x, <code>xN</code> on pulley). I was worried about putting an unwind dependency in a core type but perhaps I can pull the enum the other way -- good idea.</p>
+</blockquote>
+
+
+
+<a name="530652226"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530652226" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530652226">(Jul 24 2025 at 21:46)</a>:</h4>
+<p>cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#pullrequestreview-3053447263">PR review</a>.</p>
+
+
+
+<a name="530652227"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530652227" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530652227">(Jul 24 2025 at 21:46)</a>:</h4>
+<p>cfallin created <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#discussion_r2229648674">PR review comment</a>:</p>
+<blockquote>
+<p>(err, <a href="https://github.com/bytecodealliance/wasmtime/blob/88079b4f3f47e11c1263bde10b9c30bcbe86cc86/cranelift/codegen/src/isa/x64/inst/regs.rs#L15">here</a>, rather)</p>
+</blockquote>
+
+
+
+<a name="530655283"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530655283" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530655283">(Jul 24 2025 at 22:11)</a>:</h4>
+<p>cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#pullrequestreview-3053491100">PR review</a>.</p>
+
+
+
+<a name="530655285"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530655285" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530655285">(Jul 24 2025 at 22:11)</a>:</h4>
+<p>cfallin created <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#discussion_r2229680579">PR review comment</a>:</p>
+<blockquote>
+<p>Hmm, actually, this creates a bunch of new complexity: it requires pulling in the register mapper from the unwind implementation which ordinarily only exists on SysV platforms, conditionalizing this enum arm existence on the <code>unwind</code> feature, and some other mess as well. I only added this for genericity based on yesterday's Cranelift meeting (support context in regs/stack in general, assert stack only on the Wasmtime side), but I would rather not build out a bunch of functionality for register-based contexts if it's not actually used; and if it is eventually in Wasmtime, we will likely define our own register mappings. So I am going to go ahead and declare what we have now as Cranelift's "native" dynamic exception context register mapping, and we can refine this later as needed -- or if folks would prefer (@alexcrichton?) I can remove the <code>GPR</code> arm here and put the assert and stack-only constraint back into Cranelift.</p>
+</blockquote>
+
+
+
+<a name="530658649"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530658649" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530658649">(Jul 24 2025 at 22:43)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#pullrequestreview-3053554789">PR review</a>.</p>
+
+
+
+<a name="530658652"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530658652" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530658652">(Jul 24 2025 at 22:43)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#discussion_r2229728448">PR review comment</a>:</p>
+<blockquote>
+<p>Would it be possible to use a literal <code>PReg</code> here? That way embedders could remap if they like, but there's a canonical definition for each register (the various backend helpers). Otherwise I'd agree it's not worth too much infrastructure just yet and it's ok to assert with a todo that a register doesn't pop out</p>
+</blockquote>
+
+
+
+<a name="530660615"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530660615" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530660615">(Jul 24 2025 at 23:01)</a>:</h4>
+<p>cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#pullrequestreview-3053574885">PR review</a>.</p>
+
+
+
+<a name="530660616"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530660616" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530660616">(Jul 24 2025 at 23:01)</a>:</h4>
+<p>cfallin created <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#discussion_r2229745296">PR review comment</a>:</p>
+<blockquote>
+<p>Perhaps; but we don't export regalloc2 types from the public API anywhere else, nor those backend helpers? The latter especially mean that the <code>PReg</code> isn't much more meaningful than the raw <code>hw_enc</code> -- that's the integer we are returning currently.</p>
+<p>In fullness of time this seems like something an assembler layer should own -- canonical register names and ISA-defined numbering, then we can use this mapping in our public APIs -- but I guess no matter which type we wrap around that index today, the issue is that we don't have any public API surface that defines it.</p>
+</blockquote>
+
+
+
+<a name="530660669"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530660669" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530660669">(Jul 24 2025 at 23:02)</a>:</h4>
+<p>cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#pullrequestreview-3053575373">PR review</a>.</p>
+
+
+
+<a name="530660671"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530660671" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530660671">(Jul 24 2025 at 23:02)</a>:</h4>
+<p>cfallin created <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#discussion_r2229745711">PR review comment</a>:</p>
+<blockquote>
+<p>(Except for the unwind stuff, of course, but that has the above platform-dependence and feature-dependence issues)</p>
+</blockquote>
+
+
+
+<a name="530684460"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530684460" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530684460">(Jul 25 2025 at 03:24)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#pullrequestreview-3053974954">PR review</a>.</p>
+
+
+
+<a name="530684461"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530684461" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530684461">(Jul 25 2025 at 03:24)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#discussion_r2230055569">PR review comment</a>:</p>
+<blockquote>
+<p>Ok makes sense, personally I'm ambivalent about leaving this as <code>u8</code> or just removing the variant for now, could go either way.</p>
+</blockquote>
+
+
+
+<a name="530692292"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530692292" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530692292">(Jul 25 2025 at 04:58)</a>:</h4>
+<p>cfallin created <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#discussion_r2230138909">PR review comment</a>:</p>
+<blockquote>
+<p>Cool; maybe the deciding factor then is, as long as this PR has the change to rely on the ABI clobbers to force us to the stack case for the tail-call ABI (a good suggestion!), let's keep the register case, so we don't have to fall back to a compile panic or disallow contexts for try-calls in SysV ABI (which are already supported).</p>
+</blockquote>
+
+
+
+<a name="530692293"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530692293" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530692293">(Jul 25 2025 at 04:58)</a>:</h4>
+<p>cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#pullrequestreview-3054084424">PR review</a>.</p>
+
+
+
+<a name="530830670"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530830670" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530830670">(Jul 25 2025 at 18:50)</a>:</h4>
+<p>fitzgen submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#pullrequestreview-3056420482">PR review</a>:</p>
+<blockquote>
+<p>Looks great! A couple nitpicks below, r=me with them addressed</p>
+</blockquote>
+
+
+
+<a name="530830671"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530830671" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530830671">(Jul 25 2025 at 18:50)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#discussion_r2231759946">PR review comment</a>:</p>
+<blockquote>
+<p>This length invariant no longer holds because context entries do not have an associated target, right?</p>
+</blockquote>
+
+
+
+<a name="530830672"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530830672" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530830672">(Jul 25 2025 at 18:50)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#discussion_r2231765989">PR review comment</a>:</p>
+<blockquote>
+<p>This method would previously give only exceptional edges, but now gives all kinds of table items. That seems fine if callers were not relying on that property, but we should definitely update the method documentation and probably the method name as well.</p>
+</blockquote>
+
+
+
+<a name="530830676"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530830676" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530830676">(Jul 25 2025 at 18:50)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#discussion_r2231786883">PR review comment</a>:</p>
+<blockquote>
+<p>Double checking my understanding: we don't need to check basic properties of the context value here (like its definition dominates this use) because these checks are handled via the generic methods of getting all uses and defs of a particular instruction elsewhere in the verifier, right?</p>
+</blockquote>
+
+
+
+<a name="530830677"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530830677" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530830677">(Jul 25 2025 at 18:50)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#discussion_r2231804980">PR review comment</a>:</p>
+<blockquote>
+<div class="codehilite" data-code-language="suggestion"><pre><span></span><code>    #[expect(
+</code></pre></div>
+<p>so that it turns into a warning (and CI failure) if we forget to remove this once it is actually used</p>
+</blockquote>
+
+
+
+<a name="530830678"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530830678" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530830678">(Jul 25 2025 at 18:50)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#discussion_r2231776040">PR review comment</a>:</p>
+<blockquote>
+<p>Maybe makes sense to define <code>add_call_site</code> such that it doesn't take any handlers, and then a new <code>add_try_call_site</code> that does take them? Would cut down on the empty iterator argument stuff to clean up all these call sites a little.</p>
+<p>Actually, even better would be if we pushed the try call info into the caller, so that call sites just looked like</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">sink</span><span class="p">.</span><span class="n">add_call_site</span><span class="p">(</span><span class="n">info</span><span class="p">.</span><span class="n">try_call_info</span><span class="p">())</span>
+</code></pre></div>
+<p>and then <code>add_call_site</code> would internally do the <code>if let Some(...)</code>.</p>
+</blockquote>
+
+
+
+<a name="530871926"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530871926" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530871926">(Jul 26 2025 at 01:02)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11321">PR #11321</a>.</p>
+
+
+
+<a name="530871928"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530871928" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530871928">(Jul 26 2025 at 01:02)</a>:</h4>
+<p>cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#pullrequestreview-3057248250">PR review</a>.</p>
+
+
+
+<a name="530871929"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530871929" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530871929">(Jul 26 2025 at 01:02)</a>:</h4>
+<p>cfallin created <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#discussion_r2232312107">PR review comment</a>:</p>
+<blockquote>
+<p>Went with the former option -- interpreting the <code>TryCallInfo</code> to get handlers requires a <code>FrameLayout</code> as well, and pushing that into the <code>MachBuffer</code> felt like too much coupling (vs. taking an iterator over <code>MachExceptionHandler</code>s, which are a buffer-defined concept).</p>
+</blockquote>
+
+
+
+<a name="530871931"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530871931" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530871931">(Jul 26 2025 at 01:02)</a>:</h4>
+<p>cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#pullrequestreview-3057248279">PR review</a>.</p>
+
+
+
+<a name="530871933"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530871933" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530871933">(Jul 26 2025 at 01:02)</a>:</h4>
+<p>cfallin created <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#discussion_r2232312137">PR review comment</a>:</p>
+<blockquote>
+<p>Yep, exactly -- the context values are included in the instruction's values iterator (<code>DataFlowGraph::inst_values()</code>) now, so are verified to exist and be valid SSA uses that way.</p>
+</blockquote>
+
+
+
+<a name="530871946"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530871946" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530871946">(Jul 26 2025 at 01:02)</a>:</h4>
+<p>cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#pullrequestreview-3057248514">PR review</a>.</p>
+
+
+
+<a name="530871947"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530871947" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530871947">(Jul 26 2025 at 01:02)</a>:</h4>
+<p>cfallin created <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#discussion_r2232312206">PR review comment</a>:</p>
+<blockquote>
+<p>Done!</p>
+</blockquote>
+
+
+
+<a name="530871952"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530871952" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530871952">(Jul 26 2025 at 01:02)</a>:</h4>
+<p>cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#pullrequestreview-3057248642">PR review</a>.</p>
+
+
+
+<a name="530871954"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530871954" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530871954">(Jul 26 2025 at 01:02)</a>:</h4>
+<p>cfallin created <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#discussion_r2232312236">PR review comment</a>:</p>
+<blockquote>
+<p>Updated, thanks!</p>
+</blockquote>
+
+
+
+<a name="530872014"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530872014" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530872014">(Jul 26 2025 at 01:03)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11321">PR #11321</a>.</p>
+
+
+
+<a name="530872018"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530872018" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530872018">(Jul 26 2025 at 01:03)</a>:</h4>
+<p>cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#pullrequestreview-3057249299">PR review</a>.</p>
+
+
+
+<a name="530872019"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530872019" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530872019">(Jul 26 2025 at 01:03)</a>:</h4>
+<p>cfallin created <a href="https://github.com/bytecodealliance/wasmtime/pull/11321#discussion_r2232312789">PR review comment</a>:</p>
+<blockquote>
+<p>Done!</p>
+</blockquote>
+
+
+
+<a name="530872150"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530872150" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530872150">(Jul 26 2025 at 01:05)</a>:</h4>
+<p>cfallin has enabled auto merge for <a href="https://github.com/bytecodealliance/wasmtime/pull/11321">PR #11321</a>.</p>
+
+
+
+<a name="530873193"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530873193" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530873193">(Jul 26 2025 at 01:16)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11321">PR #11321</a>.</p>
+
+
+
+<a name="530876839"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311321%20Cranelift%3A%20support%20dynamic%20contexts%20.../near/530876839" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311321.20Cranelift.3A.20support.20dynamic.20contexts.20.2E.2E.2E.html#530876839">(Jul 26 2025 at 02:00)</a>:</h4>
+<p>cfallin merged <a href="https://github.com/bytecodealliance/wasmtime/pull/11321">PR #11321</a>.</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

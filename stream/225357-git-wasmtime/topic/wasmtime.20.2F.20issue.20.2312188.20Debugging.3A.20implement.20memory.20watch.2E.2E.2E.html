@@ -1,0 +1,43 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #12188 Debugging: implement memory watch... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312188.20Debugging.3A.20implement.20memory.20watch.2E.2E.2E.html">wasmtime / issue #12188 Debugging: implement memory watch...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="564752707"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312188%20Debugging%3A%20implement%20memory%20watch.../near/564752707" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312188.20Debugging.3A.20implement.20memory.20watch.2E.2E.2E.html#564752707">(Dec 19 2025 at 18:09)</a>:</h4>
+<p>cfallin opened <a href="https://github.com/bytecodealliance/wasmtime/issues/12188">issue #12188</a>:</p>
+<blockquote>
+<p>This is a tracking issue. In #11964, memory watchpoints are the last remaining "basic debugging primitive". I'd like to push this out of the MVP feature-set as I would like to get to a working end-to-end debugging demo sooner rather than later. This issue tracks the post-MVP work, which is still planned.</p>
+<p>I suspect the most straightforward approach will be:</p>
+<ul>
+<li>Augment <code>VMMemoryDefinition</code> to have a nullable pointer to a watchpoint shadow memory.</li>
+<li>When debugging is enabled in an Engine config, we allocate and update (grow and shrink) a memory region the same size as the memory itself for the shadow. To facilitate this it may be worthwhile to disallow custom memory creators and disallow use of the pooling allocator (this should be fine for a basic debugging configuration on a developer's machine); those could be supported again later if needed.</li>
+<li>This shadow is all-zeroes by default. Setting a watchpoint sets the byte(s) at the relevant addresses to nonzero values. These bytes are effectively 1-bit flags per address. (Why full bytes and not a bit-vector compressed by 8x? I suspect the shifting and masking logic would have more cost in the common case, and in any case would blow up code.)</li>
+<li>Add a separate <code>Config</code> method (beyond <code>guest_debug</code>) that enables watchpoints, because they will have additional overhead.</li>
+<li>At the Wasm-to-CLIF translator level, when watchpoints are enabled:<ul>
+<li>For every load, emit a load of the same size to the same offset in the shadow memory. Do this load second, so it doesn't need to carry trap metadata (actual load will trap). On result of shadow load, do a <code>brif</code> around a hostcall (with <code>PreserveAll</code> ABI) to a <code>watchpoint_load</code> hostcall with the memory ID, address, size, and data loaded.</li>
+<li>For every store, emit a load of the same size to the same offset in the original memory to force a trap before updating data (see also #8221 where I prototyped this for another purpose and measured it to have 2% performance impact). Then do the shadow load and <code>brif</code>, then the store. In the watchpoint case, make a <code>watchpoint_store</code> hostcall with the memory ID, address, size, old data, and new data.</li>
+</ul>
+</li>
+<li>Emit new <code>DebugEvent</code>s for watchpoint hits.</li>
+<li>Add an API to <code>Memory</code> to enable/disable watchpoints when a shadow is present.</li>
+<li>Perhaps address host memory accesses: add an API to trigger watchpoints when accessing a range on a <code>Memory</code>. This would lead to serious complexity if added to the basic synchronous slice-returning accessors because the event callback is async, but perhaps we could have a separate async "trigger watchpoints on read/write" method, and at least use that at the appropriate places in the component-model lowering.</li>
+</ul>
+<p>There are some tradeoffs inherent in the above, and I suspect the above will be a good balance between (i) code size, (ii) complexity, and (iii) performance, but we can experiment with any other ideas that seem promising as well. I should list a few approaches rejected (for now) and my reasoning for completeness:</p>
+<ul>
+<li>More complex "sparse" data structures for watchpoints: likely to have too much code-size and runtime performance impact. E.g., we don't want to do a multi-level trie lookup for every load/store. That will have performance approaching "softmmu"-style page table emulation (which also does a trie lookup), which is something like 10x. A bitmap (one bit per byte in original memory) will be less but still likely too much. Consider also register pressure due to computing address after shifting, versus using the same addressing mode (with different base) in real and shadow loads.</li>
+<li>Hostcall for every load/store: likely to have far too much overhead to be practical.</li>
+<li>Leveraging traps and virtual memory protection: goes against what we discovered in attempts to use traps for breakpoints -- there are very serious complexity and implementation concerns here, leading to #11964's approach instead. Also adds complexity when granting access via the host API.</li>
+</ul>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

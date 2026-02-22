@@ -1,0 +1,99 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #10719 Cranelift: deduplicate 128-bit (a... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310719.20Cranelift.3A.20deduplicate.20128-bit.20.28a.2E.2E.2E.html">wasmtime / issue #10719 Cranelift: deduplicate 128-bit (a...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="515817557"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310719%20Cranelift%3A%20deduplicate%20128-bit%20%28a.../near/515817557" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310719.20Cranelift.3A.20deduplicate.20128-bit.20.28a.2E.2E.2E.html#515817557">(May 02 2025 at 23:57)</a>:</h4>
+<p>cfallin edited <a href="https://github.com/bytecodealliance/wasmtime/issues/10719">issue #10719</a>:</p>
+<blockquote>
+<p>See the following existing compilation test:</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/e0431281326eb13b45af0d6dd7829304e18581d4/cranelift/filetests/filetests/isa/x64/simd-lane-access-compile.clif#L134-L137">https://github.com/bytecodealliance/wasmtime/blob/e0431281326eb13b45af0d6dd7829304e18581d4/cranelift/filetests/filetests/isa/x64/simd-lane-access-compile.clif#L134-L137</a></p>
+<p>A constant from the post-function pool is being loaded into <code>%xmm1</code>, but the instruction that would use it <code>paddusb</code>, then re-loads it as it writes into <code>%xmm1</code>. Now, the <code>movdqu</code> seems correct in one sense: memory addresses to packed instructions must be 128-bit aligned so, when converting an <code>XmmMemAligned</code> to an <code>XmmMem</code>, Cranelift inserts an unaligned load. But the direct use by <code>paddusb</code> might also be correct: we may be aligning the start of the constant pool and so this may be just fine.</p>
+<p>Either way, something is not quite right, though:</p>
+<ul>
+<li>if the constant pool is _not_ aligned or this can't be communicated to the instruction, <code>paddusb</code> should not be using the address directly</li>
+<li>if the constant pool _is_ aligned and communicated properly, then the <code>movdqu</code> is redundant and should be removed</li>
+</ul>
+<p>Which is it? I'm leaning towards the latter because of sequences like the following:</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/e0431281326eb13b45af0d6dd7829304e18581d4/cranelift/filetests/filetests/isa/x64/simd-pairwise-add.clif#L154-L156">https://github.com/bytecodealliance/wasmtime/blob/e0431281326eb13b45af0d6dd7829304e18581d4/cranelift/filetests/filetests/isa/x64/simd-pairwise-add.clif#L154-L156</a></p>
+<p>Those instructions have no trouble accessing the pool by aligned address... or are they incorrect?</p>
+</blockquote>
+
+
+
+<a name="516317671"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310719%20Cranelift%3A%20deduplicate%20128-bit%20%28a.../near/516317671" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310719.20Cranelift.3A.20deduplicate.20128-bit.20.28a.2E.2E.2E.html#516317671">(May 05 2025 at 23:56)</a>:</h4>
+<p>abrown <a href="https://github.com/bytecodealliance/wasmtime/issues/10719#issuecomment-2852770415">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10719">issue #10719</a>:</p>
+<blockquote>
+<p>Ok, I was getting confused by all of these constants and RIP-relative offsets. In the example I gave in the issue description, the disassembly corresponds to:</p>
+<table>
+<thead>
+<tr>
+<th>CLIF</th>
+<th>Disassembly</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>v0 = vconst.i8x16 ...</code></td>
+<td><code>movdqu 0x24(%rip), %xmm0</code></td>
+</tr>
+<tr>
+<td><code>v1 = vconst.i8x16 ...</code></td>
+<td><code>movdqu 0x1c(%rip), %xmm1</code></td>
+</tr>
+<tr>
+<td><code>v2 = swizzle v0, v1</code></td>
+<td><code>paddusb 0x24(%rip), %xmm1</code></td>
+</tr>
+<tr>
+<td>''</td>
+<td><code>pshufb %xmm1, %xmm0</code></td>
+</tr>
+</tbody>
+</table>
+<p>That lowering of <code>swizzle</code> corresponds to:</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/1761bc3340438897fd9b8ce0676ab811912347d2/cranelift/codegen/src/isa/x64/lower.isle#L4644-L4646">https://github.com/bytecodealliance/wasmtime/blob/1761bc3340438897fd9b8ce0676ab811912347d2/cranelift/codegen/src/isa/x64/lower.isle#L4644-L4646</a></p>
+<p>So there are three different constants being referred to here and <code>paddusb</code> is reading the constant we've already read into <code>%xmm1</code> and adding to it the <code>0x7070...</code> constant. All is well.</p>
+<p>I was worried about something more dire, so I feel we should close the issue, but you're right that we could deduplicate the constants in <code>v0</code> and <code>v1</code>.</p>
+</blockquote>
+
+
+
+<a name="516319492"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310719%20Cranelift%3A%20deduplicate%20128-bit%20%28a.../near/516319492" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310719.20Cranelift.3A.20deduplicate.20128-bit.20.28a.2E.2E.2E.html#516319492">(May 06 2025 at 00:15)</a>:</h4>
+<p>cfallin closed <a href="https://github.com/bytecodealliance/wasmtime/issues/10719">issue #10719</a>:</p>
+<blockquote>
+<p>See the following existing compilation test:</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/e0431281326eb13b45af0d6dd7829304e18581d4/cranelift/filetests/filetests/isa/x64/simd-lane-access-compile.clif#L134-L137">https://github.com/bytecodealliance/wasmtime/blob/e0431281326eb13b45af0d6dd7829304e18581d4/cranelift/filetests/filetests/isa/x64/simd-lane-access-compile.clif#L134-L137</a></p>
+<p>A constant from the post-function pool is being loaded into <code>%xmm1</code>, but the instruction that would use it <code>paddusb</code>, then re-loads it as it writes into <code>%xmm1</code>. Now, the <code>movdqu</code> seems correct in one sense: memory addresses to packed instructions must be 128-bit aligned so, when converting an <code>XmmMemAligned</code> to an <code>XmmMem</code>, Cranelift inserts an unaligned load. But the direct use by <code>paddusb</code> might also be correct: we may be aligning the start of the constant pool and so this may be just fine.</p>
+<p>Either way, something is not quite right, though:</p>
+<ul>
+<li>if the constant pool is _not_ aligned or this can't be communicated to the instruction, <code>paddusb</code> should not be using the address directly</li>
+<li>if the constant pool _is_ aligned and communicated properly, then the <code>movdqu</code> is redundant and should be removed</li>
+</ul>
+<p>Which is it? I'm leaning towards the latter because of sequences like the following:</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/e0431281326eb13b45af0d6dd7829304e18581d4/cranelift/filetests/filetests/isa/x64/simd-pairwise-add.clif#L154-L156">https://github.com/bytecodealliance/wasmtime/blob/e0431281326eb13b45af0d6dd7829304e18581d4/cranelift/filetests/filetests/isa/x64/simd-pairwise-add.clif#L154-L156</a></p>
+<p>Those instructions have no trouble accessing the pool by aligned address... or are they incorrect?</p>
+</blockquote>
+
+
+
+<a name="516319493"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310719%20Cranelift%3A%20deduplicate%20128-bit%20%28a.../near/516319493" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310719.20Cranelift.3A.20deduplicate.20128-bit.20.28a.2E.2E.2E.html#516319493">(May 06 2025 at 00:15)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/10719#issuecomment-2852812534">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10719">issue #10719</a>:</p>
+<blockquote>
+<p>Ah, great. I think also I missed previously that constants <em>are</em> deduplicated at the CLIF level; writing a little test by hand with two <code>vconst.i8x16 ABCD...</code> instances shows that they reduce to two <code>vconst.i8x16 const0</code> instructions. So we're doing all we can in the compiler already, and I agree we can close this.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

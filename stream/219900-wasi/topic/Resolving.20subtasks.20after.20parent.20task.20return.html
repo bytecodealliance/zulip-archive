@@ -1,0 +1,556 @@
+<html>
+<head><meta charset="utf-8"><title>Resolving subtasks after parent task return · wasi · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/index.html">wasi</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html">Resolving subtasks after parent task return</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="558098461"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558098461" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558098461">(Nov 19 2025 at 01:33)</a>:</h4>
+<p>Hey <span class="user-mention" data-user-id="509936">@Joel Dice</span>  / <span class="user-mention" data-user-id="253994">@Alex Crichton</span>  I'm a bit stuck and have a question about <a href="https://github.com/bytecodealliance/wasmtime/blob/main/crates/test-programs/src/bin/async_sleep_post_return_caller.rs">the <code>async_sleep_post_return_caller</code> test</a> -- I'm a bit stuck because I don't see <em>how</em> we keep polling the spawned subtask (i.e. calling the callback) after the first time. </p>
+<p>Pending event is set when the subtask first starts (<code>on_start()</code> which is set up during <code>canon_lower</code>), but the first time you check it, it's supposed to removed (set to <code>None</code> in the spec docs -- <code>Waitable#get_pending_event()</code> via <code>WaitableSet#get_pending_event()</code> via the <code>Subtask</code> itself)... </p>
+<p>So how could the subtask keep getting <code>wait_until</code>'d in the main loop? I think I'm missing something here. </p>
+<p>It's a bit hard to explain but let me try again:</p>
+<ol>
+<li>The initial callback call returns the code <code>2</code> (i.e. wait) and the waitable rep to watch is <code>1</code>, the new <code>Subtask</code> itself</li>
+<li><code>wait_until</code> spits out <code>{ code: State.Subtask, index: 1, result: 1 }</code>which makes sense because we have to wait for that spawned subtask,  and the task is <code>STARTED</code> (<code>result</code>) -- the pending event fn was cleared for this</li>
+<li>The callback is run a second time,  and returns the unpacked code <code>2</code> (wait) w/ waitable <code>1</code> (the subtask) -- this all makes sense</li>
+<li>We get into the <em>second</em> <code>wait_until()</code>,  and the task will never resolve because we never re-set the pending event:</li>
+</ol>
+<div class="codehilite" data-code-language="Python"><pre><span></span><code>  <span class="c1"># Task#wait_until -&gt; Task#suspend_until -&gt; Thread#suspend_until</span>
+  <span class="k">def</span><span class="w"> </span><span class="nf">wait_until</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ready_func</span><span class="p">,</span> <span class="n">thread</span><span class="p">,</span> <span class="n">wset</span><span class="p">,</span> <span class="n">cancellable</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">EventTuple</span><span class="p">:</span>
+    <span class="k">assert</span><span class="p">(</span><span class="n">thread</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">threads</span> <span class="ow">and</span> <span class="n">thread</span><span class="o">.</span><span class="n">task</span> <span class="ow">is</span> <span class="bp">self</span><span class="p">)</span>
+    <span class="n">wset</span><span class="o">.</span><span class="n">num_waiting</span> <span class="o">+=</span> <span class="mi">1</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">ready_and_has_event</span><span class="p">():</span>
+      <span class="k">return</span> <span class="n">ready_func</span><span class="p">()</span> <span class="ow">and</span> <span class="n">wset</span><span class="o">.</span><span class="n">has_pending_event</span><span class="p">()</span> <span class="c1"># &lt;-- second condition will never be the case</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">suspend_until</span><span class="p">(</span><span class="n">ready_and_has_event</span><span class="p">,</span> <span class="n">thread</span><span class="p">,</span> <span class="n">cancellable</span><span class="p">):</span>
+      <span class="n">event</span> <span class="o">=</span> <span class="p">(</span><span class="n">EventCode</span><span class="o">.</span><span class="n">TASK_CANCELLED</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+      <span class="n">event</span> <span class="o">=</span> <span class="n">wset</span><span class="o">.</span><span class="n">get_pending_event</span><span class="p">()</span>
+    <span class="n">wset</span><span class="o">.</span><span class="n">num_waiting</span> <span class="o">-=</span> <span class="mi">1</span>
+    <span class="k">return</span> <span class="n">event</span>
+</code></pre></div>
+<p>Basically, I can't see/am missing the mechanism by which <code>pending_event</code> would ever  get set again -- obviously <code>on_progress()</code> would be the thing to do this, BUT it wouldn't get called from <code>on_start()</code> established in <code>canon_lower</code> (we've already started), and not <code>on_resolve()</code> either because we're not done yet (the caller in the subtask has not <code>task.return</code>ed)</p>
+<p>Cheating and taking a look <a href="https://github.com/bytecodealliance/wasmtime/blob/main/crates/wasmtime/src/runtime/component/concurrent.rs#L2389">at the Rust impl</a>, it looks like wasmtime basically just do another turn at the loop by creating another subtask under the current task (so 1 + n subtasks for every poll while the spawned tasks have not completed) -- this makes intuitive sense but I cannot find rationale in the spec for this.</p>
+<p>If I'm reading the spec right, <code>Subtask</code>s only get created during the initial <code>canon_lower</code> call (i.e. on the code side this is responding to <code>Trampoline::StartAsyncCall</code> IIUC), so I can't figure out which mechanism is responsible for allowing the new subtask creation.</p>
+<p>Also <span class="user-mention" data-user-id="253998">@Luke Wagner</span> in case I'm misreading the spec here</p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/wasmtime/blob/main/crates/test-programs/src/bin/async_sleep_post_return_caller.rs" style="background-image: url(&quot;https://uploads.zulipusercontent.net/661786a27eab4b737a8c24357e902be6ffaaa245/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f316436626630613837303039633130613237326662343439393937333630656136313839653432666265653762343833326264646662353133656266393937322f62797465636f6465616c6c69616e63652f7761736d74696d65&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/wasmtime/blob/main/crates/test-programs/src/bin/async_sleep_post_return_caller.rs" title="wasmtime/crates/test-programs/src/bin/async_sleep_post_return_caller.rs at main · bytecodealliance/wasmtime">wasmtime/crates/test-programs/src/bin/async_sleep_post_return_caller.rs at main · bytecodealliance/wasmtime</a></div><div class="message_embed_description">A lightweight WebAssembly runtime that is fast, secure, and standards-compliant - bytecodealliance/wasmtime</div></div></div><div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/wasmtime/blob/main/crates/wasmtime/src/runtime/component/concurrent.rs#L2389" style="background-image: url(&quot;https://uploads.zulipusercontent.net/661786a27eab4b737a8c24357e902be6ffaaa245/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f316436626630613837303039633130613237326662343439393937333630656136313839653432666265653762343833326264646662353133656266393937322f62797465636f6465616c6c69616e63652f7761736d74696d65&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/wasmtime/blob/main/crates/wasmtime/src/runtime/component/concurrent.rs#L2389" title="wasmtime/crates/wasmtime/src/runtime/component/concurrent.rs at main · bytecodealliance/wasmtime">wasmtime/crates/wasmtime/src/runtime/component/concurrent.rs at main · bytecodealliance/wasmtime</a></div><div class="message_embed_description">A lightweight WebAssembly runtime that is fast, secure, and standards-compliant - bytecodealliance/wasmtime</div></div></div>
+
+
+
+<a name="558225851"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558225851" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558225851">(Nov 19 2025 at 14:56)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="598440">Victor Adossi</span> <a href="#narrow/channel/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return/near/558098461">said</a>:</p>
+<blockquote>
+<p>it looks like wasmtime basically just do another turn at the loop by creating another subtask under the current task (so 1 + n subtasks for every poll while the spawned tasks have not completed)</p>
+</blockquote>
+<p>I'm not sure what you mean by this.  Wasmtime isn't creating new subtasks on each poll or wait.  All it's doing is being <em>lazy</em> about adding it to the caller's handle table.  I.e. if the callee returns a result immediately, then there's no need to add it to the caller's handle table because, as far as the caller is concerned, the subtask is already finished.</p>
+<p>Of course in this case the subtask will still do more stuff after it has returned, but that's invisible to the caller.  And once the caller exits and the subtask still isn't done, the <em>caller's</em> caller (the host, in this case) will inherit the subtask.  The host then allows that subtask and any transitive subtasks to complete by continuing to run the event loop until there's nothing left to do: <a href="https://github.com/bytecodealliance/wasmtime/blob/7fb8b55a8d3003a926753f4c3fcd676c813ebf98/crates/misc/component-async-tests/tests/scenario/post_return.rs#L90-L92">https://github.com/bytecodealliance/wasmtime/blob/7fb8b55a8d3003a926753f4c3fcd676c813ebf98/crates/misc/component-async-tests/tests/scenario/post_return.rs#L90-L92</a></p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/wasmtime/blob/7fb8b55a8d3003a926753f4c3fcd676c813ebf98/crates/misc/component-async-tests/tests/scenario/post_return.rs#L90-L92" style="background-image: url(&quot;https://uploads.zulipusercontent.net/8f58c19e79723673c6fed419e4ecb0c3cfc2c11b/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f313939303438323662613231666561353630373062626430626661323830346162323932373535616233636462356131383531373535316532323932653735392f62797465636f6465616c6c69616e63652f7761736d74696d65&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/wasmtime/blob/7fb8b55a8d3003a926753f4c3fcd676c813ebf98/crates/misc/component-async-tests/tests/scenario/post_return.rs#L90-L92" title="wasmtime/crates/misc/component-async-tests/tests/scenario/post_return.rs at 7fb8b55a8d3003a926753f4c3fcd676c813ebf98 · bytecodealliance/wasmtime">wasmtime/crates/misc/component-async-tests/tests/scenario/post_return.rs at 7fb8b55a8d3003a926753f4c3fcd676c813ebf98 · bytecodealliance/wasmtime</a></div><div class="message_embed_description">A lightweight WebAssembly runtime that is fast, secure, and standards-compliant - bytecodealliance/wasmtime</div></div></div>
+
+
+
+<a name="558226114"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558226114" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558226114">(Nov 19 2025 at 14:57)</a>:</h4>
+<p>I'm not sure how that all matches up to the spec code, but perhaps <span class="user-mention" data-user-id="253998">@Luke Wagner</span> can help with that.</p>
+
+
+
+<a name="558231869"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558231869" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558231869">(Nov 19 2025 at 15:19)</a>:</h4>
+<p>Ah, so I get that the host gets to run the subtasks until there's nothing left to do, via the <code>tick()</code> function -- my problem is with the check in the threads that looks like this:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="p">#</span><span class="w"> </span><span class="n">Task</span><span class="p">#</span><span class="n">wait_until</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">Task</span><span class="p">#</span><span class="n">suspend_until</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">Thread</span><span class="p">#</span><span class="n">suspend_until</span>
+<span class="w">  </span><span class="n">def</span><span class="w"> </span><span class="n">wait_until</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">ready_func</span><span class="p">,</span><span class="w"> </span><span class="n">thread</span><span class="p">,</span><span class="w"> </span><span class="n">wset</span><span class="p">,</span><span class="w"> </span><span class="n">cancellable</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">EventTuple</span><span class="p">:</span>
+<span class="w">    </span><span class="nc">assert</span><span class="p">(</span><span class="n">thread</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">threads</span><span class="w"> </span><span class="n">and</span><span class="w"> </span><span class="n">thread</span><span class="p">.</span><span class="n">task</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="bp">self</span><span class="p">)</span>
+<span class="w">    </span><span class="n">wset</span><span class="p">.</span><span class="n">num_waiting</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">    </span><span class="n">def</span><span class="w"> </span><span class="n">ready_and_has_event</span><span class="p">():</span>
+<span class="w">      </span><span class="nc">return</span><span class="w"> </span><span class="n">ready_func</span><span class="p">()</span><span class="w"> </span><span class="n">and</span><span class="w"> </span><span class="n">wset</span><span class="p">.</span><span class="n">has_pending_event</span><span class="p">()</span><span class="w"> </span><span class="p">#</span><span class="w"> </span><span class="o">&lt;--</span><span class="w"> </span><span class="n">second</span><span class="w"> </span><span class="n">condition</span><span class="w"> </span><span class="n">will</span><span class="w"> </span><span class="n">never</span><span class="w"> </span><span class="n">be</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">case</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="n">not</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">suspend_until</span><span class="p">(</span><span class="n">ready_and_has_event</span><span class="p">,</span><span class="w"> </span><span class="n">thread</span><span class="p">,</span><span class="w"> </span><span class="n">cancellable</span><span class="p">):</span>
+<span class="w">      </span><span class="nc">event</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">EventCode</span><span class="p">.</span><span class="n">TASK_CANCELLED</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span>
+<span class="w">    </span><span class="k">else</span><span class="p">:</span>
+<span class="w">      </span><span class="nc">event</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">wset</span><span class="p">.</span><span class="n">get_pending_event</span><span class="p">()</span>
+<span class="w">    </span><span class="n">wset</span><span class="p">.</span><span class="n">num_waiting</span><span class="w"> </span><span class="o">-=</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">event</span>
+</code></pre></div>
+<p>My main question was how the subtask would get it's pending event set again after that first time.</p>
+<p>The host IS currently trying to drive the subtask to completion but I'm stuck (well, the host is stuck) because it's running <code>wait_until</code> on a subtask that will never be ready according to that <code>ready_and_has_event</code> logic.</p>
+
+
+
+<a name="558233669"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558233669" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558233669">(Nov 19 2025 at 15:26)</a>:</h4>
+<p>So <em>it makes sense</em> to me to keep running it, but maybe what you're saying is that once we're out of that loop of checking for event codes we don't enter it again? i.e. we break out of this loop:</p>
+<div class="codehilite" data-code-language="Python"><pre><span></span><code>    <span class="p">[</span><span class="n">packed</span><span class="p">]</span> <span class="o">=</span> <span class="n">call_and_trap_on_throw</span><span class="p">(</span><span class="n">callee</span><span class="p">,</span> <span class="n">thread</span><span class="p">,</span> <span class="n">flat_args</span><span class="p">)</span>
+    <span class="n">code</span><span class="p">,</span><span class="n">si</span> <span class="o">=</span> <span class="n">unpack_callback_result</span><span class="p">(</span><span class="n">packed</span><span class="p">)</span>
+    <span class="k">while</span> <span class="n">code</span> <span class="o">!=</span> <span class="n">CallbackCode</span><span class="o">.</span><span class="n">EXIT</span><span class="p">:</span>
+      <span class="n">thread</span><span class="o">.</span><span class="n">in_event_loop</span> <span class="o">=</span> <span class="kc">True</span>
+      <span class="n">inst</span><span class="o">.</span><span class="n">exclusive</span> <span class="o">=</span> <span class="kc">False</span>
+      <span class="k">match</span> <span class="n">code</span><span class="p">:</span>
+        <span class="k">case</span> <span class="n">CallbackCode</span><span class="o">.</span><span class="n">YIELD</span><span class="p">:</span>
+          <span class="n">event</span> <span class="o">=</span> <span class="n">task</span><span class="o">.</span><span class="n">yield_until</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="ow">not</span> <span class="n">inst</span><span class="o">.</span><span class="n">exclusive</span><span class="p">,</span> <span class="n">thread</span><span class="p">,</span> <span class="n">cancellable</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span>
+        <span class="k">case</span> <span class="n">CallbackCode</span><span class="o">.</span><span class="n">WAIT</span><span class="p">:</span>
+          <span class="n">wset</span> <span class="o">=</span> <span class="n">inst</span><span class="o">.</span><span class="n">table</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">si</span><span class="p">)</span>
+          <span class="n">trap_if</span><span class="p">(</span><span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">wset</span><span class="p">,</span> <span class="n">WaitableSet</span><span class="p">))</span>
+          <span class="n">event</span> <span class="o">=</span> <span class="n">task</span><span class="o">.</span><span class="n">wait_until</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="ow">not</span> <span class="n">inst</span><span class="o">.</span><span class="n">exclusive</span><span class="p">,</span> <span class="n">thread</span><span class="p">,</span> <span class="n">wset</span><span class="p">,</span> <span class="n">cancellable</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span>
+        <span class="k">case</span> <span class="n">CallbackCode</span><span class="o">.</span><span class="n">POLL</span><span class="p">:</span>
+          <span class="n">wset</span> <span class="o">=</span> <span class="n">inst</span><span class="o">.</span><span class="n">table</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">si</span><span class="p">)</span>
+          <span class="n">trap_if</span><span class="p">(</span><span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">wset</span><span class="p">,</span> <span class="n">WaitableSet</span><span class="p">))</span>
+          <span class="n">event</span> <span class="o">=</span> <span class="n">task</span><span class="o">.</span><span class="n">poll_until</span><span class="p">(</span><span class="k">lambda</span><span class="p">:</span> <span class="ow">not</span> <span class="n">inst</span><span class="o">.</span><span class="n">exclusive</span><span class="p">,</span> <span class="n">thread</span><span class="p">,</span> <span class="n">wset</span><span class="p">,</span> <span class="n">cancellable</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span>
+      <span class="n">thread</span><span class="o">.</span><span class="n">in_event_loop</span> <span class="o">=</span> <span class="kc">False</span>
+      <span class="n">inst</span><span class="o">.</span><span class="n">exclusive</span> <span class="o">=</span> <span class="kc">True</span>
+      <span class="n">event_code</span><span class="p">,</span> <span class="n">p1</span><span class="p">,</span> <span class="n">p2</span> <span class="o">=</span> <span class="n">event</span>
+      <span class="p">[</span><span class="n">packed</span><span class="p">]</span> <span class="o">=</span> <span class="n">call_and_trap_on_throw</span><span class="p">(</span><span class="n">opts</span><span class="o">.</span><span class="n">callback</span><span class="p">,</span> <span class="n">thread</span><span class="p">,</span> <span class="p">[</span><span class="n">event_code</span><span class="p">,</span> <span class="n">p1</span><span class="p">,</span> <span class="n">p2</span><span class="p">])</span>
+      <span class="n">code</span><span class="p">,</span><span class="n">si</span> <span class="o">=</span> <span class="n">unpack_callback_result</span><span class="p">(</span><span class="n">packed</span><span class="p">)</span>
+    <span class="n">task</span><span class="o">.</span><span class="n">exit</span><span class="p">()</span>
+    <span class="k">return</span>
+</code></pre></div>
+<p>And just start running the callback in a tight loop? somewhere else?</p>
+<p>Unless I'm reading it wrong (very possible!) progressing that subtask <em>is</em> going through that loop until we can get to <code>CallbackCode.EXIT</code>, and right now I'm stuck at <code>WAIT</code> because of the conditions of <code>wait_until</code> that will only be fulfilled once, essentially.</p>
+
+
+
+<a name="558235624"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558235624" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558235624">(Nov 19 2025 at 15:33)</a>:</h4>
+<p>At a high level, the host is looping until all tasks exit.  In the case of this particular test, that will only happen once the host tasks representing calls to <code>local:local/sleep#sleep-millis</code> complete, at which point the caller of each host task will receive a <code>returned</code> event and exit.</p>
+
+
+
+<a name="558235823"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558235823" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558235823">(Nov 19 2025 at 15:34)</a>:</h4>
+<p>Again, though, any questions about the details of the Python code will have to be addressed by Luke.  I haven't studied it in detail.</p>
+
+
+
+<a name="558239449"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558239449" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558239449">(Nov 19 2025 at 15:47)</a>:</h4>
+<p>So in the Rust code, from what I can see is that it:</p>
+<ul>
+<li>breaks out of the loop of reading and interpreting results</li>
+<li>joins the guest waitable to the old set</li>
+<li>resets to the calling task</li>
+</ul>
+<p>This is fine, but if I'm correct, this means that the subtask that was reparented is now being called in <code>Store::poll_until</code> via <code>do_run_concurrent()</code> -- is that right? </p>
+<p>Assuming what I've said above is right (minus the creating new subtasks part early on!) the thing I was getting at is that there's nowhere in the spec that it notes to break out of that callback result interpretation loop bit and "just" run the subtask to completion.</p>
+
+
+
+<a name="558241321"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558241321" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558241321">(Nov 19 2025 at 15:54)</a>:</h4>
+<p><span class="user-mention" data-user-id="598440">@Victor Adossi</span> spec-wise, the way that subtasks "keep running" even after having returned their value to the caller is that that callback loop runs in a new <code>Thread</code> created at the end of <code>canon_lift</code> and the <code>Store</code> has a list of all threads that are waiting to run and it runs them (via <code>Store.tick</code>) until there are no more left (which, it sounds like, is what Wasmtime is doing too)</p>
+
+
+
+<a name="558241389"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558241389" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558241389">(Nov 19 2025 at 15:54)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="598440">Victor Adossi</span> <a href="#narrow/channel/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return/near/558239449">said</a>:</p>
+<blockquote>
+<p>This is fine, but if I'm correct, this means that the subtask that was reparented is now being called in <code>Store::poll_until</code> via <code>do_run_concurrent()</code> -- is that right?</p>
+</blockquote>
+<p>Yeah, once the subtask is inherited by the host, it and its subtasks become (or more accurately, <em>remain</em>) part of the general set of work-to-do stored in <code>ConcurrentState</code> and iterated on in <code>poll_until</code></p>
+
+
+
+<a name="558241436"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558241436" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558241436">(Nov 19 2025 at 15:55)</a>:</h4>
+<p>The way I could see this making sense in the current spec is if this was <code>Thread#resume</code> <em>but</em> the problem still stands that I don't see how you get out of that loop</p>
+
+
+
+<a name="558241751"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558241751" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558241751">(Nov 19 2025 at 15:56)</a>:</h4>
+<p>Yup so <span class="user-mention" data-user-id="253998">@Luke Wagner</span> this is what I'm doing, but my problem is how do you get out of that callback execution loop that I posted earlier -- it depends on having a pending event set on the subtask to keep executing it</p>
+
+
+
+<a name="558242051"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558242051" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558242051">(Nov 19 2025 at 15:57)</a>:</h4>
+<p>The callback execution loop of a <code>Task</code> doesn't have any knowledge of a caller's <code>Subtask</code> (in fact, in the host-calls-component scenario, there <em>is</em> no caller <code>Subtask</code>)</p>
+
+
+
+<a name="558242132"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558242132" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558242132">(Nov 19 2025 at 15:57)</a>:</h4>
+<p>My problem is that the spec makes it seem like the thread's work <em>is</em> that callback execution and result processing loop (until you get an <code>EventCode.EXIT</code>).</p>
+
+
+
+<a name="558242188"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558242188" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558242188">(Nov 19 2025 at 15:57)</a>:</h4>
+<p>And yeah we're talking about a guest-&gt; guest call here</p>
+
+
+
+<a name="558242306"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558242306" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558242306">(Nov 19 2025 at 15:58)</a>:</h4>
+<p>the host-call to the component exits immediately basically, and a guest-&gt;guest component call lingers in the background being executed</p>
+
+
+
+<a name="558242499"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558242499" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558242499">(Nov 19 2025 at 15:58)</a>:</h4>
+<p>Yes, well, the thread's work is the callback execution.  The caller's <code>Subtask</code> isn't important; the callback execution loop just calls the <code>on_start</code> and <code>on_resolve</code> callbacks whenever it wants to and it's someone else's business of how to materialize the args and handle the results</p>
+
+
+
+<a name="558242550"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558242550" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558242550">(Nov 19 2025 at 15:58)</a>:</h4>
+<p>The <code>canon_lift</code> for that guest-&gt;guest call dictates AFAICT that we call the callback until we get an exit</p>
+
+
+
+<a name="558242606"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558242606" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558242606">(Nov 19 2025 at 15:59)</a>:</h4>
+<p>Correct</p>
+
+
+
+<a name="558242655"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558242655" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558242655">(Nov 19 2025 at 15:59)</a>:</h4>
+<p>And in host-&gt;guest</p>
+
+
+
+<a name="558242719"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558242719" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558242719">(Nov 19 2025 at 15:59)</a>:</h4>
+<p>Yup! So my problem is that I'm currently stuck in the <code>wait_until</code> branch</p>
+
+
+
+<a name="558242820"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558242820" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558242820">(Nov 19 2025 at 15:59)</a>:</h4>
+<p>Because the only time we set a pending event is <code>on-start()</code> (the first time we start executing, that's good for ONE pass through the</p>
+
+
+
+<a name="558242926"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558242926" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558242926">(Nov 19 2025 at 16:00)</a>:</h4>
+<p>And we'll never call <code>on_resolve()</code> because we never get to run the callback again and find out it's completed</p>
+
+
+
+<a name="558243020"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558243020" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558243020">(Nov 19 2025 at 16:00)</a>:</h4>
+<p>Basically, there needs to be another call to <code>on_progress()</code> somewhere</p>
+
+
+
+<a name="558243253"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558243253" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558243253">(Nov 19 2025 at 16:01)</a>:</h4>
+<p>as far as I can tell anyway. </p>
+<p>Once you look at the pending event (via function) once, it's wiped -- it gets reset to <code>None</code></p>
+
+
+
+<a name="558243284"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558243284" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558243284">(Nov 19 2025 at 16:01)</a>:</h4>
+<p>Why isn't a <code>Waitable</code> in the <code>WaitableSet</code> passed to <code>wait_until</code> being set with a pending event?</p>
+
+
+
+<a name="558243452"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558243452" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558243452">(Nov 19 2025 at 16:02)</a>:</h4>
+<p>That should happen independently of the callback loop that is waiting on the <code>WaitableSet</code></p>
+
+
+
+<a name="558243484"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558243484" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558243484">(Nov 19 2025 at 16:02)</a>:</h4>
+<p>So the pending event is set once, due to <code>on_start()</code> being called (and resultingly <code>on_progress()</code></p>
+
+
+
+<a name="558243542"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558243542" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558243542">(Nov 19 2025 at 16:02)</a>:</h4>
+<p>Ah sorry meeting! brb</p>
+
+
+
+<a name="558243988"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558243988" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558243988">(Nov 19 2025 at 16:04)</a>:</h4>
+<p>It sounds like maybe you're conflating the <code>on_progress</code> events of a task A (which would be delivered to the <em>super</em>task of A) with the <code>on_progress</code> events of a <em>sub</em>task of A.  The callback loop of A can never be waiting on A's own events.</p>
+
+
+
+<a name="558245610"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558245610" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558245610">(Nov 19 2025 at 16:09)</a>:</h4>
+<p>OK, meeting finished early -- I guess the first clarifying question I'd ask is what is the loop that the subtask is supposed to be in?</p>
+<p><code>canon_lower</code> <em>sets</em> the <code>Subtask</code>'s <code>callee</code> w/ <code>on_progress</code></p>
+
+
+
+<a name="558245790"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558245790" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558245790">(Nov 19 2025 at 16:10)</a>:</h4>
+<p>I should say, <code>on_progress</code> via <code>on_start</code> and <code>on_resolve</code></p>
+
+
+
+<a name="558245842"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558245842" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558245842">(Nov 19 2025 at 16:10)</a>:</h4>
+<p>This line: </p>
+<div class="codehilite" data-code-language="Python"><pre><span></span><code>   <span class="n">subtask</span><span class="o">.</span><span class="n">callee</span> <span class="o">=</span> <span class="n">callee</span><span class="p">(</span><span class="n">thread</span><span class="o">.</span><span class="n">task</span><span class="p">,</span> <span class="n">on_start</span><span class="p">,</span> <span class="n">on_resolve</span><span class="p">)</span>
+</code></pre></div>
+
+
+
+<a name="558246936"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558246936" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558246936">(Nov 19 2025 at 16:14)</a>:</h4>
+<p>Does <code>subtask.callee()</code> just get called in a loop somewhere? The <code>Subtask()</code> class does not seem to drive itself AFAICT -- so what I was understanding was that the <em>task</em>'s callback loop is what drives that to completion (I'll call this the "callback &amp; check" loop). </p>
+<p>The thread that is running all this <em>is running</em> that callback &amp; check loop (AFAICT)</p>
+
+
+
+<a name="558247488"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558247488" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558247488">(Nov 19 2025 at 16:16)</a>:</h4>
+<p>So with what I have written now, here's what happens:</p>
+<ol start="0">
+<li>
+<p>Host-&gt;Guest call runs, <code>task.return</code>s quickly, host gets a response.</p>
+<p>- The <code>Thread</code>'s run loop is still going (we haven't gotten a <code>CallbackCode.EXIT</code> yet)<br>
+  - AFTER the <code>task.return</code>, the <code>AsyncStartCall</code> for the guest-&gt;guest call starts </p>
+</li>
+<li>
+<p>The initial callback call returns the code <code>2</code> (i.e. wait) and the waitable rep to watch is <code>1</code>, the new <code>Subtask</code> itself</p>
+</li>
+<li><code>wait_until</code> spits out <code>{ code: State.Subtask, index: 1, result: 1 }</code>which makes sense because we have to wait for that spawned subtask, and the task is <code>STARTED</code> (<code>result</code>) -- the pending event fn was cleared for this</li>
+<li>The callback is run a second time, and returns the unpacked code <code>2</code> (wait) w/ waitable <code>1</code> (the subtask) -- this all makes sense</li>
+<li>We get into the <em>second</em> <code>wait_until()</code>, and the task will never resolve because we never re-set the pending event:</li>
+</ol>
+
+
+
+<a name="558247880"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558247880" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558247880">(Nov 19 2025 at 16:17)</a>:</h4>
+<p>The line <code>subtask.callee = callee(thread.task, on_start, on_resolve)</code> runs <code>callee</code> in a separate <code>Thread</code> so it can run its own event loop (or not... it can run synchronously or, in the future, as a stackful coroutine) and call <code>on_start</code>/<code>on_resolve</code> either synchronously or at some point in the future</p>
+
+
+
+<a name="558248650"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558248650" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558248650">(Nov 19 2025 at 16:20)</a>:</h4>
+<p>So in that sequence, after 4, what I'd expect is that the subtask (later, concurrently, from its own <code>Thread</code>) calls <code>on_resolve</code> which calls <code>on_progress</code> which re-sets the pending event on the <code>Subtask</code> and thus turns the waiting event loop</p>
+
+
+
+<a name="558248899"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558248899" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558248899">(Nov 19 2025 at 16:21)</a>:</h4>
+<p>OK, so that looks to be the bit I'm missing -- maybe that <code>callee(...)</code> like should be <code>Store#invoke</code> ?</p>
+
+
+
+<a name="558249007"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558249007" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558249007">(Nov 19 2025 at 16:22)</a>:</h4>
+<p>Also, it's not clear that spawns a new thread that just... calls the callee forever/what the loop governing that behavior should be</p>
+
+
+
+<a name="558250541"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558250541" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558250541">(Nov 19 2025 at 16:27)</a>:</h4>
+<p>AH OK, I got it: </p>
+<blockquote>
+<p>Critically, calling a <code>FuncInst</code> never "blocks" (i.e., waits on I/O); if the callee <em>would</em> block, the <code>FuncInst</code> immediately returns a <code>Call</code> object representing the ongoing asynchronous and internally creates a <code>Thread</code> that can make progress via <code>Store.tick</code>.</p>
+</blockquote>
+
+
+
+<a name="558252215"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558252215" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558252215">(Nov 19 2025 at 16:34)</a>:</h4>
+<p>Thanks, I think this is what I was missing -- the <code>Subtask</code> needs to start a completely separate <code>Thread</code> that  calls the callee repeatedly in a loop <em>and</em> calls the <code>on_start()</code> and <code>on_resolve()</code> hooks. </p>
+<p>So this line:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">subtask</span><span class="p">.</span><span class="n">callee</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">callee</span><span class="p">(</span><span class="n">thread</span><span class="p">.</span><span class="n">task</span><span class="p">,</span><span class="w"> </span><span class="n">on_start</span><span class="p">,</span><span class="w"> </span><span class="n">on_resolve</span><span class="p">)</span>
+</code></pre></div>
+<p>Is more like: </p>
+<ol>
+<li>Start new Thread (set super task to prevent re-entrance)</li>
+<li>In the body of the thread:<p>- Run <code>on_start()</code><br>
+  - Run <code>callee</code> in a tight loop... suspending after every one iteration? <br>
+  - once <code>callee</code> finished, run <code>on_resolve()</code></p>
+</li>
+</ol>
+
+
+
+<a name="558252613"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558252613" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558252613">(Nov 19 2025 at 16:35)</a>:</h4>
+<p>Almost: <code>on_resolve</code> is called somewhere during the loop, and the loop keeps running until <code>EXIT</code> is returned</p>
+
+
+
+<a name="558252727"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558252727" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558252727">(Nov 19 2025 at 16:35)</a>:</h4>
+<p>yes -- so the <code>on_resolve</code> would be called after <code>task.return</code> got called from the guest -&gt; guest call</p>
+
+
+
+<a name="558252792"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558252792" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558252792">(Nov 19 2025 at 16:35)</a>:</h4>
+<p>I'm calling that "once <code>callee</code> finished"</p>
+
+
+
+<a name="558253128"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558253128" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558253128">(Nov 19 2025 at 16:37)</a>:</h4>
+<p>I'd say that the <code>task.return</code> built-in synchronously calls <code>on_resolve</code> which sets a pending event on any guest caller's <code>Waitable</code> and also does all the lowering shenanigans (calling <code>realloc</code>, copying return values, etc)</p>
+
+
+
+<a name="558253320"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558253320" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558253320">(Nov 19 2025 at 16:38)</a>:</h4>
+<p>OK yup, that's definitely how I understand it</p>
+
+
+
+<a name="558253441"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558253441" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558253441">(Nov 19 2025 at 16:38)</a>:</h4>
+<p>One clarification as well though -- that "tight loop" is supposed to be interpreting the <code>callee</code> results as well, no?</p>
+
+
+
+<a name="558253789"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558253789" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558253789">(Nov 19 2025 at 16:40)</a>:</h4>
+<p>How do you mean "interpreting the <code>callee</code> results"?</p>
+
+
+
+<a name="558254347"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558254347" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558254347">(Nov 19 2025 at 16:42)</a>:</h4>
+<p>I meant similarly to the other callback and check loop -- so when in this other thread I call the <code>callee</code> (which is an async callback) I was thinking I should be unpacking that result</p>
+
+
+
+<a name="558254429"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558254429" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558254429">(Nov 19 2025 at 16:43)</a>:</h4>
+<p>not the <code>task.return</code> result obviously the direct async status/code result</p>
+
+
+
+<a name="558254753"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558254753" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558254753">(Nov 19 2025 at 16:44)</a>:</h4>
+<p>Ah, yes, the loop in that thread unpacks the <code>i32</code> return value of the lifted <code>callee</code> core function and the <code>callback</code> function (in a loop)</p>
+
+
+
+<a name="558254817"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558254817" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558254817">(Nov 19 2025 at 16:45)</a>:</h4>
+<p>Yeah, so I basically need a second version of that loop in the new Thread</p>
+
+
+
+<a name="558255195"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558255195" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558255195">(Nov 19 2025 at 16:45)</a>:</h4>
+<p>Yeah, there's one logical event loop per <code>async callback</code>-lifted function invocation</p>
+
+
+
+<a name="558255369"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558255369" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558255369">(Nov 19 2025 at 16:46)</a>:</h4>
+<p>I had something similar before, but again this gets me to the problem of what <code>wait_until</code></p>
+
+
+
+<a name="558255931"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558255931" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558255931">(Nov 19 2025 at 16:48)</a>:</h4>
+<p>When that new <code>Thread</code> gets called the first time, we call <code>on_start()</code> and set the pending event. </p>
+<p>IF inside the thread we're doing the callback &amp; check loop, we're going to get stuck, because only the first pending event will allow us to progress (the second time we enter the <code>wait_until</code> branch, there's no pending event). </p>
+<p>BUT if inside that loop we're <em>NOT</em> doing callback and check, and we're just running the callback, then in this case enough <code>tick</code>s will get it to eventually call <code>on_resolve()</code> (the component is just waiting a set amount of time)</p>
+
+
+
+<a name="558256654"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558256654" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558256654">(Nov 19 2025 at 16:52)</a>:</h4>
+<blockquote>
+<p>When that new <code>Thread</code> gets called the first time, we call <code>on_start()</code> and set the pending event.</p>
+</blockquote>
+<p>Technically, the <code>Task.enter</code> hits backpressure, it can suspend before calling <code>on_start</code>, such that an <code>async</code> caller will receive a subtask in the initial <code>STARTING</code> state.</p>
+
+
+
+<a name="558256761"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558256761" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558256761">(Nov 19 2025 at 16:52)</a>:</h4>
+<p>So I guess what I'm getting at is -- I think the <code>Thread</code> that <code>FuncInst</code> is supposed to create anew might need it's semantics spelled out -- it doesn't seem like the semantics should be the exact same as the Task</p>
+
+
+
+<a name="558256798"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558256798" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558256798">(Nov 19 2025 at 16:52)</a>:</h4>
+<p>I don't follow this "getting stuck" case...</p>
+
+
+
+<a name="558256817"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558256817" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558256817">(Nov 19 2025 at 16:52)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="253998">Luke Wagner</span> <a href="#narrow/channel/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return/near/558256654">said</a>:</p>
+<blockquote>
+<blockquote>
+<p>When that new <code>Thread</code> gets called the first time, we call <code>on_start()</code> and set the pending event.</p>
+</blockquote>
+<p>Technically, the <code>Task.enter</code> hits backpressure, it can suspend before calling <code>on_start</code>, such that an <code>async</code> caller will receive a subtask in the initial <code>STARTING</code> state.</p>
+</blockquote>
+<p>Ah I will keep this in mind</p>
+
+
+
+<a name="558256903"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558256903" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558256903">(Nov 19 2025 at 16:53)</a>:</h4>
+<p>Ah, so OK, it's this flow: </p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="mf">0.</span><span class="w"> </span><span class="n">The</span><span class="w"> </span><span class="n">initial</span><span class="w"> </span><span class="n">callback</span><span class="w"> </span><span class="n">call</span><span class="w"> </span><span class="n">returns</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">code</span><span class="w"> </span><span class="err">`</span><span class="mi">2</span><span class="err">`</span><span class="w"> </span><span class="p">(</span><span class="n">i</span><span class="p">.</span><span class="n">e</span><span class="p">.</span><span class="w"> </span><span class="n">wait</span><span class="p">)</span><span class="w"> </span><span class="n">and</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">waitable</span><span class="w"> </span><span class="n">rep</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">watch</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="err">`</span><span class="mi">1</span><span class="err">`</span><span class="p">,</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">new</span><span class="w"> </span><span class="err">`</span><span class="n">Subtask</span><span class="err">`</span><span class="w"> </span><span class="n">itself</span>
+
+<span class="mf">1.</span><span class="w"> </span><span class="err">`</span><span class="n">wait_until</span><span class="err">`</span><span class="w"> </span><span class="n">spits</span><span class="w"> </span><span class="n">out</span><span class="w"> </span><span class="err">`</span><span class="p">{</span><span class="w"> </span><span class="n">code</span><span class="p">:</span><span class="w"> </span><span class="nc">State</span><span class="p">.</span><span class="n">Subtask</span><span class="p">,</span><span class="w"> </span><span class="n">index</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="n">result</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="p">}</span><span class="err">`</span><span class="n">which</span><span class="w"> </span><span class="n">makes</span><span class="w"> </span><span class="n">sense</span><span class="w"> </span><span class="n">because</span><span class="w"> </span><span class="n">we</span><span class="w"> </span><span class="n">have</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">wait</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">that</span><span class="w"> </span><span class="n">spawned</span><span class="w"> </span><span class="n">subtask</span><span class="p">,</span><span class="w"> </span><span class="n">and</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">task</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="err">`</span><span class="n">STARTED</span><span class="err">`</span><span class="w"> </span><span class="p">(</span><span class="err">`</span><span class="n">result</span><span class="err">`</span><span class="p">)</span><span class="w"> </span><span class="o">--</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">pending</span><span class="w"> </span><span class="n">event</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">was</span><span class="w"> </span><span class="n">cleared</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">this</span>
+<span class="mf">2.</span><span class="w"> </span><span class="n">The</span><span class="w"> </span><span class="n">callback</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="n">second</span><span class="w"> </span><span class="n">time</span><span class="p">,</span><span class="w"> </span><span class="n">and</span><span class="w"> </span><span class="n">returns</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">unpacked</span><span class="w"> </span><span class="n">code</span><span class="w"> </span><span class="err">`</span><span class="mi">2</span><span class="err">`</span><span class="w"> </span><span class="p">(</span><span class="n">wait</span><span class="p">)</span><span class="w"> </span><span class="n">w</span><span class="o">/</span><span class="w"> </span><span class="n">waitable</span><span class="w"> </span><span class="err">`</span><span class="mi">1</span><span class="err">`</span><span class="w"> </span><span class="p">(</span><span class="n">the</span><span class="w"> </span><span class="n">subtask</span><span class="p">)</span><span class="w"> </span><span class="o">--</span><span class="w"> </span><span class="n">this</span><span class="w"> </span><span class="n">all</span><span class="w"> </span><span class="n">makes</span><span class="w"> </span><span class="n">sense</span>
+<span class="mf">3.</span><span class="w"> </span><span class="n">We</span><span class="w"> </span><span class="n">get</span><span class="w"> </span><span class="n">into</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="o">*</span><span class="n">second</span><span class="o">*</span><span class="w"> </span><span class="err">`</span><span class="n">wait_until</span><span class="p">()</span><span class="err">`</span><span class="p">,</span><span class="w"> </span><span class="n">and</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">task</span><span class="w"> </span><span class="n">will</span><span class="w"> </span><span class="n">never</span><span class="w"> </span><span class="n">resolve</span><span class="w"> </span><span class="n">because</span><span class="w"> </span><span class="n">we</span><span class="w"> </span><span class="n">never</span><span class="w"> </span><span class="n">re</span><span class="o">-</span><span class="n">set</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">pending</span><span class="w"> </span><span class="n">event</span><span class="p">:</span>
+</code></pre></div>
+
+
+
+<a name="558256942"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558256942" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558256942">(Nov 19 2025 at 16:53)</a>:</h4>
+<p>The semantics is spelled out by <code>canon_lift</code>: in guest-to-guest calls, <code>callee</code> is a curried <code>canon_lift</code> closure</p>
+
+
+
+<a name="558257465"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558257465" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558257465">(Nov 19 2025 at 16:55)</a>:</h4>
+<p>I don't see why you're saying in step 3 that the pending event is never re-set... it gets re-set when <code>on_resolve</code> gets called by the subtask (at some point in time in the future)</p>
+
+
+
+<a name="558257471"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558257471" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558257471">(Nov 19 2025 at 16:56)</a>:</h4>
+<p>Yup, that would make sense, and that is what makes me think that we need a similar "callback &amp; check" loop. </p>
+<p>The problem is, when I do the callback and check loop, I fall into the situation above. </p>
+<p>It seemed to me like wasmtime was just running the callback (I assume I am wrong here) until it completed, but I haven't seen exactly what they do for this case other than just calling the callback repeatedly/polling the future until it's done.</p>
+
+
+
+<a name="558257643"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558257643" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558257643">(Nov 19 2025 at 16:56)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="253998">Luke Wagner</span> <a href="#narrow/channel/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return/near/558257465">said</a>:</p>
+<blockquote>
+<p>I don't see why you're saying in step 3 that the pending event is never re-set... it gets re-set when <code>on_resolve</code> gets called by the subtask (at some point in time in the future)</p>
+</blockquote>
+<p>Hmmn, do you have time to get on a quick call? that might be higher bandwidth!</p>
+
+
+
+<a name="558257729"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558257729" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558257729">(Nov 19 2025 at 16:57)</a>:</h4>
+<p>(FWIW, I assume we're talking in the spec/Python terms, not how you're implementing this in JS)</p>
+
+
+
+<a name="558257740"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558257740" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558257740">(Nov 19 2025 at 16:57)</a>:</h4>
+<p>Yeah, you bet</p>
+
+
+
+<a name="558257760"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Resolving%20subtasks%20after%20parent%20task%20return/near/558257760" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Resolving.20subtasks.20after.20parent.20task.20return.html#558257760">(Nov 19 2025 at 16:57)</a>:</h4>
+<p>one sec...</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

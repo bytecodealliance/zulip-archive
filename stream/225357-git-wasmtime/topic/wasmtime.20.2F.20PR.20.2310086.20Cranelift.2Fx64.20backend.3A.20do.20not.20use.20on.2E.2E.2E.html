@@ -1,0 +1,188 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #10086 Cranelift/x64 backend: do not use on... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310086.20Cranelift.2Fx64.20backend.3A.20do.20not.20use.20on.2E.2E.2E.html">wasmtime / PR #10086 Cranelift/x64 backend: do not use on...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="495396300"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310086%20Cranelift/x64%20backend%3A%20do%20not%20use%20on.../near/495396300" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310086.20Cranelift.2Fx64.20backend.3A.20do.20not.20use.20on.2E.2E.2E.html#495396300">(Jan 23 2025 at 00:07)</a>:</h4>
+<p><strong>cfallin</strong> requested <a href="https://github.com/fitzgen">fitzgen</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/10086">PR #10086</a>.</p>
+
+
+
+<a name="495396301"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310086%20Cranelift/x64%20backend%3A%20do%20not%20use%20on.../near/495396301" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310086.20Cranelift.2Fx64.20backend.3A.20do.20not.20use.20on.2E.2E.2E.html#495396301">(Jan 23 2025 at 00:07)</a>:</h4>
+<p><strong>cfallin</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/10086">PR #10086</a>.</p>
+
+
+
+<a name="495396302"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310086%20Cranelift/x64%20backend%3A%20do%20not%20use%20on.../near/495396302" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310086.20Cranelift.2Fx64.20backend.3A.20do.20not.20use.20on.2E.2E.2E.html#495396302">(Jan 23 2025 at 00:07)</a>:</h4>
+<p>cfallin opened <a href="https://github.com/bytecodealliance/wasmtime/pull/10086">PR #10086</a> from <code>cfallin:lets-keep-our-basic-blocks-basic</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>In #9980, we saw that code copmiled with the single-pass register allocator has incorrect behavior. We eventually narrowed this down to the fact that the single-pass allocator is inserting code meant to be at the end of a block, just before its terminator, <em>between</em> two branches that form the terminator sequence. The allocator is correct; the bug is with Cranelift's x64 backend.</p>
+<p>When we produce instructions into a VCode container, we maintain basic blocks, and we have the invariant (usual for basic block-based IR) that only the last -- terminator -- instruction is a branch that can leave the block. Even the conditional branches maintain this invariant: though VCode is meant to be "almost machine code", we emit <em>two-target conditionals</em> that are semantically like "jcond; jmp". We then are able to optimize this inline during binary emission in the <code>MachBuffer</code>: the buffer knows about unconditional and conditional branches and will "chomp" branches off the tail of the buffer whenever they target the fallthrough block. (We designed the system this way because it is simpler to think about BBs that are order-invariant, i.e., not bake the "fallthrough" concept into the IR.) Thus we have a simpler abstraction but produce optimal terminator sequences.</p>
+<p>Unfortunately, when adding a branch-on-floating-point-compare lowering, we had the need to branch to a target if either of <em>two</em> conditions were true, and rather than add a new kind of terminator instruction, we added a "one-armed branch": conditionally branch to label or fall through. We emitted this in sequence right before the actual terminator, so semantically it was almost equivalent.</p>
+<p>I write "almost" because the register allocator <em>is</em> allowed to insert spills/reloads/moves between any two instructions. Here the distinct pieces of the terminator sequence matter: the allocator might insert something just before the last instruction, assuming the basic-block "single in, single out" invariant means this will always run with the block. With one-armed branches this is no longer true.</p>
+<p>The backtracking allocator (our original RA2 algorithm, and still the default today) will never insert code at the end of a block when it has multiple terminators, because it associates such block-start/end insertions with <em>edges</em>; so in such conditions it inserts instructions into the tops of successor blocks instead. But the single-pass allocator needs to perform work at the end of every block, so it will trigger this bug.</p>
+<p>This PR removes <code>JmpIf</code> and converts the br-of-fcmp lowering to use <code>JmpCondOr</code> instead, which is a pseudoinstruction that does <code>jcc1; jcc2; jmp</code>. This maintains the BB invariant and fixes the bug.</p>
+<p>Note that Winch still uses <code>JmpIf</code>, so we cannot remove it entirely: this PR renames it to <code>WinchJmpIf</code> instead, and adds a mechanism to assert failure if it is ever added to <code>VCode</code> (rather than emitted directly, as Winch's macro-assembler does). We could instead write Winch's <code>jmp_if</code> assembler function in terms of <code>JmpCond</code> with a fallthrough label that is immediately bound, and let the MachBuffer always chomp the jmp; I opted not to regress Winch compiler performance by doing this. If one day we abstract out the assembler further, we can remove <code>WinchJmpIf</code>.</p>
+<p>This is one of two instances of a "one-armed branch"; the other is s390x's <code>OneWayCondBr</code>, used in <code>br_table</code> lowerings, which we will address separately. Once we do, that will address #9980 entirely.</p>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+</blockquote>
+
+
+
+<a name="495396632"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310086%20Cranelift/x64%20backend%3A%20do%20not%20use%20on.../near/495396632" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310086.20Cranelift.2Fx64.20backend.3A.20do.20not.20use.20on.2E.2E.2E.html#495396632">(Jan 23 2025 at 00:10)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/10086">PR #10086</a>.</p>
+
+
+
+<a name="495396699"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310086%20Cranelift/x64%20backend%3A%20do%20not%20use%20on.../near/495396699" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310086.20Cranelift.2Fx64.20backend.3A.20do.20not.20use.20on.2E.2E.2E.html#495396699">(Jan 23 2025 at 00:11)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/10086#issuecomment-2608540027">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/10086">PR #10086</a>:</p>
+<blockquote>
+<p>(Thanks to @alexcrichton and others for bottoming this out into the root cause; discussed earlier today in the Cranelift meeting.)</p>
+</blockquote>
+
+
+
+<a name="495396720"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310086%20Cranelift/x64%20backend%3A%20do%20not%20use%20on.../near/495396720" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310086.20Cranelift.2Fx64.20backend.3A.20do.20not.20use.20on.2E.2E.2E.html#495396720">(Jan 23 2025 at 00:11)</a>:</h4>
+<p>cfallin edited <a href="https://github.com/bytecodealliance/wasmtime/pull/10086">PR #10086</a>:</p>
+<blockquote>
+<p>In #9980, we saw that code compiled with the single-pass register allocator has incorrect behavior. We eventually narrowed this down to the fact that the single-pass allocator is inserting code meant to be at the end of a block, just before its terminator, <em>between</em> two branches that form the terminator sequence. The allocator is correct; the bug is with Cranelift's x64 backend.</p>
+<p>When we produce instructions into a VCode container, we maintain basic blocks, and we have the invariant (usual for basic block-based IR) that only the last -- terminator -- instruction is a branch that can leave the block. Even the conditional branches maintain this invariant: though VCode is meant to be "almost machine code", we emit <em>two-target conditionals</em> that are semantically like "jcond; jmp". We then are able to optimize this inline during binary emission in the <code>MachBuffer</code>: the buffer knows about unconditional and conditional branches and will "chomp" branches off the tail of the buffer whenever they target the fallthrough block. (We designed the system this way because it is simpler to think about BBs that are order-invariant, i.e., not bake the "fallthrough" concept into the IR.) Thus we have a simpler abstraction but produce optimal terminator sequences.</p>
+<p>Unfortunately, when adding a branch-on-floating-point-compare lowering, we had the need to branch to a target if either of <em>two</em> conditions were true, and rather than add a new kind of terminator instruction, we added a "one-armed branch": conditionally branch to label or fall through. We emitted this in sequence right before the actual terminator, so semantically it was almost equivalent.</p>
+<p>I write "almost" because the register allocator <em>is</em> allowed to insert spills/reloads/moves between any two instructions. Here the distinct pieces of the terminator sequence matter: the allocator might insert something just before the last instruction, assuming the basic-block "single in, single out" invariant means this will always run with the block. With one-armed branches this is no longer true.</p>
+<p>The backtracking allocator (our original RA2 algorithm, and still the default today) will never insert code at the end of a block when it has multiple terminators, because it associates such block-start/end insertions with <em>edges</em>; so in such conditions it inserts instructions into the tops of successor blocks instead. But the single-pass allocator needs to perform work at the end of every block, so it will trigger this bug.</p>
+<p>This PR removes <code>JmpIf</code> and converts the br-of-fcmp lowering to use <code>JmpCondOr</code> instead, which is a pseudoinstruction that does <code>jcc1; jcc2; jmp</code>. This maintains the BB invariant and fixes the bug.</p>
+<p>Note that Winch still uses <code>JmpIf</code>, so we cannot remove it entirely: this PR renames it to <code>WinchJmpIf</code> instead, and adds a mechanism to assert failure if it is ever added to <code>VCode</code> (rather than emitted directly, as Winch's macro-assembler does). We could instead write Winch's <code>jmp_if</code> assembler function in terms of <code>JmpCond</code> with a fallthrough label that is immediately bound, and let the MachBuffer always chomp the jmp; I opted not to regress Winch compiler performance by doing this. If one day we abstract out the assembler further, we can remove <code>WinchJmpIf</code>.</p>
+<p>This is one of two instances of a "one-armed branch"; the other is s390x's <code>OneWayCondBr</code>, used in <code>br_table</code> lowerings, which we will address separately. Once we do, that will address #9980 entirely.</p>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+</blockquote>
+
+
+
+<a name="495398130"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310086%20Cranelift/x64%20backend%3A%20do%20not%20use%20on.../near/495398130" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310086.20Cranelift.2Fx64.20backend.3A.20do.20not.20use.20on.2E.2E.2E.html#495398130">(Jan 23 2025 at 00:26)</a>:</h4>
+<p>fitzgen submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/10086#pullrequestreview-2568584751">PR review</a>:</p>
+<blockquote>
+<p>Very nice! Thanks for trying to be defensive with the low-level branching instruction bits as well. Kind of annoying that we are dealing with that. Hopefully a separate assembler library will help here...</p>
+</blockquote>
+
+
+
+<a name="495398131"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310086%20Cranelift/x64%20backend%3A%20do%20not%20use%20on.../near/495398131" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310086.20Cranelift.2Fx64.20backend.3A.20do.20not.20use.20on.2E.2E.2E.html#495398131">(Jan 23 2025 at 00:26)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/10086#discussion_r1926170456">PR review comment</a>:</p>
+<blockquote>
+<p>Mind writing a test for this case where all three branches can get chomped and replaced with a fallthrough?</p>
+</blockquote>
+
+
+
+<a name="495408783"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310086%20Cranelift/x64%20backend%3A%20do%20not%20use%20on.../near/495408783" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310086.20Cranelift.2Fx64.20backend.3A.20do.20not.20use.20on.2E.2E.2E.html#495408783">(Jan 23 2025 at 02:06)</a>:</h4>
+<p>github-actions[bot] <a href="https://github.com/bytecodealliance/wasmtime/pull/10086#issuecomment-2608695373">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/10086">PR #10086</a>:</p>
+<blockquote>
+<h4>Subscribe to Label Action</h4>
+<p>cc @saulecabrera</p>
+<p>&lt;details&gt;<br>
+This issue or pull request has been labeled: "cranelift", "cranelift:area:machinst", "cranelift:area:x64", "winch"</p>
+<p>Thus the following users have been cc'd because of the following labels:</p>
+<ul>
+<li>saulecabrera: winch</li>
+</ul>
+<p>To subscribe or unsubscribe from this label, edit the &lt;code&gt;.github/subscribe-to-label.json&lt;/code&gt; configuration file.</p>
+<p><a href="https://github.com/bytecodealliance/subscribe-to-label-action">Learn more.</a><br>
+&lt;/details&gt;</p>
+</blockquote>
+
+
+
+<a name="495408794"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310086%20Cranelift/x64%20backend%3A%20do%20not%20use%20on.../near/495408794" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310086.20Cranelift.2Fx64.20backend.3A.20do.20not.20use.20on.2E.2E.2E.html#495408794">(Jan 23 2025 at 02:06)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/10086">PR #10086</a>.</p>
+
+
+
+<a name="495409126"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310086%20Cranelift/x64%20backend%3A%20do%20not%20use%20on.../near/495409126" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310086.20Cranelift.2Fx64.20backend.3A.20do.20not.20use.20on.2E.2E.2E.html#495409126">(Jan 23 2025 at 02:10)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/10086">PR #10086</a>.</p>
+
+
+
+<a name="495409193"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310086%20Cranelift/x64%20backend%3A%20do%20not%20use%20on.../near/495409193" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310086.20Cranelift.2Fx64.20backend.3A.20do.20not.20use.20on.2E.2E.2E.html#495409193">(Jan 23 2025 at 02:11)</a>:</h4>
+<p>cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/10086#pullrequestreview-2568714658">PR review</a>.</p>
+
+
+
+<a name="495409194"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310086%20Cranelift/x64%20backend%3A%20do%20not%20use%20on.../near/495409194" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310086.20Cranelift.2Fx64.20backend.3A.20do.20not.20use.20on.2E.2E.2E.html#495409194">(Jan 23 2025 at 02:11)</a>:</h4>
+<p>cfallin created <a href="https://github.com/bytecodealliance/wasmtime/pull/10086#discussion_r1926261360">PR review comment</a>:</p>
+<blockquote>
+<p>Done! It ends up chomping five branches in a row due to critical-edge splitting actually (two edges from one block to another; the edge blocks end up empty) which is neat to see.</p>
+</blockquote>
+
+
+
+<a name="495409387"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310086%20Cranelift/x64%20backend%3A%20do%20not%20use%20on.../near/495409387" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310086.20Cranelift.2Fx64.20backend.3A.20do.20not.20use.20on.2E.2E.2E.html#495409387">(Jan 23 2025 at 02:12)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/10086">PR #10086</a>.</p>
+
+
+
+<a name="495409548"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310086%20Cranelift/x64%20backend%3A%20do%20not%20use%20on.../near/495409548" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310086.20Cranelift.2Fx64.20backend.3A.20do.20not.20use.20on.2E.2E.2E.html#495409548">(Jan 23 2025 at 02:14)</a>:</h4>
+<p>cfallin has enabled auto merge for <a href="https://github.com/bytecodealliance/wasmtime/pull/10086">PR #10086</a>.</p>
+
+
+
+<a name="495413210"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2310086%20Cranelift/x64%20backend%3A%20do%20not%20use%20on.../near/495413210" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2310086.20Cranelift.2Fx64.20backend.3A.20do.20not.20use.20on.2E.2E.2E.html#495413210">(Jan 23 2025 at 02:50)</a>:</h4>
+<p>cfallin merged <a href="https://github.com/bytecodealliance/wasmtime/pull/10086">PR #10086</a>.</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

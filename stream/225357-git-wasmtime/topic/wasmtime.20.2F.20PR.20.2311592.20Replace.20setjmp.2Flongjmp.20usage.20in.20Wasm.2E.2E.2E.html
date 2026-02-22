@@ -1,0 +1,542 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #11592 Replace setjmp/longjmp usage in Wasm... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html">wasmtime / PR #11592 Replace setjmp/longjmp usage in Wasm...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="537351289"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537351289" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537351289">(Sep 02 2025 at 19:28)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a> from <code>alexcrichton:trampoline-try-call</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>Since Wasmtime's inception it's used the <code>setjmp</code> and <code>longjmp</code><br>
+functions in C to implement handling of traps. While this solution was<br>
+easy to implement, relatively portable, and performant enough, there are<br>
+a number of downsides that have evolved over time to make this an<br>
+unattractive approach in the long run:</p>
+<ul>
+<li>
+<p>Using <code>setjmp</code> fundamentally requires using C because Rust does not<br>
+  understand a function that returns twice. It's fundamentally unsound<br>
+  to invoke <code>setjmp</code> in Rust meaning that Wasmtime has forever needed a<br>
+  C compiler configured and set up to build. This notably means that<br>
+<code>cargo check</code> cannot check other targets easily.</p>
+</li>
+<li>
+<p>Using <code>longjmp</code> means that Rust function frames are unwound on the<br>
+  stack without running destructors. This is a dangerous operation of<br>
+  which we get no protection from the compiler about. Both frames<br>
+  entering wasm and frames exiting wasm are all skipped. Absolutely<br>
+  minimizing this has been beneficial for portability to platforms such<br>
+  as Pulley.</p>
+</li>
+<li>
+<p>Currently the no_std implementation of Wasmtime requires embedders to<br>
+  provide <code>wasmtime_{setjmp,longjmp}</code> which is a thorn in the side of<br>
+  what is otherwise a mostly entirely independent implementation of<br>
+  Wasmtime.</p>
+</li>
+<li>
+<p>There is a performance floor to using <code>setjmp</code> and <code>longjmp</code>. Calling<br>
+<code>setjmp</code> requires using C but Wasmtime is otherwise written in Rust<br>
+  meaning that there's a Rust-&gt;C-&gt;Rust-&gt;Wasm boundary which<br>
+  fundamentally can't be inlined without cross-language LTO which is<br>
+  difficult to configure.</p>
+</li>
+<li>
+<p>With the implementation of the WebAssembly exceptions proposal<br>
+  Wasmtime now has two means of unwinding the stack. Ideally Wasmtime<br>
+  would only have one, and the more general one is the method of<br>
+  exceptions.</p>
+</li>
+<li>
+<p>Jumping out of a signal handler on Unix is tricky business. While<br>
+  we've made it work it's generally most robust of the signal handler<br>
+  simply returns which it now does.</p>
+</li>
+</ul>
+<p>With all of that in mind the purpose of this commit is to replace the<br>
+setjmp/longjmp mechanism of handling traps with the recently implemented<br>
+support for exceptions in Cranelift. That is intended to resolve all of<br>
+the above points in one swoop.</p>
+<p>One point in particular though that's nice about setjmp/longjmp is that<br>
+unwinding the stack on a trap is an O(1) operation. For situations such<br>
+as stack overflow that's a particularly nice property to have as we can<br>
+guarantee embedders that traps are a constant time (albeit somewhat<br>
+expensive with signals) operation. Exceptions naively require unwinding<br>
+the entire stack, and although frame pointers mean we're just traversing<br>
+a linked list I wanted to preserve the O(1) property here nonetheless.<br>
+To achieve this a solution is implemented where the array-to-wasm<br>
+(host-to-wasm) trampolines setup state in <code>VMStoreContext</code> so looking up<br>
+the current trap handler frame is an O(1) operation. Namely the sp/fp/pc<br>
+values for a <code>Handler</code> are stored inline.</p>
+<p>Implementing this feature required supporting<br>
+relocations-to-offsets-in-functions which was not previously supported<br>
+by Wasmtime. This required Cranelift refactorings such as <a href="https://github.com/bytecodealliance/wasmtime/pull/11570">https://github.com/bytecodealliance/wasmtime/pull/11570</a>, <a href="https://github.com/bytecodealliance/wasmtime/pull/11585">https://github.com/bytecodealliance/wasmtime/pull/11585</a>,<br>
+and <a href="https://github.com/bytecodealliance/wasmtime/pull/11576">https://github.com/bytecodealliance/wasmtime/pull/11576</a>. This then additionally required some more refactoring in<br>
+this commit which was difficult to split out as it otherwise wouldn't be<br>
+tested.</p>
+<p>Apart from the relocation-related business much of this change is about<br>
+updating the platform signal handlers to use exceptions instead of<br>
+longjmp to return. For example on Unix this means updating the<br>
+<code>ucontext_t</code> with register values that the handler specifies. Windows<br>
+involves updating similar contexts, and macOS mach ports ended up not<br>
+needing too many changes.</p>
+<p>In terms of overall performance the relevant benchmark from this<br>
+repository, compared to before this commit, is:</p>
+<div class="codehilite"><pre><span></span><code>sync/no-hook/core - host-to-wasm - typed - nop
+            time:   [10.552 ns 10.561 ns 10.571 ns]
+            change: [−7.5238% −7.4011% −7.2786%] (p = 0.00 &lt; 0.05)
+            Performance has improved.
+</code></pre></div>
+
+<p>Closes <a href="https://github.com/bytecodealliance/wasmtime/issues/3927">https://github.com/bytecodealliance/wasmtime/issues/3927</a><br>
+cc <a href="https://github.com/bytecodealliance/wasmtime/issues/10923">https://github.com/bytecodealliance/wasmtime/issues/10923</a></p>
+</blockquote>
+
+
+
+<a name="537351290"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537351290" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537351290">(Sep 02 2025 at 19:28)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/abrown">abrown</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537351291"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537351291" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537351291">(Sep 02 2025 at 19:28)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537351293"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537351293" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537351293">(Sep 02 2025 at 19:28)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/dicej">dicej</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537351294"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537351294" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537351294">(Sep 02 2025 at 19:28)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537351300"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537351300" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537351300">(Sep 02 2025 at 19:28)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-default-reviewers">wasmtime-default-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537351420"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537351420" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537351420">(Sep 02 2025 at 19:28)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#issuecomment-3246537250">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>:</p>
+<blockquote>
+<p>Procedurally this is stacked on <a href="https://github.com/bytecodealliance/wasmtime/pull/11585">https://github.com/bytecodealliance/wasmtime/pull/11585</a>, <a href="https://github.com/bytecodealliance/wasmtime/pull/11577">https://github.com/bytecodealliance/wasmtime/pull/11577</a>, and <a href="https://github.com/bytecodealliance/wasmtime/pull/11576">https://github.com/bytecodealliance/wasmtime/pull/11576</a> at this time. I expect this to have a bit of a gauntlet on CI, however, so I wanted to get working on that sooner rather than later.</p>
+</blockquote>
+
+
+
+<a name="537354902"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537354902" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537354902">(Sep 02 2025 at 19:54)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537372117"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537372117" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537372117">(Sep 02 2025 at 22:16)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537375545"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537375545" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537375545">(Sep 02 2025 at 22:56)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537376267"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537376267" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537376267">(Sep 02 2025 at 23:04)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537490544"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537490544" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537490544">(Sep 03 2025 at 14:34)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537491114"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537491114" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537491114">(Sep 03 2025 at 14:38)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537509910"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537509910" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537509910">(Sep 03 2025 at 16:06)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537526971"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537526971" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537526971">(Sep 03 2025 at 17:45)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537526991"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537526991" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537526991">(Sep 03 2025 at 17:45)</a>:</h4>
+<p>alexcrichton edited a <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#issuecomment-3246537250">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>:</p>
+<blockquote>
+<p>Procedurally this is stacked on <del>https://github.com/bytecodealliance/wasmtime/pull/11585</del>, <a href="https://github.com/bytecodealliance/wasmtime/pull/11577">https://github.com/bytecodealliance/wasmtime/pull/11577</a>, and <del>https://github.com/bytecodealliance/wasmtime/pull/11576</del> at this time. I expect this to have a bit of a gauntlet on CI, however, so I wanted to get working on that sooner rather than later.</p>
+</blockquote>
+
+
+
+<a name="537553535"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537553535" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537553535">(Sep 03 2025 at 20:59)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537553571"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537553571" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537553571">(Sep 03 2025 at 20:59)</a>:</h4>
+<p>alexcrichton edited a <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#issuecomment-3246537250">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>:</p>
+<blockquote>
+<p>Procedurally this is stacked on <del>https://github.com/bytecodealliance/wasmtime/pull/11585</del>, <del>https://github.com/bytecodealliance/wasmtime/pull/11577</del>, and <del>https://github.com/bytecodealliance/wasmtime/pull/11576</del> at this time. I expect this to have a bit of a gauntlet on CI, however, so I wanted to get working on that sooner rather than later.</p>
+</blockquote>
+
+
+
+<a name="537554868"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537554868" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537554868">(Sep 03 2025 at 21:09)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#pullrequestreview-3182478503">PR review</a>.</p>
+
+
+
+<a name="537554869"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537554869" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537554869">(Sep 03 2025 at 21:09)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#discussion_r2320203576">PR review comment</a>:</p>
+<blockquote>
+<p>For review this is particularly noteworthy, I had to enable this because when we compile for Winch now the entry trampolines (system ABI) are calling a Winch-defined function (winch ABI). The <code>try_call</code> being done requires that the callee ABI (here: Winch) needs to support exceptions. </p>
+<p>I don't fully understand the implications of this flag, but I updated the aarch64/x64 backends to explicitly say that exceptions + winch clobbers all registers (like tail + winch). I'm not sure if there's more that needs be done, however.</p>
+</blockquote>
+
+
+
+<a name="537554870"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537554870" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537554870">(Sep 03 2025 at 21:09)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#discussion_r2320222722">PR review comment</a>:</p>
+<blockquote>
+<p>This is an example of trampolines getting significantly larger than before. It might worthwhile to invest some effort in making a new set of trampolines where we have something like all static entrypoints have their normal trampoline signature they have today, but internally they dispatch to a signature-specific trampoline which takes the function-to-call as a function pointer. That way we'd effectively deduplicate trampolines at least per-signature as we used to do.</p>
+</blockquote>
+
+
+
+<a name="537554871"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537554871" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537554871">(Sep 03 2025 at 21:09)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#discussion_r2320216179">PR review comment</a>:</p>
+<blockquote>
+<p>For review this is me from 3 years ago causing pain for myself. Years ago we switched from the <code>winapi</code> crate to the <code>windows-sys</code> crate. During that transition I found that the <code>windows-sys</code> crate, at the time, did not have <code>EXCEPTION_CONTINUE_{SEARCH,EXECUTION}</code> defined. It did, however, have <code>ExceptionContinue{Search,Execution}</code>. Being the naive little flower I am I assumed that this was some sort of mistake in the bindings and the values were all the same. Turns out this has always been wrong but it hasn't mattered since we practically never used <code>ExceptionContinueExecution</code> (only used for embedding-handled signals, which folks do sometimes on Linux but basically never on Windows).</p>
+<p>Turns out that <code>ExceptionContinue{Search,Execution}</code> have different values than <code>EXCEPTION_CONTINUE_{SEARCH,EXECUTION}</code> and they're both interpreted as "continue search". It's basically a bit of a miracle this never broke before now. In this PR though we're actually using <code>EXCEPTION_CONTINUE_EXECUTION</code> which required this change.</p>
+</blockquote>
+
+
+
+<a name="537554872"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537554872" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537554872">(Sep 03 2025 at 21:09)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#discussion_r2320218969">PR review comment</a>:</p>
+<blockquote>
+<p>This is another consequence of this PR, the single-pass register allocator effectively no longer works with Wasmtime because it has issues with exceptions and Wasmtime unconditionally uses <code>try_call</code> for trampolines. This manifested in tests as crashes so I've disabled the usage in various tests.</p>
+</blockquote>
+
+
+
+<a name="537554873"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537554873" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537554873">(Sep 03 2025 at 21:09)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#discussion_r2320224348">PR review comment</a>:</p>
+<blockquote>
+<p>This test is to double-check that we don't accidentally ever run exception handlers on traps now that we're almost implementing traps with exceptions.</p>
+</blockquote>
+
+
+
+<a name="537555079"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537555079" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537555079">(Sep 03 2025 at 21:11)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537556519"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537556519" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537556519">(Sep 03 2025 at 21:23)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537568604"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537568604" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537568604">(Sep 03 2025 at 23:44)</a>:</h4>
+<p>github-actions[bot] <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#issuecomment-3251144061">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>:</p>
+<blockquote>
+<h4>Label Messager: wasmtime:config</h4>
+<p>It looks like you are changing Wasmtime's configuration options. Make sure to<br>
+complete this check list:</p>
+<ul>
+<li>
+<p>[ ] If you added a new <code>Config</code> method, you wrote extensive documentation for<br>
+      it.</p>
+<p>&lt;details&gt;</p>
+<p>Our documentation should be of the following form:</p>
+<p>```text<br>
+Short, simple summary sentence.</p>
+<p>More details. These details can be multiple paragraphs. There should be<br>
+information about not just the method, but its parameters and results as<br>
+well.</p>
+<p>Is this method fallible? If so, when can it return an error?</p>
+<p>Can this method panic? If so, when does it panic?</p>
+<h1>Example</h1>
+<p>Optional example here.<br>
+```</p>
+<p>&lt;/details&gt;</p>
+</li>
+<li>
+<p>[ ] If you added a new <code>Config</code> method, or modified an existing one, you<br>
+  ensured that this configuration is exercised by the fuzz targets.</p>
+<p>&lt;details&gt;</p>
+<p>For example, if you expose a new strategy for allocating the next instance<br>
+slot inside the pooling allocator, you should ensure that at least one of our<br>
+fuzz targets exercises that new strategy.</p>
+<p>Often, all that is required of you is to ensure that there is a knob for this<br>
+configuration option in [<code>wasmtime_fuzzing::Config</code>][fuzzing-config] (or one<br>
+of its nested <code>struct</code>s).</p>
+<p>Rarely, this may require authoring a new fuzz target to specifically test this<br>
+configuration. See [our docs on fuzzing][fuzzing-docs] for more details.</p>
+<p>&lt;/details&gt;</p>
+</li>
+<li>
+<p>[ ] If you are enabling a configuration option by default, make sure that it<br>
+  has been fuzzed for at least two weeks before turning it on by default.</p>
+</li>
+</ul>
+<p>[fuzzing-config]: <a href="https://github.com/bytecodealliance/wasmtime/blob/ca0e8d0a1d8cefc0496dba2f77a670571d8fdcab/crates/fuzzing/src/generators.rs#L182-L194">https://github.com/bytecodealliance/wasmtime/blob/ca0e8d0a1d8cefc0496dba2f77a670571d8fdcab/crates/fuzzing/src/generators.rs#L182-L194</a><br>
+[fuzzing-docs]: <a href="https://docs.wasmtime.dev/contributing-fuzzing.html">https://docs.wasmtime.dev/contributing-fuzzing.html</a></p>
+<hr>
+<p>&lt;details&gt;</p>
+<p>To modify this label's message, edit the &lt;code&gt;.github/label-messager/wasmtime-config.md&lt;/code&gt; file.</p>
+<p>To add new label messages or remove existing label messages, edit the<br>
+&lt;code&gt;.github/label-messager.json&lt;/code&gt; configuration file.</p>
+<p><a href="https://github.com/bytecodealliance/label-messager-action">Learn more.</a></p>
+<p>&lt;/details&gt;</p>
+</blockquote>
+
+
+
+<a name="537579519"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537579519" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537579519">(Sep 04 2025 at 02:29)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537579920"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537579920" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537579920">(Sep 04 2025 at 02:34)</a>:</h4>
+<p><strong>alexcrichton</strong> has marked <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a> as ready for review.</p>
+
+
+
+<a name="537579997"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537579997" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537579997">(Sep 04 2025 at 02:35)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/fitzgen">fitzgen</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537579998"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537579998" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537579998">(Sep 04 2025 at 02:35)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/cfallin">cfallin</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537753806"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537753806" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537753806">(Sep 04 2025 at 21:00)</a>:</h4>
+<p>cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#pullrequestreview-3187106660">PR review</a>:</p>
+<blockquote>
+<p>This is fantastic -- thanks for pushing toward the "unwinds only within Cranelift frames" goal!</p>
+<p>Overall this all looks fine, with a few exceptions (no pun intended) around the handling of trap-handler addresses/relocations and the relocation hacks here. It's <em>workable</em> (and I left some comments on the MachBuffer changes below if we end up going this way) but I suspect there might be a simpler approach...</p>
+<p>First: I think the handler address is always within the current function (there's an assert saying so), right? Then it seems like we shouldn't need to wait until we're using the text-section builder and working across functions to resolve the reference, channeling through the relocations mechanism; rather, it seems like we should be able to take the address of an exception handler target directly, and lower to an instruction/pair of instructions with the right <code>LabelUse</code>s, never creating <code>Reloc</code>s.</p>
+<p>What I'm thinking is that an <code>exception_handler_address</code> CLIF operator, taking a block entity, could directly give us what we need. It's a property of the <code>try_call</code> lowering that we <a href="https://github.com/bytecodealliance/wasmtime/blob/e3561d515f1c217c80c634a12c17d6797ce1332a/cranelift/codegen/src/machinst/abi.rs#L2515">directly pass through the label</a> and <a href="https://github.com/bytecodealliance/wasmtime/blob/e3561d515f1c217c80c634a12c17d6797ce1332a/cranelift/codegen/src/machinst/buffer.rs#L1817">use that label to get an offset</a>, so there is no "magic glue" between the <code>try_call</code> and the block -- in the lowering we can just get the block address directly by using the appropriate <code>LabelUse</code>(s).</p>
+<p>That would remove the slightly brittle "take the one and only exception handler in this trampoline" logic, the special relocation and special <code>FuncKey</code>, the magic late-resolved labels and offset/addend stuff, and make things generally much cleaner I think.</p>
+<p>What do you think?</p>
+</blockquote>
+
+
+
+<a name="537753808"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537753808" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537753808">(Sep 04 2025 at 21:00)</a>:</h4>
+<p>cfallin created <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#discussion_r2323491567">PR review comment</a>:</p>
+<blockquote>
+<p>The code in <code>buffer.rs</code> is a little idiosyncratic in that it has an embedded informal correctness proof, but at the risk of being a slightly annoying reviewer, I think it's worth extending the correctness arguments here to really make sure we get it right...</p>
+<p>I was starting to write out a sketch of an argument that we can say "invariants don't matter when called from <code>finish()</code> but that can invoke forced veneer creation that then calls into much of the rest of the mechanisms here so I'm not super-confident actually. I think it's fine because <code>optimize_branches</code> is the step that makes the invariants load-bearing, and the text-section builder doesn't invoke that after <code>finish</code> like the VCode pipeline does <a href="https://github.com/bytecodealliance/wasmtime/blob/e3561d515f1c217c80c634a12c17d6797ce1332a/cranelift/codegen/src/machinst/vcode.rs#L1083-L1085">here</a>, but that's a fairly distributed and brittle argument. I think the fact that in practice the labels you bind late are not at the very end of the buffer may also be load-bearing here.</p>
+<p>I think what I'd rather see here is that <code>bind_label</code> becomes <code>bind_label_at_offset</code> with its whole body intact (and add a surface <code>bind_label</code> that delegates), and we do the labels-at-tail updates and optimize-branches step only if <code>offset == self.cur_offset()</code>. What do you think?</p>
+</blockquote>
+
+
+
+<a name="537753809"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537753809" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537753809">(Sep 04 2025 at 21:00)</a>:</h4>
+<p>cfallin created <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#discussion_r2323449577">PR review comment</a>:</p>
+<blockquote>
+<p>This is only used in the verifier, so I think this is fine practically. Semantically, we more or less have defined exception throws in the Winch ABI by virtue of adding the clobber and payload definitions -- so we now "support" it, even though the Winch-the-compiler doesn't yet have lowerings for any of the opcodes.</p>
+</blockquote>
+
+
+
+<a name="537769723"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537769723" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537769723">(Sep 04 2025 at 23:24)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#issuecomment-3256320933">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>:</p>
+<blockquote>
+<blockquote>
+<p>What I'm thinking is that an <code>exception_handler_address</code> CLIF operator</p>
+</blockquote>
+<p>I definitely agree this would be nicer, but can you sketch out more fully what you're thinking? For example this would need to come before a <code>try_call</code> and I'm not aware of anything else in CLIF where you'd want to refer to a label as a value (e.g. like <code>label_addr block0</code> or something). I've been under the impression that adding something a bit more first-class in Cranelift would be a pretty big lift and not necessarily worth it for this case where a "special reloc" worked well enough (you're right though that there's no need to defer until the end of the <code>MachBuffer</code> building, I think it could be done sooner)</p>
+</blockquote>
+
+
+
+<a name="537770070"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537770070" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537770070">(Sep 04 2025 at 23:29)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#pullrequestreview-3187537091">PR review</a>.</p>
+
+
+
+<a name="537770071"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537770071" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537770071">(Sep 04 2025 at 23:29)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#discussion_r2323744128">PR review comment</a>:</p>
+<blockquote>
+<p>To make sure I understand, you're saying revert this PR's changes, add an <code>offset</code> parameter to <code>bind_label</code> and only apply the optimizations if it's <code>cur_offset</code>, and then add a new method <code>bind_label_at_current_offset</code> as a helper for setting the <code>offset</code> parameter to <code>self.cur_offset</code> (or similarly bikeshedded)?</p>
+<p>That all sounds reasonable to me yeah, I'd also be fine asserting that the labels are all empty since I think during text section creation we never hit those paths. If you're confident that running the optimizations is safe to only do conditionally though I'm happy to change to that too</p>
+</blockquote>
+
+
+
+<a name="537770447"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537770447" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537770447">(Sep 04 2025 at 23:34)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#issuecomment-3256372699">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>:</p>
+<blockquote>
+<p>Right, it would more or less be that -- an operator that takes a <code>Block</code> as an argument; and we define its semantics to be: return the address of the handler that would be placed in exception-table metadata if this block were an exception handler. I suppose it also needs an ABI for that exception transfer, and we check the signature as we do for <code>try_call</code>. So something like</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">v1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">exception_handler_address</span><span class="w"> </span><span class="n">winch</span><span class="w"> </span><span class="n">block1</span>
+</code></pre></div>
+<p>could appear anywhere in the function, and would lower to the ADRP/ADR, or LEA, or whatever is appropriate on the target.</p>
+<p>I'm happy to whip this up tomorrow or late tonight if you like (about to disappear for the day right now)...</p>
+</blockquote>
+
+
+
+<a name="537771142"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537771142" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537771142">(Sep 04 2025 at 23:41)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="537786693"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537786693" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537786693">(Sep 05 2025 at 03:14)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#issuecomment-3256937607">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>:</p>
+<blockquote>
+<p>Is it reasonable to expect Cranelift to always provide the guarantee that an exceptional entrypoint can be purely based on a block name alone? I would have expected that what we really want here is an identification of an edge, or a <code>try_call</code> plus <code>block</code> pair, as opposed to just the <code>block</code>. Otherwise if we're comfortable going just with blocks, how come <code>exception_handler_address</code> would be needed vs a bare <code>v1 = block_addr block2</code>?</p>
+<p>I suppose put another way, if you wouldn't mind sketching this out I'd appreciate that. I'm having a bit of a block imagining what this would look like in CLIF but I fear I'm shackled by my current understanding of CLIF. This isn't that urgent though so don't feel the need to drop everything to sketch this out.</p>
+</blockquote>
+
+
+
+<a name="537796503"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537796503" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537796503">(Sep 05 2025 at 05:32)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#issuecomment-3257123586">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>:</p>
+<blockquote>
+<blockquote>
+<p>Is it reasonable to expect Cranelift to always provide the guarantee that an exceptional entrypoint can be purely based on a block name alone? I would have expected that what we really want here is an identification of an edge, or a <code>try_call</code> plus <code>block</code> pair, as opposed to just the <code>block</code>. Otherwise if we're comfortable going just with blocks, how come <code>exception_handler_address</code> would be needed vs a bare <code>v1 = block_addr block2</code>?</p>
+<p>I suppose put another way, if you wouldn't mind sketching this out I'd appreciate that. I'm having a bit of a block imagining what this would look like in CLIF but I fear I'm shackled by my current understanding of CLIF. This isn't that urgent though so don't feel the need to drop everything to sketch this out.</p>
+</blockquote>
+<p>So I dove down the surprisingly deep rabbithole <a href="https://github.com/bytecodealliance/wasmtime/commit/15825ab953f458034a3b2e81f6b36f1f0d96ab81">here</a>, at least for x64 (other backends left as an exercise for the reader...).</p>
+<p>You're right that one actually needs to identify the edge, not the handler block; I ended up spec'ing the instruction to take a raw block entity reference to the <em>callsite</em> block (the one that ends with <code>try_call</code>) and an immediate indicating which out-edge. Then given that, the idea is it gives exactly the PC that the exception table gives for that handler edge.</p>
+<p>Now that I wrote it out I'm not sure if I like it any better than the relocation-with-fake-external-<code>FuncKey</code> hack that you have here, though. It is more direct at least. I'll flesh it out for the other four backends and put up a PR if you'd like. Or if not, the one thing I would say about this PR is that, for avoidance of potential for subtle correctness bugs or unexpected coupling later, I'd prefer that we resolve the reloc eagerly after function compilation rather than add the deferred-label-resolution mechanism to the <code>MachBuffer</code> -- that's the part that sketches me out the most honestly. Thoughts?</p>
+</blockquote>
+
+
+
+<a name="537882344"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537882344" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537882344">(Sep 05 2025 at 14:21)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#issuecomment-3258538261">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>:</p>
+<blockquote>
+<blockquote>
+<p>I'd prefer that we resolve the reloc eagerly after function compilation</p>
+</blockquote>
+<p>For this I'd defintely be ok switching to this behavior, but I'm not sure how to implement this. From Cranelift's perspective it just sees a <code>symbol_addr</code> with some opaque symbol and it's later embedder-specific knowlege "oh yeah that symbol is in the function here". Given that the function is completely finished by the time it's learned what the label is bound to, so no matter what the <code>MachBuffer</code> would need to support "bind this label at this offset which isn't necessarily the current offset".</p>
+<p>Were you thinking something else though? Or did you have an idea of how this would get plumbed to the <code>MachBuffer</code> during construction?</p>
+</blockquote>
+
+
+
+<a name="537884024"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537884024" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537884024">(Sep 05 2025 at 14:30)</a>:</h4>
+<p>bjorn3 <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#issuecomment-3258565946">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>:</p>
+<blockquote>
+<blockquote>
+<p>v1 = exception_handler_address winch block1</p>
+</blockquote>
+<p>You could emulate this in the frontend as <code>v1 = symbol_value gv1</code> where <code>gv1</code> gets a relocation applied immediately after compilation based on the exception table Cranelift emits, right?</p>
+</blockquote>
+
+
+
+<a name="537894946"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537894946" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537894946">(Sep 05 2025 at 15:24)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#issuecomment-3258773018">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>:</p>
+<blockquote>
+<p>I believe that's more-or-less what this PR does already though. Supporting that requires a bind-this-label-at-this-offset mechanism in <code>MachBuffer</code> which it seems @cfallin would prefer to avoid</p>
+</blockquote>
+
+
+
+<a name="537907802"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/537907802" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#537907802">(Sep 05 2025 at 16:34)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#issuecomment-3258973717">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>:</p>
+<blockquote>
+<p>Hmm, yeah, if we don't adopt the <code>get_exception_handler_address</code> approach from my branch above, I was imagining a more direct approach where we process the relocs directly as they come out of Cranelift -- the key is not using the deferred-label mechanism, because I am not actually sure that it is correct in all cases (it violates the invariants at least on paper, but right at the end of processing, but there are edge cases that could still possibly happen wrt island insertion).</p>
+<p>Basically rather than converting the reloc to a label we would apply the reloc directly into the slice of function body. Given that we know the offset of the start of the function and the offset of the exception handler at that point we should have everything we need I think.</p>
+<p>That said, I think it's probably best I finish other backends on my branch and put up a PR for the first-class operator instead -- it's a more straightforward design (even if a slightly heavy lift to add the new instruction format). Will do that shortly!</p>
+</blockquote>
+
+
+
+<a name="538108625"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/538108625" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#538108625">(Sep 07 2025 at 22:13)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<a name="538108767"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/538108767" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#538108767">(Sep 07 2025 at 22:15)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#issuecomment-3264106178">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>:</p>
+<blockquote>
+<p>Updated now to incorporate the work from <a href="https://github.com/bytecodealliance/wasmtime/pull/11629">https://github.com/bytecodealliance/wasmtime/pull/11629</a></p>
+</blockquote>
+
+
+
+<a name="538112864"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/538112864" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#538112864">(Sep 07 2025 at 23:54)</a>:</h4>
+<p>cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11592#pullrequestreview-3194659634">PR review</a>:</p>
+<blockquote>
+<p>Looks great -- thanks for the patience!</p>
+</blockquote>
+
+
+
+<a name="538248516"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311592%20Replace%20setjmp/longjmp%20usage%20in%20Wasm.../near/538248516" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311592.20Replace.20setjmp.2Flongjmp.20usage.20in.20Wasm.2E.2E.2E.html#538248516">(Sep 08 2025 at 14:57)</a>:</h4>
+<p>alexcrichton merged <a href="https://github.com/bytecodealliance/wasmtime/pull/11592">PR #11592</a>.</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

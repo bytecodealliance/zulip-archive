@@ -1,0 +1,95 @@
+<html>
+<head><meta charset="utf-8"><title>Reclaiming Linear Memory on Instance destruction · wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/index.html">wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Reclaiming.20Linear.20Memory.20on.20Instance.20destruction.html">Reclaiming Linear Memory on Instance destruction</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="574546971"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Reclaiming%20Linear%20Memory%20on%20Instance%20destruction/near/574546971" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Antoine Lavandier <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Reclaiming.20Linear.20Memory.20on.20Instance.20destruction.html#574546971">(Feb 18 2026 at 16:09)</a>:</h4>
+<p>Is there a way to reclaim the linear memory used by an Instance (Component or Module) without destroying the <code>Store</code> ?<br>
+The use case is a service where people can publish, update and run wasm code running on micro controllers. Right now all of the instances belong to the same store so if I update the same capsule over and over (destroying the instance and rebuilding it) at some point since the store is never destroyed wasmtime panics (in my testing at `src/runtime/vm/mmap_vec.rs:72:18). <br>
+Is there a way to:</p>
+<ul>
+<li>Reclaim the memory without destroying the store</li>
+<li>If not, at least gracefully fail instead of panicking<br>
+Also, the functions <code>MmapVec::new_externally_owned</code>/<code>Mmap::from_raw</code> seem like they could be part of the solution. Is there an example of usage somewhere that I could take inspiration from ? </li>
+</ul>
+<p>Wasmtime version is <code>42.0</code> at rev <code>3dc6b5ec5572ab8b304c668d5b929bbc7f49cbcf</code></p>
+
+
+
+<a name="574551642"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Reclaiming%20Linear%20Memory%20on%20Instance%20destruction/near/574551642" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Reclaiming.20Linear.20Memory.20on.20Instance.20destruction.html#574551642">(Feb 18 2026 at 16:28)</a>:</h4>
+<p>No, the <code>Store</code> is meant to be cheap to create and freshly created for each unit of work you have -- "request", or an update lifecycle, or whatever. Unfortunately there's no way to remove an instance from a store once created (doing so would greatly complicate our index-based handles; we'd need some kind of invalidation and/or GC)</p>
+
+
+
+<a name="574551756"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Reclaiming%20Linear%20Memory%20on%20Instance%20destruction/near/574551756" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Reclaiming.20Linear.20Memory.20on.20Instance.20destruction.html#574551756">(Feb 18 2026 at 16:29)</a>:</h4>
+<p>in your host code, is there a reason you can't create a new store each time you "destroy the instance and rebuild it"?</p>
+
+
+
+<a name="574554411"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Reclaiming%20Linear%20Memory%20on%20Instance%20destruction/near/574554411" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Antoine Lavandier <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Reclaiming.20Linear.20Memory.20on.20Instance.20destruction.html#574554411">(Feb 18 2026 at 16:40)</a>:</h4>
+<p>Right now I could do as you say (and will if it's the only option) but I have concerns: currently I have one store that "owns" all of my instances, to do what you propose, I would need to either have a) one store per instance or b) kill all of the instances, destroy the store, update the relevant bytecode, rebuild everything everytime I want to update the capsules. <br>
+a) has the following issues :</p>
+<ul>
+<li>What if my store data is non trivial and thus cloning isn't great. This is a lesser concern because I don't expect the store data to be big relative to the linear memory of the capsules. </li>
+<li>If at some point I want to support composing the modules/components then I run into an issue because I would need several instances on a single store. </li>
+</ul>
+<p>b) seems generally like a hassle and inefficient</p>
+
+
+
+<a name="574561468"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Reclaiming%20Linear%20Memory%20on%20Instance%20destruction/near/574561468" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> fitzgen (he/him) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Reclaiming.20Linear.20Memory.20on.20Instance.20destruction.html#574561468">(Feb 18 2026 at 17:09)</a>:</h4>
+<p><code>Store</code> is designed to be cheap to create and throw away, that is its main use case</p>
+
+
+
+<a name="574561737"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Reclaiming%20Linear%20Memory%20on%20Instance%20destruction/near/574561737" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> fitzgen (he/him) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Reclaiming.20Linear.20Memory.20on.20Instance.20destruction.html#574561737">(Feb 18 2026 at 17:10)</a>:</h4>
+<p>e.g. function-as-a-service platforms create one <code>Store</code> (and <code>Instance</code> within that store) per incoming HTTP request, and then throw it away when the HTTP request is completed; create a new <code>Store</code> for the next incoming HTTP request, etc...</p>
+
+
+
+<a name="574561902"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Reclaiming%20Linear%20Memory%20on%20Instance%20destruction/near/574561902" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Reclaiming.20Linear.20Memory.20on.20Instance.20destruction.html#574561902">(Feb 18 2026 at 17:11)</a>:</h4>
+<blockquote>
+<p>What if my store data is non trivial and thus cloning isn't great</p>
+</blockquote>
+<p>If there's shared data you need to reference from hostcalls on all stores, you could put it behind an <code>Arc</code> and share a reference to it? That's cheap to clone</p>
+<blockquote>
+<p>If at some point I want to support composing the modules/components then I run into an issue because I would need several instances on a single store.</p>
+</blockquote>
+<p>This one is interesting; having instances with different lifetimes in different stores talk to each other somehow is a plausible use-case. You can make this work with some host-side glue (an instance/function handle API basically)</p>
+
+
+
+<a name="574621312"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Reclaiming%20Linear%20Memory%20on%20Instance%20destruction/near/574621312" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Till Schneidereit <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Reclaiming.20Linear.20Memory.20on.20Instance.20destruction.html#574621312">(Feb 18 2026 at 23:12)</a>:</h4>
+<p>FWIW instances with different lifetimes are currently somewhat fundamentally not supported for composed components: there's no way to sever the link between one component's exports and another's imports, for one. The Component Model change intended to make this viable is described <a href="https://github.com/WebAssembly/component-model/blob/main/design/mvp/FutureFeatures.md#blast-zones">here</a>. Implementing this will certainly involve either a pretty substantial change in Wasmtime's architecture or (much more likely) using separate stores per "blast zone"</p>
+
+
+
+<a name="574694659"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Reclaiming%20Linear%20Memory%20on%20Instance%20destruction/near/574694659" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Antoine Lavandier <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Reclaiming.20Linear.20Memory.20on.20Instance.20destruction.html#574694659">(Feb 19 2026 at 10:33)</a>:</h4>
+<p>Thanks for the replies. I think that for now I'll just have multiple stores and deal with code composition when it becomes relevant. <br>
+Also, is there a way or a plan to make the panic go away ? I would prefer my service to reply with a non enough memory error than straight up crash ...</p>
+
+
+
+<a name="574760554"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Reclaiming%20Linear%20Memory%20on%20Instance%20destruction/near/574760554" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Reclaiming.20Linear.20Memory.20on.20Instance.20destruction.html#574760554">(Feb 19 2026 at 15:43)</a>:</h4>
+<p>I've sent <a href="https://github.com/bytecodealliance/wasmtime/pull/12625">https://github.com/bytecodealliance/wasmtime/pull/12625</a> to handle the panic by returning an error instead</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

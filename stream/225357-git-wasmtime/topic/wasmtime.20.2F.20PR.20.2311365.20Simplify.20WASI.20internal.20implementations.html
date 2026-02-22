@@ -1,0 +1,138 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #11365 Simplify WASI internal implementations · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311365.20Simplify.20WASI.20internal.20implementations.html">wasmtime / PR #11365 Simplify WASI internal implementations</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="532161620"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311365%20Simplify%20WASI%20internal%20implementations/near/532161620" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311365.20Simplify.20WASI.20internal.20implementations.html#532161620">(Jul 31 2025 at 20:24)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/pull/11365">PR #11365</a> from <code>alexcrichton:wasi-refactor</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>This commit migrates the WASIp2 implementation to be closer to the upcoming WASIp3 implementation in terms of how things are implemented internally. Previously the way things worked with WASIp2 is:</p>
+<ul>
+<li>Embedders call <code>add_to_linker</code> with <code>T: WasiView</code></li>
+<li>Internally <code>add_to_linker</code> is called which creates <code>WasiImpl&lt;&amp;mut T&gt;</code></li>
+<li>All internal implementations were <code>impl&lt;T&gt; Host for WasiImpl&lt;T&gt; where T: WasiView</code></li>
+<li>A forwarding impl of <code>impl&lt;T: WasiView&gt; WasiView for &amp;mut T</code> was required</li>
+</ul>
+<p>While this all worked it's a bit complicated for a few reasons:</p>
+<ol>
+<li>Dealing with generically named structures like <code>WasiImpl</code> (or <code>IoImpl</code> or <code>WasiHttpImpl</code>) is a bit baroque and not always obvious as to what's going on.</li>
+<li>The extra layer of generics in <code>impl&lt;T&gt; Host for WasiImpl&lt;T&gt;</code> adds a layer of conceptual indirection which is non-obvious.</li>
+<li>Other WASI proposal implementations do not use this strategy and instead use "view" types or <code>impl Host for TheType</code> for example.</li>
+<li>Internal incantations of <code>add_to_linker</code> had to deal with mixtures of <code>IoImpl</code> and <code>WasiImpl</code> and aligning everything just right.</li>
+<li>An extra layer of generics on all impls meant that everything was generic meaning that <code>wasmtime-wasi</code>-the-crate didn't generate much code, causing longer codegen times for consumers.</li>
+</ol>
+<p>The goal of this commit is to migrate towards the style of what WASIp3 is prototyping for how impls are modeled. This is done to increase the amount of code that can be shared between WASIp2 and WASIp3. This has a number of benefits such as being easier to understand and also being more modular where <code>wasi:clocks</code> implementations of traits don't require filesystem context to be present (as is the case today). This in theory helps a more mix-and-match paradigm of blending together various bits and pieces of <code>wasmtime-wasi</code> implementations.</p>
+<p>Concretely the changes made here are:</p>
+<ul>
+<li><code>WasiView</code> no longer inherits from <code>IoView</code>, they're unrelated traits now.</li>
+<li><code>WasiView</code> now returns <code>WasiViewCtx&lt;'a&gt;</code> which has <code>ctx: &amp;'a mut WasiCtx</code> and <code>table: &amp;'a mut ResourceTable</code>. That means it basically does the same thing before but in a slightly different fashion.</li>
+<li>Implementations of <code>Host</code> traits are now directly for <code>WasiCtxView&lt;'_&gt;</code> and don't involve any generics at all. These are hopefully easier to understand and also better from a codegen/compile-time perspective.</li>
+<li>Embedders no longer need to implement <code>IoView</code> directly and instead fold that functionality into <code>WasiView</code>.</li>
+<li><code>WasiHttpView</code> no longer inherits from <code>IoView</code> and instead has a direct <code>fn table</code> method. Additionally <code>WasiHttpImpl</code> no longer embeds <code>IoImpl</code> inside of it.</li>
+<li>Host traits for <code>wasi:io</code> are now implemented directly for <code>ResourceTable</code> instead of <code>IoImpl&lt;T&gt;</code>.</li>
+</ul>
+<p>The immediate goal of this refactoring is to enable more sharing along the lines of #11362. This was not possible prior because WASIp3 requires a simultaneous borrow on the table/ctx while the trait hierarchy previously gave you one-or-the-other. With this new organization it will be possible to get both at the same time meaning more structure/contexts/etc can be shared between implementations.</p>
+<p>prtest:full</p>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+</blockquote>
+
+
+
+<a name="532161621"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311365%20Simplify%20WASI%20internal%20implementations/near/532161621" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311365.20Simplify.20WASI.20internal.20implementations.html#532161621">(Jul 31 2025 at 20:24)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-wasi-reviewers">wasmtime-wasi-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11365">PR #11365</a>.</p>
+
+
+
+<a name="532161623"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311365%20Simplify%20WASI%20internal%20implementations/near/532161623" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311365.20Simplify.20WASI.20internal.20implementations.html#532161623">(Jul 31 2025 at 20:24)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11365">PR #11365</a>.</p>
+
+
+
+<a name="532161625"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311365%20Simplify%20WASI%20internal%20implementations/near/532161625" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311365.20Simplify.20WASI.20internal.20implementations.html#532161625">(Jul 31 2025 at 20:24)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/fitzgen">fitzgen</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11365">PR #11365</a>.</p>
+
+
+
+<a name="532161859"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311365%20Simplify%20WASI%20internal%20implementations/near/532161859" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311365.20Simplify.20WASI.20internal.20implementations.html#532161859">(Jul 31 2025 at 20:25)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/11365#issuecomment-3141242763">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11365">PR #11365</a>:</p>
+<blockquote>
+<p>I can sort of preemptively apologize to embedders about this. I feel like every few versions of Wasmtime we rejigger how WASI traits work and how the impls are set up. I feel like we continue to march towards something that fits for all use cases and feels right but this is inevitably an iterative progress where we can't leapfrog to the end.</p>
+<p>If anyone runs across this and has difficulty updating I'm happy to help out in updates, feel free to ping me on Zulip or here or an issue.</p>
+</blockquote>
+
+
+
+<a name="532170635"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311365%20Simplify%20WASI%20internal%20implementations/near/532170635" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311365.20Simplify.20WASI.20internal.20implementations.html#532170635">(Jul 31 2025 at 21:27)</a>:</h4>
+<p>pchickey submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11365#pullrequestreview-3076926255">PR review</a>.</p>
+
+
+
+<a name="532170878"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311365%20Simplify%20WASI%20internal%20implementations/near/532170878" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311365.20Simplify.20WASI.20internal.20implementations.html#532170878">(Jul 31 2025 at 21:29)</a>:</h4>
+<p>pchickey <a href="https://github.com/bytecodealliance/wasmtime/pull/11365#issuecomment-3141387626">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11365">PR #11365</a>:</p>
+<blockquote>
+<p>There are still some more places to thread through this change (CI found wasi-keyvalue) but the design change looks good. Glad this is possible now that we got rid of get_host for HasData.</p>
+</blockquote>
+
+
+
+<a name="532195760"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311365%20Simplify%20WASI%20internal%20implementations/near/532195760" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311365.20Simplify.20WASI.20internal.20implementations.html#532195760">(Aug 01 2025 at 00:46)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11365">PR #11365</a>.</p>
+
+
+
+<a name="532196099"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311365%20Simplify%20WASI%20internal%20implementations/near/532196099" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311365.20Simplify.20WASI.20internal.20implementations.html#532196099">(Aug 01 2025 at 00:48)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11365">PR #11365</a>.</p>
+
+
+
+<a name="532196113"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311365%20Simplify%20WASI%20internal%20implementations/near/532196113" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311365.20Simplify.20WASI.20internal.20implementations.html#532196113">(Aug 01 2025 at 00:48)</a>:</h4>
+<p>alexcrichton has enabled auto merge for <a href="https://github.com/bytecodealliance/wasmtime/pull/11365">PR #11365</a>.</p>
+
+
+
+<a name="532197382"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311365%20Simplify%20WASI%20internal%20implementations/near/532197382" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311365.20Simplify.20WASI.20internal.20implementations.html#532197382">(Aug 01 2025 at 01:00)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11365">PR #11365</a>.</p>
+
+
+
+<a name="532202965"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311365%20Simplify%20WASI%20internal%20implementations/near/532202965" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311365.20Simplify.20WASI.20internal.20implementations.html#532202965">(Aug 01 2025 at 01:48)</a>:</h4>
+<p>alexcrichton merged <a href="https://github.com/bytecodealliance/wasmtime/pull/11365">PR #11365</a>.</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

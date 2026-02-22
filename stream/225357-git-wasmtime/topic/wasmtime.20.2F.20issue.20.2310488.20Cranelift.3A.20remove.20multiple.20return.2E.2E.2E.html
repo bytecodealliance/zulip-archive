@@ -1,0 +1,196 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #10488 Cranelift: remove multiple return... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310488.20Cranelift.3A.20remove.20multiple.20return.2E.2E.2E.html">wasmtime / issue #10488 Cranelift: remove multiple return...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="508962196"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310488%20Cranelift%3A%20remove%20multiple%20return.../near/508962196" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310488.20Cranelift.3A.20remove.20multiple.20return.2E.2E.2E.html#508962196">(Mar 29 2025 at 22:08)</a>:</h4>
+<p>cfallin opened <a href="https://github.com/bytecodealliance/wasmtime/issues/10488">issue #10488</a>:</p>
+<blockquote>
+<p>I am currently implementing exception handling for Cranelift (<a href="https://github.com/cfallin/wasmtime/tree/lets-be-truly-exceptional">WIP branch</a>) and I believe I have hit a complexity wall that merits further discussion about Cranelift's IR design.</p>
+<p>Currently, we permit signatures to have arbitrary numbers of return values, and we lower these to use stack slots. This adds a nontrivial bit of complexity to ABI handling, but we manage. It means that after a true <code>call</code> instruction, we may have loads that are nominally part of the callsite but are separate VCode instructions.</p>
+<p>However, adding <code>try_call</code> instructions, which define return values as block-call args for their successors, has led me into a difficult spot when these extra "return-value instructions" exist -- I have tried all of the below approaches:</p>
+<ul>
+<li>We cannot emit these as instructions after the<code> try_call</code> in the same block, because the <code>try_call</code> is a terminator; it acts as a branch to either the normal-return target or exceptional return targets; this is a hard constraint and unlikely to change (e.g. via EBBs).</li>
+<li>Perhaps we could emit the loads as part of the one call VCode instruction. This is the path that was taken for a post-call SP adjustment for tail-call support. However:<ul>
+<li>We can't hold a <code>Vec&lt;Inst&gt;</code> inside the <code>CallInfo</code> or whatever: Pulley's instruction type is parameterized on a generic parameter that selects between 32- and 64-bit targets, we need to define the inst enum in ISLE, and ISLE doesn't have generics.</li>
+<li>We can't add a notion of "PReg or stack offset" to the <code>CallRetPair</code>s, and emit loads directly: we need to support an arbitrarily large number of vreg definitions, and if they're all constrained as registers, this breaks down after we fill the machine registers (regalloc panics because the program is un-allocatable per its constraints).<ul>
+<li>We can't add these loads with "any" constraints because they we need to codegen loads from stack offsets to spillslots and at this point we are re-inventing regalloc's handling of the various cases of memory-to-memory moves with or without temporaries available.</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>We can't split control-flow edges with critical-edge blocks and emit the retval instructions into the edge block when processing the main branch because VCode emission has very tight constraints about instruction lowering order, contiguous instruction IDs, and instruction ID ordering being the same as block ordering.<ul>
+<li>In the latest version of my WIP branch above I have a notion of "block instruction range overrides" and a post-patching mechanism that allows the branch lowering to enqueue a "prepend" for VCode finalization. Note that we lower backwards, so when we reach the <code>try_call</code> we've already seen the edge block; this is why it's a post-patch mechanism. Unfortunately this leads to a RA2 panic during liverange construction because we depend on the instruction ID ranges being ordered for a nice linear-time algorithm to be possible.</li>
+<li>If we instead try to emit the retval insts when we see the edge block, that implies knowing everything about the call before we reach it; we need to set up context to lower an instruction from block B1 while processing block B2; infeasible.</li>
+</ul>
+</li>
+</ul>
+<p>In summary: I've explored I believe every branch of the possibility tree, and the constraints are infeasible. We're doing too much in too few passes and/or supporting too-general input. We need to relax something:</p>
+<ul>
+<li>We could support, at the base CLIF level, only function signatures that have returns that can be placed in registers, or at worst, a fixed number of returns that can be done in the "call pseudoinst" all with register defs. This would avoid all of the above by removing the notion of "retval instructions". This is a little unfortunate from the PoV of flexibility, but it's not too bad: it would mean that Wasmtime would basically inherit this functionality instead, explicitly allocate stackslots and pass pointers if more than one (or two) returns. In essence we're saying: let's legalize the sequence into separate CLIF instructions, so we don't have the complexity of lowering the one super-complex CLIF instruction.</li>
+<li>We could add a notion of "ABI legalization". Old-world Cranelift had this much more pervasively. Maybe we do it for arbitrary returns (and stackrets? and other weird corner cases we handle now?) to make core ABI code more manageable.</li>
+<li>We could go back to atomic-VCode-pseudoinst with loads as part of the try_call, "any" constraints, and allocate a temp reg as another def, and just live with the poor codegen.</li>
+<li>We could find a way through the above possibility-space that I've missed.</li>
+<li>We could support exceptions only for a limited set of signatures. I don't like this at all; it's unclear how we'd lower to it from Wasmtime.</li>
+</ul>
+<p>Thoughts?</p>
+</blockquote>
+
+
+
+<a name="508962303"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310488%20Cranelift%3A%20remove%20multiple%20return.../near/508962303" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310488.20Cranelift.3A.20remove.20multiple.20return.2E.2E.2E.html#508962303">(Mar 29 2025 at 22:10)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/10488#issuecomment-2764261441">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10488">issue #10488</a>:</p>
+<blockquote>
+<blockquote>
+<p>We could go back to atomic-VCode-pseudoinst with loads as part of the try_call, "any" constraints, and allocate a temp reg as another def, and just live with the poor codegen.</p>
+</blockquote>
+<p>I'll note that this just occurred to me when writing up the issue and is a late addition; it may be a way out. I still wanted to document the design-space exploration so far and see if anyone has any other thoughts here.</p>
+</blockquote>
+
+
+
+<a name="508994845"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310488%20Cranelift%3A%20remove%20multiple%20return.../near/508994845" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310488.20Cranelift.3A.20remove.20multiple.20return.2E.2E.2E.html#508994845">(Mar 30 2025 at 06:07)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/10488#issuecomment-2764404280">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10488">issue #10488</a>:</p>
+<blockquote>
+<p>I have  WIP implementation of the temp-reg approach now in <a href="https://github.com/cfallin/wasmtime/tree/new-retvals-same-great-flavor-now-with-less-instructions">this branch</a> -- this removes retval insts completely.</p>
+<p>However, the next "final boss" that appears is that by having a potentially unbounded number of loads of retvals inside the one pseudo-inst, we exceed the max emission size so we'll need a mechanism similar to what we do for branch-table data to handle islanding properly.</p>
+<p>In the process of writing a test and having to set options to get spillslots to come out in retvals, I discovered a reference to #9510 -- we actually discussed removing the "implicit loads from a return-area" behavior there too. I think this is more evidence that this aspect of our ABI handling is far too complex and has painted us into a corner. I suspect that we need to tackle #9510 (and thus resolve this issue by removing multiple-returns beyond a handful of registers) as a hard prerequisite to finishing exception-handling support.</p>
+</blockquote>
+
+
+
+<a name="509008280"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310488%20Cranelift%3A%20remove%20multiple%20return.../near/509008280" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310488.20Cranelift.3A.20remove.20multiple.20return.2E.2E.2E.html#509008280">(Mar 30 2025 at 09:29)</a>:</h4>
+<p>bjorn3 <a href="https://github.com/bytecodealliance/wasmtime/issues/10488#issuecomment-2764471009">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10488">issue #10488</a>:</p>
+<blockquote>
+<p>Have you seen <a href="https://github.com/bytecodealliance/wasmtime/issues/9510">https://github.com/bytecodealliance/wasmtime/issues/9510</a>? Cranelift will need to remain support for multiple return values for ABI compat, but I don't see a reason why it needs to support more return values than fit in return registers. When you have more return values it will have to return them through a return area pointer, which you can implement in a fully abi-compatible way from the frontend. And in fact cg_clif already does this in most cases.</p>
+</blockquote>
+
+
+
+<a name="509276760"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310488%20Cranelift%3A%20remove%20multiple%20return.../near/509276760" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310488.20Cranelift.3A.20remove.20multiple.20return.2E.2E.2E.html#509276760">(Mar 31 2025 at 18:43)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/10488#issuecomment-2767098463">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10488">issue #10488</a>:</p>
+<blockquote>
+<p>I'm not familiar enough with all the complications of reval handling enough in our backends to comment much on possible avenues here, but at a high level I would ideally like to preserve the ability to return multiple values all in registers at the machine code level. AFAIK that basically requires modeling multi-return to some degree in CLIF. If this means though that the number of return values is limited by the ABI that seems like a reasonable limitation to me, though.</p>
+</blockquote>
+
+
+
+<a name="509280258"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310488%20Cranelift%3A%20remove%20multiple%20return.../near/509280258" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310488.20Cranelift.3A.20remove.20multiple.20return.2E.2E.2E.html#509280258">(Mar 31 2025 at 19:02)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/10488#issuecomment-2767140999">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10488">issue #10488</a>:</p>
+<blockquote>
+<blockquote>
+<p>Have you seen #9510 </p>
+</blockquote>
+<p>Indeed, rediscovered this while writing my most recent comment -- seems there are a number of reasons to dislike the complexity of the current situation!</p>
+<blockquote>
+<p>preserve the ability to return multiple values all in registers</p>
+</blockquote>
+<p>I agree; I think a limit somewhere between 2 (x86-64 SysV, <code>rax</code> + <code>rdx</code>) and 8 (aarch64, <code>x0</code> to <code>x7</code>) makes sense. That's basically what the option that @bjorn3 added in #9511 is limiting us to anyway, in a default Cranelift config. (<code>wasmtime-cranelift</code> enables <code>enable_multi_ret_implicit_sret</code> so it does still rely on the arbitrary-returns-in-memory functionality, which is the part we'd have to migrate to the CLIF generation as discussed in #9510.) Open question whether we should pick a number that all ABIs can support (2?) or allow this limit to be platform-specific -- the latter would mean that we have one more dimension of platform-specificity in CLIF beyond pointer size today, but maybe that's fine.</p>
+</blockquote>
+
+
+
+<a name="509281000"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310488%20Cranelift%3A%20remove%20multiple%20return.../near/509281000" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310488.20Cranelift.3A.20remove.20multiple.20return.2E.2E.2E.html#509281000">(Mar 31 2025 at 19:07)</a>:</h4>
+<p>bjorn3 <a href="https://github.com/bytecodealliance/wasmtime/issues/10488#issuecomment-2767151938">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10488">issue #10488</a>:</p>
+<blockquote>
+<p>The limit inside Cranelift will have to be platform and calling convention specific. On x86_64 cg_clif sometimes needs 3 registers for the Rust ABI, while at most two registers are allowed on windows.</p>
+</blockquote>
+
+
+
+<a name="509296630"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310488%20Cranelift%3A%20remove%20multiple%20return.../near/509296630" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310488.20Cranelift.3A.20remove.20multiple.20return.2E.2E.2E.html#509296630">(Mar 31 2025 at 20:43)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/10488#issuecomment-2767355581">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10488">issue #10488</a>:</p>
+<blockquote>
+<p>I tried pushing this forward just a little bit more (<a href="https://github.com/cfallin/wasmtime/commit/b2aafe3e12e1fd027e4de62605a550abf502ed69">commit</a>) by emitting islands inline prior to retval insts when needed on aarch64, riscv64, pulley. I'm still hitting a number of regalloc panics and other issues that confirm for me that resolving this issue first is, indeed, a hard requirement for exception support.</p>
+</blockquote>
+
+
+
+<a name="509362109"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310488%20Cranelift%3A%20remove%20multiple%20return.../near/509362109" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310488.20Cranelift.3A.20remove.20multiple.20return.2E.2E.2E.html#509362109">(Apr 01 2025 at 05:30)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/10488#issuecomment-2768140260">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10488">issue #10488</a>:</p>
+<blockquote>
+<p>To add just a bit more complexity here: when lifting the return-area-pointer functionality into Wasmtime we can <em>almost</em> get away with inventing our own details here, <em>except</em> that the return-area-pointer support in the ABI code is also load-bearing for the Cranelift Winch ABI implementation, which is used in our trampoline generation for Winch code. So we'll need to either implement two return-area-pointer ABIs by hand in the CLIF generation, or (perhaps) standardize on the Winch one. Unfortunately Winch's ABI is a little suboptimal register-usage-wise -- it passes only one retval (the last) in a register, and the rest on the stack.</p>
+</blockquote>
+
+
+
+<a name="509386521"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310488%20Cranelift%3A%20remove%20multiple%20return.../near/509386521" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310488.20Cranelift.3A.20remove.20multiple.20return.2E.2E.2E.html#509386521">(Apr 01 2025 at 08:11)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/10488#issuecomment-2768545089">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10488">issue #10488</a>:</p>
+<blockquote>
+<p>Final update: after realizing how deeply enmeshed multi-return usage is, I pushed on this further, and I've got a branch <a href="https://github.com/cfallin/wasmtime/tree/new-retvals-same-great-flavor-now-with-less-instructions">here</a> that now passes all tests -- I bulldozed through the issues mentioned above (emitting islands; regalloc panics turned out to be <a href="https://github.com/bytecodealliance/regalloc2/issues/196">bytecodealliance/regalloc2#196</a> plus trying to allocate a temp with all regs already used as rets or clobbered in tail callconv; a few other minor issues). I'll clean this up and submit a PR tomorrow so as to unblock exception handling and then the broader refactor can happen off the critical path.</p>
+</blockquote>
+
+
+
+<a name="509386636"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310488%20Cranelift%3A%20remove%20multiple%20return.../near/509386636" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310488.20Cranelift.3A.20remove.20multiple.20return.2E.2E.2E.html#509386636">(Apr 01 2025 at 08:12)</a>:</h4>
+<p>cfallin edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/10488#issuecomment-2768545089">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10488">issue #10488</a>:</p>
+<blockquote>
+<p>Final update: after realizing how deeply enmeshed multi-return usage is, I pushed on this further, and I've got a branch <a href="https://github.com/cfallin/wasmtime/tree/new-retvals-same-great-flavor-now-with-less-instructions">here</a> that now passes all tests with return-value instructions completely removed/integrated into the call inst -- I bulldozed through the issues mentioned above (emitting islands; regalloc panics turned out to be <a href="https://github.com/bytecodealliance/regalloc2/issues/196">bytecodealliance/regalloc2#196</a> plus trying to allocate a temp with all regs already used as rets or clobbered in tail callconv; a few other minor issues). I'll clean this up and submit a PR tomorrow so as to unblock exception handling and then the broader refactor can happen off the critical path.</p>
+</blockquote>
+
+
+
+<a name="510398798"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310488%20Cranelift%3A%20remove%20multiple%20return.../near/510398798" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310488.20Cranelift.3A.20remove.20multiple.20return.2E.2E.2E.html#510398798">(Apr 05 2025 at 18:29)</a>:</h4>
+<p>cfallin closed <a href="https://github.com/bytecodealliance/wasmtime/issues/10488">issue #10488</a>:</p>
+<blockquote>
+<p>I am currently implementing exception handling for Cranelift (<a href="https://github.com/cfallin/wasmtime/tree/lets-be-truly-exceptional">WIP branch</a>) and I believe I have hit a complexity wall that merits further discussion about Cranelift's IR design.</p>
+<p>Currently, we permit signatures to have arbitrary numbers of return values, and we lower these to use stack slots. This adds a nontrivial bit of complexity to ABI handling, but we manage. It means that after a true <code>call</code> instruction, we may have loads that are nominally part of the callsite but are separate VCode instructions.</p>
+<p>However, adding <code>try_call</code> instructions, which define return values as block-call args for their successors, has led me into a difficult spot when these extra "return-value instructions" exist -- I have tried all of the below approaches:</p>
+<ul>
+<li>We cannot emit these as instructions after the<code> try_call</code> in the same block, because the <code>try_call</code> is a terminator; it acts as a branch to either the normal-return target or exceptional return targets; this is a hard constraint and unlikely to change (e.g. via EBBs).</li>
+<li>Perhaps we could emit the loads as part of the one call VCode instruction. This is the path that was taken for a post-call SP adjustment for tail-call support. However:<ul>
+<li>We can't hold a <code>Vec&lt;Inst&gt;</code> inside the <code>CallInfo</code> or whatever: Pulley's instruction type is parameterized on a generic parameter that selects between 32- and 64-bit targets, we need to define the inst enum in ISLE, and ISLE doesn't have generics.</li>
+<li>We can't add a notion of "PReg or stack offset" to the <code>CallRetPair</code>s, and emit loads directly: we need to support an arbitrarily large number of vreg definitions, and if they're all constrained as registers, this breaks down after we fill the machine registers (regalloc panics because the program is un-allocatable per its constraints).<ul>
+<li>We can't add these loads with "any" constraints because they we need to codegen loads from stack offsets to spillslots and at this point we are re-inventing regalloc's handling of the various cases of memory-to-memory moves with or without temporaries available.</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>We can't split control-flow edges with critical-edge blocks and emit the retval instructions into the edge block when processing the main branch because VCode emission has very tight constraints about instruction lowering order, contiguous instruction IDs, and instruction ID ordering being the same as block ordering.<ul>
+<li>In the latest version of my WIP branch above I have a notion of "block instruction range overrides" and a post-patching mechanism that allows the branch lowering to enqueue a "prepend" for VCode finalization. Note that we lower backwards, so when we reach the <code>try_call</code> we've already seen the edge block; this is why it's a post-patch mechanism. Unfortunately this leads to a RA2 panic during liverange construction because we depend on the instruction ID ranges being ordered for a nice linear-time algorithm to be possible.</li>
+<li>If we instead try to emit the retval insts when we see the edge block, that implies knowing everything about the call before we reach it; we need to set up context to lower an instruction from block B1 while processing block B2; infeasible.</li>
+</ul>
+</li>
+</ul>
+<p>In summary: I've explored I believe every branch of the possibility tree, and the constraints are infeasible. We're doing too much in too few passes and/or supporting too-general input. We need to relax something:</p>
+<ul>
+<li>We could support, at the base CLIF level, only function signatures that have returns that can be placed in registers, or at worst, a fixed number of returns that can be done in the "call pseudoinst" all with register defs. This would avoid all of the above by removing the notion of "retval instructions". This is a little unfortunate from the PoV of flexibility, but it's not too bad: it would mean that Wasmtime would basically inherit this functionality instead, explicitly allocate stackslots and pass pointers if more than one (or two) returns. In essence we're saying: let's legalize the sequence into separate CLIF instructions, so we don't have the complexity of lowering the one super-complex CLIF instruction.</li>
+<li>We could add a notion of "ABI legalization". Old-world Cranelift had this much more pervasively. Maybe we do it for arbitrary returns (and stackrets? and other weird corner cases we handle now?) to make core ABI code more manageable.</li>
+<li>We could go back to atomic-VCode-pseudoinst with loads as part of the try_call, "any" constraints, and allocate a temp reg as another def, and just live with the poor codegen.</li>
+<li>We could find a way through the above possibility-space that I've missed.</li>
+<li>We could support exceptions only for a limited set of signatures. I don't like this at all; it's unclear how we'd lower to it from Wasmtime.</li>
+</ul>
+<p>Thoughts?</p>
+</blockquote>
+
+
+
+<a name="510398800"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310488%20Cranelift%3A%20remove%20multiple%20return.../near/510398800" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310488.20Cranelift.3A.20remove.20multiple.20return.2E.2E.2E.html#510398800">(Apr 05 2025 at 18:29)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/10488#issuecomment-2781032196">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10488">issue #10488</a>:</p>
+<blockquote>
+<p>Since #10502 removed return-value instructions, I believe this issue is, well, no longer an issue. We discussed whether we should do something about arbitrary return-value signatures and the integrated handling of stack returns in the ABI code during the most recent Cranelift meeting, and concluded that maybe it's fine for now. So I'm going to go ahead and close this. Thanks all for the discussion!</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

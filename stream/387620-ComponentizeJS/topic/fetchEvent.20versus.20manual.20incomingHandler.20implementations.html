@@ -1,0 +1,136 @@
+<html>
+<head><meta charset="utf-8"><title>fetchEvent versus manual incomingHandler implementations · ComponentizeJS · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/387620-ComponentizeJS/index.html">ComponentizeJS</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/387620-ComponentizeJS/topic/fetchEvent.20versus.20manual.20incomingHandler.20implementations.html">fetchEvent versus manual incomingHandler implementations</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="527749817"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/387620-ComponentizeJS/topic/fetchEvent%20versus%20manual%20incomingHandler%20implementations/near/527749817" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/387620-ComponentizeJS/topic/fetchEvent.20versus.20manual.20incomingHandler.20implementations.html#527749817">(Jul 08 2025 at 18:12)</a>:</h4>
+<p>I think I've found a problem with the current way we try to handle <code>wasi:incoming-handler</code>... Let me try to sum things up:</p>
+<ul>
+<li><code>starlingmonkey.wasm</code> <em>always</em> exports <code>wasi:http/incoming-handler</code></li>
+<li><code>componentize-js</code> removes the import by default and attempts to re-add it based on what the <em>guest</em> component exports, before it is merged</li>
+<li>We <a href="https://github.com/bytecodealliance/ComponentizeJS/blob/c4d72cd8512ba35b30181e1c41d137576a429f57/src/componentize.js#L72">*used* to parse the JS source code</a> to figure out exports and decide whether someone had done it manually but we <a href="https://github.com/bytecodealliance/ComponentizeJS/pull/202">don't anymore</a><ul>
+<li>The reason we did this was to avoid breaking debugging</li>
+</ul>
+</li>
+<li>We disabled the HTTP check because fetchEvent could be used at any time, but this breaks manual <code>incomingHandler</code> implementations, so <a href="https://github.com/bytecodealliance/ComponentizeJS/pull/218">the check was re-enabled</a>)</li>
+</ul>
+<p>Here are the problems (I think) with this situation:</p>
+<ol>
+<li>
+<p>StarlingMonkey <em>always</em> exposes <code>wasi:http/incoming-handler</code>, because the user could use the fetchEvent integration at any time <span aria-label="shrug" class="emoji emoji-1f937" role="img" title="shrug">:shrug:</span> </p>
+<ul>
+<li>This is not ideal, but I'm not sure if we can fix this without suing some sort of custom build machinery or something.</li>
+</ul>
+</li>
+<li>
+<p>Without parsing the JS (like we used to), we do not know if someone has implemented <code>wasi:http/incoming-handler</code> themselves.  <span aria-label="thinking" class="emoji emoji-1f914" role="img" title="thinking">:thinking:</span> </p>
+<ul>
+<li>Without this, we cannot <em>ignore</em> checking that the export is properly implemented when <code>fetchEvent</code> may not be in use (i.e. <a href="https://github.com/bytecodealliance/ComponentizeJS/pull/218">that check that was re-added</a>)</li>
+</ul>
+</li>
+</ol>
+<p>There are 4 scenarios:</p>
+<ol>
+<li>user does no HTTP, no wasi export <span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span> </li>
+<li>user does HTTP manually, w/<code>export wasi:http/incoming-handler</code> <span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span></li>
+<li>user does HTTP manually, no wasi export <span aria-label="no signal" class="emoji emoji-1f645" role="img" title="no signal">:no_signal:</span>   (this is invalid/doesn't make sense)</li>
+<li>
+<p>user does HTTP with fetchEvent, no wasi export <span aria-label="cross mark" class="emoji emoji-274c" role="img" title="cross mark">:cross_mark:</span> </p>
+<ul>
+<li>w/ current code, the issue is that <code>wasi:http/incoming-handler</code> <em>is</em> stripped from the component that comes out</li>
+<li>Ideally, we would ensure the incoming handler export got added <em>or</em> skip the check like before</li>
+</ul>
+</li>
+<li>
+<p>user does HTTP with fetchEvent, w/  <code>export wasi:http/incoming-handler</code> <span aria-label="cross mark" class="emoji emoji-274c" role="img" title="cross mark">:cross_mark:</span> </p>
+<ul>
+<li>Checks to ensure <code>incomingHandler</code> is exported (like in the manual impl case) fail</li>
+</ul>
+</li>
+</ol>
+<p>I'm currently mulling two ways to solve this:</p>
+<p>1.Always export <code>wasi:http/incoming-handler</code> when <code>http</code> feature is on</p>
+<p>- This is just a little bit similar to what we hand before, i.e. requiring splice-bindings to know about features<br>
+  - This solution is somewhat unsatisfying but is the simplest and isn't unreasonable, as the HTTP feature does indicate that there should be inclusion of the interface</p>
+<ol start="2">
+<li>
+<p>Re-add parsing of the JS (no rewriting) via <code>es-module-lexer</code> to figure out which case we're in</p>
+<ul>
+<li>If the WIT export is present, and there is no <code>incomingHandler</code> export, we can <em>assume</em> that fetchEvent is used</li>
+<li>If the WIT export is NOT there, don't know anything. This weirdly boils down to (1) <em>unless</em> we try to figure out if an event handler for fetch <em>was</em> used, which is tricky.<ul>
+<li>Bad idea (?): Try to figure it out w/ static code analysis like we do the imports/exports (we might be able to do this cleverly)</li>
+<li>Better idea (?): Could this information be saved in the <em>post</em> wizer snapshot somehow? Maybe StarlingMonkey could expose a diagnostic that can be checked to see if <code>addEventListener</code> was called?</li>
+<li>Use a new age parser like <a href="https://oxc.rs/docs/guide/usage/parser.html">oxc</a> to do what <code>es-module-lexer</code> was doing previously <em>and</em> check for top level calls to <code>addEventListener</code>.</li>
+<li>Figure out some other clever way to know if <code>addEventListener</code> was called.</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<p>Any feedback would be appreciated. I'm leaning towards (1) for expedience (and I'm not sure it's worth re-introducing the additional dependencies to do (2) just yet, though it's the more satisfying solution).</p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/ComponentizeJS/blob/c4d72cd8512ba35b30181e1c41d137576a429f57/src/componentize.js#L72" style="background-image: url(&quot;https://uploads.zulipusercontent.net/65d674e85a67c06f63db863bdbdae1a684e5a853/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f393139633331333037313939333732323734613131616137396463636534393236323737653765336231393062383338323463303336356631636332653437662f62797465636f6465616c6c69616e63652f436f6d706f6e656e74697a654a53&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/ComponentizeJS/blob/c4d72cd8512ba35b30181e1c41d137576a429f57/src/componentize.js#L72" title="ComponentizeJS/src/componentize.js at c4d72cd8512ba35b30181e1c41d137576a429f57 · bytecodealliance/ComponentizeJS">ComponentizeJS/src/componentize.js at c4d72cd8512ba35b30181e1c41d137576a429f57 · bytecodealliance/ComponentizeJS</a></div><div class="message_embed_description">JS -&gt; WebAssembly Component. Contribute to bytecodealliance/ComponentizeJS development by creating an account on GitHub.</div></div></div><div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/ComponentizeJS/pull/202" style="background-image: url(&quot;https://uploads.zulipusercontent.net/569374ba7b46558f0df4b45b151f44d59634fab4/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f303733373333343636383966346334646131626136383837656163623439353831306439353339633936653337346338346363643336376439373366306337352f62797465636f6465616c6c69616e63652f436f6d706f6e656e74697a654a532f70756c6c2f323032&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/ComponentizeJS/pull/202" title="Overhaul bindings generation and introduce a CLI tool by tschneidereit · Pull Request #202 · bytecodealliance/ComponentizeJS">Overhaul bindings generation and introduce a CLI tool by tschneidereit · Pull Request #202 · bytecodealliance/ComponentizeJS</a></div><div class="message_embed_description">This is a pretty large patch containing a whole bunch of changes. They&#39;re not really all related, but are hard to disentangle now, after being introduced while I worked on enabling debugging of...</div></div></div><div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/ComponentizeJS/pull/218" style="background-image: url(&quot;https://uploads.zulipusercontent.net/a2009659f1db1888fd37746e4160a26a1c9bea45/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f396336333364386236333732646631373566373966353862353130376666653739303035663636323664303534633031636134393037373232363830306162342f62797465636f6465616c6c69616e63652f436f6d706f6e656e74697a654a532f70756c6c2f323138&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/ComponentizeJS/pull/218" title="fix: do not skip wasi:http export processing by vados-cosmonic · Pull Request #218 · bytecodealliance/ComponentizeJS">fix: do not skip wasi:http export processing by vados-cosmonic · Pull Request #218 · bytecodealliance/ComponentizeJS</a></div><div class="message_embed_description">This commit removes the ignored handling of wasi:http/incoming-handler which breaks components that have manually implemented the handle export.
+This change was introduced during the recent overhau...</div></div></div><div class="message_embed"><a class="message_embed_image" href="https://oxc.rs/docs/guide/usage/parser.html" style="background-image: url(&quot;https://uploads.zulipusercontent.net/37d65a823ba69fef7a5dfa4ecf69fa5d7c511a2c/68747470733a2f2f63646e2e6a7364656c6976722e6e65742f67682f6f78632d70726f6a6563742f6f78632d6173736574732f707265766965772d756e6976657273616c2e706e67&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://oxc.rs/docs/guide/usage/parser.html" title="The JavaScript Oxidation Compiler">The JavaScript Oxidation Compiler</a></div><div class="message_embed_description">A collection of high-performance JavaScript tools written in Rust</div></div></div>
+
+
+
+<a name="527751146"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/387620-ComponentizeJS/topic/fetchEvent%20versus%20manual%20incomingHandler%20implementations/near/527751146" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/387620-ComponentizeJS/topic/fetchEvent.20versus.20manual.20incomingHandler.20implementations.html#527751146">(Jul 08 2025 at 18:20)</a>:</h4>
+<p>On second thought, I really am starting to like the <code>oxc</code> based solution here -- the <a href="https://www.npmjs.com/package/oxc-parser">node bindings</a> are quite ergonomic and look like they'll work nicely to help figure out top level statements and imports/exports.</p>
+<p>This <em>would</em> require of course introducing a new non-trivial (but production ready, IMO) dependency to <code>componentize-js</code> -- thoughts, <span class="user-mention" data-user-id="234973">@Till Schneidereit</span> ?</p>
+<div class="message_embed"><a class="message_embed_image" href="https://www.npmjs.com/package/oxc-parser" style="background-image: url(&quot;https://uploads.zulipusercontent.net/1f95ebb8bfed4d27a76408b23d90d6ad57189dbd/68747470733a2f2f7374617469632d70726f64756374696f6e2e6e706d6a732e636f6d2f33333865343930356132363834636139366530386337373830666336383431322e706e67&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://www.npmjs.com/package/oxc-parser" title="oxc-parser">oxc-parser</a></div><div class="message_embed_description">Oxc Parser Node API. Latest version: 0.76.0, last published: 8 hours ago. Start using oxc-parser in your project by running `npm i oxc-parser`. There are 62 other projects in the npm registry using oxc-parser.</div></div></div>
+
+
+
+<a name="527762722"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/387620-ComponentizeJS/topic/fetchEvent%20versus%20manual%20incomingHandler%20implementations/near/527762722" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Tomasz Andrzejak <a href="https://bytecodealliance.github.io/zulip-archive/stream/387620-ComponentizeJS/topic/fetchEvent.20versus.20manual.20incomingHandler.20implementations.html#527762722">(Jul 08 2025 at 19:48)</a>:</h4>
+<p>Hey Victor! Thanks for the write up. I was banging my head against the wall today trying to use local componentize-js. Everything appears to work correctly with the published version 18.2 for my use case, which is installing a handler using <code>addEventListener("fetch")</code>.  However, when I switch to the local <code>componentize-js</code> for the same js code, I get this error:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">Error</span><span class="p">:</span><span class="w"> </span><span class="nc">Unable</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">extract</span><span class="w"> </span><span class="n">expected</span><span class="w"> </span><span class="n">exports</span><span class="w"> </span><span class="n">list</span>
+<span class="n">Error</span><span class="p">:</span><span class="w"> </span><span class="s">"source.js"</span><span class="w"> </span><span class="n">does</span><span class="w"> </span><span class="n">not</span><span class="w"> </span><span class="n">export</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="s">"incomingHandler"</span><span class="w"> </span><span class="n">interface</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">expected</span><span class="w"> </span><span class="n">by</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">world</span><span class="p">.</span>
+<span class="w">  </span><span class="n">Try</span><span class="w"> </span><span class="n">defining</span><span class="w"> </span><span class="n">it</span><span class="w"> </span><span class="n">by</span><span class="w"> </span><span class="n">its</span><span class="w"> </span><span class="n">alias</span><span class="p">:</span>
+<span class="w">  </span><span class="nc">export</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="n">incomingHandler</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{};</span>
+</code></pre></div>
+<p>I guess this is exactly the issue you described here. Do you happen to know which commit introduced this breaking change?</p>
+
+
+
+<a name="527866944"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/387620-ComponentizeJS/topic/fetchEvent%20versus%20manual%20incomingHandler%20implementations/near/527866944" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/387620-ComponentizeJS/topic/fetchEvent.20versus.20manual.20incomingHandler.20implementations.html#527866944">(Jul 09 2025 at 11:29)</a>:</h4>
+<p>Yup, so the commit that introduced this change is this one (and the related PR):</p>
+<p><a href="https://github.com/bytecodealliance/ComponentizeJS/commit/54ab08566d0cdf7cd8db8483bc5c02d9e35e3ffb">https://github.com/bytecodealliance/ComponentizeJS/commit/54ab08566d0cdf7cd8db8483bc5c02d9e35e3ffb</a><br>
+<a href="https://github.com/bytecodealliance/ComponentizeJS/pull/218">https://github.com/bytecodealliance/ComponentizeJS/pull/218</a></p>
+<p>The problem with 18.2 is that it breaks existing <code>wasi:http</code> implementations -- this is something that should have been solved before 18.2 was released, and why Jco has been stuck on <code>0.17.0</code> for a while now.</p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/ComponentizeJS/commit/54ab08566d0cdf7cd8db8483bc5c02d9e35e3ffb" style="background-image: url(&quot;https://uploads.zulipusercontent.net/c57222a1f8e02ed89afb4d157b162834ece79edd/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f393661613232653339356135613438373436663235316430313431613865303462643832383837383764663266663763613064323862376261626136653732642f62797465636f6465616c6c69616e63652f436f6d706f6e656e74697a654a532f636f6d6d69742f35346162303835363664306364663763643864623834383362633563303264396533356533666662&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/ComponentizeJS/commit/54ab08566d0cdf7cd8db8483bc5c02d9e35e3ffb" title="fix: do not skip wasi:http export processing (#218) · bytecodealliance/ComponentizeJS@54ab085">fix: do not skip wasi:http export processing (#218) · bytecodealliance/ComponentizeJS@54ab085</a></div><div class="message_embed_description">This commit removes the ignored handling of `wasi:http/incoming-handler`
+which breaks components that have manually implemented the `handle` export.
+
+Signed-off-by: Victor Adossi &lt;vadossi@cosmon...</div></div></div><div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/ComponentizeJS/pull/218" style="background-image: url(&quot;https://uploads.zulipusercontent.net/a2009659f1db1888fd37746e4160a26a1c9bea45/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f396336333364386236333732646631373566373966353862353130376666653739303035663636323664303534633031636134393037373232363830306162342f62797465636f6465616c6c69616e63652f436f6d706f6e656e74697a654a532f70756c6c2f323138&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/ComponentizeJS/pull/218" title="fix: do not skip wasi:http export processing by vados-cosmonic · Pull Request #218 · bytecodealliance/ComponentizeJS">fix: do not skip wasi:http export processing by vados-cosmonic · Pull Request #218 · bytecodealliance/ComponentizeJS</a></div><div class="message_embed_description">This commit removes the ignored handling of wasi:http/incoming-handler which breaks components that have manually implemented the handle export.
+This change was introduced during the recent overhau...</div></div></div>
+
+
+
+<a name="528126110"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/387620-ComponentizeJS/topic/fetchEvent%20versus%20manual%20incomingHandler%20implementations/near/528126110" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/387620-ComponentizeJS/topic/fetchEvent.20versus.20manual.20incomingHandler.20implementations.html#528126110">(Jul 10 2025 at 17:03)</a>:</h4>
+<p>PR to fix this is up -- works on my machine <span aria-label="tm" class="emoji emoji-2122" role="img" title="tm">:tm:</span> </p>
+<p><a href="https://github.com/bytecodealliance/ComponentizeJS/pull/247">https://github.com/bytecodealliance/ComponentizeJS/pull/247</a></p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/ComponentizeJS/pull/247" style="background-image: url(&quot;https://uploads.zulipusercontent.net/0336585abbfabc65a47e69dbb053975fbb7b8fdc/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f346530646561316133303138313864333831373236316565643337356630643531353633353736323030376663633932666532353463656330616465323034362f62797465636f6465616c6c69616e63652f436f6d706f6e656e74697a654a532f70756c6c2f323437&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/ComponentizeJS/pull/247" title="fix: allow for use of both manual &amp; fetchEvent based HTTP by vados-cosmonic · Pull Request #247 · bytecodealliance/ComponentizeJS">fix: allow for use of both manual &amp; fetchEvent based HTTP by vados-cosmonic · Pull Request #247 · bytecodealliance/ComponentizeJS</a></div><div class="message_embed_description">This commit updates the componentize-js code to support both fetchEvent and manual based HTTP.
+To make this possible we needed to re-introduce a few things:
+
+A feature that represents fetch-event
+A...</div></div></div>
+
+
+
+<a name="528132446"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/387620-ComponentizeJS/topic/fetchEvent%20versus%20manual%20incomingHandler%20implementations/near/528132446" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Ralph <a href="https://bytecodealliance.github.io/zulip-archive/stream/387620-ComponentizeJS/topic/fetchEvent.20versus.20manual.20incomingHandler.20implementations.html#528132446">(Jul 10 2025 at 17:44)</a>:</h4>
+<p>nice move!</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

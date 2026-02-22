@@ -1,0 +1,110 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #10869 Memory &quot;leak&quot; when running a GC · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310869.20Memory.20.22leak.22.20when.20running.20a.20GC.html">wasmtime / issue #10869 Memory &quot;leak&quot; when running a GC</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="521321892"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310869%20Memory%20%22leak%22%20when%20running%20a%20GC/near/521321892" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310869.20Memory.20.22leak.22.20when.20running.20a.20GC.html#521321892">(May 30 2025 at 15:34)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/issues/10869">issue #10869</a>:</p>
+<blockquote>
+<p>When running this program:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">wasmtime</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">config</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Config</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="w">    </span><span class="n">config</span><span class="p">.</span><span class="n">wasm_gc</span><span class="p">(</span><span class="kc">true</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">engine</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Engine</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">config</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Store</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span><span class="w"> </span><span class="p">());</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">module</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Module</span><span class="p">::</span><span class="n">new</span><span class="p">(</span>
+<span class="w">        </span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span>
+<span class="w">        </span><span class="s">r#"</span>
+<span class="s">            (module</span>
+<span class="s">                (table 1 anyref)</span>
+
+<span class="s">                (func (result anyref)</span>
+<span class="s">                    i32.const 0</span>
+<span class="s">                    table.get)</span>
+
+<span class="s">            )</span>
+<span class="s">        "#</span><span class="p">,</span>
+<span class="w">    </span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">    </span><span class="n">Instance</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">module</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="p">[]).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="w">    </span><span class="k">loop</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">store</span><span class="p">.</span><span class="n">gc</span><span class="p">(</span><span class="nb">None</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>this will infinitely consume memory and eventually die. The problem here is that GC is written at the abstraction level of wasmtime-crate-exports but created those from internals requires pushing onto an internal vector. These vectors are never shrunk meaning that the memory is held until the store is dropped, meaning that a store's memory usage is O(gcs) which isn't great for long-running programs.</p>
+</blockquote>
+
+
+
+<a name="521321895"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310869%20Memory%20%22leak%22%20when%20running%20a%20GC/near/521321895" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310869.20Memory.20.22leak.22.20when.20running.20a.20GC.html#521321895">(May 30 2025 at 15:34)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasmtime:api label to <a href="https://github.com/bytecodealliance/wasmtime/issues/10869">Issue #10869</a>.</p>
+
+
+
+<a name="521321896"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310869%20Memory%20%22leak%22%20when%20running%20a%20GC/near/521321896" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310869.20Memory.20.22leak.22.20when.20running.20a.20GC.html#521321896">(May 30 2025 at 15:34)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasm-proposal:gc label to <a href="https://github.com/bytecodealliance/wasmtime/issues/10869">Issue #10869</a>.</p>
+
+
+
+<a name="522143808"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310869%20Memory%20%22leak%22%20when%20running%20a%20GC/near/522143808" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310869.20Memory.20.22leak.22.20when.20running.20a.20GC.html#522143808">(Jun 03 2025 at 14:42)</a>:</h4>
+<p>alexcrichton closed <a href="https://github.com/bytecodealliance/wasmtime/issues/10869">issue #10869</a>:</p>
+<blockquote>
+<p>When running this program:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">wasmtime</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">config</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Config</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="w">    </span><span class="n">config</span><span class="p">.</span><span class="n">wasm_gc</span><span class="p">(</span><span class="kc">true</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">engine</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Engine</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">config</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Store</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span><span class="w"> </span><span class="p">());</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">module</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Module</span><span class="p">::</span><span class="n">new</span><span class="p">(</span>
+<span class="w">        </span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span>
+<span class="w">        </span><span class="s">r#"</span>
+<span class="s">            (module</span>
+<span class="s">                (table 1 anyref)</span>
+
+<span class="s">                (func (result anyref)</span>
+<span class="s">                    i32.const 0</span>
+<span class="s">                    table.get)</span>
+
+<span class="s">            )</span>
+<span class="s">        "#</span><span class="p">,</span>
+<span class="w">    </span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">    </span><span class="n">Instance</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">module</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="p">[]).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="w">    </span><span class="k">loop</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">store</span><span class="p">.</span><span class="n">gc</span><span class="p">(</span><span class="nb">None</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>this will infinitely consume memory and eventually die. The problem here is that GC is written at the abstraction level of wasmtime-crate-exports but created those from internals requires pushing onto an internal vector. These vectors are never shrunk meaning that the memory is held until the store is dropped, meaning that a store's memory usage is O(gcs) which isn't great for long-running programs.</p>
+</blockquote>
+
+
+
+<a name="522143813"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310869%20Memory%20%22leak%22%20when%20running%20a%20GC/near/522143813" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310869.20Memory.20.22leak.22.20when.20running.20a.20GC.html#522143813">(Jun 03 2025 at 14:42)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/10869#issuecomment-2935669568">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10869">issue #10869</a>:</p>
+<blockquote>
+<p>Fixed in <a href="https://github.com/bytecodealliance/wasmtime/pull/10903">https://github.com/bytecodealliance/wasmtime/pull/10903</a></p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

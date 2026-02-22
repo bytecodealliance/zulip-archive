@@ -1,0 +1,62 @@
+[
+    {
+        "content": "<p>Hi, is there a good way to read and write the full linear memory of a core module in the component model from the wasmtime host? For context, I am using Binaryen's Asyncify on the core module. My goal is to make a snapshot of the linear memory when unwinding to stop the runtime and resume execution later. I got this working with wasm32-wasip1. I am now adapting the code to use wasm32-wasip2, to import richer host functions. But I'm struggling to get access to the linear memory of the core module, since it's not exportable to the wasmtime host.</p>",
+        "id": 564344096,
+        "sender_full_name": "Jonas",
+        "timestamp": 1766006290
+    },
+    {
+        "content": "<p>For now, the answer is unfortunately no: the intent of the host API design is to enforce the same encapsulation that components provide at the Wasm type level, so if a memory is not exported, it's not reachable.</p>\n<p>The <code>component-init</code> tool (now folded into Wizer I think?) has some tricks to work around this, for the same purpose (snapshotting), that definitely involved rewriting with additional exports but I'm not sure how it actually allowed external access (injecting accessors? something else?). <span class=\"user-mention\" data-user-id=\"509936\">@Joel Dice</span> would probably be able to say more</p>",
+        "id": 564344595,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1766006510
+    },
+    {
+        "content": "<p>Yes, Wizer now supports snapshotting components, using the same trick <code>component-init</code> did: adding an extra function which returns a <code>list&lt;u8&gt;</code> that covers the entire linear memory, then creating a new component as output with a data section containing that snapshot.  It also adds accessor functions for each mutable global variable so it can snapshot those, too.</p>\n<p>See <a href=\"https://github.com/dicej/component-init/blob/main/README.md\">the README.md</a> and/or source code for details.</p>\n<div class=\"message_embed\"><a class=\"message_embed_image\" href=\"https://github.com/dicej/component-init/blob/main/README.md\" style=\"background-image: url(&quot;https://uploads.zulipusercontent.net/1f212b3776f317298e2c22f8bed8fa907d0d9c3f/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f616663386533613138643761643264393832636561313738363062376165383230313435343239623237306536643965663439633935666533396164663531622f646963656a2f636f6d706f6e656e742d696e6974&quot;)\"></a><div class=\"data-container\"><div class=\"message_embed_title\"><a href=\"https://github.com/dicej/component-init/blob/main/README.md\" title=\"component-init/README.md at main · dicej/component-init\">component-init/README.md at main · dicej/component-init</a></div><div class=\"message_embed_description\">WebAssembly Component Pre-initializer. Contribute to dicej/component-init development by creating an account on GitHub.</div></div></div>",
+        "id": 564346462,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1766007242
+    },
+    {
+        "content": "<p>Perfect! I'm happy to transform the wasm code a bit if needed (some transforms are already needed to make Asyncify and the component model play nicely together). Is there any performance hit by using <code>list&lt;u8&gt;</code>?</p>\n<p>I was hoping the runtime was allowed to bend the rules a bit. Like if it a component instance could give access to an underlying core module instance, similar to what you get without components (if there even is one?).</p>",
+        "id": 564346934,
+        "sender_full_name": "Jonas",
+        "timestamp": 1766007450
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"1006194\">Jonas</span> <a href=\"#narrow/channel/217126-wasmtime/topic/Reading.20and.20writing.20core.20module.20memory.20in.20wasmtime.20host/near/564346934\">said</a>:</p>\n<blockquote>\n<p>Is there any performance hit by using <code>list&lt;u8&gt;</code>?</p>\n</blockquote>\n<p>In the case of <code>component-init</code>, yes; it requires copying the whole memory into a <code>Vec&lt;u8&gt;</code>.  One of my goals was to make it runtime-agnostic (i.e. not depend on Wasmtime directly), so I couldn't use any Wasmtime-specific APIs.  Otherwise, I would have used <a href=\"https://docs.rs/wasmtime/latest/wasmtime/component/struct.WasmList.html\">WasmList</a>, which gives you direct, read-only access to the guest memory without any copies.</p>",
+        "id": 564347701,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1766007822
+    },
+    {
+        "content": "<p>AFAIK, there's no public API in Wasmtime to get read or write access to any of the (possibly many) memories inside a component besides <code>WasmList</code> plus Wasm code transformation.  It would be technically feasible to add something like that, but we'd need a strong justification for piercing the component abstraction.</p>",
+        "id": 564348088,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1766007989
+    },
+    {
+        "content": "<p>Thank you! WasmList looks like what I need.</p>\n<p>Btw, to check my understanding, are the mutable parts of a wasm module memories, globals and tables? And <code>component-init</code> does not support mutable tables yet (<a href=\"https://github.com/dicej/component-init/blob/2d96595716615426e26b4346003a29f557e2f31b/transform/src/lib.rs#L64-L69\">https://github.com/dicej/component-init/blob/2d96595716615426e26b4346003a29f557e2f31b/transform/src/lib.rs#L64-L69</a>). Why are tables more complicated to support? (also, do you know which rust constructs compile to tables?)</p>\n<div class=\"message_embed\"><a class=\"message_embed_image\" href=\"https://github.com/dicej/component-init/blob/2d96595716615426e26b4346003a29f557e2f31b/transform/src/lib.rs#L64-L69\" style=\"background-image: url(&quot;https://uploads.zulipusercontent.net/1f212b3776f317298e2c22f8bed8fa907d0d9c3f/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f616663386533613138643761643264393832636561313738363062376165383230313435343239623237306536643965663439633935666533396164663531622f646963656a2f636f6d706f6e656e742d696e6974&quot;)\"></a><div class=\"data-container\"><div class=\"message_embed_title\"><a href=\"https://github.com/dicej/component-init/blob/2d96595716615426e26b4346003a29f557e2f31b/transform/src/lib.rs#L64-L69\" title=\"component-init/transform/src/lib.rs at 2d96595716615426e26b4346003a29f557e2f31b · dicej/component-init\">component-init/transform/src/lib.rs at 2d96595716615426e26b4346003a29f557e2f31b · dicej/component-init</a></div><div class=\"message_embed_description\">WebAssembly Component Pre-initializer. Contribute to dicej/component-init development by creating an account on GitHub.</div></div></div>",
+        "id": 564349551,
+        "sender_full_name": "Jonas",
+        "timestamp": 1766008703
+    },
+    {
+        "content": "<p><code>component-init</code> and Wizer support snapshotting memory and mutable globals.  My understanding is that runtime table mutations are not possible to snapshot in general because funcrefs are not serializable; e.g. they could point to imported host functions which can't be saved and restored in any meaningful way.  To my knowledge no Rust constructs compile to table <em>mutations</em> -- only to statically-initialized tables which are not modified at runtime.</p>",
+        "id": 564350136,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1766008959
+    },
+    {
+        "content": "<p>Thank you for all the answers. I'll probably come back later with some more questions :)</p>",
+        "id": 564351131,
+        "sender_full_name": "Jonas",
+        "timestamp": 1766009431
+    },
+    {
+        "content": "<p>I suppose in principle that one could add some more instrumentation to track funcref provenance -- e.g. a new Wasm memory with as many u32s as table slots in a given table, and instrument table.get/table.set/... to carry a shadow i32 alongside the funcref, and assign a unique ID to each initial funcref and to those that come from imports; then in the snapshotting output one could generate code to do the equivalent assignments to reproduce a given state. All that assuming that new funcrefs do not come in as return values from outside, only as taken-references to imports or Wasm functions. But all that's superfluous because (as Joel says) LLVM will use u32s as function pointers and never mutate the table they index</p>",
+        "id": 564351467,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1766009601
+    }
+]

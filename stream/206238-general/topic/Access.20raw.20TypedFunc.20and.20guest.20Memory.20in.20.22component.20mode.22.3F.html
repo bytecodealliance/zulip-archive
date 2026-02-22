@@ -1,0 +1,118 @@
+<html>
+<head><meta charset="utf-8"><title>Access raw TypedFunc and guest Memory in &quot;component mode&quot;? · general · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/index.html">general</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/Access.20raw.20TypedFunc.20and.20guest.20Memory.20in.20.22component.20mode.22.3F.html">Access raw TypedFunc and guest Memory in &quot;component mode&quot;?</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="547081541"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/Access%20raw%20TypedFunc%20and%20guest%20Memory%20in%20%22component%20mode%22%3F/near/547081541" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Meeuwsen <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/Access.20raw.20TypedFunc.20and.20guest.20Memory.20in.20.22component.20mode.22.3F.html#547081541">(Oct 25 2025 at 20:42)</a>:</h4>
+<p>I am using the standard embedded wasmtime host in component mode by using <code>bindgen!</code> macro and calling the generated guest resource trait methods and it works great. However, there is a hot function where this interface is forcing an additional copy (Rust Type -&gt; WIT Type -&gt; WASM memory) causing non-ideal performance. I think if I could go from Rust Type -&gt; WASM memory directly I could shave off some time. I just need to do this for 1 or 2 methods. Is there a way to do this?</p>
+
+
+
+<a name="547082506"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/Access%20raw%20TypedFunc%20and%20guest%20Memory%20in%20%22component%20mode%22%3F/near/547082506" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/Access.20raw.20TypedFunc.20and.20guest.20Memory.20in.20.22component.20mode.22.3F.html#547082506">(Oct 25 2025 at 21:02)</a>:</h4>
+<p>Not currently, no, there's no way to get core wasm functions from a component. Would you be able to share the shape of the performance problem you're running into? That could help guide perhaps an alternative architecture or possibly different APIs to add to wasmtime to make this faster</p>
+
+
+
+<a name="547082839"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/Access%20raw%20TypedFunc%20and%20guest%20Memory%20in%20%22component%20mode%22%3F/near/547082839" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Meeuwsen <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/Access.20raw.20TypedFunc.20and.20guest.20Memory.20in.20.22component.20mode.22.3F.html#547082839">(Oct 25 2025 at 21:10)</a>:</h4>
+<p>I created the same real world component in Rust native compiled mode and again as a WASM plugin (only difference is the WASM version uses <code>RefCell</code> to achieve mutability). I benchmarked the simple hot call that gets a slice of a WIT record as a param (which I convert from a slice of the non-WIT type). The native version is ~5ns per call and the WASM ~250ns per call on my M3 max. I haven't done any real profiling yet, but I suspect the handling of the slice conversion and copy into WASM memory is likely most of what is possible to optimize. The only optimization I did was swap out to a <code>SmallVec</code> from a <code>Vec</code> when converting to the WIT type. That shaved off 12% from skipping the allocation (~285ns --&gt; ~250ns). </p>
+<p>This is the function I call on the host side:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">update_bar_and_calc</span><span class="p">(</span>
+<span class="w">        </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">,</span>
+<span class="w">        </span><span class="n">data</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="p">[</span><span class="n">indicator</span><span class="p">::</span><span class="n">DataUpdate</span><span class="p">],</span>
+<span class="w">        </span><span class="n">new_bar</span><span class="p">:</span><span class="w"> </span><span class="kt">bool</span><span class="p">,</span>
+<span class="w">    </span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="kt">f64</span><span class="p">,</span><span class="w"> </span><span class="n">StringError</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// TODO: Copy slice directly into Wasm memory instead of an extra copy/type conversion</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">data</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">data</span>
+<span class="w">            </span><span class="p">.</span><span class="n">iter</span><span class="p">()</span>
+<span class="w">            </span><span class="p">.</span><span class="n">map</span><span class="p">(</span><span class="o">|</span><span class="n">d</span><span class="o">|</span><span class="w"> </span><span class="n">d</span><span class="p">.</span><span class="n">into</span><span class="p">())</span>
+<span class="w">            </span><span class="p">.</span><span class="n">collect</span><span class="p">::</span><span class="o">&lt;</span><span class="n">SmallVec</span><span class="o">&lt;</span><span class="p">[</span><span class="n">DataUpdate</span><span class="p">;</span><span class="w"> </span><span class="mi">4</span><span class="p">]</span><span class="o">&gt;&gt;</span><span class="p">();</span>
+
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">self</span>
+<span class="w">            </span><span class="p">.</span><span class="n">component</span>
+<span class="w">            </span><span class="p">.</span><span class="n">trading_indicator_guest</span><span class="p">()</span>
+<span class="w">            </span><span class="p">.</span><span class="n">indicator</span><span class="p">()</span>
+<span class="w">            </span><span class="p">.</span><span class="n">call_update_bar_and_calc</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">resource</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">data</span><span class="p">,</span><span class="w"> </span><span class="n">new_bar</span><span class="p">);</span>
+<span class="w">        </span><span class="bp">Self</span><span class="p">::</span><span class="n">map_result</span><span class="p">(</span><span class="n">result</span><span class="p">,</span><span class="w"> </span><span class="o">|</span><span class="n">value</span><span class="o">|</span><span class="w"> </span><span class="n">value</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+</code></pre></div>
+<p>Guest side:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="w">    </span><span class="sd">/// Update the current bar or start a new one</span>
+<span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">update_bar</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">data</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="n">DataUpdate</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="n">new_bar</span><span class="p">:</span><span class="w"> </span><span class="kt">bool</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">(),</span><span class="w"> </span><span class="nb">String</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="n">new_bar</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// Panic safety: data is same length as dependencies (length validated in 'new')</span>
+<span class="w">            </span><span class="bp">self</span><span class="p">.</span><span class="n">data</span><span class="p">.</span><span class="n">borrow_mut</span><span class="p">().</span><span class="n">push</span><span class="p">(</span><span class="n">data</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">data</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// Panic safety: data is same length as dependencies (length validated in 'new')</span>
+<span class="w">            </span><span class="bp">self</span><span class="p">.</span><span class="n">data</span><span class="p">.</span><span class="n">borrow_mut</span><span class="p">().</span><span class="n">update_last</span><span class="p">(</span><span class="n">data</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">data</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+
+<span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="sd">/// Update the current bar or start a new one and calculate the indicator value</span>
+<span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">update_bar_and_calc</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">data</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="n">DataUpdate</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="n">new_bar</span><span class="p">:</span><span class="w"> </span><span class="kt">bool</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="kt">f64</span><span class="p">,</span><span class="w"> </span><span class="nb">String</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="bp">self</span><span class="p">.</span><span class="n">update_bar</span><span class="p">(</span><span class="n">data</span><span class="p">,</span><span class="w"> </span><span class="n">new_bar</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">        </span><span class="nb">Ok</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">data</span><span class="p">.</span><span class="n">borrow</span><span class="p">()[</span><span class="mi">0</span><span class="p">])</span>
+<span class="w">    </span><span class="p">}</span>
+</code></pre></div>
+
+
+
+<a name="547651706"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/Access%20raw%20TypedFunc%20and%20guest%20Memory%20in%20%22component%20mode%22%3F/near/547651706" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/Access.20raw.20TypedFunc.20and.20guest.20Memory.20in.20.22component.20mode.22.3F.html#547651706">(Oct 29 2025 at 08:19)</a>:</h4>
+<p>(haven't forgotten about this it's just a busy week with the wasm CG meeting, I'll probably investigate deeper next week myself if no one else gets to it in the meantime)</p>
+
+
+
+<a name="547702147"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/Access%20raw%20TypedFunc%20and%20guest%20Memory%20in%20%22component%20mode%22%3F/near/547702147" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Meeuwsen <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/Access.20raw.20TypedFunc.20and.20guest.20Memory.20in.20.22component.20mode.22.3F.html#547702147">(Oct 29 2025 at 12:26)</a>:</h4>
+<p>Appreciated and no hurry. I've moved onto other parts of the project for now.</p>
+
+
+
+<a name="553198479"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/Access%20raw%20TypedFunc%20and%20guest%20Memory%20in%20%22component%20mode%22%3F/near/553198479" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/Access.20raw.20TypedFunc.20and.20guest.20Memory.20in.20.22component.20mode.22.3F.html#553198479">(Nov 01 2025 at 23:25)</a>:</h4>
+<p>Ok looked more into this, and yeah unfortunately I'm not coming up with any sort of low hanging fruit of what to do here. Although if what you gist'd is what the guest is "doing for real" it seems a bit odd that a whole vec is passed in but only the first element is used? Is that intentional?</p>
+<p>Otherwise though the main way to improve this that I can think of would be to push the <code>DataUpdate</code> type further upwards (e.g. don't require the <code>.into()</code> and natively store it with the wit-bindgen type). Either that or you could try implementing lift/lower directly for <code>indicator::DataUpdate</code> and work with that directly</p>
+
+
+
+<a name="553255994"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/Access%20raw%20TypedFunc%20and%20guest%20Memory%20in%20%22component%20mode%22%3F/near/553255994" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Meeuwsen <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/Access.20raw.20TypedFunc.20and.20guest.20Memory.20in.20.22component.20mode.22.3F.html#553255994">(Nov 02 2025 at 16:19)</a>:</h4>
+<p>It is intentional. This is a trait and implementers will have between 0 and n entries in the vec (where n typically won't exceed 4 or 5, so SmallVec works well as an optimization). This particular implementer knows the length will always be 1 for it, and that is guaranteed by my framework, so I don't check and just use the first slot.</p>
+<p>That is always a conundrum for me with these frameworks/ORMs etc or anything w/ generated types. How far do you allow its types make it into the rest of your code? In this case, WASM plugins are an add on crate, so I hesitate to bring knowledge of WASM further into other crates, esp. given this isn't light stuff (Thinking more on this: maybe I could make a feature "wasm" and swap between the two impls depending on that. It will have to compile wasmtime regardless in that case).</p>
+<p>One quick question to wrap this up. I can probably do this legwork myself but I figure you might know outright: Are there any guarantees on field ordering of generated code? (I assume it probably isn't repr C though...) Are the bitflags just regular bitflags crate generated? Wondering if I might be able to prove my data structure is same as the generated one and just transmute somehow vs copy. The only actual even possible difference is in the bitfields, but that is very probable to be identical as well (Thinking my idea at end of prev paragraph might be better though...).</p>
+<p>Thanks again for your thoughts. I know you are busy.</p>
+
+
+
+<a name="553417811"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/Access%20raw%20TypedFunc%20and%20guest%20Memory%20in%20%22component%20mode%22%3F/near/553417811" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/Access.20raw.20TypedFunc.20and.20guest.20Memory.20in.20.22component.20mode.22.3F.html#553417811">(Nov 03 2025 at 15:54)</a>:</h4>
+<p>For data layouts it's a bit tricky. The layout of structs and such is defined at <a href="https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md">https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md</a> so in that sense it's fixed in stone. That being said though there's no guarantee that the bindings themselves are using exactly that layout. For example a <code>record</code>-with-a-<code>string</code> uses a <code>String</code> in Rust meaning that passing to the canonical ABI requires a conversion of the struct itself. Basically the generated bindings are going to a conversion from the raw data in-memory to the actual types in Rust.</p>
+<p>This sort of reminds me though that it might be another source of slowdown. For example to remove some copies you'd need to:</p>
+<ol>
+<li>Host: implement <code>Lift</code> and <code>Lower</code> for <code>indicator::DataUpdate</code> (or something like that) to use the data at-rest as it is on the host.</li>
+<li>Guest: perhaps write raw bindings rather than using the default ones. For example the raw canonical ABI data is, I think, transformed into a different <code>Vec&lt;T&gt;</code> in the guest meaning that the guest receives a copy of the data and then copies it again.</li>
+</ol>
+<p>The guest dosen't do this copy for simple types like <code>Vec&lt;u8&gt;</code> but for aggregates it does perform a copy. That could be fixed, however, by improving the logic of wit-bindgen.</p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md" style="background-image: url(&quot;https://uploads.zulipusercontent.net/3880bb7d575ac4a698d8a9a3752a4471c6967dfd/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f653839646361663965326266656338656264663734616136656565633161333132306162396262306566643633633134316164376562363330613035336537612f576562417373656d626c792f636f6d706f6e656e742d6d6f64656c&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md" title="component-model/design/mvp/CanonicalABI.md at main · WebAssembly/component-model">component-model/design/mvp/CanonicalABI.md at main · WebAssembly/component-model</a></div><div class="message_embed_description">Repository for design and specification of the Component Model - WebAssembly/component-model</div></div></div>
+
+
+
+<a name="553435669"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/Access%20raw%20TypedFunc%20and%20guest%20Memory%20in%20%22component%20mode%22%3F/near/553435669" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Meeuwsen <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/Access.20raw.20TypedFunc.20and.20guest.20Memory.20in.20.22component.20mode.22.3F.html#553435669">(Nov 03 2025 at 17:08)</a>:</h4>
+<p>You've given me some reading and things to think about. Thanks again.</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

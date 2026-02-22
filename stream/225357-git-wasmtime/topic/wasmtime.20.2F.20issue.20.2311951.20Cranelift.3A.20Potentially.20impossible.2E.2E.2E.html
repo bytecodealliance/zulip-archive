@@ -1,0 +1,97 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #11951 Cranelift: Potentially impossible... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311951.20Cranelift.3A.20Potentially.20impossible.2E.2E.2E.html">wasmtime / issue #11951 Cranelift: Potentially impossible...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="547514077"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311951%20Cranelift%3A%20Potentially%20impossible.../near/547514077" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311951.20Cranelift.3A.20Potentially.20impossible.2E.2E.2E.html#547514077">(Oct 28 2025 at 14:48)</a>:</h4>
+<p>WireWhiz opened <a href="https://github.com/bytecodealliance/wasmtime/issues/11951">issue #11951</a>:</p>
+<blockquote>
+<p>I'm currently working on implementing C ABI function calling support for a jit compiled scripting runtime, and I've hit some interesting edge cases when implementing the spec for SystemV aarch64.</p>
+<p>So far I have C ABI function calls working with WindowsFastcall x86_64, SystemV x86_64, and very nearly have SystemV aarch64 done, which is the last platform I'm targeting for the moment.</p>
+<p>I've gone the route of manually recreating the ABI spec algorithms using the type information in my own IR and then relying on cranelift only for register allocation and overflowing arguments to the stack.</p>
+<p>For implementing the arm64 SystemV spec I'm referencing this document: <a href="https://c9x.me/compile/bib/abi-arm64.pdf">https://c9x.me/compile/bib/abi-arm64.pdf</a></p>
+<p>There are two edge cases I've found that are unique to this convention:</p>
+<h2>1. Register alignment</h2>
+<p>The spec states:</p>
+<blockquote>
+<p>C.8 If the argument has an alignment of 16 then the NGRN is rounded up to the next even number</p>
+</blockquote>
+<p>Arm sometimes skips registers to keep <em>registers</em> aligned. This is likely an optimization so instructions like LDP, SRP that work on pairs of registers (that must start with an even-indexed register) can be used. This one isn't a blocker since I can either pack arguments into i128 args, that I assume cranelift implements that same alignment spec for, or insert "padding" values into signatures and zeroed constants to those padding arguments when I do function calls. It's not clean and injects unneeded instructions, but it's not a blocker.</p>
+<h2>2. Accounting for running out of arguments when working with HVAs and Aggregate types</h2>
+<p>The SystemV spec on both platforms I've implemented it on allows structs that are 16bytes or less to be passed in two registers. However, on both platforms to pass a struct in registers, it must be <em>fully</em> passable in registers. So you cannot pass the first 8bytes of a type in a register and then the rest on the stack. </p>
+<p>For x86_64 this isn't a problem since you fall back to implicitly passing the struct on the stack, and I can use ArgumentPurpose::StructArgument for that case easily. </p>
+<p>However, on on ARM, since ArgumentPurpose::StructArgument was removed in <a href="https://github.com/bytecodealliance/wasmtime/pull/9258">https://github.com/bytecodealliance/wasmtime/pull/9258</a> this is not possible. (Also I assume that the behavior of this argument was originally to pass a pointer in a register, which is correct most of the time, but <em>not</em> correct in this instance). </p>
+<p>For 9-16byte structs there is still a work around, I can use a "padding" argument to overflow the struct struct to be passed implicitly on the stack as described in the spec.  </p>
+<p>The problem is HFA (Homogeneous Floating-point Aggregate) and HVA (Homogeneous Short-Vector Aggregate) arguments.</p>
+<p>Basically, if you have an aggregate type that contains four or less floating point variables of the same type, that aggregate or struct is passed in up to 4 vector/float registers. However if there are not enough floating point registers left to pass all the fields of that aggregate in registers, the <em>entire</em> aggregate is passed on the stack implicitly, without passing a pointer in it's place.</p>
+<p>I have not yet found a way to work around this case. Though writing this report has given me an idea:<br>
+Instead of doing what I do now where I construct one vector of arguments, I could instead have two vectors, one for values passed in registers, and one for arguments that must be passed on the stack. When constructing a function signature or the values for a function call I could first append the register values, then append padding general and float values until both are overflowing to memory (I'm already calculating when this overflow happens), then appending values I need to be on the stack.</p>
+<p>I believe that workaround will function, but it won't be clean and will introduce overhead in both reconstructing arguments and calling functions since I will need to pass padding constants to functions.</p>
+<h1>Proposed Solution</h1>
+<p>Rename <code>ArgumentPurpose::StructArgument</code> to something like <code>StackArgument</code>, since that more closely matches it's behavior now that it's no longer interacting structures directly, and then reintroduce it to aarch64 and possibly other operating systems where implicit stack arguments are utilized. This would immediately solve my issue here very cleanly, and also clarify what StructArgument is even used for. I know when I figured it out it was basically a complete guess because I could find zero examples and the current comment does not describe it's behavior.</p>
+<p>I also propose adding in an <code>ArgumentPurpose::Padding</code> or something of the sort to account for intentionally unused registers, to safely avoid needing to pass or handle junk data that is not used in an abi, though this one is definitely a lot less important.</p>
+<p>I'm willing to attempt to solve at least StructArgument for aarch64 myself on a fork, but I'm unfamiliar with the codebase and if something like this would warrant an RFC. </p>
+<p>I'm currently in pre-production for a project and want to get something working rather quickly, but I also do want to contribute here if possible.</p>
+</blockquote>
+
+
+
+<a name="547514081"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311951%20Cranelift%3A%20Potentially%20impossible.../near/547514081" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311951.20Cranelift.3A.20Potentially.20impossible.2E.2E.2E.html#547514081">(Oct 28 2025 at 14:48)</a>:</h4>
+<p><a href="https://github.com/WireWhiz">WireWhiz</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/11951">Issue #11951</a>.</p>
+
+
+
+<a name="547514082"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311951%20Cranelift%3A%20Potentially%20impossible.../near/547514082" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311951.20Cranelift.3A.20Potentially.20impossible.2E.2E.2E.html#547514082">(Oct 28 2025 at 14:48)</a>:</h4>
+<p><a href="https://github.com/WireWhiz">WireWhiz</a> added the cranelift label to <a href="https://github.com/bytecodealliance/wasmtime/issues/11951">Issue #11951</a>.</p>
+
+
+
+<a name="547517825"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311951%20Cranelift%3A%20Potentially%20impossible.../near/547517825" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311951.20Cranelift.3A.20Potentially.20impossible.2E.2E.2E.html#547517825">(Oct 28 2025 at 15:03)</a>:</h4>
+<p>bjorn3 <a href="https://github.com/bytecodealliance/wasmtime/issues/11951#issuecomment-3456951736">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11951">issue #11951</a>:</p>
+<blockquote>
+<p>Your second point is a duplicate of <a href="https://github.com/bytecodealliance/wasmtime/issues/9509">https://github.com/bytecodealliance/wasmtime/issues/9509</a>. As for your first point, I wasn't aware arm64 also skipped registers in some cases.</p>
+</blockquote>
+
+
+
+<a name="547518472"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311951%20Cranelift%3A%20Potentially%20impossible.../near/547518472" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311951.20Cranelift.3A.20Potentially.20impossible.2E.2E.2E.html#547518472">(Oct 28 2025 at 15:05)</a>:</h4>
+<p>WireWhiz <a href="https://github.com/bytecodealliance/wasmtime/issues/11951#issuecomment-3456962932">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11951">issue #11951</a>:</p>
+<blockquote>
+<p>Upon looking closer at the spec it looks like both general and vector registers have it explicitly stated that if an aggregate or HVA type can't be allocated on the stack no more arguments of that type (general or vector) will be passed after that struct, this is implied in C.3 and C.11. This means I wouldn't need to maintain two vectors of values for a work around, just would need to perform an intentional overflow of general or vector registers when that needs to happen. Still results in the use of padding arguments.</p>
+</blockquote>
+
+
+
+<a name="547526040"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311951%20Cranelift%3A%20Potentially%20impossible.../near/547526040" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311951.20Cranelift.3A.20Potentially.20impossible.2E.2E.2E.html#547526040">(Oct 28 2025 at 15:34)</a>:</h4>
+<p>bjorn3 <a href="https://github.com/bytecodealliance/wasmtime/issues/11951#issuecomment-3457114870">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11951">issue #11951</a>:</p>
+<blockquote>
+<p>Looks like for cg_clif the padding is already effectively handled by the rustc frontend: <a href="https://github.com/rust-lang/rust/blob/c9537a94a6300a8292804829801f7724fb8a33f6/compiler/rustc_target/src/callconv/aarch64.rs#L142-L149">https://github.com/rust-lang/rust/blob/c9537a94a6300a8292804829801f7724fb8a33f6/compiler/rustc_target/src/callconv/aarch64.rs#L142-L149</a> Presumably with LLVM the frontend is also responsible for adding those padding arguments. FWIW the ABI handling of Cranelift operates on the same level as LLVM, aka the frontend is responsible for lowering C types to calling convention specific combinations of clif ir types + argument purpose.</p>
+<p>So I think only <a href="https://github.com/bytecodealliance/wasmtime/issues/9509">https://github.com/bytecodealliance/wasmtime/issues/9509</a> is necessary.</p>
+</blockquote>
+
+
+
+<a name="547809666"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311951%20Cranelift%3A%20Potentially%20impossible.../near/547809666" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311951.20Cranelift.3A.20Potentially.20impossible.2E.2E.2E.html#547809666">(Oct 29 2025 at 20:52)</a>:</h4>
+<p>WireWhiz <a href="https://github.com/bytecodealliance/wasmtime/issues/11951#issuecomment-3463957497">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11951">issue #11951</a>:</p>
+<blockquote>
+<p>I'm using the i128 packing trick as well, I just would prefer parameter behavior was explicit instead of implied in those cases.</p>
+<p>In any case though I wanted to report that I got it working. First I intentionally added in padding float/vector arguments to force an overflow to the stack for the vector registers. Then since all stack values are 8byte aligned, I push enough f64 arguments to hold the up to 4 potentially smaller types. When calling and reconstructing arguments I use vector register instructions to pack smaller float values into the lower bytes of a vector register, and then extract one or two 64 bit lanes from. The same process works in reverse for reading function arguments.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

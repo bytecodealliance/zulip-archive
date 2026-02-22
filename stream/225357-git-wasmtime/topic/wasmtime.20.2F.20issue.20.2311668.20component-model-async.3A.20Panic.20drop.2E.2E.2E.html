@@ -1,0 +1,303 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #11668 component-model-async: Panic drop... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311668.20component-model-async.3A.20Panic.20drop.2E.2E.2E.html">wasmtime / issue #11668 component-model-async: Panic drop...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="538677886"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311668%20component-model-async%3A%20Panic%20drop.../near/538677886" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311668.20component-model-async.3A.20Panic.20drop.2E.2E.2E.html#538677886">(Sep 10 2025 at 15:11)</a>:</h4>
+<p>alexcrichton assigned dicej to <a href="https://github.com/bytecodealliance/wasmtime/issues/11668">issue #11668</a>.</p>
+
+
+
+<a name="538677897"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311668%20component-model-async%3A%20Panic%20drop.../near/538677897" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311668.20component-model-async.3A.20Panic.20drop.2E.2E.2E.html#538677897">(Sep 10 2025 at 15:11)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/issues/11668">issue #11668</a>:</p>
+<blockquote>
+<p>This test case:</p>
+<div class="codehilite" data-code-language="wasm"><pre><span></span><code>(component
+  (component $A
+    (core module $a
+      (func (export "run") (result i32)
+        i32.const 1)
+      (func (export "run-cb") (param i32 i32 i32) (result i32)
+        unreachable)
+    )
+
+    (core instance $a (instantiate $a))
+    (func (export "run")
+      (canon lift (core func $a "run") async (callback (func $a "run-cb"))))
+  )
+  (component $B
+    (import "a" (instance $a (export "run" (func))))
+
+    (core module $libc (memory (export "memory") 1))
+    (core instance $libc (instantiate $libc))
+
+    (core func $run (canon lower (func $a "run") async))
+    (core func $new (canon waitable-set.new))
+    (core func $join (canon waitable.join))
+    (core func $drop (canon waitable-set.drop))
+    (core func $wait (canon waitable-set.wait (memory $libc "memory")))
+
+    (core module $b
+      (import "" "run" (func $run_a (result i32)))
+      (import "" "new" (func $new (result i32)))
+      (import "" "join" (func $join (param i32 i32)))
+      (import "" "drop" (func $drop (param i32)))
+      (import "" "wait" (func $wait (param i32 i32) (result i32)))
+
+      (func (export "run")
+        (local $ret i32)
+        (local $set i32)
+
+        (local.set $ret (call $run_a))
+
+        ;; make sure it's in the "started" state
+        (if (i32.ne (i32.and (local.get $ret) (i32.const 0xf)) (i32.const 1))
+          (then (unreachable)))
+
+        ;; extract the waitable handle
+        (local.set $ret (i32.shr_u (local.get $ret) (i32.const 4)))
+
+        ;; Make a waitable set and insert our handle into it
+        (local.set $set (call $new))
+        (call $join (local.get $ret) (local.get $set))
+
+        ;; wait for something to happen filling in memory address 4, but don't
+        ;; actually see what happened since this panics right now.
+        (call $wait (local.get $set) (i32.const 4))
+        drop
+      )
+    )
+    (core instance $b (instantiate $b
+      (with "" (instance
+        (export "run" (func $run))
+        (export "new" (func $new))
+        (export "join" (func $join))
+        (export "drop" (func $drop))
+        (export "wait" (func $wait))
+      ))
+    ))
+    (func (export "run")
+      (canon lift (core func $b "run")))
+  )
+
+  (instance $a (instantiate $A))
+  (instance $b (instantiate $B (with "a" (instance $a))))
+  (export "run" (func $b "run"))
+)
+
+(assert_return (invoke "run"))
+</code></pre></div>
+<p>yields:</p>
+<p><div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">WASMTIME_BACKTRACE_DETAILS</span><span class="o">=</span><span class="mi">1</span><span class="w"> </span><span class="o">../</span><span class="n">wasmtime</span><span class="o">/</span><span class="n">target</span><span class="o">/</span><span class="n">x86_64</span><span class="o">-</span><span class="n">unknown</span><span class="o">-</span><span class="n">linux</span><span class="o">-</span><span class="n">gnu</span><span class="o">/</span><span class="n">release</span><span class="o">/</span><span class="n">wasmtime</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">W</span><span class="w"> </span><span class="n">component</span><span class="o">-</span><span class="n">model</span><span class="o">-</span><span class="k">async</span><span class="w"> </span><span class="n">foo</span><span class="p">.</span><span class="n">wast</span>
+
+<span class="n">thread</span><span class="w"> </span><span class="o">'</span><span class="na">main</span><span class="o">'</span><span class="w"> </span><span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">crates</span><span class="o">/</span><span class="n">wasmtime</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">runtime</span><span class="o">/</span><span class="n">fiber</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">442</span><span class="p">:</span><span class="mi">9</span><span class="p">:</span>
+<span class="nc">attempted</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="nb">drop</span><span class="w"> </span><span class="k">in</span><span class="o">-</span><span class="n">progress</span><span class="w"> </span><span class="n">fiber</span><span class="w"> </span><span class="n">without</span><span class="w"> </span><span class="n">first</span><span class="w"> </span><span class="n">calling</span><span class="w"> </span><span class="err">`</span><span class="n">StoreFiber</span><span class="p">::</span><span class="n">dispose</span><span class="err">`</span>
+<span class="n">note</span><span class="p">:</span><span class="w"> </span><span class="nc">run</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="err">`</span><span class="n">RUST_BACKTRACE</span><span class="o">=</span><span class="mi">1</span><span class="err">`</span><span class="w"> </span><span class="n">environment</span><span class="w"> </span><span class="n">variable</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">display</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="n">backtrace</span>
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="538677898"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311668%20component-model-async%3A%20Panic%20drop.../near/538677898" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311668.20component-model-async.3A.20Panic.20drop.2E.2E.2E.html#538677898">(Sep 10 2025 at 15:11)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasm-proposal:component-model-async label to <a href="https://github.com/bytecodealliance/wasmtime/issues/11668">Issue #11668</a>.</p>
+
+
+
+<a name="538678013"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311668%20component-model-async%3A%20Panic%20drop.../near/538678013" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311668.20component-model-async.3A.20Panic.20drop.2E.2E.2E.html#538678013">(Sep 10 2025 at 15:12)</a>:</h4>
+<p>alexcrichton edited <a href="https://github.com/bytecodealliance/wasmtime/issues/11668">issue #11668</a>:</p>
+<blockquote>
+<p>This test case:</p>
+<div class="codehilite" data-code-language="wasm"><pre><span></span><code>(component
+  (component $A
+    (core module $a
+      (func (export "run") (result i32)
+        i32.const 1)
+      ;; raise a trap in the callback which is what causes the host-side panic
+      (func (export "run-cb") (param i32 i32 i32) (result i32)
+        unreachable)
+    )
+
+    (core instance $a (instantiate $a))
+    (func (export "run")
+      (canon lift (core func $a "run") async (callback (func $a "run-cb"))))
+  )
+  (component $B
+    (import "a" (instance $a (export "run" (func))))
+
+    (core module $libc (memory (export "memory") 1))
+    (core instance $libc (instantiate $libc))
+
+    (core func $run (canon lower (func $a "run") async))
+    (core func $new (canon waitable-set.new))
+    (core func $join (canon waitable.join))
+    (core func $drop (canon waitable-set.drop))
+    (core func $wait (canon waitable-set.wait (memory $libc "memory")))
+
+    (core module $b
+      (import "" "run" (func $run_a (result i32)))
+      (import "" "new" (func $new (result i32)))
+      (import "" "join" (func $join (param i32 i32)))
+      (import "" "drop" (func $drop (param i32)))
+      (import "" "wait" (func $wait (param i32 i32) (result i32)))
+
+      (func (export "run")
+        (local $ret i32)
+        (local $set i32)
+
+        (local.set $ret (call $run_a))
+
+        ;; make sure it's in the "started" state
+        (if (i32.ne (i32.and (local.get $ret) (i32.const 0xf)) (i32.const 1))
+          (then (unreachable)))
+
+        ;; extract the waitable handle
+        (local.set $ret (i32.shr_u (local.get $ret) (i32.const 4)))
+
+        ;; Make a waitable set and insert our handle into it
+        (local.set $set (call $new))
+        (call $join (local.get $ret) (local.get $set))
+
+        ;; wait for something to happen filling in memory address 4, but don't
+        ;; actually see what happened since this panics right now.
+        (call $wait (local.get $set) (i32.const 4))
+        drop
+      )
+    )
+    (core instance $b (instantiate $b
+      (with "" (instance
+        (export "run" (func $run))
+        (export "new" (func $new))
+        (export "join" (func $join))
+        (export "drop" (func $drop))
+        (export "wait" (func $wait))
+      ))
+    ))
+    (func (export "run")
+      (canon lift (core func $b "run")))
+  )
+
+  (instance $a (instantiate $A))
+  (instance $b (instantiate $B (with "a" (instance $a))))
+  (export "run" (func $b "run"))
+)
+
+(assert_return (invoke "run"))
+</code></pre></div>
+<p>yields:</p>
+<p><div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">WASMTIME_BACKTRACE_DETAILS</span><span class="o">=</span><span class="mi">1</span><span class="w"> </span><span class="o">../</span><span class="n">wasmtime</span><span class="o">/</span><span class="n">target</span><span class="o">/</span><span class="n">x86_64</span><span class="o">-</span><span class="n">unknown</span><span class="o">-</span><span class="n">linux</span><span class="o">-</span><span class="n">gnu</span><span class="o">/</span><span class="n">release</span><span class="o">/</span><span class="n">wasmtime</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">W</span><span class="w"> </span><span class="n">component</span><span class="o">-</span><span class="n">model</span><span class="o">-</span><span class="k">async</span><span class="w"> </span><span class="n">foo</span><span class="p">.</span><span class="n">wast</span>
+
+<span class="n">thread</span><span class="w"> </span><span class="o">'</span><span class="na">main</span><span class="o">'</span><span class="w"> </span><span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">crates</span><span class="o">/</span><span class="n">wasmtime</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">runtime</span><span class="o">/</span><span class="n">fiber</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">442</span><span class="p">:</span><span class="mi">9</span><span class="p">:</span>
+<span class="nc">attempted</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="nb">drop</span><span class="w"> </span><span class="k">in</span><span class="o">-</span><span class="n">progress</span><span class="w"> </span><span class="n">fiber</span><span class="w"> </span><span class="n">without</span><span class="w"> </span><span class="n">first</span><span class="w"> </span><span class="n">calling</span><span class="w"> </span><span class="err">`</span><span class="n">StoreFiber</span><span class="p">::</span><span class="n">dispose</span><span class="err">`</span>
+<span class="n">note</span><span class="p">:</span><span class="w"> </span><span class="nc">run</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="err">`</span><span class="n">RUST_BACKTRACE</span><span class="o">=</span><span class="mi">1</span><span class="err">`</span><span class="w"> </span><span class="n">environment</span><span class="w"> </span><span class="n">variable</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">display</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="n">backtrace</span>
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="538750010"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311668%20component-model-async%3A%20Panic%20drop.../near/538750010" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311668.20component-model-async.3A.20Panic.20drop.2E.2E.2E.html#538750010">(Sep 10 2025 at 23:14)</a>:</h4>
+<p>dicej closed <a href="https://github.com/bytecodealliance/wasmtime/issues/11668">issue #11668</a>:</p>
+<blockquote>
+<p>This test case:</p>
+<div class="codehilite" data-code-language="wasm"><pre><span></span><code>(component
+  (component $A
+    (core module $a
+      (func (export "run") (result i32)
+        i32.const 1)
+      ;; raise a trap in the callback which is what causes the host-side panic
+      (func (export "run-cb") (param i32 i32 i32) (result i32)
+        unreachable)
+    )
+
+    (core instance $a (instantiate $a))
+    (func (export "run")
+      (canon lift (core func $a "run") async (callback (func $a "run-cb"))))
+  )
+  (component $B
+    (import "a" (instance $a (export "run" (func))))
+
+    (core module $libc (memory (export "memory") 1))
+    (core instance $libc (instantiate $libc))
+
+    (core func $run (canon lower (func $a "run") async))
+    (core func $new (canon waitable-set.new))
+    (core func $join (canon waitable.join))
+    (core func $drop (canon waitable-set.drop))
+    (core func $wait (canon waitable-set.wait (memory $libc "memory")))
+
+    (core module $b
+      (import "" "run" (func $run_a (result i32)))
+      (import "" "new" (func $new (result i32)))
+      (import "" "join" (func $join (param i32 i32)))
+      (import "" "drop" (func $drop (param i32)))
+      (import "" "wait" (func $wait (param i32 i32) (result i32)))
+
+      (func (export "run")
+        (local $ret i32)
+        (local $set i32)
+
+        (local.set $ret (call $run_a))
+
+        ;; make sure it's in the "started" state
+        (if (i32.ne (i32.and (local.get $ret) (i32.const 0xf)) (i32.const 1))
+          (then (unreachable)))
+
+        ;; extract the waitable handle
+        (local.set $ret (i32.shr_u (local.get $ret) (i32.const 4)))
+
+        ;; Make a waitable set and insert our handle into it
+        (local.set $set (call $new))
+        (call $join (local.get $ret) (local.get $set))
+
+        ;; wait for something to happen filling in memory address 4, but don't
+        ;; actually see what happened since this panics right now.
+        (call $wait (local.get $set) (i32.const 4))
+        drop
+      )
+    )
+    (core instance $b (instantiate $b
+      (with "" (instance
+        (export "run" (func $run))
+        (export "new" (func $new))
+        (export "join" (func $join))
+        (export "drop" (func $drop))
+        (export "wait" (func $wait))
+      ))
+    ))
+    (func (export "run")
+      (canon lift (core func $b "run")))
+  )
+
+  (instance $a (instantiate $A))
+  (instance $b (instantiate $B (with "a" (instance $a))))
+  (export "run" (func $b "run"))
+)
+
+(assert_return (invoke "run"))
+</code></pre></div>
+<p>yields:</p>
+<p><div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">WASMTIME_BACKTRACE_DETAILS</span><span class="o">=</span><span class="mi">1</span><span class="w"> </span><span class="o">../</span><span class="n">wasmtime</span><span class="o">/</span><span class="n">target</span><span class="o">/</span><span class="n">x86_64</span><span class="o">-</span><span class="n">unknown</span><span class="o">-</span><span class="n">linux</span><span class="o">-</span><span class="n">gnu</span><span class="o">/</span><span class="n">release</span><span class="o">/</span><span class="n">wasmtime</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">W</span><span class="w"> </span><span class="n">component</span><span class="o">-</span><span class="n">model</span><span class="o">-</span><span class="k">async</span><span class="w"> </span><span class="n">foo</span><span class="p">.</span><span class="n">wast</span>
+
+<span class="n">thread</span><span class="w"> </span><span class="o">'</span><span class="na">main</span><span class="o">'</span><span class="w"> </span><span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">crates</span><span class="o">/</span><span class="n">wasmtime</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">runtime</span><span class="o">/</span><span class="n">fiber</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">442</span><span class="p">:</span><span class="mi">9</span><span class="p">:</span>
+<span class="nc">attempted</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="nb">drop</span><span class="w"> </span><span class="k">in</span><span class="o">-</span><span class="n">progress</span><span class="w"> </span><span class="n">fiber</span><span class="w"> </span><span class="n">without</span><span class="w"> </span><span class="n">first</span><span class="w"> </span><span class="n">calling</span><span class="w"> </span><span class="err">`</span><span class="n">StoreFiber</span><span class="p">::</span><span class="n">dispose</span><span class="err">`</span>
+<span class="n">note</span><span class="p">:</span><span class="w"> </span><span class="nc">run</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="err">`</span><span class="n">RUST_BACKTRACE</span><span class="o">=</span><span class="mi">1</span><span class="err">`</span><span class="w"> </span><span class="n">environment</span><span class="w"> </span><span class="n">variable</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">display</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="n">backtrace</span>
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

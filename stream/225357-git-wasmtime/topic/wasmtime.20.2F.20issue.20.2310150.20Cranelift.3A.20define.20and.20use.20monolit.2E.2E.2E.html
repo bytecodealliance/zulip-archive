@@ -1,0 +1,136 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #10150 Cranelift: define and use monolit... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310150.20Cranelift.3A.20define.20and.20use.20monolit.2E.2E.2E.html">wasmtime / issue #10150 Cranelift: define and use monolit...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="496634772"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310150%20Cranelift%3A%20define%20and%20use%20monolit.../near/496634772" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310150.20Cranelift.3A.20define.20and.20use.20monolit.2E.2E.2E.html#496634772">(Jan 29 2025 at 20:08)</a>:</h4>
+<p>cfallin opened <a href="https://github.com/bytecodealliance/wasmtime/issues/10150">issue #10150</a>:</p>
+<blockquote>
+<p>Today in the Wasm-to-CLIF translator we have a <a href="https://github.com/bytecodealliance/wasmtime/blob/facc9925242cad47df3d9910afd2a552e196c7f7/crates/cranelift/src/translate/code_translator/bounds_checks.rs#L1">detailed set of cases</a> by which we break down Wasm-level loads and stores into statically or dynamically bounds-checked operations. For example, a fully general dynamic bounds check becomes something like:</p>
+<ul>
+<li>Compute the Wasm index value (<code>i32</code>) plus offset given on the load;</li>
+<li>Compute that Wasm address plus the access size;</li>
+<li>Compare that end-of-access address to a loaded memory size/bound;</li>
+<li>Trap if out-of-bounds;</li>
+<li>Add the loaded memory base to the index plus offset;</li>
+<li>Load from that computed host address.</li>
+</ul>
+<p>With variations possible depending on exactly what guard regions exist, whether Spectre mitigations are enabled (cmoves-of-null-pointers rather than branches for traps), whether the address is constant and known in-bounds, whether the access is 1 byte or multiple, and all the rest.</p>
+<p>The theory behind "exploding" the Wasm-level operation into constituent parts in CLIF is twofold. First, it allows the compiler backends to deal with a simpler "core IR" that knows only about host loads and stores -- there is no need to have a concept of separate bounds-checked address spaces baked into every backend, and all the backends benefit from one central encoding of all the special cases and optimizations. Second, it was thought that this might allow some parts to be optimized: e.g., GVN when accesses have parts of the address in common (only offsets differ), or GVN and LICM when some parts are loop-invariant (e.g., base pointers on immovable memories or limits on non-growable memories), or constant folding, or maybe other things. The less we have to teach the optimizer about "bounds check" as a concept, the better.</p>
+<p>However, there are several more recent realizations we have had. First, the promised optimization is only partly realizable; for example, the ability for memories to grow means that limit fields must be reloaded frequently or every time. And the common deployment mode that results in dynamic bounds-checking typically has no guard region at all ("no virtual memory" scenarios on embedded systems, or high-density scenarios with many memories where frequent virtual memory changes on guards during memory growth might become a bottleneck). Because of this, some of the commonality is lost: e.g., in common configurations we probably won't be able to factor out the compare-and-trap/cmov from Wasm loads/stores with different offsets on the same base.</p>
+<p>Second, as @alexcrichton noted in today's Cranelift meeting, the Pulley interpreter-bytecode Cranelift backend wants to target new macro-ops that implement the Wasm bounds-check sequence. When there is interpreter overhead for every instruction, there is pressure away from "exploded" views of operation steps and back toward ready-made larger ops. Currently we would have to pattern-match all the various kinds of code we can generate to recover these macro-ops.</p>
+<p>Third, as I described recently in a talk about proof-carrying code, verifying the tiny pieces that make up a dynamic bounds-check sequence is extremely challenging: getting an analysis to understand all the variations is brittle and complex, and leads to surprising and un-intuitive quadratic verification behavior. A verifier ideally wants to see a bounds-check as a single operation with a verified implementation rather than a graph of operators that lose the intent.</p>
+<p>For all these reasons, I think we should consider adding a <code>bounds_check</code> operator to CLIF. Its semantics might be something like: <code>boundscheck32_or_null.i64 host_base, offset, limit, imm_offset, size</code>, where <code>host_base</code> (<code>i64</code> on 64-bit-pointer systems) is a host address of the start of a bounds-checked memory, <code>offset</code> is an <code>i32</code> offset into the memory, <code>limit</code> is an <code>i32</code> memory size, <code>imm_offset</code> is a 16-bit constant offset to add to the returned address (<code>u16</code>), and <code>size</code> <code>is the size of the access (</code>u8<code>). (These operand sizes were picked to allow the whole </code>InstructionData<code> to fit in 16 bytes: three </code>Value<code>s and 24 bits of payload. If the enum tag becomes a </code>u16<code> then we can make </code>imm_offset<code> a </code>u8<code> and still capture most cases without a separate </code>iadd` probably.)</p>
+<p>The semantics would be: if <code>offset + imm_offset + size &lt;= limit</code>, then return <code>host_base + offset + imm_offset</code>, otherwise return <code>0</code>. We could define a variant <code>..._or_trap</code> that traps instead on out-of-bounds.</p>
+<p>The important considerations in my view are:</p>
+<ul>
+<li>We should ensure that we can either encode optimizations that <code>bounds_check.rs</code> does with the new opcode, or else decide these optimizations aren't desired anymore. (Hopefully the former unless we have good data otherwise.) For example, if we <em>do</em> have a guard region, we could use the bounds-check opcode to compute a base without the specific load offset, then put the load offset on the machine load instruction. The Pulley backend should be able to combine these still and the verifier should be able to reason about valid ranges too.</li>
+<li>We should ensure that we aren't removing important GVN-ability. Notably the above still externalizes the loads of base and limit; so whatever we do to allow those to be readonly, LICM them out of loops, etc., still applies. Also, this opcode would be either pure (Spectre/null variant) or idempotent (trapping variant) so to the extent that we can factor out offsets as above, it should be combinable.</li>
+</ul>
+<p>Curious what others think -- any requirements this is missing? Any other important optimizations we would lose out on?</p>
+</blockquote>
+
+
+
+<a name="496634895"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310150%20Cranelift%3A%20define%20and%20use%20monolit.../near/496634895" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310150.20Cranelift.3A.20define.20and.20use.20monolit.2E.2E.2E.html#496634895">(Jan 29 2025 at 20:09)</a>:</h4>
+<p>cfallin edited <a href="https://github.com/bytecodealliance/wasmtime/issues/10150">issue #10150</a>:</p>
+<blockquote>
+<p>Today in the Wasm-to-CLIF translator we have a <a href="https://github.com/bytecodealliance/wasmtime/blob/facc9925242cad47df3d9910afd2a552e196c7f7/crates/cranelift/src/translate/code_translator/bounds_checks.rs#L1">detailed set of cases</a> by which we break down Wasm-level loads and stores into statically or dynamically bounds-checked operations. For example, a fully general dynamic bounds check becomes something like:</p>
+<ul>
+<li>Compute the Wasm index value (<code>i32</code>) plus offset given on the load;</li>
+<li>Compute that Wasm address plus the access size;</li>
+<li>Compare that end-of-access address to a loaded memory size/bound;</li>
+<li>Trap if out-of-bounds;</li>
+<li>Add the loaded memory base to the index plus offset;</li>
+<li>Load from that computed host address.</li>
+</ul>
+<p>With variations possible depending on exactly what guard regions exist, whether Spectre mitigations are enabled (cmoves-of-null-pointers rather than branches for traps), whether the address is constant and known in-bounds, whether the access is 1 byte or multiple, and all the rest.</p>
+<p>The theory behind "exploding" the Wasm-level operation into constituent parts in CLIF is twofold. First, it allows the compiler backends to deal with a simpler "core IR" that knows only about host loads and stores -- there is no need to have a concept of separate bounds-checked address spaces baked into every backend, and all the backends benefit from one central encoding of all the special cases and optimizations. Second, it was thought that this might allow some parts to be optimized: e.g., GVN when accesses have parts of the address in common (only offsets differ), or GVN and LICM when some parts are loop-invariant (e.g., base pointers on immovable memories or limits on non-growable memories), or constant folding, or maybe other things. The less we have to teach the optimizer about "bounds check" as a concept, the better.</p>
+<p>However, there are several more recent realizations we have had. First, the promised optimization is only partly realizable; for example, the ability for memories to grow means that limit fields must be reloaded frequently or every time. And the common deployment mode that results in dynamic bounds-checking typically has no guard region at all ("no virtual memory" scenarios on embedded systems, or high-density scenarios with many memories where frequent virtual memory changes on guards during memory growth might become a bottleneck). Because of this, some of the commonality is lost: e.g., in common configurations we probably won't be able to factor out the compare-and-trap/cmov from Wasm loads/stores with different offsets on the same base.</p>
+<p>Second, as @alexcrichton noted in today's Cranelift meeting, the Pulley interpreter-bytecode Cranelift backend wants to target new macro-ops that implement the Wasm bounds-check sequence. When there is interpreter overhead for every instruction, there is pressure away from "exploded" views of operation steps and back toward ready-made larger ops. Currently we would have to pattern-match all the various kinds of code we can generate to recover these macro-ops.</p>
+<p>Third, as I described recently in a talk about proof-carrying code, verifying the tiny pieces that make up a dynamic bounds-check sequence is extremely challenging: getting an analysis to understand all the variations is brittle and complex, and leads to surprising and un-intuitive quadratic verification behavior. A verifier ideally wants to see a bounds-check as a single operation with a verified implementation rather than a graph of operators that lose the intent.</p>
+<p>For all these reasons, I think we should consider adding a <code>bounds_check</code> operator to CLIF. Its semantics might be something like: <code>boundscheck32_or_null.i64 host_base, offset, limit, imm_offset, size</code>, where <code>host_base</code> (<code>i64</code> on 64-bit-pointer systems) is a host address of the start of a bounds-checked memory, <code>offset</code> is an <code>i32</code> offset into the memory, <code>limit</code> is an <code>i32</code> memory size, <code>imm_offset</code> is a 16-bit constant offset to add to the returned address (<code>u16</code>), and <code>size</code> is the size of the access (<code>u8</code>). (These operand sizes were picked to allow the whole <code>InstructionData</code> to fit in 16 bytes: three <code>Value</code>s and 24 bits of payload. If the enum tag becomes a <code>u16</code> then we can make <code>imm_offset</code> a <code>u8</code> and still capture most cases without a separate <code>iadd</code> probably.)</p>
+<p>The semantics would be: if <code>offset + imm_offset + size &lt;= limit</code>, then return <code>host_base + offset + imm_offset</code>, otherwise return <code>0</code>. We could define a variant <code>..._or_trap</code> that traps instead on out-of-bounds.</p>
+<p>The important considerations in my view are:</p>
+<ul>
+<li>We should ensure that we can either encode optimizations that <code>bounds_check.rs</code> does with the new opcode, or else decide these optimizations aren't desired anymore. (Hopefully the former unless we have good data otherwise.) For example, if we <em>do</em> have a guard region, we could use the bounds-check opcode to compute a base without the specific load offset, then put the load offset on the machine load instruction. The Pulley backend should be able to combine these still and the verifier should be able to reason about valid ranges too.</li>
+<li>We should ensure that we aren't removing important GVN-ability. Notably the above still externalizes the loads of base and limit; so whatever we do to allow those to be readonly, LICM them out of loops, etc., still applies. Also, this opcode would be either pure (Spectre/null variant) or idempotent (trapping variant) so to the extent that we can factor out offsets as above, it should be combinable.</li>
+</ul>
+<p>Curious what others think -- any requirements this is missing? Any other important optimizations we would lose out on?</p>
+</blockquote>
+
+
+
+<a name="496635000"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310150%20Cranelift%3A%20define%20and%20use%20monolit.../near/496635000" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310150.20Cranelift.3A.20define.20and.20use.20monolit.2E.2E.2E.html#496635000">(Jan 29 2025 at 20:10)</a>:</h4>
+<p>cfallin edited <a href="https://github.com/bytecodealliance/wasmtime/issues/10150">issue #10150</a>:</p>
+<blockquote>
+<p>Today in the Wasm-to-CLIF translator we have a <a href="https://github.com/bytecodealliance/wasmtime/blob/facc9925242cad47df3d9910afd2a552e196c7f7/crates/cranelift/src/translate/code_translator/bounds_checks.rs#L1">detailed set of cases</a> by which we break down Wasm-level loads and stores into statically or dynamically bounds-checked operations. For example, a fully general dynamic bounds check becomes something like:</p>
+<ul>
+<li>Compute the Wasm index value (<code>i32</code>) plus offset given on the load;</li>
+<li>Compute that Wasm address plus the access size;</li>
+<li>Compare that end-of-access address to a loaded memory size/bound;</li>
+<li>Trap if out-of-bounds;</li>
+<li>Add the loaded memory base to the index plus offset;</li>
+<li>Load from that computed host address.</li>
+</ul>
+<p>With variations possible depending on exactly what guard regions exist, whether Spectre mitigations are enabled (cmoves-of-null-pointers rather than branches for traps), whether the address is constant and known in-bounds, whether the access is 1 byte or multiple, and all the rest.</p>
+<p>The theory behind "exploding" the Wasm-level operation into constituent parts in CLIF is twofold. First, it allows the compiler backends to deal with a simpler "core IR" that knows only about host loads and stores -- there is no need to have a concept of separate bounds-checked address spaces baked into every backend, and all the backends benefit from one central encoding of all the special cases and optimizations. Second, it was thought that this might allow some parts to be optimized: e.g., GVN when accesses have parts of the address in common (only offsets differ), or GVN and LICM when some parts are loop-invariant (e.g., base pointers on immovable memories or limits on non-growable memories), or constant folding, or maybe other things. The less we have to teach the optimizer about "bounds check" as a concept, the better.</p>
+<p>However, there are several more recent realizations we have had. First, the promised optimization is only partly realizable; for example, the ability for memories to grow means that limit fields must be reloaded frequently or every time. And the common deployment mode that results in dynamic bounds-checking typically has no guard region at all ("no virtual memory" scenarios on embedded systems, or high-density scenarios with many memories where frequent virtual memory changes on guards during memory growth might become a bottleneck). Because of this, some of the commonality is lost: e.g., in common configurations we probably won't be able to factor out the compare-and-trap/cmov from Wasm loads/stores with different offsets on the same base.</p>
+<p>Second, as @alexcrichton noted in today's Cranelift meeting, the Pulley interpreter-bytecode Cranelift backend wants to target new macro-ops that implement the Wasm bounds-check sequence. When there is interpreter overhead for every instruction, there is pressure away from "exploded" views of operation steps and back toward ready-made larger ops. Currently we would have to pattern-match all the various kinds of code we can generate to recover these macro-ops.</p>
+<p>Third, as I described recently in a talk about proof-carrying code, verifying the tiny pieces that make up a dynamic bounds-check sequence is extremely challenging: getting an analysis to understand all the variations is brittle and complex, and leads to surprising and un-intuitive quadratic verification behavior. A verifier ideally wants to see a bounds-check as a single operation with a verified implementation rather than a graph of operators that lose the intent.</p>
+<p>For all these reasons, I think we should consider adding a bounds-check operator to CLIF. Its semantics might be something like: <code>boundscheck32_or_null.i64 host_base, offset, limit, imm_offset, size</code>, where <code>host_base</code> (<code>i64</code> on 64-bit-pointer systems) is a host address of the start of a bounds-checked memory, <code>offset</code> is an <code>i32</code> offset into the memory, <code>limit</code> is an <code>i32</code> memory size, <code>imm_offset</code> is a 16-bit constant offset to add to the returned address (<code>u16</code>), and <code>size</code> is the size of the access (<code>u8</code>). (These operand sizes were picked to allow the whole <code>InstructionData</code> to fit in 16 bytes: three <code>Value</code>s and 24 bits of payload. If the enum tag becomes a <code>u16</code> then we can make <code>imm_offset</code> a <code>u8</code> and still capture most cases without a separate <code>iadd</code> probably.)</p>
+<p>The semantics would be: if <code>offset + imm_offset + size &lt;= limit</code>, then return <code>host_base + offset + imm_offset</code>, otherwise return <code>0</code>. We could define a variant <code>..._or_trap</code> that traps instead on out-of-bounds.</p>
+<p>The important considerations in my view are:</p>
+<ul>
+<li>We should ensure that we can either encode optimizations that <code>bounds_check.rs</code> does with the new opcode, or else decide these optimizations aren't desired anymore. (Hopefully the former unless we have good data otherwise.) For example, if we <em>do</em> have a guard region, we could use the bounds-check opcode to compute a base without the specific load offset, then put the load offset on the machine load instruction. The Pulley backend should be able to combine these still and the verifier should be able to reason about valid ranges too.</li>
+<li>We should ensure that we aren't removing important GVN-ability. Notably the above still externalizes the loads of base and limit; so whatever we do to allow those to be readonly, LICM them out of loops, etc., still applies. Also, this opcode would be either pure (Spectre/null variant) or idempotent (trapping variant) so to the extent that we can factor out offsets as above, it should be combinable.</li>
+</ul>
+<p>Curious what others think -- any requirements this is missing? Any other important optimizations we would lose out on?</p>
+</blockquote>
+
+
+
+<a name="496667513"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310150%20Cranelift%3A%20define%20and%20use%20monolit.../near/496667513" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310150.20Cranelift.3A.20define.20and.20use.20monolit.2E.2E.2E.html#496667513">(Jan 30 2025 at 00:06)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/10150#issuecomment-2623210484">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10150">issue #10150</a>:</p>
+<blockquote>
+<p>For reference <a href="https://github.com/bytecodealliance/wasmtime/pull/10154">https://github.com/bytecodealliance/wasmtime/pull/10154</a> is the culmination of the work I was doing for folding pulley bounds checks/loads into one op. For me the ISLE isn't tiny but it's also not unmanagable, personally.</p>
+</blockquote>
+
+
+
+<a name="502151498"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310150%20Cranelift%3A%20define%20and%20use%20monolit.../near/502151498" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310150.20Cranelift.3A.20define.20and.20use.20monolit.2E.2E.2E.html#502151498">(Feb 26 2025 at 21:55)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/10150#issuecomment-2686291280">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10150">issue #10150</a>:</p>
+<blockquote>
+<blockquote>
+<p>However, there are several more recent realizations we have had. First, the promised optimization is only partly realizable; for example, the ability for memories to grow means that limit fields must be reloaded frequently or every time.</p>
+</blockquote>
+<p>I would expect that alias analysis would make it so that two wasm loads/stores that do not cross a function call would indeed only load the heap limit once. Are you saying that is not the case in practice?</p>
+</blockquote>
+
+
+
+<a name="503380722"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310150%20Cranelift%3A%20define%20and%20use%20monolit.../near/503380722" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310150.20Cranelift.3A.20define.20and.20use.20monolit.2E.2E.2E.html#503380722">(Mar 04 2025 at 22:54)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/10150#issuecomment-2699162825">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10150">issue #10150</a>:</p>
+<blockquote>
+<blockquote>
+<p>I would expect that alias analysis would make it so that two wasm loads/stores that do not cross a function call would indeed only load the heap limit once. Are you saying that is not the case in practice?</p>
+</blockquote>
+<p>Ah, I may have read too much into some examples I had been looking at -- indeed it seems that limits are reused (alias analysis merges loads) between function calls.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

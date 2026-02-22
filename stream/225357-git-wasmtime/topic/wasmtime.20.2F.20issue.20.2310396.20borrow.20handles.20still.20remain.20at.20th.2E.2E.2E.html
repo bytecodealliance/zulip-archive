@@ -1,0 +1,231 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #10396 borrow handles still remain at th... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310396.20borrow.20handles.20still.20remain.20at.20th.2E.2E.2E.html">wasmtime / issue #10396 borrow handles still remain at th...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="505625888"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310396%20borrow%20handles%20still%20remain%20at%20th.../near/505625888" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310396.20borrow.20handles.20still.20remain.20at.20th.2E.2E.2E.html#505625888">(Mar 14 2025 at 09:34)</a>:</h4>
+<p>sammyne opened <a href="https://github.com/bytecodealliance/wasmtime/issues/10396">issue #10396</a>:</p>
+<blockquote>
+<p>Based on this awesome sdk, I build a project (<a href="https://github.com/sammyne/cc-wasip2-borrow-handles-remain-at-the-end-of-the-call">https://github.com/sammyne/cc-wasip2-borrow-handles-remain-at-the-end-of-the-call</a>) demo simple component using borrowed resource.<br>
+It failed the wasmtime <code>post-return</code> with error as</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>borrow<span class="w"> </span>handles<span class="w"> </span>still<span class="w"> </span>remain<span class="w"> </span>at<span class="w"> </span>the<span class="w"> </span>end<span class="w"> </span>of<span class="w"> </span>the<span class="w"> </span>call
+</code></pre></div>
+<h2>Environment</h2>
+<ul>
+<li>clang wasi-sdk 19.1.5 installed in /opt/wasi-sdk</li>
+<li>make 4.3.0</li>
+<li>rust 1.85.0</li>
+<li>wasm-tools 1.227.0</li>
+<li>wit-bindgen-cli 0.40.0</li>
+<li>wasmtime 0.30.2</li>
+</ul>
+<h2>Brief</h2>
+<h3>Guest component</h3>
+<h4>WIT</h4>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>package<span class="w"> </span>sammyne:helloworld@1.0.0<span class="p">;</span>
+
+interface<span class="w"> </span>greeter<span class="w"> </span><span class="o">{</span>
+<span class="w">    </span>use<span class="w"> </span>types.<span class="o">{</span>context,<span class="w"> </span>hello-request,<span class="w"> </span>hello-reply<span class="o">}</span><span class="p">;</span>
+
+<span class="w">    </span>say-hello:<span class="w"> </span>func<span class="o">(</span>ctx:<span class="w"> </span>borrow&lt;context&gt;,<span class="w"> </span>req:<span class="w"> </span>hello-request<span class="o">)</span><span class="w"> </span>-&gt;<span class="w"> </span>hello-reply<span class="p">;</span>
+<span class="o">}</span>
+
+interface<span class="w"> </span>types<span class="w"> </span><span class="o">{</span>
+<span class="w">    </span>record<span class="w"> </span>hello-request<span class="w"> </span><span class="o">{</span>
+<span class="w">        </span>name:<span class="w"> </span>string,
+<span class="w">    </span><span class="o">}</span>
+
+<span class="w">    </span>record<span class="w"> </span>hello-reply<span class="w"> </span><span class="o">{</span>
+<span class="w">        </span>message:<span class="w"> </span>string,
+<span class="w">    </span><span class="o">}</span>
+
+<span class="w">    </span>resource<span class="w"> </span>context<span class="w"> </span><span class="o">{</span>
+<span class="w">        </span>request-id:<span class="w"> </span>func<span class="o">()</span><span class="w"> </span>-&gt;<span class="w"> </span>s64<span class="p">;</span>
+<span class="w">    </span><span class="o">}</span>
+<span class="o">}</span>
+
+///<span class="w"> </span>An<span class="w"> </span>example<span class="w"> </span>world<span class="w"> </span><span class="k">for</span><span class="w"> </span>the<span class="w"> </span>component<span class="w"> </span>to<span class="w"> </span>target.
+world<span class="w"> </span>helloworld<span class="w"> </span><span class="o">{</span>
+<span class="w">    </span><span class="nb">export</span><span class="w"> </span>greeter<span class="p">;</span>
+<span class="o">}</span>
+</code></pre></div>
+<h4>C++ implementation</h4>
+<div class="codehilite" data-code-language="C++"><pre><span></span><code><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;iostream&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;string&gt;</span>
+
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">"helloworld.h"</span>
+
+<span class="kt">void</span><span class="w"> </span><span class="nf">exports_sammyne_helloworld_greeter_say_hello</span><span class="p">(</span>
+<span class="w">    </span><span class="n">exports_sammyne_helloworld_greeter_borrow_context_t</span><span class="w"> </span><span class="n">ctx</span><span class="p">,</span>
+<span class="w">    </span><span class="n">exports_sammyne_helloworld_greeter_hello_request_t</span><span class="w"> </span><span class="o">*</span><span class="n">req</span><span class="p">,</span>
+<span class="w">    </span><span class="n">exports_sammyne_helloworld_greeter_hello_reply_t</span><span class="w"> </span><span class="o">*</span><span class="n">ret</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">auto</span><span class="w"> </span><span class="n">request_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">sammyne_helloworld_types_method_context_request_id</span><span class="p">(</span><span class="n">ctx</span><span class="p">);</span>
+<span class="w">  </span><span class="n">printf</span><span class="p">(</span><span class="s">"request-id = %lld</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">request_id</span><span class="p">);</span>
+
+<span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="n">message</span><span class="p">((</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="p">)(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">.</span><span class="n">ptr</span><span class="p">),</span><span class="w"> </span><span class="n">req</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">.</span><span class="n">len</span><span class="p">);</span>
+
+<span class="w">  </span><span class="n">message</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="p">(</span><span class="s">"Hello "</span><span class="p">)</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">message</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="p">(</span><span class="s">" with request-id="</span><span class="p">)</span><span class="w"> </span><span class="o">+</span>
+<span class="w">            </span><span class="n">std</span><span class="o">::</span><span class="n">to_string</span><span class="p">(</span><span class="n">request_id</span><span class="p">);</span>
+
+<span class="w">  </span><span class="n">helloworld_string_dup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ret</span><span class="o">-&gt;</span><span class="n">message</span><span class="p">,</span><span class="w"> </span><span class="n">message</span><span class="p">.</span><span class="n">c_str</span><span class="p">());</span>
+<span class="p">}</span>
+</code></pre></div>
+<h2>Reproduction</h2>
+<p>Build the component written in C++ in the guest foler and the host written in Rust in the host-rs folder with the<br>
+following command</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>make<span class="w"> </span>run
+</code></pre></div>
+<p>It will output sample errors as</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>borrow<span class="w"> </span>handles<span class="w"> </span>still<span class="w"> </span>remain<span class="w"> </span>at<span class="w"> </span>the<span class="w"> </span>end<span class="w"> </span>of<span class="w"> </span>the<span class="w"> </span>call
+</code></pre></div>
+<p>Really apprecate if someone could help me out~<br>
+</p>
+</blockquote>
+
+
+
+<a name="505688041"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310396%20borrow%20handles%20still%20remain%20at%20th.../near/505688041" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310396.20borrow.20handles.20still.20remain.20at.20th.2E.2E.2E.html#505688041">(Mar 14 2025 at 14:23)</a>:</h4>
+<p>alexcrichton closed <a href="https://github.com/bytecodealliance/wasmtime/issues/10396">issue #10396</a>:</p>
+<blockquote>
+<p>Based on this awesome sdk, I build a project (<a href="https://github.com/sammyne/cc-wasip2-borrow-handles-remain-at-the-end-of-the-call">https://github.com/sammyne/cc-wasip2-borrow-handles-remain-at-the-end-of-the-call</a>) demo simple component using borrowed resource.<br>
+It failed the wasmtime <code>post-return</code> with error as</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>borrow<span class="w"> </span>handles<span class="w"> </span>still<span class="w"> </span>remain<span class="w"> </span>at<span class="w"> </span>the<span class="w"> </span>end<span class="w"> </span>of<span class="w"> </span>the<span class="w"> </span>call
+</code></pre></div>
+<h2>Environment</h2>
+<ul>
+<li>clang wasi-sdk 19.1.5 installed in /opt/wasi-sdk</li>
+<li>make 4.3.0</li>
+<li>rust 1.85.0</li>
+<li>wasm-tools 1.227.0</li>
+<li>wit-bindgen-cli 0.40.0</li>
+<li>wasmtime 0.30.2</li>
+</ul>
+<h2>Brief</h2>
+<h3>Guest component</h3>
+<h4>WIT</h4>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>package<span class="w"> </span>sammyne:helloworld@1.0.0<span class="p">;</span>
+
+interface<span class="w"> </span>greeter<span class="w"> </span><span class="o">{</span>
+<span class="w">    </span>use<span class="w"> </span>types.<span class="o">{</span>context,<span class="w"> </span>hello-request,<span class="w"> </span>hello-reply<span class="o">}</span><span class="p">;</span>
+
+<span class="w">    </span>say-hello:<span class="w"> </span>func<span class="o">(</span>ctx:<span class="w"> </span>borrow&lt;context&gt;,<span class="w"> </span>req:<span class="w"> </span>hello-request<span class="o">)</span><span class="w"> </span>-&gt;<span class="w"> </span>hello-reply<span class="p">;</span>
+<span class="o">}</span>
+
+interface<span class="w"> </span>types<span class="w"> </span><span class="o">{</span>
+<span class="w">    </span>record<span class="w"> </span>hello-request<span class="w"> </span><span class="o">{</span>
+<span class="w">        </span>name:<span class="w"> </span>string,
+<span class="w">    </span><span class="o">}</span>
+
+<span class="w">    </span>record<span class="w"> </span>hello-reply<span class="w"> </span><span class="o">{</span>
+<span class="w">        </span>message:<span class="w"> </span>string,
+<span class="w">    </span><span class="o">}</span>
+
+<span class="w">    </span>resource<span class="w"> </span>context<span class="w"> </span><span class="o">{</span>
+<span class="w">        </span>request-id:<span class="w"> </span>func<span class="o">()</span><span class="w"> </span>-&gt;<span class="w"> </span>s64<span class="p">;</span>
+<span class="w">    </span><span class="o">}</span>
+<span class="o">}</span>
+
+///<span class="w"> </span>An<span class="w"> </span>example<span class="w"> </span>world<span class="w"> </span><span class="k">for</span><span class="w"> </span>the<span class="w"> </span>component<span class="w"> </span>to<span class="w"> </span>target.
+world<span class="w"> </span>helloworld<span class="w"> </span><span class="o">{</span>
+<span class="w">    </span><span class="nb">export</span><span class="w"> </span>greeter<span class="p">;</span>
+<span class="o">}</span>
+</code></pre></div>
+<h4>C++ implementation</h4>
+<div class="codehilite" data-code-language="C++"><pre><span></span><code><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;iostream&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;string&gt;</span>
+
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">"helloworld.h"</span>
+
+<span class="kt">void</span><span class="w"> </span><span class="nf">exports_sammyne_helloworld_greeter_say_hello</span><span class="p">(</span>
+<span class="w">    </span><span class="n">exports_sammyne_helloworld_greeter_borrow_context_t</span><span class="w"> </span><span class="n">ctx</span><span class="p">,</span>
+<span class="w">    </span><span class="n">exports_sammyne_helloworld_greeter_hello_request_t</span><span class="w"> </span><span class="o">*</span><span class="n">req</span><span class="p">,</span>
+<span class="w">    </span><span class="n">exports_sammyne_helloworld_greeter_hello_reply_t</span><span class="w"> </span><span class="o">*</span><span class="n">ret</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">auto</span><span class="w"> </span><span class="n">request_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">sammyne_helloworld_types_method_context_request_id</span><span class="p">(</span><span class="n">ctx</span><span class="p">);</span>
+<span class="w">  </span><span class="n">printf</span><span class="p">(</span><span class="s">"request-id = %lld</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">request_id</span><span class="p">);</span>
+
+<span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="n">message</span><span class="p">((</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="p">)(</span><span class="n">req</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">.</span><span class="n">ptr</span><span class="p">),</span><span class="w"> </span><span class="n">req</span><span class="o">-&gt;</span><span class="n">name</span><span class="p">.</span><span class="n">len</span><span class="p">);</span>
+
+<span class="w">  </span><span class="n">message</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="p">(</span><span class="s">"Hello "</span><span class="p">)</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">message</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="p">(</span><span class="s">" with request-id="</span><span class="p">)</span><span class="w"> </span><span class="o">+</span>
+<span class="w">            </span><span class="n">std</span><span class="o">::</span><span class="n">to_string</span><span class="p">(</span><span class="n">request_id</span><span class="p">);</span>
+
+<span class="w">  </span><span class="n">helloworld_string_dup</span><span class="p">(</span><span class="o">&amp;</span><span class="n">ret</span><span class="o">-&gt;</span><span class="n">message</span><span class="p">,</span><span class="w"> </span><span class="n">message</span><span class="p">.</span><span class="n">c_str</span><span class="p">());</span>
+<span class="p">}</span>
+</code></pre></div>
+<h2>Reproduction</h2>
+<p>Build the component written in C++ in the guest foler and the host written in Rust in the host-rs folder with the<br>
+following command</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>make<span class="w"> </span>run
+</code></pre></div>
+<p>It will output sample errors as</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>borrow<span class="w"> </span>handles<span class="w"> </span>still<span class="w"> </span>remain<span class="w"> </span>at<span class="w"> </span>the<span class="w"> </span>end<span class="w"> </span>of<span class="w"> </span>the<span class="w"> </span>call
+</code></pre></div>
+<p>Really apprecate if someone could help me out~<br>
+</p>
+</blockquote>
+
+
+
+<a name="505688042"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310396%20borrow%20handles%20still%20remain%20at%20th.../near/505688042" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310396.20borrow.20handles.20still.20remain.20at.20th.2E.2E.2E.html#505688042">(Mar 14 2025 at 14:23)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/10396#issuecomment-2724858310">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10396">issue #10396</a>:</p>
+<blockquote>
+<p>Thanks for the report! If you plan on using C and/or C++ bindings for component APIs you'll need to become very familiar with the <a href="https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md">upstream definition of the canonical ABI</a>. There are requirements that guests need to uphold that are automatically handled in languages like JS and Rust but when using the C bindings for wit-bindgen you'll need to manually handle all of it.</p>
+<p>For example in this case the canonical ABI dictates that when given a <code>borrow&lt;T&gt;</code> you're required to drop that borrow before the call returns. Here you're not dropping the borrow, hence the trap.</p>
+<p>This is currently expected behavior so I'm going to close this, but feel free to follow-up here if there's more questions.</p>
+</blockquote>
+
+
+
+<a name="506119729"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310396%20borrow%20handles%20still%20remain%20at%20th.../near/506119729" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310396.20borrow.20handles.20still.20remain.20at.20th.2E.2E.2E.html#506119729">(Mar 17 2025 at 11:18)</a>:</h4>
+<p>sammyne <a href="https://github.com/bytecodealliance/wasmtime/issues/10396#issuecomment-2729120592">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10396">issue #10396</a>:</p>
+<blockquote>
+<blockquote>
+<p>Thanks for the report! If you plan on using C and/or C++ bindings for component APIs you'll need to become very familiar with the <a href="https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md">upstream definition of the canonical ABI</a>. There are requirements that guests need to uphold that are automatically handled in languages like JS and Rust but when using the C bindings for wit-bindgen you'll need to manually handle all of it.</p>
+<p>For example in this case the canonical ABI dictates that when given a <code>borrow&lt;T&gt;</code> you're required to drop that borrow before the call returns. Here you're not dropping the borrow, hence the trap.</p>
+<p>This is currently expected behavior so I'm going to close this, but feel free to follow-up here if there's more questions.</p>
+</blockquote>
+<p>Which API can be used to drop the <code>borrow&lt;T&gt;</code>? @alexcrichton </p>
+</blockquote>
+
+
+
+<a name="506120795"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310396%20borrow%20handles%20still%20remain%20at%20th.../near/506120795" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310396.20borrow.20handles.20still.20remain.20at.20th.2E.2E.2E.html#506120795">(Mar 17 2025 at 11:22)</a>:</h4>
+<p>sammyne edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/10396#issuecomment-2729120592">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10396">issue #10396</a>:</p>
+<blockquote>
+<blockquote>
+<p>Thanks for the report! If you plan on using C and/or C++ bindings for component APIs you'll need to become very familiar with the <a href="https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md">upstream definition of the canonical ABI</a>. There are requirements that guests need to uphold that are automatically handled in languages like JS and Rust but when using the C bindings for wit-bindgen you'll need to manually handle all of it.</p>
+<p>For example in this case the canonical ABI dictates that when given a <code>borrow&lt;T&gt;</code> you're required to drop that borrow before the call returns. Here you're not dropping the borrow, hence the trap.</p>
+<p>This is currently expected behavior so I'm going to close this, but feel free to follow-up here if there's more questions.</p>
+</blockquote>
+<p>So I need to drop the <code>borrow&lt;context&gt;</code> in func <code>exports_sammyne_helloworld_greeter_say_hello</code> before return.</p>
+<p>Which API can be used to drop the <code>borrow&lt;T&gt;</code>? @alexcrichton </p>
+</blockquote>
+
+
+
+<a name="506124139"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310396%20borrow%20handles%20still%20remain%20at%20th.../near/506124139" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310396.20borrow.20handles.20still.20remain.20at.20th.2E.2E.2E.html#506124139">(Mar 17 2025 at 11:37)</a>:</h4>
+<p>sammyne edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/10396#issuecomment-2729120592">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10396">issue #10396</a>:</p>
+<blockquote>
+<blockquote>
+<p>Thanks for the report! If you plan on using C and/or C++ bindings for component APIs you'll need to become very familiar with the <a href="https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md">upstream definition of the canonical ABI</a>. There are requirements that guests need to uphold that are automatically handled in languages like JS and Rust but when using the C bindings for wit-bindgen you'll need to manually handle all of it.</p>
+<p>For example in this case the canonical ABI dictates that when given a <code>borrow&lt;T&gt;</code> you're required to drop that borrow before the call returns. Here you're not dropping the borrow, hence the trap.</p>
+<p>This is currently expected behavior so I'm going to close this, but feel free to follow-up here if there's more questions.</p>
+</blockquote>
+<p>Adding the <code>--autodrop-borrows</code> option to <code>wit-bindgen c</code> would generated the necessary stub dropping the borrow. Great thanks~</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

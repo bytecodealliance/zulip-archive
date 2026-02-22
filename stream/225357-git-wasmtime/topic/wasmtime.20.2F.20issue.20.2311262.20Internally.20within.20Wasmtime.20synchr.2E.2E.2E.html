@@ -1,0 +1,74 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #11262 Internally within Wasmtime synchr... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311262.20Internally.20within.20Wasmtime.20synchr.2E.2E.2E.html">wasmtime / issue #11262 Internally within Wasmtime synchr...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="529174176"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311262%20Internally%20within%20Wasmtime%20synchr.../near/529174176" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311262.20Internally.20within.20Wasmtime.20synchr.2E.2E.2E.html#529174176">(Jul 16 2025 at 22:12)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/issues/11262">issue #11262</a>:</p>
+<blockquote>
+<p>In the spirit of making Wasmtime more sound internally over time this is a major thorn in our side right now. Many functions in Wasmtime are synchronous but they're actually asynchronous in nature due to the possibility that something could be context-switched away at any moment. These context switches are required to happen on a fiber and while I'm not aware of any issues internally within Wasmtime, this is, in my opinion, unnecessarily surprising. I would ideally like to move towards a world where Wasmtime actually uses <code>async</code> internally, not just for the <code>async</code> feature of wasm itself, and then in synchronous mode it asserts the future is always ready since there aren't any sources of blocking async.</p>
+<p>Concretely sources of surprising async-ness are:</p>
+<ul>
+<li>Async resource limiters</li>
+<li>Async GC</li>
+<li>Async call hooks </li>
+<li>... maybe more? this isn't intended to be exhaustive</li>
+</ul>
+<p>Concretely one location of unsoundness has to do with growth of tables and memories. For example memory growth requires a <a href="https://github.com/bytecodealliance/wasmtime/blob/c3ac18b3e4fc3dacd83bbf9e1b0fefb0837a4607/crates/wasmtime/src/runtime/memory.rs#L602-L615">split borrow</a> both of and within the store. The same is <a href="https://github.com/bytecodealliance/wasmtime/blob/c3ac18b3e4fc3dacd83bbf9e1b0fefb0837a4607/crates/wasmtime/src/runtime/externals/table.rs#L275-L288">true for tables</a>. This is due to the fact that the methods of growth require a <code>&amp;mut self</code> on the runtime data structure but also require, effectively, <code>&amp;mut StoreOpaque</code> to suspend the world. Given that memories/tables live within <code>&amp;mut StoreOpaque</code>, this is not a sound way to model this problem.</p>
+<p>Another concrete location of unsoundness is that <a href="https://github.com/bytecodealliance/wasmtime/blob/c3ac18b3e4fc3dacd83bbf9e1b0fefb0837a4607/crates/wasmtime/src/runtime/vm/memory/shared_memory.rs#L77">growth of a shared memory</a> suspends the stack with an rwlock write lock on the stack. This means that <code>unsafe impl Send for FiberFuture {}</code> is a lie because that's foundationally built on the premise that Wasmtime's own stack-local variables are all <code>Send</code>. This is effectively something that's impossible to guarantee and this hypothetically can result in locking an rwlock on one thread and unlocking it on another (technically UB, tested on glibc and other platforms to at least not behave badly for now). I was able to trivially detect this by migrating to <code>async fn</code>, however, as the compiler checks the send-ness of local variables.</p>
+<p>If hypothetically growth were to use an <code>async</code> fn I believe this would be sound. For example growth still requires a limiter, but there's no need to borrow the full store. This is morally a borrow of separate fields in the store, for example (a) the data/limiter and (b) the memory itself. That's sound to model in Wasmtime (albeit clunky).</p>
+<p>There are additional downsides to the way this is all implemented today such as async table/memory growth requiring a fiber. This doesn't actually execute any WebAssembly code yet we nonetheless require a fiber to satisfy how suspension works in an async context. This is, in my opinion, unnecessarily unsafe where we're suspending Rust frames on a stack when we don't really need to if things were actually modeled as an <code>async</code> function.</p>
+<hr>
+<p>I'll note that this issue is not going to be easy to solve. We can't "simply go sprinkle some <code>async</code>" as there are some fundamental blockers to that. The main one I ran into while attempting this is that <code>VMStore</code> is not <code>Send</code>. This is a trait object backed by any <code>Store&lt;T&gt;</code> for any <code>T</code> meaning that we don't know it's <code>Send</code> ahead of time. While everything in an async context is <code>Send</code> we don't know that for a sync context. I know of no fix for this other than adding <code>Store&lt;T: Send&gt;</code> everywhere, but that's a very heavy hammer and is not one we should reach for lightly.</p>
+</blockquote>
+
+
+
+<a name="529174177"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311262%20Internally%20within%20Wasmtime%20synchr.../near/529174177" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311262.20Internally.20within.20Wasmtime.20synchr.2E.2E.2E.html#529174177">(Jul 16 2025 at 22:12)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasmtime:unsafe-code label to <a href="https://github.com/bytecodealliance/wasmtime/issues/11262">Issue #11262</a>.</p>
+
+
+
+<a name="535412274"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311262%20Internally%20within%20Wasmtime%20synchr.../near/535412274" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311262.20Internally.20within.20Wasmtime.20synchr.2E.2E.2E.html#535412274">(Aug 21 2025 at 01:17)</a>:</h4>
+<p>alexcrichton closed <a href="https://github.com/bytecodealliance/wasmtime/issues/11262">issue #11262</a>:</p>
+<blockquote>
+<p>In the spirit of making Wasmtime more sound internally over time this is a major thorn in our side right now. Many functions in Wasmtime are synchronous but they're actually asynchronous in nature due to the possibility that something could be context-switched away at any moment. These context switches are required to happen on a fiber and while I'm not aware of any issues internally within Wasmtime, this is, in my opinion, unnecessarily surprising. I would ideally like to move towards a world where Wasmtime actually uses <code>async</code> internally, not just for the <code>async</code> feature of wasm itself, and then in synchronous mode it asserts the future is always ready since there aren't any sources of blocking async.</p>
+<p>Concretely sources of surprising async-ness are:</p>
+<ul>
+<li>Async resource limiters</li>
+<li>Async GC</li>
+<li>Async call hooks </li>
+<li>... maybe more? this isn't intended to be exhaustive</li>
+</ul>
+<p>Concretely one location of unsoundness has to do with growth of tables and memories. For example memory growth requires a <a href="https://github.com/bytecodealliance/wasmtime/blob/c3ac18b3e4fc3dacd83bbf9e1b0fefb0837a4607/crates/wasmtime/src/runtime/memory.rs#L602-L615">split borrow</a> both of and within the store. The same is <a href="https://github.com/bytecodealliance/wasmtime/blob/c3ac18b3e4fc3dacd83bbf9e1b0fefb0837a4607/crates/wasmtime/src/runtime/externals/table.rs#L275-L288">true for tables</a>. This is due to the fact that the methods of growth require a <code>&amp;mut self</code> on the runtime data structure but also require, effectively, <code>&amp;mut StoreOpaque</code> to suspend the world. Given that memories/tables live within <code>&amp;mut StoreOpaque</code>, this is not a sound way to model this problem.</p>
+<p>Another concrete location of unsoundness is that <a href="https://github.com/bytecodealliance/wasmtime/blob/c3ac18b3e4fc3dacd83bbf9e1b0fefb0837a4607/crates/wasmtime/src/runtime/vm/memory/shared_memory.rs#L77">growth of a shared memory</a> suspends the stack with an rwlock write lock on the stack. This means that <code>unsafe impl Send for FiberFuture {}</code> is a lie because that's foundationally built on the premise that Wasmtime's own stack-local variables are all <code>Send</code>. This is effectively something that's impossible to guarantee and this hypothetically can result in locking an rwlock on one thread and unlocking it on another (technically UB, tested on glibc and other platforms to at least not behave badly for now). I was able to trivially detect this by migrating to <code>async fn</code>, however, as the compiler checks the send-ness of local variables.</p>
+<p>If hypothetically growth were to use an <code>async</code> fn I believe this would be sound. For example growth still requires a limiter, but there's no need to borrow the full store. This is morally a borrow of separate fields in the store, for example (a) the data/limiter and (b) the memory itself. That's sound to model in Wasmtime (albeit clunky).</p>
+<p>There are additional downsides to the way this is all implemented today such as async table/memory growth requiring a fiber. This doesn't actually execute any WebAssembly code yet we nonetheless require a fiber to satisfy how suspension works in an async context. This is, in my opinion, unnecessarily unsafe where we're suspending Rust frames on a stack when we don't really need to if things were actually modeled as an <code>async</code> function.</p>
+<hr>
+<p>I'll note that this issue is not going to be easy to solve. We can't "simply go sprinkle some <code>async</code>" as there are some fundamental blockers to that. The main one I ran into while attempting this is that <code>VMStore</code> is not <code>Send</code>. This is a trait object backed by any <code>Store&lt;T&gt;</code> for any <code>T</code> meaning that we don't know it's <code>Send</code> ahead of time. While everything in an async context is <code>Send</code> we don't know that for a sync context. I know of no fix for this other than adding <code>Store&lt;T: Send&gt;</code> everywhere, but that's a very heavy hammer and is not one we should reach for lightly.</p>
+</blockquote>
+
+
+
+<a name="535412276"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311262%20Internally%20within%20Wasmtime%20synchr.../near/535412276" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311262.20Internally.20within.20Wasmtime.20synchr.2E.2E.2E.html#535412276">(Aug 21 2025 at 01:17)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/11262#issuecomment-3208609090">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11262">issue #11262</a>:</p>
+<blockquote>
+<p>A lot of progress is now made on this issue starting in #11430 and ending in all the linked PRs from that PR.</p>
+<p>What remains is primarily async call hooks which I'm going to say we can leave as-is for now. Call hooks are far more scoped than the pervasiveness of resource limiters and GC, so I think there's much less benefit from moving them to "true async" and there's also more possible pitfalls for performance hits.</p>
+<p>Overall I'm personally satisfied with where we've ended up now, so I'm going to close this.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

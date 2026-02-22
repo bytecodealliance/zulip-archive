@@ -1,0 +1,75 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #10200 asm: pretty-printing signed immed... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310200.20asm.3A.20pretty-printing.20signed.20immed.2E.2E.2E.html">wasmtime / issue #10200 asm: pretty-printing signed immed...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="498185350"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310200%20asm%3A%20pretty-printing%20signed%20immed.../near/498185350" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310200.20asm.3A.20pretty-printing.20signed.20immed.2E.2E.2E.html#498185350">(Feb 06 2025 at 18:26)</a>:</h4>
+<p>abrown opened <a href="https://github.com/bytecodealliance/wasmtime/issues/10200">issue #10200</a>:</p>
+<blockquote>
+<p>This issue outlines two problems I encountered adding new assembler instructions:</p>
+<ol>
+<li>to match <code>capstone</code>'s pretty-printing, we must distinguish between signed and unsigned immediates, both of which can be sign-extended (!)</li>
+<li>to avoid a semantic mismatch at the ISLE level, the assembler must clearly differentiate between signed and unsigned immediates with the same representation (@alexcrichton suggested using different types).</li>
+</ol>
+<p>Taken together, these two problems make it difficult to find a solution that satisfies both requirements. Let me explain: <code>capstone</code> pretty-prints immediates differently per instruction. The x64 <code>add</code> and <code>and</code> groups both have instructions that sign-extend a 32-bit immediate into a 64-bit one before the operation. The <code>add</code> output prints like a signed integer, but the <code>and</code> prints like an unsigned integer:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="n">add</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">inst</span><span class="p">::</span><span class="n">addq_i_sxl</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">Imm32</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="mh">0xd7f247b5</span><span class="p">));</span>
+<span class="fm">println!</span><span class="p">(</span><span class="s">"{add}"</span><span class="p">);</span>
+<span class="o">&gt;</span><span class="w"> </span><span class="n">addq</span><span class="w"> </span><span class="cp">$</span><span class="o">-</span><span class="mh">0x280db84b</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">rax</span>
+
+<span class="kd">let</span><span class="w"> </span><span class="n">and</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">inst</span><span class="p">::</span><span class="n">andq_i_sxl</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">Imm32</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="mh">0xd7f247b5</span><span class="p">));</span>
+<span class="fm">println!</span><span class="p">(</span><span class="s">"{and}"</span><span class="p">);</span>
+<span class="o">&gt;</span><span class="w"> </span><span class="n">andq</span><span class="w"> </span><span class="cp">$</span><span class="mh">0xffffffffd7f247b5</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">rax</span>
+</code></pre></div>
+<p>This is probably due to <code>capstone</code> understanding that <code>add</code> is arithmetic and <code>and</code> is logical &mdash; makes sense, right? One solution to properly match what <code>capstone</code> prints is to add a new <code>simm*</code> form to the DSL: for sign-extending instructions, <code>add</code> would get the <code>simm*</code> form and print the signed integer (<code>$-0x...</code>), <code>and</code> would get the current <code>imm*</code> form and print the unsigned integer (<code>$0xffff...</code>)... just extended to the right width. (There are other solutions here, like switching to XED which prints both forms as unsigned integers, but we may not be ready for that just yet).</p>
+<p>But what about problem 2? @alexcrichton was concerned that if we don't differentiate the immediate type that the assembly instruction takes, we could try to pass in bit-equivalent values to these sign-extending instructions but then have unexpected effects when they are sign-extended; e.g., we pass in <code>254u8</code> to one of these instructions but it gets treated as <code>-2i8</code> and sign-extended to <code>-2i64</code>. We added this comment to track this:</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/d943d57e78950da21dd430e0847f3b8fd0ade073/cranelift/codegen/src/isa/x64/lower/isle.rs#L965-L978">https://github.com/bytecodealliance/wasmtime/blob/d943d57e78950da21dd430e0847f3b8fd0ade073/cranelift/codegen/src/isa/x64/lower/isle.rs#L965-L978</a></p>
+<p>Problem 1 and problem 2 interfere: if we choose to represent the <code>add</code> operand with <code>simm*</code> as suggested above, the instruction can accept a new <code>Simm*</code> type at the CLIF level that makes it clear that we accept a signed integer and that this will be sign-extended &mdash; all is well. But, the <code>and</code> operand would still be <code>imm*</code>, accepting an <code>Imm*</code> type, and still confusing the user at the CLIF level, as @alexcrichton was worried would happen. There are several solutions here, but none that I really like, so I'll just describe the problem for now.</p>
+</blockquote>
+
+
+
+<a name="498208011"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310200%20asm%3A%20pretty-printing%20signed%20immed.../near/498208011" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310200.20asm.3A.20pretty-printing.20signed.20immed.2E.2E.2E.html#498208011">(Feb 06 2025 at 20:49)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/10200#issuecomment-2640981486">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10200">issue #10200</a>:</p>
+<blockquote>
+<p>Personally I feel like we should prioritize the representation of the types of the immediates to ensure it minimizes errors and is easy to use. Matching capstone exactly seems like something where we might want to instead engineer the test suite/fuzzing to remove that necessity. </p>
+<p>One possible option with that is to rework tests to (a) generate an arbitrary Inst, (b) convert Inst to binary, (c) print the Inst and use a different assembler to convert to binary (maybe <code>llvm-as</code>? maybe just <code>as</code>?), and finally (d) assert the binary is the same. That means that our exact printed format won't necessarily be the same as any other tool, but it does mean that what we print is accepted by a tool.</p>
+</blockquote>
+
+
+
+<a name="499598771"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310200%20asm%3A%20pretty-printing%20signed%20immed.../near/499598771" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310200.20asm.3A.20pretty-printing.20signed.20immed.2E.2E.2E.html#499598771">(Feb 13 2025 at 22:38)</a>:</h4>
+<p>abrown closed <a href="https://github.com/bytecodealliance/wasmtime/issues/10200">issue #10200</a>:</p>
+<blockquote>
+<p>This issue outlines two problems I encountered adding new assembler instructions:</p>
+<ol>
+<li>to match <code>capstone</code>'s pretty-printing, we must distinguish between signed and unsigned immediates, both of which can be sign-extended (!)</li>
+<li>to avoid a semantic mismatch at the ISLE level, the assembler must clearly differentiate between signed and unsigned immediates with the same representation (@alexcrichton suggested using different types).</li>
+</ol>
+<p>Taken together, these two problems make it difficult to find a solution that satisfies both requirements. Let me explain: <code>capstone</code> pretty-prints immediates differently per instruction. The x64 <code>add</code> and <code>and</code> groups both have instructions that sign-extend a 32-bit immediate into a 64-bit one before the operation. The <code>add</code> output prints like a signed integer, but the <code>and</code> prints like an unsigned integer:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="n">add</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">inst</span><span class="p">::</span><span class="n">addq_i_sxl</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">Imm32</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="mh">0xd7f247b5</span><span class="p">));</span>
+<span class="fm">println!</span><span class="p">(</span><span class="s">"{add}"</span><span class="p">);</span>
+<span class="o">&gt;</span><span class="w"> </span><span class="n">addq</span><span class="w"> </span><span class="cp">$</span><span class="o">-</span><span class="mh">0x280db84b</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">rax</span>
+
+<span class="kd">let</span><span class="w"> </span><span class="n">and</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">inst</span><span class="p">::</span><span class="n">andq_i_sxl</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">Imm32</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="mh">0xd7f247b5</span><span class="p">));</span>
+<span class="fm">println!</span><span class="p">(</span><span class="s">"{and}"</span><span class="p">);</span>
+<span class="o">&gt;</span><span class="w"> </span><span class="n">andq</span><span class="w"> </span><span class="cp">$</span><span class="mh">0xffffffffd7f247b5</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">rax</span>
+</code></pre></div>
+<p>This is probably due to <code>capstone</code> understanding that <code>add</code> is arithmetic and <code>and</code> is logical &mdash; makes sense, right? One solution to properly match what <code>capstone</code> prints is to add a new <code>simm*</code> form to the DSL: for sign-extending instructions, <code>add</code> would get the <code>simm*</code> form and print the signed integer (<code>$-0x...</code>), <code>and</code> would get the current <code>imm*</code> form and print the unsigned integer (<code>$0xffff...</code>)... just extended to the right width. (There are other solutions here, like switching to XED which prints both forms as unsigned integers, but we may not be ready for that just yet).</p>
+<p>But what about problem 2? @alexcrichton was concerned that if we don't differentiate the immediate type that the assembly instruction takes, we could try to pass in bit-equivalent values to these sign-extending instructions but then have unexpected effects when they are sign-extended; e.g., we pass in <code>254u8</code> to one of these instructions but it gets treated as <code>-2i8</code> and sign-extended to <code>-2i64</code>. We added this comment to track this:</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/d943d57e78950da21dd430e0847f3b8fd0ade073/cranelift/codegen/src/isa/x64/lower/isle.rs#L965-L978">https://github.com/bytecodealliance/wasmtime/blob/d943d57e78950da21dd430e0847f3b8fd0ade073/cranelift/codegen/src/isa/x64/lower/isle.rs#L965-L978</a></p>
+<p>Problem 1 and problem 2 interfere: if we choose to represent the <code>add</code> operand with <code>simm*</code> as suggested above, the instruction can accept a new <code>Simm*</code> type at the CLIF level that makes it clear that we accept a signed integer and that this will be sign-extended &mdash; all is well. But, the <code>and</code> operand would still be <code>imm*</code>, accepting an <code>Imm*</code> type, and still confusing the user at the CLIF level, as @alexcrichton was worried would happen. There are several solutions here, but none that I really like, so I'll just describe the problem for now.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

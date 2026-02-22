@@ -1,0 +1,386 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #11285 Wasmtime exception support needs ... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html">wasmtime / issue #11285 Wasmtime exception support needs ...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="529554169"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/529554169" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#529554169">(Jul 19 2025 at 05:46)</a>:</h4>
+<p>cfallin opened <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<p>I have come to a late realization in my quest to implement exception support: we will need to modify the Wasm calling convention to store the vmctx value in each frame. This will unfortunately pessimize common-case execution because it expands each frame by one word (possibly two with padding; 1.5 on average) and adds a store to every prologue.</p>
+<p>The reason for this has to do with the nominal aspect of tag identities (see <a href="https://webassembly.github.io/exception-handling/core/exec/instructions.html#xref-syntax-instructions-syntax-instr-control-mathsf-throw-ref">spec for <code>throw_ref</code></a> for details):</p>
+<ul>
+<li>Tags to identify handlers are <em>dynamic entities</em>, instantiated as part of the state of a given instance in the store. The spec refers to "tag addresses" to denote this. Tag instances can be exported and imported just as memories, tables, and globals can be.</li>
+<li>In Wasmtime, we represent tags with <code>VMTagDefinition</code>s inline in the vmctx, and <code>VMTagImport</code>s that hold pointers to the tag definitions, similarly to memories and tables.</li>
+<li>Exception objects reference tag instances by defining-instance ID and defined tag index in that instance, since we have to ensure that GC heap contents remain untrusted and bounds-checked on use, but this is otherwise equivalent: we are naming the dynamic instance.</li>
+</ul>
+<p>When compiling a <code>try_table</code>, we emit tag identities for handlers with static <code>TagIndex</code>es, and those get serialized into the exception table. My thought has always been that on a throw's stack-walk, we will translate these to dynamic tag instances and compare to the dynamic tag instance in the thrown exception.</p>
+<p>The problem is that as we walk the stack, we have PC and FP only; we can map PC to a particular <em>static module</em>, but one module may be instantiated multiple times within a store. And each of these instances will have different tag instances (in general) for a given static tag index. The vmctx is saved <em>somewhere</em>, but that's up to regalloc, and opaque to our stack-walk. We simply don't have enough information.</p>
+<p>In the case where we have a single-instance store, and no imported tags (the former implies the latter actually, because we create dummy instances for host-created tags), we can get around this by comparing static tag indices directly. But that's a subset and we need to support the full spec.</p>
+<p>Prior art in other engines seems to be that the instance (vmctx) is available during stackwalking -- e.g., in SpiderMonkey, <a href="https://searchfox.org/mozilla-central/rev/0fe32133f12ed0f20d5fde8fe970157f04817982/js/src/wasm/WasmFrame.h#365-366">caller and callee vmctx are saved in-frame</a> in every Wasm frame.</p>
+<p>For what it's worth, I believe we will run into this need eventually even independently of exception-handling: for example, debug support will also have a need to access instance state (vmctx) when introspecting stack frames. So far our stackwalking usage has been restricted to GC, where instance identity doesn't matter (GC refs are store-wide), and backtrace generation, where we only need static module identity to symbolicate. So this is the first time that dynamic instance identity matters, but likely not the last.</p>
+</blockquote>
+
+
+
+<a name="529554223"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/529554223" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#529554223">(Jul 19 2025 at 05:47)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/11285#issuecomment-3091902874">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<p>(As an aside, this is the <em>very last piece</em> I need to get exception-support working; my <a href="https://github.com/cfallin/wasmtime/tree/wasm-exceptions">WIP branch</a> now has throw/catch working successfully, and I've simply hardcoded tag matching to "always match" to work around this issue's question for testing purposes.)</p>
+</blockquote>
+
+
+
+<a name="529554228"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/529554228" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#529554228">(Jul 19 2025 at 05:48)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/11285#issuecomment-3091902945">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<p>cc @fitzgen @alexcrichton </p>
+</blockquote>
+
+
+
+<a name="529558620"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/529558620" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#529558620">(Jul 19 2025 at 07:28)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/11285#issuecomment-3091992669">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<p>A few other assorted thoughts:</p>
+<ul>
+<li>inlining across modules interacts poorly with an assumption that one frame comes from one instance. (Actually, means we can't inline at all unless we have metadata to indicate another vmctx in some PC range.)</li>
+<li>there's always the big hammer of using a catch-all at every call site within a try-table and dynamically comparing tags in the compiled code. We could even "shard" the decision chain by functype (payload signature), but not any more than that statically. This kind of sucks as it could imply many useless rethrows but at least is pay-as-you-go (functions without any exception insts are unchanged). Asymptotic complexity unchanged because unwind is linear in frame count anyway, and dynamism of nominal tags means we can't do any log-time lookups at a call site in any case.</li>
+</ul>
+<p>I'm starting to lean toward the latter option...</p>
+</blockquote>
+
+
+
+<a name="529570612"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/529570612" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#529570612">(Jul 19 2025 at 11:36)</a>:</h4>
+<p>tschneidereit <a href="https://github.com/bytecodealliance/wasmtime/issues/11285#issuecomment-3092302239">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<p>Does it make a difference that in the CM, exceptions can't cross component boundaries? They always have to be caught in the exported function and turned into a result type</p>
+</blockquote>
+
+
+
+<a name="529608749"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/529608749" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#529608749">(Jul 19 2025 at 19:42)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/11285#issuecomment-3092536528">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<blockquote>
+<p>Does it make a difference that in the CM, exceptions can't cross component boundaries? They always have to be caught in the exported function and turned into a result type</p>
+</blockquote>
+<p>Unfortunately I don't think it helps -- a single component can still have multiple core modules internally, and/or multiple instances of those modules, so there is still a dynamic-identity aspect to the tag matching.</p>
+</blockquote>
+
+
+
+<a name="529610508"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/529610508" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#529610508">(Jul 19 2025 at 20:23)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/11285#issuecomment-3092553906">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<p>A third solution that occurred to me this morning: we could emit metadata with the exception table to describe where vmctx is located, and take it as an argument to the exception table in a <code>try_call</code> -- something like a "dynamic context for tags". This would allow us to get <code>vmctx</code> once we have the static callsite metadata for a given frame, but crucially, would only require us to spill it when we have a <code>try_call</code> (i.e., a <code>try_table</code> at the Wasm level).</p>
+<p>In more detail, this would look like</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">function</span><span class="w"> </span><span class="o">%</span><span class="n">foo</span><span class="p">(</span><span class="kt">i64</span><span class="w"> </span><span class="n">vmctx</span><span class="p">)</span><span class="w"> </span><span class="n">tail</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="n">fn0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">..</span><span class="p">.</span>
+<span class="w">  </span><span class="n">sig0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">..</span><span class="p">.</span>
+<span class="n">block0</span><span class="p">(</span><span class="n">v0</span><span class="p">:</span><span class="w"> </span><span class="kt">i64</span><span class="p">):</span>
+<span class="w">  </span><span class="nc">try_call</span><span class="w"> </span><span class="n">fn0</span><span class="p">(</span><span class="n">v1</span><span class="p">,</span><span class="w"> </span><span class="n">v2</span><span class="p">,</span><span class="w"> </span><span class="n">v3</span><span class="p">),</span><span class="w"> </span><span class="n">sig0</span><span class="p">,</span><span class="w"> </span><span class="n">block1</span><span class="p">(</span><span class="n">ret0</span><span class="p">),</span><span class="w"> </span><span class="p">[</span><span class="n">context</span><span class="w"> </span><span class="n">v0</span><span class="p">,</span><span class="w"> </span><span class="n">tag0</span><span class="p">:</span><span class="w"> </span><span class="nc">block2</span><span class="p">(</span><span class="n">exn0</span><span class="p">,</span><span class="w"> </span><span class="n">exn1</span><span class="p">),</span><span class="w"> </span><span class="n">tag1</span><span class="p">:</span><span class="w"> </span><span class="nc">block3</span><span class="p">(</span><span class="n">exn0</span><span class="p">,</span><span class="w"> </span><span class="n">exn1</span><span class="p">)]</span>
+<span class="o">..</span><span class="p">.</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>and an additional array in the <code>ExceptionTable</code> format (and field on <code>FinalizedMachCallSite</code>) that, with an <code>Option&lt;i32&gt;</code>, indicates offset-from-FP for this frame at which we can find the "context" arg. The <code>try_call</code> lowering would add a regalloc use constrained to "stack" so regalloc would handle spilling vmctx to a stack slot only at <code>try_call</code> sites (and potentially reusing the same spill across multiple sites). We can then find it when we walk the stack. This is not quite as efficient at stackwalk time as a vmctx at fixed offset -- the latter actually lets us get away without querying the module-map btree at all, because we can directly get the instance and module from a stack frame -- but it's almost certainly worth not growing stack frames and adding a store to every prologue.</p>
+<p>So to recap: the need is to get the dynamic instance for a given frame in a stackwalk so we can match dynamic instances of tags. The solutions so far are:</p>
+<ol>
+<li>
+<p>Add a vmctx field to the frame format (as an option to the <code>tail</code> ABI probably) and fill it in with a store in every prologue of every function.</p>
+<ul>
+<li>(+) Very simple design.</li>
+<li>(+) Very fast stackwalking: we can get directly to an instance and module from a frame with two pointer indirections; no more need to query the module-map btree.</li>
+<li>(+) Perhaps needed later anyway when introspecting frames with a debugger API.</li>
+<li>(-) Adds 16 bytes to every frame (8-byte word, but then alignment) on our 64-bit architectures, and adds a store to every prologue.</li>
+<li>(-) Likely incompatible with inlining, unless we design complex metadata of some sort or add save/restore logic to the inliner (at some complexity cost, and crossing abstraction boundaries, because this is an ABI concern).</li>
+</ul>
+</li>
+<li>
+<p>(Variant of above) add a vmctx field to every frame, but only store to it when we know we're crossing instance boundaries. Encode this crossing by interposing a special trampoline frame.</p>
+<ul>
+<li>(+) Potentially saves the cost of a store in every prologue.</li>
+<li>(-) Major re-architecting of Wasmtime's function-call internals; probably a non-starter.</li>
+</ul>
+</li>
+<li>
+<p>Emit code that dynamically disambiguates tags; every <code>try_call</code> has only a catch-all handler at the CLIF level.</p>
+<ul>
+<li>(+) Conceptually simple: the vmctx is already available in Wasm code, and we can statically generate efficient code to access each tag (as an offset in the vmctx for defined tags, or a load of a pointer for imported tags).</li>
+<li>(-) Potentially large code bloat.</li>
+<li>(-) Slower unwinding (not asymptotically so, but major constant factor in practice likely) because we need to re-enter the <code>throw_ref</code> libcall every time we pass a <code>try_call</code> that doesn't have a handler.</li>
+</ul>
+</li>
+<li>
+<p>Add a notion of "dynamic context" to exception tables, taken as an arg to <code>try_call</code>'s exception table, spilled to stack, and accessible at a stack offset recorded in the exception table entry for a callsite. Use this "dynamic context" to communicate instance identity to the stackwalker.</p>
+<ul>
+<li>(+) Lowest-cost option so far: no impact at all to functions that don't have exception handlers, and spills only at <code>try_call</code> sites for those that do.</li>
+<li>(+) Directly reifies the semantic information we need -- the instance identity -- as an argument to the call, which feels cleanest design-wise.</li>
+<li>(+) Allows stack-walking to directly find the appropriate handler without intermediate catch/rethrow steps.</li>
+<li>(-) Requires some Cranelift changes (but doesn't anything interesting?).</li>
+</ul>
+</li>
+</ol>
+<p>Since I've talked myself into option 4 above, I will likely prototype this, but I'm very curious what others think as well...</p>
+</blockquote>
+
+
+
+<a name="529610545"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/529610545" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#529610545">(Jul 19 2025 at 20:23)</a>:</h4>
+<p>cfallin edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/11285#issuecomment-3092553906">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<p>A third solution that occurred to me this morning: we could emit metadata with the exception table to describe where vmctx is located, and take it as an argument to the exception table in a <code>try_call</code> -- something like a "dynamic context for tags". This would allow us to get <code>vmctx</code> once we have the static callsite metadata for a given frame, but crucially, would only require us to spill it when we have a <code>try_call</code> (i.e., a <code>try_table</code> at the Wasm level).</p>
+<p>In more detail, this would look like</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">function</span><span class="w"> </span><span class="o">%</span><span class="n">foo</span><span class="p">(</span><span class="kt">i64</span><span class="w"> </span><span class="n">vmctx</span><span class="p">)</span><span class="w"> </span><span class="n">tail</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="n">fn0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">..</span><span class="p">.</span>
+<span class="w">  </span><span class="n">sig0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">..</span><span class="p">.</span>
+<span class="n">block0</span><span class="p">(</span><span class="n">v0</span><span class="p">:</span><span class="w"> </span><span class="kt">i64</span><span class="p">):</span>
+<span class="w">  </span><span class="nc">try_call</span><span class="w"> </span><span class="n">fn0</span><span class="p">(</span><span class="n">v1</span><span class="p">,</span><span class="w"> </span><span class="n">v2</span><span class="p">,</span><span class="w"> </span><span class="n">v3</span><span class="p">),</span><span class="w"> </span><span class="n">sig0</span><span class="p">,</span><span class="w"> </span><span class="n">block1</span><span class="p">(</span><span class="n">ret0</span><span class="p">),</span><span class="w"> </span><span class="p">[</span><span class="n">context</span><span class="w"> </span><span class="n">v0</span><span class="p">,</span><span class="w"> </span><span class="n">tag0</span><span class="p">:</span><span class="w"> </span><span class="nc">block2</span><span class="p">(</span><span class="n">exn0</span><span class="p">,</span><span class="w"> </span><span class="n">exn1</span><span class="p">),</span><span class="w"> </span><span class="n">tag1</span><span class="p">:</span><span class="w"> </span><span class="nc">block3</span><span class="p">(</span><span class="n">exn0</span><span class="p">,</span><span class="w"> </span><span class="n">exn1</span><span class="p">)]</span>
+<span class="o">..</span><span class="p">.</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>and an additional array in the <code>ExceptionTable</code> format (and field on <code>FinalizedMachCallSite</code>) that, with an <code>Option&lt;i32&gt;</code>, indicates offset-from-FP for this frame at which we can find the "context" arg. The <code>try_call</code> lowering would add a regalloc use constrained to "stack" so regalloc would handle spilling vmctx to a stack slot only at <code>try_call</code> sites (and potentially reusing the same spill across multiple sites). We can then find it when we walk the stack. This is not quite as efficient at stackwalk time as a vmctx at fixed offset -- the latter actually lets us get away without querying the module-map btree at all, because we can directly get the instance and module from a stack frame -- but it's almost certainly worth not growing stack frames and adding a store to every prologue.</p>
+<p>So to recap: the need is to get the dynamic instance for a given frame in a stackwalk so we can match dynamic instances of tags. The solutions so far are:</p>
+<ol>
+<li>
+<p>Add a vmctx field to the frame format (as an option to the <code>tail</code> ABI probably) and fill it in with a store in every prologue of every function.</p>
+<p>- (+) Very simple design.<br>
+  - (+) Very fast stackwalking: we can get directly to an instance and module from a frame with two pointer indirections; no more need to query the module-map btree.<br>
+  - (+) Perhaps needed later anyway when introspecting frames with a debugger API.<br>
+  - (-) Adds 16 bytes to every frame (8-byte word, but then alignment) on our 64-bit architectures, and adds a store to every prologue.<br>
+  - (-) Likely incompatible with inlining, unless we design complex metadata of some sort or add save/restore logic to the inliner (at some complexity cost, and crossing abstraction boundaries, because this is an ABI concern).</p>
+</li>
+<li>
+<p>(Variant of above) add a vmctx field to every frame, but only store to it when we know we're crossing instance boundaries. Encode this crossing by interposing a special trampoline frame.</p>
+<p>- (+) Potentially saves the cost of a store in every prologue.<br>
+  - (-) Major re-architecting of Wasmtime's function-call internals; probably a non-starter.</p>
+</li>
+<li>
+<p>Emit code that dynamically disambiguates tags; every <code>try_call</code> has only a catch-all handler at the CLIF level.</p>
+<p>- (+) Conceptually simple: the vmctx is already available in Wasm code, and we can statically generate efficient code to access each tag (as an offset in the vmctx for defined tags, or a load of a pointer for imported tags).<br>
+  - (-) Potentially large code bloat.<br>
+  - (-) Slower unwinding (not asymptotically so, but major constant factor in practice likely) because we need to re-enter the <code>throw_ref</code> libcall every time we pass a <code>try_call</code> that doesn't have a handler.</p>
+</li>
+<li>
+<p>Add a notion of "dynamic context" to exception tables, taken as an arg to <code>try_call</code>'s exception table, spilled to stack, and accessible at a stack offset recorded in the exception table entry for a callsite. Use this "dynamic context" to communicate instance identity to the stackwalker.</p>
+<p>- (+) Lowest-cost option so far: no impact at all to functions that don't have exception handlers, and spills only at <code>try_call</code> sites for those that do.<br>
+  - (+) Directly reifies the semantic information we need -- the instance identity -- as an argument to the call, which feels cleanest design-wise.<br>
+  - (+) Allows stack-walking to directly find the appropriate handler without intermediate catch/rethrow steps.<br>
+  - (-) Requires some Cranelift changes (but doesn't anything interesting?).</p>
+</li>
+</ol>
+<p>Since I've talked myself into option 4 above, I will likely prototype this, but I'm very curious what others think as well...</p>
+</blockquote>
+
+
+
+<a name="529610684"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/529610684" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#529610684">(Jul 19 2025 at 20:26)</a>:</h4>
+<p>cfallin edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/11285#issuecomment-3092553906">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<p>A third solution that occurred to me this morning: we could emit metadata with the exception table to describe where vmctx is located, and take it as an argument to the exception table in a <code>try_call</code> -- something like a "dynamic context for tags". This would allow us to get <code>vmctx</code> once we have the static callsite metadata for a given frame, but crucially, would only require us to spill it when we have a <code>try_call</code> (i.e., a <code>try_table</code> at the Wasm level).</p>
+<p>In more detail, this would look like</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">function</span><span class="w"> </span><span class="o">%</span><span class="n">foo</span><span class="p">(</span><span class="kt">i64</span><span class="w"> </span><span class="n">vmctx</span><span class="p">)</span><span class="w"> </span><span class="n">tail</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="n">fn0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">..</span><span class="p">.</span>
+<span class="w">  </span><span class="n">sig0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">..</span><span class="p">.</span>
+<span class="n">block0</span><span class="p">(</span><span class="n">v0</span><span class="p">:</span><span class="w"> </span><span class="kt">i64</span><span class="p">):</span>
+<span class="w">  </span><span class="nc">try_call</span><span class="w"> </span><span class="n">fn0</span><span class="p">(</span><span class="n">v1</span><span class="p">,</span><span class="w"> </span><span class="n">v2</span><span class="p">,</span><span class="w"> </span><span class="n">v3</span><span class="p">),</span><span class="w"> </span><span class="n">sig0</span><span class="p">,</span><span class="w"> </span><span class="n">block1</span><span class="p">(</span><span class="n">ret0</span><span class="p">),</span><span class="w"> </span><span class="p">[</span><span class="n">context</span><span class="w"> </span><span class="n">v0</span><span class="p">,</span><span class="w"> </span><span class="n">tag0</span><span class="p">:</span><span class="w"> </span><span class="nc">block2</span><span class="p">(</span><span class="n">exn0</span><span class="p">,</span><span class="w"> </span><span class="n">exn1</span><span class="p">),</span><span class="w"> </span><span class="n">tag1</span><span class="p">:</span><span class="w"> </span><span class="nc">block3</span><span class="p">(</span><span class="n">exn0</span><span class="p">,</span><span class="w"> </span><span class="n">exn1</span><span class="p">)]</span>
+<span class="o">..</span><span class="p">.</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>and an additional array in the <code>ExceptionTable</code> format (and field on <code>FinalizedMachCallSite</code>) that, with an <code>Option&lt;i32&gt;</code>, indicates offset-from-FP for this frame at which we can find the "context" arg. The <code>try_call</code> lowering would add a regalloc use constrained to "stack" so regalloc would handle spilling vmctx to a stack slot only at <code>try_call</code> sites (and potentially reusing the same spill across multiple sites). We can then find it when we walk the stack. This is not quite as efficient at stackwalk time as a vmctx at fixed offset -- the latter actually lets us get away without querying the module-map btree at all, because we can directly get the instance and module from a stack frame -- but it's almost certainly worth not growing stack frames and adding a store to every prologue.</p>
+<p>So to recap: the need is to get the dynamic instance for a given frame in a stackwalk so we can match dynamic instances of tags. The solutions so far are:</p>
+<ol>
+<li>
+<p>Add a vmctx field to the frame format (as an option to the <code>tail</code> ABI probably) and fill it in with a store in every prologue of every function.</p>
+<p>- (+) Very simple design.<br>
+  - (+) Very fast stackwalking: we can get directly to an instance and module from a frame with two pointer indirections; no more need to query the module-map btree.<br>
+  - (+) Perhaps needed later anyway when introspecting frames with a debugger API.<br>
+  - (-) Adds 16 bytes to every frame (8-byte word, but then alignment) on our 64-bit architectures, and adds a store to every prologue.<br>
+  - (-) Likely incompatible with inlining, unless we design complex metadata of some sort or add save/restore logic to the inliner (at some complexity cost, and crossing abstraction boundaries, because this is an ABI concern).</p>
+</li>
+<li>
+<p>(Variant of above) add a vmctx field to every frame, but only store to it when we know we're crossing instance boundaries. Encode this crossing by interposing a special trampoline frame.</p>
+<p>- (+) Potentially saves the cost of a store in every prologue.<br>
+  - (-) Major re-architecting of Wasmtime's function-call internals; probably a non-starter.</p>
+</li>
+<li>
+<p>Emit code that dynamically disambiguates tags; every <code>try_call</code> has only a catch-all handler at the CLIF level.</p>
+<p>- (+) Conceptually simple: the vmctx is already available in Wasm code, and we can statically generate efficient code to access each tag (as an offset in the vmctx for defined tags, or a load of a pointer for imported tags).<br>
+  - (-) Potentially large code bloat.<br>
+  - (-) Slower unwinding (not asymptotically so, but major constant factor in practice likely) because we need to re-enter the <code>throw_ref</code> libcall every time we pass a <code>try_call</code> that doesn't have a handler.</p>
+</li>
+<li>
+<p>Add a notion of "dynamic context" to exception tables, taken as an arg to <code>try_call</code>'s exception table, spilled to stack, and accessible at a stack offset recorded in the exception table entry for a callsite. Use this "dynamic context" to communicate instance identity to the stackwalker.</p>
+<p>- (+) Lowest-cost option so far: no impact at all to functions that don't have exception handlers, and spills only at <code>try_call</code> sites for those that do.<br>
+  - (+) Directly reifies the semantic information we need -- the instance identity -- as metadata on the call, which feels cleanest design-wise (and makes it compatible with arbitrary inlining of separate instances' functions).<br>
+  - (+) Is a nice conceptual generalization of exception-handler sites: we can provide context <em>to</em> the runtime, and the runtime can provide payload back to us.<br>
+  - (+) Allows stack-walking to directly find the appropriate handler without intermediate catch/rethrow steps.<br>
+  - (-) Requires some Cranelift changes (but doesn't anything interesting?).</p>
+</li>
+</ol>
+<p>Since I've talked myself into option 4 above, I will likely prototype this, but I'm very curious what others think as well...</p>
+</blockquote>
+
+
+
+<a name="529616802"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/529616802" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#529616802">(Jul 19 2025 at 22:49)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/11285#issuecomment-3092613814">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<p>The <code>context</code> argument sounds quite plausible to me, although I'm also not the best judge of that since almost all of that solution is basically in Cranelift so I'd defer to you for complexity on that. What you say though seems reasonable to me!</p>
+<blockquote>
+<p>This is not quite as efficient at stackwalk time as a vmctx at fixed offset -- the latter actually lets us get away without querying the module-map btree at all,</p>
+</blockquote>
+<p>I think the efficiency here will be the same though right in that we have to search for a handler? For each frame in the stackwalk we'll have to consult the handler map to see if that frame has a handler, and if we find a handler finding the offset to the vmctx can probably be a constant operation at that point. Basically I'm not sure there's any downside (even speed-wise) than solution (4) you mentiond apart from the Cranelift complexity you mention.</p>
+<p>Thinking forward a bit to debugging bits, one possible downside though would be that the <code>context</code> solution wouldn't be naturally extensible to all calls. That seems reasonable to defer a possible solution to that til later though and figure out how best to deal with it.</p>
+</blockquote>
+
+
+
+<a name="529628373"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/529628373" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#529628373">(Jul 20 2025 at 04:02)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/11285#issuecomment-3093182547">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<blockquote>
+<p>I think the efficiency here will be the same though right in that we have to search for a handler? For each frame in the stackwalk we'll have to consult the handler map to see if that frame has a handler, and if we find a handler finding the offset to the vmctx can probably be a constant operation at that point. </p>
+</blockquote>
+<p>The distinction is that with option (4) we have to do two log-time lookups -- in the module map btree by PC to get the whole module's exception table, then a binary search in the module's exception table by relative PC to get handlers; while with option (1)/(2) we can directly get the module info and exception table in constant time, then only have the binary search by relative PC to get handlers. I take back what I said about asymptotic equivalence actually -- option (4) is <code>O(log |modules in Engine| + log |try-call callsites in module|)</code>, while option (1)/(2) is <code>O(log |try-call callsites in module|)</code>. In practice this may be visible in a many-modules-in-address-space configuration but <code>std</code>'s <code>BTreeMap</code> is pretty good, so... I don't think it's a reason to pessimize the common (non-throwing) case either.</p>
+<p>One other tidbit I figure I should mention here: when inlining is considered, we actually need multiple contexts in one exception table, because new try-call exception tables can be constructed as the aggregation of all handlers in lexical scope in caller and inlined callee, across differing vmctx's; so it would look something like <code>[context v0, tag1: blockN, tag2: ..., context v1, tag3: blockM, tag4: ...]</code>, where the semantics are that one reads this left-to-right with context applying to tags following. Then I don't think we can filter out "overlapping" tags when inlining in general because dynamically they can differ -- tag identity is logically the context/tag tuple. (Some may dynamically alias too -- context v0 tag1 may be the same as context v1 tag3, if the inlined callee is from an instance that imported the tag under that index; and this isn't resolved until runtime and can change for each new Store.) The handler-matching semantics then have to be an ordered left-to-right read as well. Some Cranelift embedders may know more about tags, i.e., use them as static labels instead, and so can impose a tighter interpretation on the compilation result (use the fact that static tag labels may-not-alias). I'll write all this up in an upcoming PR for option 4 :-)</p>
+</blockquote>
+
+
+
+<a name="529628434"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/529628434" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#529628434">(Jul 20 2025 at 04:03)</a>:</h4>
+<p>cfallin edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/11285#issuecomment-3093182547">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<blockquote>
+<p>I think the efficiency here will be the same though right in that we have to search for a handler? For each frame in the stackwalk we'll have to consult the handler map to see if that frame has a handler, and if we find a handler finding the offset to the vmctx can probably be a constant operation at that point. </p>
+</blockquote>
+<p>The distinction is that with option (4) we have to do two log-time lookups -- in the module map btree by PC to get the whole module's exception table, then a binary search in the module's exception table by relative PC to get handlers; while with option (1)/(2) we can directly get the module info and exception table in constant time, then only have the binary search by relative PC to get handlers. I take back what I said about asymptotic equivalence actually -- option (4) is <code>O(log |modules in Engine| + log |try-call callsites in module|)</code>, while option (1)/(2) is <code>O(log |try-call callsites in module|)</code>. In practice this may be visible in a many-modules-in-address-space configuration but <code>std</code>'s <code>BTreeMap</code> is pretty good, so... I don't think it's a reason to pessimize the common (non-throwing) case either.</p>
+<p>One other tidbit I figure I should mention here: when inlining is considered, we actually need multiple contexts in one exception table, because new try-call exception tables can be constructed as the aggregation of all handlers in lexical scope in caller and inlined callee, across differing vmctx's; so it would look something like <code>[context v0, tag1: blockN, tag2: ..., context v1, tag3: blockM, tag4: ...]</code>, where the semantics are that one reads this left-to-right with context applying to tags following. Then I don't think we can filter out "overlapping" tags when inlining in general because dynamically they can differ -- tag identity is logically the context/tag tuple. (Some may dynamically alias too -- context v0 tag1 may be the same as context v1 tag3, if the inlined callee is from an instance that imported the tag under that index; and this isn't resolved until runtime and can change for each new Store.) The handler-matching semantics then have to be an ordered left-to-right read as well. Some Cranelift embedders may know more about tags, e.g., use them as static labels instead, and so can impose a tighter interpretation on the compilation result (use the fact that static tag labels may-not-alias). I'll write all this up in an upcoming PR for option 4 :-)</p>
+</blockquote>
+
+
+
+<a name="529939235"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/529939235" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#529939235">(Jul 21 2025 at 17:49)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/11285#issuecomment-3097806636">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<p>FWIW, our core dumps are currently incomplete/inaccurate for similar reasons: we can determine which module each frame is in, but not which instance, so we always just assume the first instance of that frame's module. So it isn't just hypothetical future debugging that wants to be able to recover the vmctx/instance for each frame while walking the stack, it is also our core dumps of today.</p>
+<p>Regarding the trampolines option (2): In addition to also not work well with inlining like (1), it would maybe even break tail calls across modules unless we did something heroic. The spec explicitly mandates that cross-module mutually-recursive tail calls have O(1) stack usage, so this is probably a show stopper. However, if we did figure out how to do this correctly/simply, we could probably remove the callee vmctx argument from our calling convention and just have that be in the <code>VMStoreContext</code>, which would be nice and perhaps a nice little runtime speed up.</p>
+<p>Regarding inlining and options (1) and (2): I guess we could efffectively keep most of the prologue/epilogue when inlining a callee, so that we push a stack frame and the hypothetical new vmctx stack slot, but then don't jump to an external function body and just continue to the inlined callee body instead. And then the reverse for "returning" from the callee. Would need to take care that code motion doesn't move inlined callee code beyond the bounds of the stack frame, which is probably fine since anything that could trap wouldn't be <code>can_move</code>. And we probably wouldn't literally reuse the prologue/eiplogue code in Cranelift, since it is in the backend, and instead do it in the inliner trait implementation, which is kinda gross and would need to be kept in-sync with our actual ABI/calling convention. And after all that, while we would be able to do some inlining, we would still have more overhead on inlined calls than we otherwise do with today's calling conventions and what (3) and (4) would have with for inlined calls.</p>
+<p>But yeah option (4) does seem the most promising to me. Bit of a shame that we won't be able to reuse it for core dumps and debugging, but very nice that it doesn't impose any new overhead and works with inlined calls.</p>
+</blockquote>
+
+
+
+<a name="529952366"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/529952366" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#529952366">(Jul 21 2025 at 19:17)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/11285#issuecomment-3098059982">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<p>I suspect we'll want something like the context-in-handler-lists when inlining even if we do eventually have "nested inlined frames" of some sort: a <code>try_call</code> in an inlined body can consist of handlers merged from the inliner and inlinee; these two different sets of tags have different contexts. So the only reasonable thing we can do (I think) is to have a strict concatenation approach to handler lists, context-elements and tag-elements alike, with first-match-wins semantics (inlined <code>try_calls</code> get their original handler list with caller's handler list appended). Fortunately this is actually simpler than the current inliner logic that deduplicates tag handlers!</p>
+<p>It sounds like consensus exists around option 4, so I'll go ahead and build that out. Separately, about frame vmctx slots:</p>
+<ul>
+<li>Great point about core-dumps needing instance IDs as well. It would probably be useful for me to get a data-point for this conversation, namely the overhead of the frame slot plus store. Perhaps this could be an option that we build that enhances coredumps and becomes mandatory for debug APIs.</li>
+<li>Regarding inlining the prologue: my mental sketch for how that would go is something like we would expose the store-to-vmctx-slot with a new opcode (<code>set_frame_context v0</code>) and one to load too (<code>v0 = get_frame_context</code>); then we could generate CLIF to save, update, and restore when inlining, and also use these ops to set the frame slot at the beginning of every function (rather than a magic connection to <code>ArgPurpose::Vmctx</code> or whatever else).</li>
+</ul>
+</blockquote>
+
+
+
+<a name="529979928"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/529979928" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#529979928">(Jul 21 2025 at 23:43)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/11285#issuecomment-3099946915">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<p>I'll note for awareness here that this change is requiring me to add back <code>Stack</code> operand constraints to regalloc2 (previously removed in <a href="https://github.com/bytecodealliance/regalloc2/issues/185">bytecodealliance/regalloc2#185</a> after we stopped using regalloc-managed stackmaps). I'll do a PR for that, then a PR for dynamic tag contexts in Cranelift exception tables, then a PR for Wasm exception support based on that.</p>
+</blockquote>
+
+
+
+<a name="530081056"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/530081056" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#530081056">(Jul 22 2025 at 07:05)</a>:</h4>
+<p>Amanieu <a href="https://github.com/bytecodealliance/wasmtime/issues/11285#issuecomment-3101365479">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<p>Since <code>caller_vmctx</code> is already an argument for all function calls, would it make sense to adjust the calling convention to make this a callee-saved register instead? The unwinder could then restore this value along with PC/FP, which would avoid the need for a forced spill on every function that uses <code>try_call</code>.</p>
+</blockquote>
+
+
+
+<a name="530089624"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/530089624" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#530089624">(Jul 22 2025 at 08:04)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/11285#issuecomment-3101541902">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<blockquote>
+<p>Since <code>caller_vmctx</code> is already an argument for all function calls, would it make sense to adjust the calling convention to make this a callee-saved register instead? The unwinder could then restore this value along with PC/FP, which would avoid the need for a forced spill on every function that uses <code>try_call</code>.</p>
+</blockquote>
+<p>I think the major issue is that this approach imposes a cost on every function, not just those that use <code>try_call</code>. Even in programs that use exceptions, most callsites are typically not <code>try_call</code>s (most levels of the callstack don't have active handlers); so this will be more expensive. In fact it should result in practice in behavior similar to option 1; and has the same issues with inlining as well, I believe.</p>
+</blockquote>
+
+
+
+<a name="530166638"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/530166638" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#530166638">(Jul 22 2025 at 15:04)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/11285#issuecomment-3103238956">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<p>Aha that makes sense @cfallin, thanks for explaining the two lookups! I suspect we could probably skip the module lookup most of the time by remembering the module of the previous frame and assuming the next frame comes from the same module, so I'm not too too worried about the cost there personally.</p>
+<p>Here's a bit of a wild thought though: instead of a new <code>context</code> thing on exception tables, what if instead this was all modeled as "the exception metadata is present for block params to the destination unwind block". Those variables (apart from <code>exn0</code> and <code>exn1</code>) are already guaranteed to be on the stack with our ABI and there's additionally already a clean way to support multiple vmcontext arguments (different block params to different blocks). Cranelift would need to preserve metadata about each of the parameter which Wasmtime can then translate to an exception table, but that may not require any regalloc or structural/CLIF changes?</p>
+</blockquote>
+
+
+
+<a name="530212609"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/530212609" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#530212609">(Jul 22 2025 at 19:53)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/11285#issuecomment-3104641462">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<blockquote>
+<p>what if instead this was all modeled as "the exception metadata is present for block params to the destination unwind block"</p>
+</blockquote>
+<p>Interesting thought, and it does seem appealing to try to reuse plumbing like this -- the issue though is that edge moves for that control flow edge will appear in the destination block, so we would need to interpret moves/loads/stores to get at the blockparam state...</p>
+</blockquote>
+
+
+
+<a name="530640898"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/530640898" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#530640898">(Jul 24 2025 at 20:26)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasm-proposal:exceptions label to <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">Issue #11285</a>.</p>
+
+
+
+<a name="530876841"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311285%20Wasmtime%20exception%20support%20needs%20.../near/530876841" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311285.20Wasmtime.20exception.20support.20needs.20.2E.2E.2E.html#530876841">(Jul 26 2025 at 02:00)</a>:</h4>
+<p>cfallin closed <a href="https://github.com/bytecodealliance/wasmtime/issues/11285">issue #11285</a>:</p>
+<blockquote>
+<p>I have come to a late realization in my quest to implement exception support: we will need to modify the Wasm calling convention to store the vmctx value in each frame. This will unfortunately pessimize common-case execution because it expands each frame by one word (possibly two with padding; 1.5 on average) and adds a store to every prologue.</p>
+<p>The reason for this has to do with the nominal aspect of tag identities (see <a href="https://webassembly.github.io/exception-handling/core/exec/instructions.html#xref-syntax-instructions-syntax-instr-control-mathsf-throw-ref">spec for <code>throw_ref</code></a> for details):</p>
+<ul>
+<li>Tags to identify handlers are <em>dynamic entities</em>, instantiated as part of the state of a given instance in the store. The spec refers to "tag addresses" to denote this. Tag instances can be exported and imported just as memories, tables, and globals can be.</li>
+<li>In Wasmtime, we represent tags with <code>VMTagDefinition</code>s inline in the vmctx, and <code>VMTagImport</code>s that hold pointers to the tag definitions, similarly to memories and tables.</li>
+<li>Exception objects reference tag instances by defining-instance ID and defined tag index in that instance, since we have to ensure that GC heap contents remain untrusted and bounds-checked on use, but this is otherwise equivalent: we are naming the dynamic instance.</li>
+</ul>
+<p>When compiling a <code>try_table</code>, we emit tag identities for handlers with static <code>TagIndex</code>es, and those get serialized into the exception table. My thought has always been that on a throw's stack-walk, we will translate these to dynamic tag instances and compare to the dynamic tag instance in the thrown exception.</p>
+<p>The problem is that as we walk the stack, we have PC and FP only; we can map PC to a particular <em>static module</em>, but one module may be instantiated multiple times within a store. And each of these instances will have different tag instances (in general) for a given static tag index. The vmctx is saved <em>somewhere</em>, but that's up to regalloc, and opaque to our stack-walk. We simply don't have enough information.</p>
+<p>In the case where we have a single-instance store, and no imported tags (the former implies the latter actually, because we create dummy instances for host-created tags), we can get around this by comparing static tag indices directly. But that's a subset and we need to support the full spec.</p>
+<p>Prior art in other engines seems to be that the instance (vmctx) is available during stackwalking -- e.g., in SpiderMonkey, <a href="https://searchfox.org/mozilla-central/rev/0fe32133f12ed0f20d5fde8fe970157f04817982/js/src/wasm/WasmFrame.h#365-366">caller and callee vmctx are saved in-frame</a> in every Wasm frame.</p>
+<p>For what it's worth, I believe we will run into this need eventually even independently of exception-handling: for example, debug support will also have a need to access instance state (vmctx) when introspecting stack frames. So far our stackwalking usage has been restricted to GC, where instance identity doesn't matter (GC refs are store-wide), and backtrace generation, where we only need static module identity to symbolicate. So this is the first time that dynamic instance identity matters, but likely not the last.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

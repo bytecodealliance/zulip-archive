@@ -1,0 +1,239 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #11430 Use `async fn` internally within Was... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311430.20Use.20.60async.20fn.60.20internally.20within.20Was.2E.2E.2E.html">wasmtime / PR #11430 Use `async fn` internally within Was...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="534281773"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311430%20Use%20%60async%20fn%60%20internally%20within%20Was.../near/534281773" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311430.20Use.20.60async.20fn.60.20internally.20within.20Was.2E.2E.2E.html#534281773">(Aug 13 2025 at 18:24)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/pull/11430">PR #11430</a> from <code>alexcrichton:internal-async-functions</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>This commit is an initial step towards resolving <a href="https://github.com/bytecodealliance/wasmtime/issues/11262">https://github.com/bytecodealliance/wasmtime/issues/11262</a> by having async<br>
+functions internally Wasmtime actually be <code>async</code> instead of requiring<br>
+the use of fibers. This is expected to have a number of benefits:</p>
+<ul>
+<li>
+<p>The Rust compiler can be used to verify a future is <code>Send</code> instead of<br>
+  "please audit the whole codebase's stack-local variables".</p>
+</li>
+<li>
+<p>Raw pointer workarounds during table/memory growth will no longer be<br>
+  required since the arguments can properly be a split borrow to data in<br>
+  the store (eventually leading to unblocking <a href="https://github.com/bytecodealliance/wasmtime/issues/11178">https://github.com/bytecodealliance/wasmtime/issues/11178</a>).</p>
+</li>
+<li>
+<p>Less duplication inside of Wasmtime and clearer implementations<br>
+  internally. For example GC bits prior to this PR has duplicated<br>
+  sync/async entrypoints (sometimes a few layers deep) which eventually<br>
+  bottomed out in <code>*_maybe_async</code> bits which were <code>unsafe</code> and require<br>
+  fiber bits to be setup. All of that is now gone with the <code>async</code><br>
+  functions being the "source of truth" and sync functions just call<br>
+  them.</p>
+</li>
+<li>
+<p>Fibers are not required for operations such as a GC, growing memory,<br>
+  etc.</p>
+</li>
+</ul>
+<p>The general idea is that the source of truth for the implementation of<br>
+Wasmtime internals are all <code>async</code> functions. These functions are<br>
+callable from synchronous functions in the API with a documented panic<br>
+condition about avoiding them when <code>Config::async_support</code> is disabled.<br>
+When <code>async_support</code> is disabled it's known internally there should<br>
+never be an <code>.await</code> point meaning that we can poll the future of the<br>
+async version and assert that it's ready.</p>
+<p>This commit is not the full realization of plumbing <code>async</code> everywhere<br>
+internally in Wasmtime. Instead all this does is plumb the async-ness of<br>
+<code>ResourceLimiterAsync</code> and that's it, aka memory and table growth are<br>
+now properly async. It turns out though that these limiters are<br>
+extremely deep within Wasmtime and thus necessitated many changes to get<br>
+this all working. In the end this ended up covering some of the trickier<br>
+parts of dealing with async and propagating that throughout the runtime.</p>
+<p>Most changes in this commit are intended to be straightforward, but a<br>
+summary is:</p>
+<ul>
+<li>
+<p>Many more functions are <code>async</code> and <code>.await</code> their internals.</p>
+</li>
+<li>
+<p>Some instances of run-a-closure-and-catch-the-error are now replaced<br>
+  with type-with-<code>Drop</code> as that's the equivalent in the async world.</p>
+</li>
+<li>
+<p>Internal traits in Wasmtime are now <code>#[async_trait]</code> to be object<br>
+  safe. This has a performance impact detailed more below.</p>
+</li>
+<li>
+<p><code>vm::assert_ready</code> is used in synchronous contexts to assert that the<br>
+  async version is done immediately. This is intended to always be<br>
+  accompanied with an assert about <code>async_support</code> nearby.</p>
+</li>
+<li>
+<p><code>vm::one_poll</code> is used test if an asynchronous computation is ready<br>
+  yet and is used in a few locations where a synchronous public API says<br>
+  it'll work in <code>async_support</code> mode but fails with an async resource limiter.</p>
+</li>
+<li>
+<p>GC and other internals were simplified where <code>async</code> functions are now<br>
+  the "guts" and sync functions are thin veneers over these <code>async</code> functions.</p>
+</li>
+<li>
+<p>An example of new async functions are that lazy GC store allocation<br>
+  and instance allocation are both async functions now.</p>
+</li>
+<li>
+<p>In a small number of locations a conditional check of<br>
+<code>store.async_support()</code> is done. For example during GC if<br>
+<code>async_support</code> is enabled arbitrary yield points are injected. For<br>
+  libcalls if it's enabled <code>block_on</code> is used or otherwise it's asserted<br>
+  to complete synchronously.</p>
+</li>
+<li>
+<p>Previously <code>unsafe</code> functions dealing requiring external fiber<br>
+  handling are now all safe and <code>async</code>.</p>
+</li>
+<li>
+<p>Libcalls have a <code>block_on!</code> helper macro which should be itself a<br>
+  function-taking-async-closure but requires future Rust features to<br>
+  make it a function.</p>
+</li>
+</ul>
+<p>A consequence of this refactoring is that instantiation is now slower<br>
+than before. For example from our <code>instantiation.rs</code> benchmark:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">sequential</span><span class="o">/</span><span class="n">pooling</span><span class="o">/</span><span class="n">spidermonkey</span><span class="p">.</span><span class="n">wasm</span>
+<span class="w">                        </span><span class="n">time</span><span class="p">:</span><span class="w">   </span><span class="p">[</span><span class="mf">2.6674</span><span class="w"> </span><span class="err">µ</span><span class="n">s</span><span class="w"> </span><span class="mf">2.6691</span><span class="w"> </span><span class="err">µ</span><span class="n">s</span><span class="w"> </span><span class="mf">2.6718</span><span class="w"> </span><span class="err">µ</span><span class="n">s</span><span class="p">]</span>
+<span class="w">                        </span><span class="n">change</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="o">+</span><span class="mf">20.975</span><span class="o">%</span><span class="w"> </span><span class="o">+</span><span class="mf">21.039</span><span class="o">%</span><span class="w"> </span><span class="o">+</span><span class="mf">21.111</span><span class="o">%</span><span class="p">]</span><span class="w"> </span><span class="p">(</span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0.00</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mf">0.05</span><span class="p">)</span>
+<span class="w">                        </span><span class="n">Performance</span><span class="w"> </span><span class="n">has</span><span class="w"> </span><span class="n">regressed</span><span class="p">.</span>
+</code></pre></div>
+<p>Other benchmarks I've been looking at locally in <code>instantiation.rs</code> have<br>
+pretty wild swings from either a performance improvement in this PR of<br>
+10% to a regression of 20%. This benchmark in particular though, also<br>
+one of the more interesting ones, is consistently 20% slower with this<br>
+commit. Attempting to bottom out this performance difference it looks<br>
+like it's largely "just async state machines vs not" where nothing else<br>
+really jumps out in the profile to me. In terms of absolute numbers the<br>
+time-to-instantiate is still in the single-digit-microsecond range with<br>
+<code>madvise</code> being the dominant function.</p>
+</blockquote>
+
+
+
+<a name="534281826"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311430%20Use%20%60async%20fn%60%20internally%20within%20Was.../near/534281826" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311430.20Use.20.60async.20fn.60.20internally.20within.20Was.2E.2E.2E.html#534281826">(Aug 13 2025 at 18:25)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/11430#issuecomment-3185022804">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11430">PR #11430</a>:</p>
+<blockquote>
+<p>I'm starting this as a draft for now while I sort out CI things, but I also want to have some discussion about this ideally before landing. I plan on bringing this up in tomorrow's Wasmtime meeting.</p>
+</blockquote>
+
+
+
+<a name="534282555"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311430%20Use%20%60async%20fn%60%20internally%20within%20Was.../near/534282555" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311430.20Use.20.60async.20fn.60.20internally.20within.20Was.2E.2E.2E.html#534282555">(Aug 13 2025 at 18:30)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11430">PR #11430</a>.</p>
+
+
+
+<a name="534291534"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311430%20Use%20%60async%20fn%60%20internally%20within%20Was.../near/534291534" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311430.20Use.20.60async.20fn.60.20internally.20within.20Was.2E.2E.2E.html#534291534">(Aug 13 2025 at 19:30)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11430">PR #11430</a>.</p>
+
+
+
+<a name="534436793"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311430%20Use%20%60async%20fn%60%20internally%20within%20Was.../near/534436793" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311430.20Use.20.60async.20fn.60.20internally.20within.20Was.2E.2E.2E.html#534436793">(Aug 14 2025 at 08:51)</a>:</h4>
+<p>tschneidereit <a href="https://github.com/bytecodealliance/wasmtime/pull/11430#issuecomment-3187547073">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11430">PR #11430</a>:</p>
+<blockquote>
+<blockquote>
+<p>Attempting to bottom out this performance difference it looks<br>
+like it's largely "just async state machines vs not" where nothing else<br>
+really jumps out in the profile to me.</p>
+</blockquote>
+<p>IIUC, that means the overhead is a fixed cost that should be stable across different module types, as opposed to somehow scaling with _something_ about the module type itself? If so, that seems not ideal but okay to me, given that we're talking about 0.5us. Otherwise I'd like to understand the implications a bit more.</p>
+</blockquote>
+
+
+
+<a name="534536232"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311430%20Use%20%60async%20fn%60%20internally%20within%20Was.../near/534536232" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311430.20Use.20.60async.20fn.60.20internally.20within.20Was.2E.2E.2E.html#534536232">(Aug 14 2025 at 18:13)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/pull/11430#issuecomment-3189433042">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11430">PR #11430</a>:</p>
+<blockquote>
+<p>For posterity, in today's Wasmtime meeting, we discussed this PR and ways to claw back some of the perf regression. The primary option we discussed was using Cranelift to compile a state-initialization function, which we have on file as <a href="https://github.com/bytecodealliance/wasmtime/issues/2639">https://github.com/bytecodealliance/wasmtime/issues/2639</a></p>
+</blockquote>
+
+
+
+<a name="534716891"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311430%20Use%20%60async%20fn%60%20internally%20within%20Was.../near/534716891" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311430.20Use.20.60async.20fn.60.20internally.20within.20Was.2E.2E.2E.html#534716891">(Aug 15 2025 at 21:48)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/11430#issuecomment-3192839411">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11430">PR #11430</a>:</p>
+<blockquote>
+<p>Ok I've done some more performance profiling an analysis of this. After more thinking and more optimizing, I think I've got an idea for a design that is cheaper at runtime as well as doesn't require <code>T: Send</code>. It'll require preparatory refactorings though so I'm going to start things out in <a href="https://github.com/bytecodealliance/wasmtime/pull/11442">https://github.com/bytecodealliance/wasmtime/pull/11442</a> and we can go from there. I've got everything queued up in my head I think but it'll take some time to get it all into PRs. The other benefit of all of this is that it's going to resolve a number of issues related to unsafe code and unnecessary <code>unsafe</code>, e.g. #11442 handles an outstanding unsafe block in <code>table.rs</code>.</p>
+</blockquote>
+
+
+
+<a name="535213744"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311430%20Use%20%60async%20fn%60%20internally%20within%20Was.../near/535213744" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311430.20Use.20.60async.20fn.60.20internally.20within.20Was.2E.2E.2E.html#535213744">(Aug 19 2025 at 22:59)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/11430#issuecomment-3202685032">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11430">PR #11430</a>:</p>
+<blockquote>
+<p>Further work/investigation on <a href="https://github.com/bytecodealliance/wasmtime/pull/11468">https://github.com/bytecodealliance/wasmtime/pull/11468</a> revealed an optimization opportunity I was not aware of, but makes sense in retrospect: in an <code>async</code> function if an <code>.await</code> point is dynamically not executed then the function will execute faster. This makes sense to me because it avoids updating a state machine and/or spilling locals and execution continues as "normal", so hot-path/fast-path optimizations need to model, statically, that <code>.await</code> isn't necessary.</p>
+<p>With <a href="https://github.com/bytecodealliance/wasmtime/pull/11468">https://github.com/bytecodealliance/wasmtime/pull/11468</a> there's no performance regression currently. That's not the complete story but I'm growing confident we can land this PR without <code>T: Send</code> and without a performance regression. Basically we get to have our cake and eat it too.</p>
+</blockquote>
+
+
+
+<a name="535412080"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311430%20Use%20%60async%20fn%60%20internally%20within%20Was.../near/535412080" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311430.20Use.20.60async.20fn.60.20internally.20within.20Was.2E.2E.2E.html#535412080">(Aug 21 2025 at 01:15)</a>:</h4>
+<p>alexcrichton closed without merge <a href="https://github.com/bytecodealliance/wasmtime/pull/11430">PR #11430</a>.</p>
+
+
+
+<a name="535412083"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311430%20Use%20%60async%20fn%60%20internally%20within%20Was.../near/535412083" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311430.20Use.20.60async.20fn.60.20internally.20within.20Was.2E.2E.2E.html#535412083">(Aug 21 2025 at 01:15)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/11430#issuecomment-3208604235">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11430">PR #11430</a>:</p>
+<blockquote>
+<p>Ok through all the various PRs above this PR is now entirely obsolete. All the benefits of this are on <code>main</code>, yay!</p>
+<p>There's a 5% performance regression on <code>main</code> relative to when I started this work which is due to <code>#[async_trait]</code> making boxed futures. Otherwise though I think it all worked out well!</p>
+</blockquote>
+
+
+
+<a name="535451988"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311430%20Use%20%60async%20fn%60%20internally%20within%20Was.../near/535451988" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311430.20Use.20.60async.20fn.60.20internally.20within.20Was.2E.2E.2E.html#535451988">(Aug 21 2025 at 08:15)</a>:</h4>
+<p>tschneidereit <a href="https://github.com/bytecodealliance/wasmtime/pull/11430#issuecomment-3209497954">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11430">PR #11430</a>:</p>
+<blockquote>
+<blockquote>
+<p>There's a 5% performance regression on <code>main</code> relative to when I started this work which is due to <code>#[async_trait]</code> making boxed futures.</p>
+</blockquote>
+<p>Can you say more about what kinds of things regressed? Or is this just "everything is pretty uniformly 5% slower"?</p>
+<p>And separately, is there anything we can do to claw this back? And if so, can we track that somewhere?</p>
+</blockquote>
+
+
+
+<a name="535565241"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311430%20Use%20%60async%20fn%60%20internally%20within%20Was.../near/535565241" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311430.20Use.20.60async.20fn.60.20internally.20within.20Was.2E.2E.2E.html#535565241">(Aug 21 2025 at 19:23)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/11430#issuecomment-3211812244">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11430">PR #11430</a>:</p>
+<blockquote>
+<p>Throughout this work I was watching the <code>sequential/pooling/(spidermonkey|wasi).wasm</code> benchmark defined in <code>benches/instantiation.rs</code> in this repo. I copied <code>spidermonkey.wasm</code> from Sightglass and otherwise this benchmark repeatedly instantiates in a loop these wasm modules. The 5% regression was time-to-instantiate-and-tear-down-the-store as measured by Criterion. Numbers were in the ~2us range for both modules and the 5% regression was on that number as well.</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/pull/11470">https://github.com/bytecodealliance/wasmtime/pull/11470</a> was the cause of this change and in profiling and analyzing that my conclusion was it's more-or-less entirely due to <code>#[async_trait]</code>. Previously where we had only dynamic dispatch we now have dynamic dispatch plus heap-allocated futures. The extra heap allocation was what was showing up in the profile primarily different from before. Effectively each table and memory being allocated now requires a heap-allocated future to track the state of progressing through the allocation there.</p>
+<p>I don't really know of a great way to claw back this performance easily. One option is to way for <code>dyn</code>-compatible async traits in Rust, but that's likely to take awhile. Another option is to possibly have both an async and a sync trait method and we dynamically select which one depending on the resource limiter that's been configured. For the small wins here though I'd say that's probably not worth it, personally. Given the scale of the numbers here and the micro-benchmark nature I also wasn't planning on tracking this since we generally just try to get instantiation as fast as possible as opposed to "must be below this threshold at all times". In that sense it's a larger constant-factor than before, but that's naturally going to fluctuate over time IMO</p>
+</blockquote>
+
+
+
+<a name="535571842"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311430%20Use%20%60async%20fn%60%20internally%20within%20Was.../near/535571842" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311430.20Use.20.60async.20fn.60.20internally.20within.20Was.2E.2E.2E.html#535571842">(Aug 21 2025 at 20:11)</a>:</h4>
+<p>tschneidereit <a href="https://github.com/bytecodealliance/wasmtime/pull/11430#issuecomment-3211938814">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11430">PR #11430</a>:</p>
+<blockquote>
+<p>Thank you, that's very helpful. I was mildly concerned because I thought you were talking about _everything_ being 5% slower. If it's just instantiation (and I now remember you mentioning this earlier), not e.g. execution throughput, then that's much less concerning. I think that all seems fine, then.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

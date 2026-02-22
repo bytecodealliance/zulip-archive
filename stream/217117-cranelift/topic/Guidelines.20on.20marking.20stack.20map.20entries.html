@@ -1,0 +1,115 @@
+<html>
+<head><meta charset="utf-8"><title>Guidelines on marking stack map entries · cranelift · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/index.html">cranelift</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/Guidelines.20on.20marking.20stack.20map.20entries.html">Guidelines on marking stack map entries</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="539357476"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/Guidelines%20on%20marking%20stack%20map%20entries/near/539357476" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Max T. Kristiansen <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/Guidelines.20on.20marking.20stack.20map.20entries.html#539357476">(Sep 13 2025 at 19:57)</a>:</h4>
+<p>Hi again,</p>
+<p>It's late and I've been fumbling with this for a couple of hours, so the following ramble may not make much sense.</p>
+<p>I've been trying to put together a GC using the user stack maps in Cranelift, but I'm having throuble with the stack maps not containing the pointers I expected. For example, given a snippet like:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">i32</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">x</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Foo</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">a</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="p">};</span>
+
+<span class="w">    </span><span class="n">function_call_to_trigger_gc</span><span class="p">();</span>
+
+<span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">3</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">y</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Foo</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">a</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="w"> </span><span class="p">};</span>
+
+<span class="w">        </span><span class="n">function_call_to_trigger_gc</span><span class="p">();</span>
+
+<span class="w">        </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// explicit use of `x`</span>
+<span class="w">    </span><span class="n">x</span><span class="p">.</span><span class="n">a</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>After each allocation (so, each call to <code>Foo::new</code>), the return value is declared as needing a stack map. When calling the first <code>function_call_to_trigger_gc </code>, the stack map contains the offset to <code>x</code>, which is great. Inside the <code>while</code> loop, <code>function_call_to_trigger_gc </code> is called again, but now the stack map only has a single entry, pointing to <code>y</code>. I would've expected <code>x</code> to also be included, but maybe I'm not declaring the correct values as needing a stack map.</p>
+<p>My bottom line is; is there some guidelines for what values / variables need to be declared as needing stack maps? Would they ever need to be declared multiple times? Am I meant to see both <code>x</code> and <code>y</code> in the loops stack map, or am I missing something?</p>
+
+
+
+<a name="539614217"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/Guidelines%20on%20marking%20stack%20map%20entries/near/539614217" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> fitzgen (he/him) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/Guidelines.20on.20marking.20stack.20map.20entries.html#539614217">(Sep 15 2025 at 17:25)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="957937">Max T. Kristiansen</span> <a href="#narrow/channel/217117-cranelift/topic/Guidelines.20on.20marking.20stack.20map.20entries/near/539357476">said</a>:</p>
+<blockquote>
+<p>is there some guidelines for what values / variables need to be declared as needing stack maps?</p>
+</blockquote>
+<p>if you want a value to appear in a stack map (i.e. it is a GC reference that is potentially live across some call that might trigger GC) then it needs to be declared as needing inclusion in stack maps.</p>
+<p>if you are not using <code>Variable</code>s, then the needs-stack-map bit will not be propagated from block argument values to block parameter values, and you are responsible for marking those block parameters as needing stack maps yourself.</p>
+<p>If you are using <code>Variable</code>s then declaring the variable as needing stack maps should automatically propagate that to all of that variable's def and use values. That includes any block arguments/parameters that the variable infrastructure inserts. (but it will not be propagated across block args/params that you insert yourself and manually thread values derived from the variable into, you are responsible for marking such block args/params as needing stack maps).</p>
+<p><span class="user-mention silent" data-user-id="957937">Max T. Kristiansen</span> <a href="#narrow/channel/217117-cranelift/topic/Guidelines.20on.20marking.20stack.20map.20entries/near/539357476">said</a>:</p>
+<blockquote>
+<p>Would they ever need to be declared multiple times?</p>
+</blockquote>
+<p>If you look at the implementation of <code>declare_{var,value}_needs_stack_map</code> it is just inserting into a set, so it is an idempotent operation and calling the methods multiple times does nothing that the first call didn't already do:</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/625a3e3fd9958f4bfb2445b4aea90588d08719b8/cranelift/frontend/src/frontend.rs#L557">https://github.com/bytecodealliance/wasmtime/blob/625a3e3fd9958f4bfb2445b4aea90588d08719b8/cranelift/frontend/src/frontend.rs#L557</a></p>
+<p><span class="user-mention silent" data-user-id="957937">Max T. Kristiansen</span> <a href="#narrow/channel/217117-cranelift/topic/Guidelines.20on.20marking.20stack.20map.20entries/near/539357476">said</a>:</p>
+<blockquote>
+<p>Am I meant to see both <code>x</code> and <code>y</code> in the loops stack map, or am I missing something?</p>
+</blockquote>
+<p>Are you sure you aren't seeing only an entry for <code>x</code> and not for <code>y</code>? it doesn't look like <code>y</code> is live across any function call.</p>
+<hr>
+<p>backing up a bit, it would be good to look at the logs you get for this test case with (assuming <code>env_logger</code>) <code>RUST_LOG=cranelift_frontend::frontend::safepoints=trace</code></p>
+<p>that will show the CLIF before and after spilling and reloading needs-stack-map values across safepoints, as well as the results of the liveness analysis and all that. in general, it is a good first place to look when confused about why a particular value is or is not present in a stack map</p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/wasmtime/blob/625a3e3fd9958f4bfb2445b4aea90588d08719b8/cranelift/frontend/src/frontend.rs#L557" style="background-image: url(&quot;https://uploads.zulipusercontent.net/eafdd39b41305801c632718a883710568a4d0ca1/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f653939363966363632343962666237363663356464396338653539666531396462653737326561613537626333393162613263613466313539363137663465312f62797465636f6465616c6c69616e63652f7761736d74696d65&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/wasmtime/blob/625a3e3fd9958f4bfb2445b4aea90588d08719b8/cranelift/frontend/src/frontend.rs#L557" title="wasmtime/cranelift/frontend/src/frontend.rs at 625a3e3fd9958f4bfb2445b4aea90588d08719b8 · bytecodealliance/wasmtime">wasmtime/cranelift/frontend/src/frontend.rs at 625a3e3fd9958f4bfb2445b4aea90588d08719b8 · bytecodealliance/wasmtime</a></div><div class="message_embed_description">A lightweight WebAssembly runtime that is fast, secure, and standards-compliant - bytecodealliance/wasmtime</div></div></div>
+
+
+
+<a name="539707696"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/Guidelines%20on%20marking%20stack%20map%20entries/near/539707696" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Max T. Kristiansen <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/Guidelines.20on.20marking.20stack.20map.20entries.html#539707696">(Sep 16 2025 at 08:09)</a>:</h4>
+<p>Okay, I think I'm beginning to understand my issue now. I think the sentence that made it click was:</p>
+<blockquote>
+<p>But [variables] will not be propagated across block args/params that you insert yourself.</p>
+</blockquote>
+<p>While it makes total sense in hindsight, it wasn't intuitive to me that <em>block</em> parameters would need to be declared as well. I had just assumed that the liveness analysis would see a given <code>Variable</code> on the stack map as needing a stack map, even across block boundaries. When looking over the generated IR again, all the declarations were made using <code>declare_value_needs_stack_map</code>, ie without using <code>Variable</code>s. </p>
+<p>I'm unsure when, or even if, I'd ever get around, but would it be fine for me to add an example project to the <code>cranelift</code> package, outlining how stack maps might be used? Looking through the topics in the Zulip chat, it's something multiple people seem to struggle with.</p>
+
+
+
+<a name="539816250"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/Guidelines%20on%20marking%20stack%20map%20entries/near/539816250" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> fitzgen (he/him) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/Guidelines.20on.20marking.20stack.20map.20entries.html#539816250">(Sep 16 2025 at 16:48)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="957937">Max T. Kristiansen</span> <a href="#narrow/channel/217117-cranelift/topic/Guidelines.20on.20marking.20stack.20map.20entries/near/539707696">said</a>:</p>
+<blockquote>
+<p>I'm unsure when, or even if, I'd ever get around, but would it be fine for me to add an example project to the <code>cranelift</code> package, outlining how stack maps might be used? Looking through the topics in the Zulip chat, it's something multiple people seem to struggle with.</p>
+</blockquote>
+<p>example projects would be great to have; none of the core maintainers have time for writing them at the moment. if you find time to contribute something, that would be neat. also, feel free to send doc comment update PRs; the docs can always improve and it is good to have the perspective of people who didn't write the implementation and are unknowingly assuming implementation knowledge while writing docs</p>
+<p>in the meantime, when in doubt, the best bet is to look at what Wasmtime does</p>
+
+
+
+<a name="540027301"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/Guidelines%20on%20marking%20stack%20map%20entries/near/540027301" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Max T. Kristiansen <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/Guidelines.20on.20marking.20stack.20map.20entries.html#540027301">(Sep 17 2025 at 14:16)</a>:</h4>
+<blockquote>
+<p>the docs can always improve and it is good to have the perspective of people who didn't write the implementation and are unknowingly assuming implementation knowledge while writing docs</p>
+</blockquote>
+<p>Is there a specific place these docs should go? Module documentation, Markdown files under <code>cranelift/docs</code>, etc?</p>
+
+
+
+<a name="540049955"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/Guidelines%20on%20marking%20stack%20map%20entries/near/540049955" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> fitzgen (he/him) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/Guidelines.20on.20marking.20stack.20map.20entries.html#540049955">(Sep 17 2025 at 15:47)</a>:</h4>
+<p><span class="user-mention" data-user-id="957937">@Max T. Kristiansen</span> I was imagining the <code>/// ...</code> doc comments above the <code>declare_*_needs_stack_map</code> methods that rustdoc turns into API docs, but if you have other ideas I'm all ears</p>
+<p><code>cranelift/docs</code> would be good for that kind of longer-form reference/tutorial/example project we talked about earlier</p>
+
+
+
+<a name="540311697"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/Guidelines%20on%20marking%20stack%20map%20entries/near/540311697" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Max T. Kristiansen <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/Guidelines.20on.20marking.20stack.20map.20entries.html#540311697">(Sep 18 2025 at 20:05)</a>:</h4>
+<p>I got around to making an example, along with a Markdown file for a higher-level view of the way it would work.</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/pull/11710">https://github.com/bytecodealliance/wasmtime/pull/11710</a></p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/wasmtime/pull/11710" style="background-image: url(&quot;https://uploads.zulipusercontent.net/0994d82e04cf3421b009c543a2d3379ae89d3255/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f346636613065643533313662393061373564633830653434373463383637323630343539343063613132373564396137646132313964663536616534653931322f62797465636f6465616c6c69616e63652f7761736d74696d652f70756c6c2f3131373130&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/wasmtime/pull/11710" title="docs: add documentation and example of using stack maps for GC by maxnatamo · Pull Request #11710 · bytecodealliance/wasmtime">docs: add documentation and example of using stack maps for GC by maxnatamo · Pull Request #11710 · bytecodealliance/wasmtime</a></div><div class="message_embed_description">Adds a documentation entry for how stack maps might be used to implement a garbage collector.
+Adds an example project which shows off how a simple garbage collector might actually be implemented. C...</div></div></div>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

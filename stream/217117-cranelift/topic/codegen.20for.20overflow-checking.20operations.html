@@ -1,0 +1,274 @@
+<html>
+<head><meta charset="utf-8"><title>codegen for overflow-checking operations · cranelift · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/index.html">cranelift</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations.html">codegen for overflow-checking operations</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="543955558"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/codegen%20for%20overflow-checking%20operations/near/543955558" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Simonas (nagisa) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations.html#543955558">(Oct 09 2025 at 13:07)</a>:</h4>
+<p>Currently if you codegen an operation such as <code>u64::checked_sub(v)</code> to wasm you are going to get a sequence of operations that first check for bounds (<code>i64.lt_u</code> in this case) and then the actual subtraction inside an if.</p>
+<p>This seems to be compiled pretty much verbatim by clift on x86:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="w">  </span><span class="n">mov</span><span class="w">    </span><span class="mh">0x30</span><span class="p">(</span><span class="o">%</span><span class="n">rdi</span><span class="p">),</span><span class="o">%</span><span class="n">rax</span>
+<span class="w">  </span><span class="n">cmp</span><span class="w">    </span><span class="cp">$</span><span class="mh">0x4d2</span><span class="p">,</span><span class="o">%</span><span class="n">rax</span>
+<span class="w">  </span><span class="n">jb</span><span class="w">     </span><span class="n">fail</span>
+<span class="w">  </span><span class="n">sub</span><span class="w">    </span><span class="cp">$</span><span class="mh">0x4d2</span><span class="p">,</span><span class="o">%</span><span class="n">rax</span>
+<span class="w">  </span><span class="n">mov</span><span class="w">    </span><span class="o">%</span><span class="n">rax</span><span class="p">,</span><span class="mh">0x30</span><span class="p">(</span><span class="o">%</span><span class="n">rdi</span><span class="p">)</span>
+<span class="n">fail</span><span class="p">:</span>
+<span class="w">  </span><span class="nc">ud2</span>
+</code></pre></div>
+<p>However this can compute sub and get overflow information from flags directly. A-la:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="w">  </span><span class="n">mov</span><span class="w">    </span><span class="mh">0x30</span><span class="p">(</span><span class="o">%</span><span class="n">rdi</span><span class="p">),</span><span class="o">%</span><span class="n">rax</span>
+<span class="w">  </span><span class="n">sub</span><span class="w">    </span><span class="cp">$</span><span class="mh">0x4d2</span><span class="p">,</span><span class="o">%</span><span class="n">rax</span>
+<span class="w">  </span><span class="n">jo</span><span class="w">     </span><span class="n">fail</span>
+<span class="w">  </span><span class="n">mov</span><span class="w">    </span><span class="o">%</span><span class="n">rax</span><span class="p">,</span><span class="mh">0x30</span><span class="p">(</span><span class="o">%</span><span class="n">rdi</span><span class="p">)</span>
+<span class="n">fail</span><span class="p">:</span>
+<span class="w">  </span><span class="nc">ud2</span>
+</code></pre></div>
+<p>Would such optimization be desirable? Is there an issue for this?</p>
+
+
+
+<a name="543957515"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/codegen%20for%20overflow-checking%20operations/near/543957515" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Simonas (nagisa) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations.html#543957515">(Oct 09 2025 at 13:15)</a>:</h4>
+<p>Similarly silly thing happens when using i64.sub128 to test for overflow as well:</p>
+<div class="codehilite" data-code-language="GAS"><pre><span></span><code><span class="w">  </span><span class="nf">mov</span><span class="w">    </span><span class="mi">0x30</span><span class="p">(</span><span class="nv">%rdi</span><span class="p">),</span><span class="nv">%rax</span>
+<span class="w">  </span><span class="nf">xor</span><span class="w">    </span><span class="nv">%rdx</span><span class="p">,</span><span class="nv">%rdx</span><span class="w">                 </span><span class="c1">;; rdx = 0</span>
+<span class="w">  </span><span class="nf">sub</span><span class="w">    </span><span class="no">$0x4d2</span><span class="p">,</span><span class="nv">%rax</span>
+<span class="w">  </span><span class="nf">sbb</span><span class="w">    </span><span class="no">$0x0</span><span class="p">,</span><span class="nv">%rdx</span><span class="w">                 </span><span class="c1">;; rdx = 0 - 0 - overflow_flag</span>
+<span class="w">  </span><span class="nf">test</span><span class="w">   </span><span class="nv">%rdx</span><span class="p">,</span><span class="nv">%rdx</span><span class="w">                 </span><span class="c1">;; rdx == 0?</span>
+<span class="w">  </span><span class="nf">jne</span><span class="w">    </span><span class="no">fail</span>
+<span class="w">  </span><span class="nf">mov</span><span class="w">    </span><span class="nv">%rax</span><span class="p">,</span><span class="mi">0x30</span><span class="p">(</span><span class="nv">%rdi</span><span class="p">)</span>
+<span class="nl">fail:</span>
+<span class="w">  </span><span class="nf">ud2</span>
+</code></pre></div>
+<p>which could equally test for overflow flag.</p>
+<p>Sample wat:</p>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">global</span> <span class="nv">$glob</span> <span class="p">(</span><span class="k">mut</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mf">12345</span><span class="p">))</span>
+
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"one"</span><span class="p">)</span>
+    <span class="nb">global.get</span> <span class="nv">$glob</span>
+    <span class="nb">i64.const</span> <span class="mf">1234</span>
+    <span class="nb">i64.lt_u</span>
+    <span class="k">if</span>
+      <span class="nb">unreachable</span>
+    <span class="k">else</span>
+      <span class="p">(</span><span class="nb">i64.sub</span> <span class="p">(</span><span class="nb">global.get</span> <span class="nv">$glob</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mf">1234</span><span class="p">))</span>
+      <span class="nb">global.set</span> <span class="nv">$glob</span>
+    <span class="k">end</span>
+  <span class="p">)</span>
+
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"two"</span><span class="p">)</span>
+    <span class="p">(</span><span class="k">local</span> <span class="kt">i64</span><span class="p">)</span>
+    <span class="nb">global.get</span> <span class="nv">$glob</span>
+    <span class="nb">local.tee</span> <span class="mi">0</span>
+    <span class="nb">i64.const</span> <span class="mf">1234</span>
+    <span class="nb">i64.lt_u</span>
+    <span class="k">if</span>
+      <span class="nb">unreachable</span>
+    <span class="k">else</span>
+      <span class="p">(</span><span class="nb">i64.sub</span> <span class="p">(</span><span class="nb">local.get</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mf">1234</span><span class="p">))</span>
+      <span class="nb">global.set</span> <span class="nv">$glob</span>
+    <span class="k">end</span>
+  <span class="p">)</span>
+
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"three"</span><span class="p">)</span>
+    <span class="p">(</span><span class="k">local</span> <span class="kt">i64</span><span class="p">)</span>
+    <span class="nb">global.get</span> <span class="nv">$glob</span>
+    <span class="nb">i64.const</span> <span class="mi">0</span>
+    <span class="nb">i64.const</span> <span class="mf">1234</span>
+    <span class="nb">i64.const</span> <span class="mi">0</span>
+    <span class="nb">i64.sub</span><span class="mf">128</span>
+    <span class="nb">i64.eqz</span>
+    <span class="k">if</span>
+    <span class="k">else</span>
+      <span class="nb">unreachable</span>
+    <span class="k">end</span>
+    <span class="nb">global.set</span> <span class="nv">$glob</span>
+  <span class="p">)</span>
+<span class="p">)</span>
+</code></pre></div>
+
+
+
+<a name="543977922"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/codegen%20for%20overflow-checking%20operations/near/543977922" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations.html#543977922">(Oct 09 2025 at 14:35)</a>:</h4>
+<p>Optimizations are definitely desirable! This is a space that has historically been quite tricky to optimize, but if possible we'd definitely be interested</p>
+
+
+
+<a name="543991258"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/codegen%20for%20overflow-checking%20operations/near/543991258" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> fitzgen (he/him) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations.html#543991258">(Oct 09 2025 at 15:30)</a>:</h4>
+<p>it's tricky to match on in Cranelift's mid-end optimization framework because the operation is split across control-flow blocks</p>
+
+
+
+<a name="543993201"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/codegen%20for%20overflow-checking%20operations/near/543993201" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Simonas (nagisa) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations.html#543993201">(Oct 09 2025 at 15:38)</a>:</h4>
+<p>I think the i64.sub128 case might be possible to improve without going across a control flow block. The clif looks this currently:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="w">                                </span><span class="n">block0</span><span class="p">(</span><span class="n">v0</span><span class="p">:</span><span class="w"> </span><span class="kt">i64</span><span class="p">,</span><span class="w"> </span><span class="n">v1</span><span class="p">:</span><span class="w"> </span><span class="kt">i64</span><span class="p">):</span>
+<span class="o">@</span><span class="mi">006</span><span class="n">c</span><span class="w">                               </span><span class="n">v4</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">load</span><span class="p">.</span><span class="kt">i64</span><span class="w"> </span><span class="n">notrap</span><span class="w"> </span><span class="n">aligned</span><span class="w"> </span><span class="n">table</span><span class="w"> </span><span class="n">v0</span><span class="o">+</span><span class="mi">48</span>
+<span class="w">                                    </span><span class="n">v17</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">uextend</span><span class="p">.</span><span class="kt">i128</span><span class="w"> </span><span class="n">v4</span>
+<span class="o">@</span><span class="mi">0070</span><span class="w">                               </span><span class="n">v6</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">iconst</span><span class="p">.</span><span class="kt">i64</span><span class="w"> </span><span class="mi">1234</span>
+<span class="w">                                    </span><span class="n">v19</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">uextend</span><span class="p">.</span><span class="kt">i128</span><span class="w"> </span><span class="n">v6</span><span class="w">  </span><span class="p">;</span><span class="w"> </span><span class="n">v6</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1234</span>
+<span class="o">@</span><span class="mi">0075</span><span class="w">                               </span><span class="n">v10</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">isub</span><span class="w"> </span><span class="n">v17</span><span class="p">,</span><span class="w"> </span><span class="n">v19</span>
+<span class="o">@</span><span class="mi">0075</span><span class="w">                               </span><span class="n">v11</span><span class="p">,</span><span class="w"> </span><span class="n">v12</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">isplit</span><span class="w"> </span><span class="n">v10</span>
+<span class="o">@</span><span class="mi">006</span><span class="n">a</span><span class="w">                               </span><span class="n">v2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">iconst</span><span class="p">.</span><span class="kt">i64</span><span class="w"> </span><span class="mi">0</span>
+<span class="o">@</span><span class="mi">0077</span><span class="w">                               </span><span class="n">v13</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">icmp</span><span class="w"> </span><span class="n">eq</span><span class="w"> </span><span class="n">v12</span><span class="p">,</span><span class="w"> </span><span class="n">v2</span><span class="w">  </span><span class="p">;</span><span class="w"> </span><span class="n">v2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span>
+<span class="o">@</span><span class="mi">0077</span><span class="w">                               </span><span class="n">v14</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">uextend</span><span class="p">.</span><span class="kt">i32</span><span class="w"> </span><span class="n">v13</span>
+<span class="o">@</span><span class="mi">007</span><span class="n">b</span><span class="w">                               </span><span class="n">trapz</span><span class="w"> </span><span class="n">v14</span><span class="p">,</span><span class="w"> </span><span class="n">user11</span>
+<span class="o">@</span><span class="mi">0078</span><span class="w">                               </span><span class="n">jump</span><span class="w"> </span><span class="n">block2</span>
+
+<span class="w">                                </span><span class="n">block2</span><span class="p">:</span>
+<span class="o">@</span><span class="mi">007</span><span class="n">a</span><span class="w">                               </span><span class="n">jump</span><span class="w"> </span><span class="n">block3</span>
+
+<span class="w">                                </span><span class="n">block3</span><span class="p">:</span>
+<span class="o">@</span><span class="mi">007</span><span class="n">d</span><span class="w">                               </span><span class="n">store</span><span class="p">.</span><span class="kt">i64</span><span class="w"> </span><span class="n">notrap</span><span class="w"> </span><span class="n">aligned</span><span class="w"> </span><span class="n">table</span><span class="w"> </span><span class="n">v11</span><span class="p">,</span><span class="w"> </span><span class="n">v0</span><span class="o">+</span><span class="mi">48</span>
+<span class="o">@</span><span class="mi">007</span><span class="n">f</span><span class="w">                               </span><span class="n">jump</span><span class="w"> </span><span class="n">block1</span>
+
+<span class="w">                                </span><span class="n">block1</span><span class="p">:</span>
+<span class="o">@</span><span class="mi">007</span><span class="n">f</span><span class="w">                               </span><span class="k">return</span>
+</code></pre></div>
+<p>The part with icmp at @0077 in particular could probably be simplified to just (if trapz supports non-i32 sized registers?)</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="o">@</span><span class="mi">007</span><span class="n">b</span><span class="w">                               </span><span class="n">trapz</span><span class="w"> </span><span class="n">v12</span><span class="p">,</span><span class="w"> </span><span class="n">user11</span>
+</code></pre></div>
+<p>cause it just compares value with 0 and then passes it along into trapz.</p>
+
+
+
+<a name="543993699"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/codegen%20for%20overflow-checking%20operations/near/543993699" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Simonas (nagisa) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations.html#543993699">(Oct 09 2025 at 15:41)</a>:</h4>
+<p>(assuming I'm looking at post-optimization clif as output by wasmtime --emit-clif?)</p>
+
+
+
+<a name="543995035"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/codegen%20for%20overflow-checking%20operations/near/543995035" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Simonas (nagisa) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations.html#543995035">(Oct 09 2025 at 15:46)</a>:</h4>
+<p>if nobody takes this on, I may take a look at least at the last thing here over the weekend.</p>
+
+
+
+<a name="543996600"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/codegen%20for%20overflow-checking%20operations/near/543996600" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Simonas (nagisa) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations.html#543996600">(Oct 09 2025 at 15:53)</a>:</h4>
+<p>(to trapnz, not trapz…)</p>
+
+
+
+<a name="544015377"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/codegen%20for%20overflow-checking%20operations/near/544015377" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations.html#544015377">(Oct 09 2025 at 17:28)</a>:</h4>
+<blockquote>
+<p>However this can compute sub and get overflow information from flags directly</p>
+</blockquote>
+<p>This is going to be very tricky and needs careful design work, as a warning -- there are a number of tough-to-crack reasons that we don't share flags generation with multiple consumers of those flags:</p>
+<ul>
+<li>We don't track flags with regalloc, and doing so would be tricky because a "spill" is very expensive (either a special instruction like pushf on x86-64 or msr on aarch64, or just rematerializing all the flags) and there's only one set of flags. The consequence of this is that we always codegen flags producers and consumers together</li>
+<li>In essence this is an "opportunistic rematerialization" optimization, where we notice some other instruction has computed a result and we can use it too. We don't have any infrastructure for that in isel and in general it's an NP-complete (set-cover) problem so we'd want to decide on a good approximation strategy</li>
+<li>All of our opts are on a single value, not "seeing two similar values side-by-side". We do have some ideas that we came up with when discussing how to merge div/rem into one instruction if the ISA gives us that; the basic idea would be to have a mid-end rewrite that turns both sub <em>and</em> the icmp into a "subtract result and icmp result" combo op, then let GVN do its thing, and rely on the cost minimization to pick the combined op. But that needs the cost minimization to be aware of multiple uses amortizing cost, which it doesn't do today</li>
+</ul>
+<p>All this to say, it's not a simple "add an opt rule" thing -- we need deep thought on our core algorithms to give us the tools to do this</p>
+
+
+
+<a name="544215567"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/codegen%20for%20overflow-checking%20operations/near/544215567" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Simonas (nagisa) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations.html#544215567">(Oct 10 2025 at 17:09)</a>:</h4>
+<p>I started prodding the i64.sub128 case with what I think should be relatively straightforward:</p>
+<div class="codehilite" data-code-language="isle"><pre><span></span><code>(rule (simplify_skeleton (trapz (uextend _ a) code)) (trapz a code))
+</code></pre></div>
+<p>and </p>
+<div class="codehilite" data-code-language="clif"><pre><span></span><code>function %test1(i32) -&gt; i32 {
+block0(v0: i32):
+    v1 = uextend.i64 v0
+    trapz.i64 v1, user1
+    return v0
+}
+</code></pre></div>
+<p>as my test case. However, even though logs suggest that the rule matches and applies (<code>simplify_skeleton: replace inst with inst3: trapz.i32 v0, user1</code>) it ends up weird shortly after:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>[2025-10-10T16:39:19Z TRACE cranelift_codegen::egraph] Processing inst inst1: trapz.i64 v1, user1
+[2025-10-10T16:39:19Z TRACE cranelift_codegen::opts] new iter from root v1
+[2025-10-10T16:39:19Z TRACE cranelift_codegen::opts] iter: value v1
+[2025-10-10T16:39:19Z TRACE cranelift_codegen::opts]  -&gt; value of type i64
+[2025-10-10T16:39:19Z TRACE cranelift_codegen::egraph]  -&gt; simplify_skeleton: yielded 1 simplification(s)
+[2025-10-10T16:39:19Z TRACE cranelift_codegen::egraph]  -&gt; simplify_skeleton: replace inst with inst3: trapz.i32 v0, user1
+[2025-10-10T16:39:19Z TRACE cranelift_codegen::egraph]  -&gt; mergeable side-effecting op inst1
+[2025-10-10T16:39:19Z TRACE cranelift_codegen::egraph]  -&gt; inserts as new (no GVN)
+[2025-10-10T16:39:19Z TRACE cranelift_codegen::egraph] Processing inst inst2: return v0
+[2025-10-10T16:39:19Z TRACE cranelift_codegen::egraph] rewriting arg v0 of inst inst2 to v0
+[2025-10-10T16:39:19Z TRACE cranelift_codegen::egraph]  -&gt; simplify_skeleton: yielded 0 simplification(s)
+[2025-10-10T16:39:19Z TRACE cranelift_codegen::alias_analysis] alias analysis: scanning at inst2 with state LastStores { heap: None, table: None, vmctx: No
+ne, other: None } (MultiAry { opcode: Return, args: EntityList { index: 9, unused: PhantomData&lt;cranelift_codegen::ir::entities::Value&gt; } })
+[2025-10-10T16:39:19Z TRACE cranelift_codegen::egraph] egraph built:
+    function %test1(i32) -&gt; i32 fast {
+    block0(v0: i32):
+        trapz.i64 v1, user1 ;; /!\ why v1? the insn should've been replaced with `trapz.i32 v0`.
+        return v0
+    }
+</code></pre></div>
+<p>which eventually returns back to the original shape with the uextend. Before I dive into this (and having read the cautioning message above as well as the comment on <code>simplify_skeleton_inst</code>): should it be possible to make <em>this</em> transformation? am I right in thinking that the outcome here is weird?</p>
+
+
+
+<a name="544217753"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/codegen%20for%20overflow-checking%20operations/near/544217753" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations.html#544217753">(Oct 10 2025 at 17:24)</a>:</h4>
+<p>Adding a little more logging around the <code>if cost &lt; best_cost</code> logic (line 689 in cranelift/codegen/src/egraphs.rs), I see</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="p">[</span><span class="mi">2025</span><span class="o">-</span><span class="mi">10</span><span class="o">-</span><span class="mi">10</span><span class="n">T17</span><span class="p">:</span><span class="mi">22</span><span class="p">:</span><span class="mi">12</span><span class="n">Z</span><span class="w"> </span><span class="n">TRACE</span><span class="w"> </span><span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">egraph</span><span class="p">]</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">cost</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Cost</span><span class="p">::</span><span class="n">Finite</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">op_cost</span><span class="p">:</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span><span class="w"> </span><span class="n">depth</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="p">};</span><span class="w"> </span><span class="n">best_cost</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Cost</span><span class="p">::</span><span class="n">Finite</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">op_cost</span><span class="p">:</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span><span class="w"> </span><span class="n">depth</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="p">}</span>
+</code></pre></div>
+<p>so I think this is a consequence of <code>Cost::of_skeleton_op</code> not considering the cost of operands; it appears that the two trapz's are equally costly so we prefer not to replace.</p>
+<p>I'd be happy to review a PR if you wanted to add operand cost into <code>Cost::of_skeleton_op</code>, then add that simplification rule!</p>
+
+
+
+<a name="544259411"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/codegen%20for%20overflow-checking%20operations/near/544259411" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Simonas (nagisa) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations.html#544259411">(Oct 10 2025 at 22:46)</a>:</h4>
+<p>Hm, this is somewhat problematic to do as elaborator computes costs for values after the skeleton passes run. We also wouldn't want to recurse in the <code>Cost::of_skeleton_op</code> as that would lead straight into the pit of non-linearity. </p>
+<p>For initial prototyping I'll compute costs of operands recursing 1-deep only, but in the final version computation of cost for skeleton ops may want to become a little more like that of <code>of_pure_op</code> wherein the caller maintains a list of operand costs…</p>
+
+
+
+<a name="544259704"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/codegen%20for%20overflow-checking%20operations/near/544259704" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations.html#544259704">(Oct 10 2025 at 22:49)</a>:</h4>
+<p>Ah, yeah, you're right</p>
+
+
+
+<a name="544259928"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/codegen%20for%20overflow-checking%20operations/near/544259928" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations.html#544259928">(Oct 10 2025 at 22:52)</a>:</h4>
+<p>An alternative approach is to say that <code>simplify_skeleton</code> always unconditionally takes one rewrite and performs it. That would mean that the constructor is no longer "multi", which would cause the ISLE compiler's overlap checking to statically check that only one rewrite is possible (either because of LHS non-overlap or because of explicit priorities); then we always take that rewrite. Since these ops don't get turned into multi-representation egraph nodes anyway, I don't see that as <em>hugely</em> problematic, though it does mean that one has to be a little more manual about choosing the correct rewrites</p>
+
+
+
+<a name="544259947"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/codegen%20for%20overflow-checking%20operations/near/544259947" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations.html#544259947">(Oct 10 2025 at 22:52)</a>:</h4>
+<p>(cc <span class="user-mention" data-user-id="253990">@fitzgen (he/him)</span> on that one for thoughts; he's out today and will be back next week)</p>
+
+
+
+<a name="544415805"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/codegen%20for%20overflow-checking%20operations/near/544415805" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Simonas (nagisa) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations.html#544415805">(Oct 12 2025 at 17:10)</a>:</h4>
+<p>I wasn't able to spend too much time on this, although I did find myself hitting new and exciting bugs in the implementation of <code>simplify_skeleton</code> <span aria-label="frown" class="emoji emoji-1f641" role="img" title="frown">:frown:</span></p>
+
+
+
+<a name="544595428"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/codegen%20for%20overflow-checking%20operations/near/544595428" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> fitzgen (he/him) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations.html#544595428">(Oct 13 2025 at 17:09)</a>:</h4>
+<p>if we wanted to keep the multi aspect, and fix the cost computation, then we could create a separate type of eclass for the side-effectful skeleton that stores insts instead of values</p>
+<p>or we could just switch to non-multi and add priorities. although I vaguely remember attempting that at one point and running into islec bugs I didn't want to fix, iirc</p>
+
+
+
+<a name="544595533"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/codegen%20for%20overflow-checking%20operations/near/544595533" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> fitzgen (he/him) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations.html#544595533">(Oct 13 2025 at 17:10)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="515815">Simonas (nagisa)</span> <a href="#narrow/channel/217117-cranelift/topic/codegen.20for.20overflow-checking.20operations/near/544415805">said</a>:</p>
+<blockquote>
+<p>I wasn't able to spend too much time on this, although I did find myself hitting new and exciting bugs in the implementation of <code>simplify_skeleton</code> <span aria-label="frown" class="emoji emoji-1f641" role="img" title="frown">:frown:</span></p>
+</blockquote>
+<p>bug reports and fixes are always welcome!</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

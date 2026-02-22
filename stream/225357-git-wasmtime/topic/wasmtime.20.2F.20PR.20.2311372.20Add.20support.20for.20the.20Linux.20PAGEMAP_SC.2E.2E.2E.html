@@ -1,0 +1,544 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #11372 Add support for the Linux PAGEMAP_SC... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html">wasmtime / PR #11372 Add support for the Linux PAGEMAP_SC...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="532367887"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/532367887" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#532367887">(Aug 01 2025 at 19:38)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a> from <code>alexcrichton:pagemap_scan</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>This series of commits is the brainchild of @tschneidereit who, in his spare time, reads Linux kernel documentation and finds random ioctls. Specifically @tschneidereit discovered the <a href="https://www.man7.org/linux/man-pages/man2/PAGEMAP_SCAN.2const.html"><code>PAGEMAP_SCAN</code> ioctl</a> which has the basic description of:</p>
+<blockquote>
+<p>This <a href="https://www.man7.org/linux/man-pages/man2/ioctl.2.html">ioctl(2)</a> is used to get and optionally clear some specific<br>
+       flags from page table entries.  The information is returned with<br>
+       PAGE_SIZE granularity.</p>
+</blockquote>
+<p>As a bit of background one of the main scaling bottlenecks for Wasmtime-on-the-server is the implementation of resetting WebAssembly instances back to their original state, notably linear memories and tables. Wasmtime employs two separate strategies on Linux for doing this today:</p>
+<ul>
+<li>The <code>PoolingAllocationConfig</code> has <code>*_keep_resident</code> options which indicates that this much memory will be memset back to the original contents. This options default to 0 bytes.</li>
+<li>Resetting memory beyond <code>*_keep_resident</code> is done with <code>madvise(MADV_DONTNEED)</code> to reset linear memories and tables back to their original state.</li>
+</ul>
+<p>Both of these strategies have drawbacks. For <code>*_keep_resident</code> and memset this is a blind memset of the lower addresses in linear memory where lots of memory is set that wasn't either read or written from the guest. As a result this can't be too large lest Wasmtime become a <code>memset</code> benchmark. For <code>madvise(MADV_DONTNEED)</code> this requires modifying page tables (removing resident pages) which results in IPIs to synchronize other cores. Additionally each invocation of a WebAssembly instance will always incur a page fault on memory accesses (albeit a minor fault, not a major fault), which can add up.</p>
+<p>By using the <code>PAGEMAP_SCAN</code> ioctl we can take the best of both worlds here and combine these into a more efficient way to reset linear memories and tables back to their original contents. At a high level the ioctl works by:</p>
+<ul>
+<li>A range of virtual memory is specified to "scan". Flags are also configured to indicate what are the interesting bits we care about in the page table.</li>
+<li>The ioctl writes to a user-supplied buffer with page-aligned regions of memory that match the flags specified. </li>
+<li>Wasmtime uses this to detect, within an entire linear memory, what pages are "dirty" or written to and will memset these while <code>madvise</code>-ing any pages above the <code>*_keep_resident</code> threshold.</li>
+</ul>
+<p>In essence this is almost a tailor-made syscall for Wasmtime and perfectly fits our use case. We can quickly find dirty pages, up to a certain maximum, which segments memory into "manually reset these regions" followed by "decommit these regions". This enables Wasmtime to <code>memset</code> only memory written by the guest and, for example, memory that's only read by the guest remains paged in and remains unmodified.</p>
+<p>This is an improvement over <code>*_keep_resident</code> because only written pages are reset back to their original contents, not all pages in the low addresses of the linear memory address space. This is also an improvement over <code>madvise(MADV_DONTNEED)</code> because readonly pages are kept resident over time (no page faults on future invocations, all mapped to the same file-backed readonly page across multiple instances), written pages are kept resident over time (but reset back to original contents after instantiation), and IPIs/TLB shootdowns can be avoided (assuming the working set of written memory is less than <code>*_keep_resident</code> and memory isn't grown during execution). Overall this helps combine the best of both worlds and provides another tool in the toolbox of Wasmtime to efficiently reset linear memory back to zero.</p>
+<p>In terms of practical impact this enables a 2.5x increase in RPS measured of a simple p2 hello-world server that uses <code>wasmtime serve</code>. The server in question only writes two host pages of memory and so resetting a linear memory requires a single syscall and 8192 bytes of memcpy. Tables are memset to zero and don't require an ioctl because their total size is so small (both are less than 1 page of memory).</p>
+<hr>
+<p>This series of commits was originally written by @tschneidereit who did all the initial exploration and effort. I've rebased the commits and cleaned things up towards the end for integration in Wasmtime. The main technical changes here are to hook into linear memory and table deallocation. The <code>MemoryImageSlot</code> has also been refactored to contain an <code>Arc</code> pointing to the original image itself in-memory which is used to manually <code>memset</code> contents back to their original version. Resetting a <code>MemoryImageSlot</code> has been refactored to pretend that page maps are always available which helps simplify the code and ensure thorough testing even when not on Linux.</p>
+<p>Wasmtime only uses <code>PAGEMAP_SCAN</code> on Linux and this support is disabled on all other platforms. The <code>PAGEMAP_SCAN</code> ioctl is also relatively new so Wasmtime also disables this all on Linux at runtime if the kernel isn't new enough to support <code>PAGEMAP_SCAN</code>. </p>
+<p>Support for the <code>PAGEMAP_SCAN</code> ioctl is in a Linux-specific module and is effectively a copy of <a href="https://github.com/alexcrichton/linux-pagemap-scan">this repository</a> where I did initial testing of this ioctl. That repository isn't published on <a href="http://crates.io">crates.io</a> nor do I plan on publishing it on <a href="http://crates.io">crates.io</a>. The test suite is included here as well in the module for Linux pagemap bits.</p>
+<p>A new test is added to <code>cow.rs</code> which exercises some of the more interesting cases with <code>PAGEMAP_SCAN</code> additionally.</p>
+</blockquote>
+
+
+
+<a name="532367889"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/532367889" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#532367889">(Aug 01 2025 at 19:38)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/fitzgen">fitzgen</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>.</p>
+
+
+
+<a name="532367890"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/532367890" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#532367890">(Aug 01 2025 at 19:38)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>.</p>
+
+
+
+<a name="532368822"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/532368822" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#532368822">(Aug 01 2025 at 19:44)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>.</p>
+
+
+
+<a name="532369605"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/532369605" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#532369605">(Aug 01 2025 at 19:50)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>.</p>
+
+
+
+<a name="532378094"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/532378094" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#532378094">(Aug 01 2025 at 20:58)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>.</p>
+
+
+
+<a name="532378423"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/532378423" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#532378423">(Aug 01 2025 at 21:01)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>.</p>
+
+
+
+<a name="532753119"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/532753119" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#532753119">(Aug 04 2025 at 15:43)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#issuecomment-3151291705">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>:</p>
+<blockquote>
+<p>One thing I should also note here is that @tschneidereit has plans for revamping the <code>*_keep_resident</code> options to rationalize them a bit more in light of this new syscall, but we've agreed that it's best to separate that out to a separate change. That means that this PR doesn't change the meaning of the preexisting <code>*_keep_resident</code> options, it just makes them much more effective.</p>
+</blockquote>
+
+
+
+<a name="532994147"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/532994147" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#532994147">(Aug 05 2025 at 21:46)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#discussion_r2255326051">PR review comment</a>:</p>
+<blockquote>
+<p>nitpick newline between the closing brace and the <code>#[cfg(test)]</code></p>
+</blockquote>
+
+
+
+<a name="532994148"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/532994148" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#532994148">(Aug 05 2025 at 21:46)</a>:</h4>
+<p>fitzgen submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#pullrequestreview-3089661697">PR review</a>:</p>
+<blockquote>
+<p>Very cool! Excited for this!</p>
+<p>I remember we had some discussion in the Wasmtime meeting about the dual-purpose of <code>keep_resident</code> and how it configures both an amount to <code>memset</code> and a limit on the pool's max RSS when idle. This PR would remove that second bit: if the Wasm program touches different pages on each instantiation, but always touches only less than <code>keep_resident</code> on each instantiation, then all pages in the slot will eventually become and stay resident. Probably this is the correct thing to do long term, and we should have two different knobs for these two different purposes, but some embedders might be relying on that functionality today and it isn't being replaced with a new/different knob right now. It is not clear to me whether punting on a solution for that use case until some vague re-rationalization of options happens in the future is acceptable or not.</p>
+</blockquote>
+
+
+
+<a name="532994149"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/532994149" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#532994149">(Aug 05 2025 at 21:46)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#discussion_r2255322096">PR review comment</a>:</p>
+<blockquote>
+<p>"an indeed a" ?</p>
+</blockquote>
+
+
+
+<a name="532994150"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/532994150" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#532994150">(Aug 05 2025 at 21:46)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#discussion_r2255339475">PR review comment</a>:</p>
+<blockquote>
+<p>Doc for this variant?</p>
+</blockquote>
+
+
+
+<a name="532994151"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/532994151" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#532994151">(Aug 05 2025 at 21:46)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#discussion_r2255383829">PR review comment</a>:</p>
+<blockquote>
+<p>It would be nice if we could batch up and coalesce <code>PAGEMAP_SCAN</code>s similar to what we do with decommits. Specifically, while I don't think we will have an <code>ioctlv</code> of <code>PAGEMAP_SCANv</code> or whatever anytime soon, I can imagine that when a component uses multiple tables/memories, those pool slots will often be right next to each other, and we could fold them into one bigger scan region instead of performing multpiple <code>ioctl</code>s with smaller scan regions for each pool slot.</p>
+<p>Not something that needs to happen in this PR, but would be good to file a follow up issue for.</p>
+</blockquote>
+
+
+
+<a name="532994152"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/532994152" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#532994152">(Aug 05 2025 at 21:46)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#discussion_r2255311047">PR review comment</a>:</p>
+<blockquote>
+<p>Should this consult <code>walk_end</code> to only return the regions that have actually been scanned?</p>
+</blockquote>
+
+
+
+<a name="532994153"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/532994153" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#532994153">(Aug 05 2025 at 21:46)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#discussion_r2255389530">PR review comment</a>:</p>
+<blockquote>
+<p>"files" -&gt; "fails" ?</p>
+</blockquote>
+
+
+
+<a name="532994154"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/532994154" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#532994154">(Aug 05 2025 at 21:46)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#discussion_r2255359160">PR review comment</a>:</p>
+<blockquote>
+<p>Should this and <code>category_anyof_mask</code> be <code>expect(dead_code, reason = "...")</code> instead? That way we won't need to remember to remove this fake usage if we do end up actually using it elsewhere.</p>
+</blockquote>
+
+
+
+<a name="532994155"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/532994155" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#532994155">(Aug 05 2025 at 21:46)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#discussion_r2255314960">PR review comment</a>:</p>
+<blockquote>
+<p>This will only contain valid data for categories that were set in the <code>return_mask</code>, right? Good thing to note in the docs.</p>
+</blockquote>
+
+
+
+<a name="532994156"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/532994156" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#532994156">(Aug 05 2025 at 21:46)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#discussion_r2255299275">PR review comment</a>:</p>
+<blockquote>
+<p>So <code>category_mask</code> is "scan if all categories match (ie skip if any doesn't match)" and <code>category_anyof_mask</code> is "scan if any category matches (ie skip if none match" right?</p>
+<p>Can you specify both masks at the same time? If you are inverting any categories, do they have to be inverted in both masks? If I am understanding correctly, the answer is "yes". That is a little unfortunate, and makes crafting a higher-level API a little bit harder.</p>
+<p>So yeah, I see that this very directly reflects the underlying API while exposing a safe interface, which is fantastic, but this all feels fairly funky still. I think that at minimum we should rename <code>category_mask</code> to <code>category_allof_mask</code> or something like that, to better disambiguate it and <code>category_anyof_mask</code>. In an ideal world, I'd like some kind of boolean term builder but that seems pretty difficult given the restrictions of the underlying API. I'll have to think on that a little more.</p>
+</blockquote>
+
+
+
+<a name="532994157"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/532994157" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#532994157">(Aug 05 2025 at 21:46)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#discussion_r2255323624">PR review comment</a>:</p>
+<blockquote>
+<p>ditto</p>
+</blockquote>
+
+
+
+<a name="533124180"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533124180" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533124180">(Aug 06 2025 at 15:10)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#pullrequestreview-3093133344">PR review</a>.</p>
+
+
+
+<a name="533124181"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533124181" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533124181">(Aug 06 2025 at 15:10)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#discussion_r2257515469">PR review comment</a>:</p>
+<blockquote>
+<p>I'll be honest I don't know what this is and while I found sources for docs for the other variants I am unable to find a copy/paste snippet for this.</p>
+</blockquote>
+
+
+
+<a name="533124644"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533124644" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533124644">(Aug 06 2025 at 15:12)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>.</p>
+
+
+
+<a name="533125289"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533125289" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533125289">(Aug 06 2025 at 15:16)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#pullrequestreview-3093155164">PR review</a>.</p>
+
+
+
+<a name="533125292"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533125292" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533125292">(Aug 06 2025 at 15:16)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#discussion_r2257530445">PR review comment</a>:</p>
+<blockquote>
+<p>One issue I think we'd run into for linear memories is guard regions where the "reset this region" specification would never take into account guards meaning that all regions would appear disjoint. For tables that could in theory work better but even then the "region to reset" is just the active table upon deallocation which isn't the entire table and so tables would also appear disjoint.</p>
+<p>Personally I'd be wary of refactoring significantly to handle all those cases to try to get a larger <code>PAGEMAP_SCAN</code> ioctl region and coalesce them because that would also run afoul of <code>*_keep_resident</code> options where all lower-addressed pages would be the first to remain resident while everything afterwards would be paged out. Basically while I agree it'd be nice to coalesce calls I don't think it'd be practical even if things were structured to enable it.</p>
+</blockquote>
+
+
+
+<a name="533126952"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533126952" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533126952">(Aug 06 2025 at 15:26)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#pullrequestreview-3093190678">PR review</a>.</p>
+
+
+
+<a name="533126955"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533126955" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533126955">(Aug 06 2025 at 15:26)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#discussion_r2257557158">PR review comment</a>:</p>
+<blockquote>
+<p>Oh this is part of the <code>ioctl</code> itself where the return value of the <code>ioctl</code> is the number of regions that were filled in by the kernel, so the length of this array is determined by that without needing to consult <code>walk_end</code> and such. The regions may not end in <code>walk_end</code> as well because the scan could have finished but only pages before the end were considered "interesting". If the regions fill up though I think the end address of the last region would be <code>walk_end</code></p>
+</blockquote>
+
+
+
+<a name="533127721"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533127721" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533127721">(Aug 06 2025 at 15:30)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#pullrequestreview-3093204713">PR review</a>.</p>
+
+
+
+<a name="533127722"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533127722" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533127722">(Aug 06 2025 at 15:30)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#discussion_r2257567504">PR review comment</a>:</p>
+<blockquote>
+<p>Personally I also found this confusing and I struggled with the precise behavior of these masks as well. In the end I gave up trying to understand the documentation and went to the source:</p>
+<p><a href="https://github.com/torvalds/linux/blob/cca7a0aae8958c9b1cd14116cb8b2f22ace2205e/fs/proc/task_mmu.c#L2422-L2432">https://github.com/torvalds/linux/blob/cca7a0aae8958c9b1cd14116cb8b2f22ace2205e/fs/proc/task_mmu.c#L2422-L2432</a></p>
+<p>From what I've seen the ioctl docs for these fields are confusing and/or not precise enough. I tried to synthesize documentation from the function definition itself.</p>
+<p>Overall though I'd prefer to stay as a close as possible to the kernel API itself without changing the abstraction. Basically be a "pure mostly safe layer" to ensure that callers have a direct connection to what's happening for the <code>ioctl</code> rather than having to first wade through an abstraction in Wasmtime and then understanding the <code>ioctl</code> itself. Given that I'd push back on renames of fields, but I can do another pass at docs to fill them out more faithfully.</p>
+</blockquote>
+
+
+
+<a name="533136025"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533136025" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533136025">(Aug 06 2025 at 16:13)</a>:</h4>
+<p>pchickey <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#issuecomment-3160780556">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>:</p>
+<blockquote>
+<p>Did some private benchmarking and, in my server application, this took a single-core wasi-http hello world from 25000 to 40000 rps - 60% speedup in a benchmark that is mostly measuring instantiation and cleanup overhead. Awesome work!</p>
+</blockquote>
+
+
+
+<a name="533162022"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533162022" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533162022">(Aug 06 2025 at 18:52)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#issuecomment-3161235730">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>:</p>
+<blockquote>
+<blockquote>
+<p>I remember we had some discussion in the Wasmtime meeting about the dual-purpose of <code>keep_resident</code> and how it configures both an amount to <code>memset</code> and a limit on the pool's max RSS when idle. This PR would remove that second bit: if the Wasm program touches different pages on each instantiation, but always touches only less than <code>keep_resident</code> on each instantiation, then all pages in the slot will eventually become and stay resident. Probably this is the correct thing to do long term, and we should have two different knobs for these two different purposes, but some embedders might be relying on that functionality today and it isn't being replaced with a new/different knob right now. It is not clear to me whether punting on a solution for that use case until some vague re-rationalization of options happens in the future is acceptable or not.</p>
+</blockquote>
+<p>This comment is based on a misunderstanding I had about the way this PR works and can be ignored. We will still only keep <code>keep_resident</code> bytes resident with this change.</p>
+</blockquote>
+
+
+
+<a name="533162083"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533162083" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533162083">(Aug 06 2025 at 18:52)</a>:</h4>
+<p>fitzgen submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#pullrequestreview-3093825830">PR review</a>.</p>
+
+
+
+<a name="533162086"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533162086" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533162086">(Aug 06 2025 at 18:52)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#discussion_r2258007530">PR review comment</a>:</p>
+<blockquote>
+<p>That's fair.</p>
+</blockquote>
+
+
+
+<a name="533162182"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533162182" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533162182">(Aug 06 2025 at 18:53)</a>:</h4>
+<p>fitzgen submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#pullrequestreview-3093827990">PR review</a>.</p>
+
+
+
+<a name="533162573"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533162573" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533162573">(Aug 06 2025 at 18:56)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>.</p>
+
+
+
+<a name="533177613"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533177613" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533177613">(Aug 06 2025 at 20:51)</a>:</h4>
+<p>pchickey submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#pullrequestreview-3094237859">PR review</a>:</p>
+<blockquote>
+<p>I've found a correctness issue in this implementation that I'm working to make a reproducing test case for</p>
+</blockquote>
+
+
+
+<a name="533183291"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533183291" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533183291">(Aug 06 2025 at 21:39)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>.</p>
+
+
+
+<a name="533373003"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533373003" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533373003">(Aug 07 2025 at 22:48)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#issuecomment-3166059851">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>:</p>
+<blockquote>
+<p>Finished debugging with Pat. Culprit is that the <code>Engine</code> was created, but forked subprocesses created stores. That definitely doesn't work given how I've set things up because the stores have a page map for the parent process, not the child process. Will work on a fix.</p>
+</blockquote>
+
+
+
+<a name="533377492"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533377492" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533377492">(Aug 07 2025 at 23:43)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>.</p>
+
+
+
+<a name="533377516"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533377516" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533377516">(Aug 07 2025 at 23:43)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#issuecomment-3166144239">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>:</p>
+<blockquote>
+<p>@pchickey mind reviewing the most recent commit to confirm it looks good?</p>
+</blockquote>
+
+
+
+<a name="533377778"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533377778" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533377778">(Aug 07 2025 at 23:47)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>.</p>
+
+
+
+<a name="533378414"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533378414" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533378414">(Aug 07 2025 at 23:57)</a>:</h4>
+<p>pchickey submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#pullrequestreview-3099097516">PR review</a>:</p>
+<blockquote>
+<p>I can confirm that pagemap is now working properly when wasmtime is used in a forked child process! Thank you for tracking this down with me @alexcrichton .</p>
+</blockquote>
+
+
+
+<a name="533380696"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533380696" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533380696">(Aug 08 2025 at 00:29)</a>:</h4>
+<p>pchickey submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#pullrequestreview-3099097516">PR review</a>:</p>
+<blockquote>
+<p>I can confirm that pagemap is now working properly when wasmtime is used in a forked child process! Thank you for tracking this down with me @alexcrichton .</p>
+<p>Now that pagemap scan is actually returning a non-empty set of pages (because, before fixing the bug, it was scanning the parent process's pages) our throughput improvement is 50%, not 60% as before. 50% is still outstanding!</p>
+</blockquote>
+
+
+
+<a name="533485715"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533485715" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533485715">(Aug 08 2025 at 15:36)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>.</p>
+
+
+
+<a name="533485723"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533485723" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533485723">(Aug 08 2025 at 15:36)</a>:</h4>
+<p>alexcrichton has enabled auto merge for <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>.</p>
+
+
+
+<a name="533489044"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533489044" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533489044">(Aug 08 2025 at 15:59)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>.</p>
+
+
+
+<a name="533495118"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/533495118" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#533495118">(Aug 08 2025 at 16:39)</a>:</h4>
+<p>alexcrichton merged <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>.</p>
+
+
+
+<a name="534285807"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/534285807" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#534285807">(Aug 13 2025 at 18:52)</a>:</h4>
+<p>posborne <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#issuecomment-3185099105">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>:</p>
+<blockquote>
+<p>I missed this PR dropping but am reviewing now. If I am understanding correctly, one quirk of this approach is that with lazy page faulting of the <code>keep_resident_*</code> portion of regions, we might expect to see zeroing get slower over time as it would just take a single full use of the <code>keep_resident</code> pages for the scan to always report all pages as dirty henceforth, thus making resetting this memory revert to a more expensive path from that point forward (as we're going to incur the full cost of memset plus we'll be doing the syscall on these pages).</p>
+<p>This behavior wouldn't show up in a microbenchmark but is something I would expect to see in the real world; please correct me if my understanding is off.</p>
+<hr>
+<p>I also have a standalone test program / benchmarking suite where I've been trying to get some more concrete numbers on where different approaches perform worse/better (based off an earlier version of @tschneidereit's branch).  This includes a half-hearted attempt to do runs in parallel, though my setup definitely doesn't get to the point of meaningfully capture the IPI/TLB-Shootdown behavior encountered at scale.</p>
+<p>I'm actively tinkering with getting the test to be more representative of real-world use and costs: <a href="https://github.com/posborne/pagemap-scan-benchmark">https://github.com/posborne/pagemap-scan-benchmark</a>.  So far, I'm seeing quite a few cases where doing a scan approach can be more expensive than other approaches.  Hopefully I'll have that updated later today with a model I'm a bit more confident in as well as my analysis tools for processing and plotting the comparisons.</p>
+</blockquote>
+
+
+
+<a name="534290618"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/534290618" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#534290618">(Aug 13 2025 at 19:24)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#issuecomment-3185236772">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>:</p>
+<blockquote>
+<p>Before responsding, if you're concerned about this PR though I'd be happy to add a <code>Config</code> option to forcibly disable (or enable) it as that seems generally useful no matter what. Basically want to make sure it's no a headache to upgrade or have you feel like you're forced to bottom all this out before the next upgrade.</p>
+<p>Otherwise though one factor not necessarily captured in your benchmark is that it's not always the first N bytes of linear memory that are in the working set of the module. For example all Rust programs start with ~1MB of a linear memory shadow stack of which only a very small fraction is used at the top. After the shadow stack is read-only data which can have variable size depending on the program at hand. After that is data and the heap which will have likely an expected amount of churn. More-or-less I would predict that the old heuristic of "only memset the first N bytes" much worse in practice than what pagemaps can achieve by figuring out a module's working set over time.</p>
+<p>Another factor perhaps is that one big benefit of pagemaps is that it's possible to skip the <code>madvise</code> call altogether. If the working set is smaller than keep-resident options then the pagemap scan is sufficient to reset linear memory.</p>
+<p>In general though I'd love to be able to improve our set of benchmarks over time and how we're modeling all of this and measuring what to optimize, so I look forward to the results you get! I would definitely believe that further tuning of heuristics is needed here to, for example, completely madvise-away a memory if it's been reused too many times or the last known-keep-resident size was too large or something like that.</p>
+</blockquote>
+
+
+
+<a name="534304385"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/534304385" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#534304385">(Aug 13 2025 at 21:06)</a>:</h4>
+<p>posborne <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#issuecomment-3185824963">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>:</p>
+<blockquote>
+<blockquote>
+<p>Before responding, if you're concerned about this PR though I'd be happy to add a Config option to forcibly disable (or enable) it as that seems generally useful no matter what. Basically want to make sure it's no a headache to upgrade or have you feel like you're forced to bottom all this out before the next upgrade.</p>
+</blockquote>
+<p>I don't have any acute concerns with this ATM, though having reasonable controls may be a good thing to look at with any follow-on PRs to cleanup <code>keep_resident</code> config clarity, etc.</p>
+<blockquote>
+<p>Another factor perhaps is that one big benefit of pagemaps is that it's possible to skip the madvise call altogether. If the working set is smaller than keep-resident options then the pagemap scan is sufficient to reset linear memory.</p>
+</blockquote>
+<p>Part of what I'm trying to piece together and potentially suss out with benchmarking is whether doing the scan in userspace to avoid the madvise call is actually cheaper than just doing the madvise.  Both are going to have some awareness of the VMAs and be using much of the same code in the kernel, so it isn't clear that avoiding madvise for a clean pages is a huge win in practice.</p>
+<p>The savings in the case where we can avoid doing memset's for a good chunk of pages is the only area I'm currently confident is providing potentially significant savings.  I'll try to break some of these cases down better and provide that data here.  I'll also spend a bit more time reading through the kernel code paths taken byawareness of the VMAs and be using much of the same code in the kernel, so it isn't clear that avoiding madvise and whether there's any potential side-benefits (or risks) with the userspace pagemap scanning.</p>
+<p>I haven't carefully considered the COW side of things as of yet.</p>
+<blockquote>
+<p>In general though I'd love to be able to improve our set of benchmarks over time and how we're modeling all of this and measuring what to optimize, so I look forward to the results you get! I would definitely believe that further tuning of heuristics is needed here to, for example, completely madvise-away a memory if it's been reused too many times or the last known-keep-resident size was too large or something like that.</p>
+</blockquote>
+<p>I agree that heuristics will probably be required at some point; right now I'm just trying to build a slightly better model to see what might make sense.  There's probably some factors that may come into play with embeddings at scale in terms of the number of vmas and associated cost of the scan op, etc. but things don't look terrible here at first blush.</p>
+</blockquote>
+
+
+
+<a name="534307568"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/534307568" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#534307568">(Aug 13 2025 at 21:33)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#issuecomment-3185902477">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>:</p>
+<blockquote>
+<p>(FWIW I've also added this as a <a href="https://github.com/bytecodealliance/meetings/pull/661">discussion topic for tomorrow</a> for further, synchronous, discussion)</p>
+<blockquote>
+<p>Part of what I'm trying to piece together and potentially suss out with benchmarking is whether doing the scan in userspace to avoid the madvise call is actually cheaper than just doing the madvise.</p>
+</blockquote>
+<p>Oh this is surprising to me! I'll admit that I basically take it as an axiom that <code>madvise</code> is slow, but that's also been the result of almost all historical benchmarking. You're right that both syscalls will iterate/synchronize on VMAs, but the major costs of <code>madvise</code> are:</p>
+<ul>
+<li>IPIs and more synchronization are required to remove present pages from the page tables.</li>
+<li>Reuse of the same pages in the future will incur a minor page fault that the kernel services. This has historically had contention in the kernel show up high in profiles too.</li>
+</ul>
+<p>These extra costs of <code>madvise</code> become more problematic the higher the concurrency too. The <code>instantiation.rs</code> benchmark in this repository measures time-to-instantiate with N threads in the background also doing work, and while we ideally want that to be constant (unaffected by other threads) it steadily gets worse the more threads you add due to all of the contention. (this isn't a perfect benchmark but a proxy at least). By doing a memset we avoid all of the kernel synchronization at the cost of a pagemap (ideally) which is the main goal here.</p>
+<p>The main ways COW comes into the picture I know of are:</p>
+<ul>
+<li>If a page is only read (e.g. rodata for the wasm) using PAGEMAP_SCAN vs memset-or-madvise enables us to avoid touching the page entirely. That means that after the first instance faults in the read-only page it never changes from then on and it's always present with no future page faults necessary for future instances. For memset we'd unnecessarily copy the contents and for madvise we'd unnecessarily page it out.</li>
+<li>If a page is read, then written, then PAGEMAP_SCAN and memset achieve the same goal of keeping the memory resident. The first instance will fault on the read, then fault on the write, and so that cost would be paid on all future instances with madvise but both PAGEMAP_SCAN and memset avoid the cost for future instances. </li>
+<li>Written-first pages are similar to the above, but slightly cheaper to fault in the future with madvise since it's just one fault instead of 2.</li>
+</ul>
+<p>One thing I know as well is that @tschneidereit's original benchmarking found the implementation in the kernel relatively expensive with temporary data structures and such. My own benchmarking shows the ioctl is still highest in the profile and so it's probably not the fastest thing in the world, but it's so far consistently beaten out pure-madvise. (I haven't been benchmarking against madvise-plus-memset vs pagemaps since I've assumed madvise-plus-memset is way slower, but I should probably confirm that)</p>
+</blockquote>
+
+
+
+<a name="534557671"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/534557671" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#534557671">(Aug 14 2025 at 20:48)</a>:</h4>
+<p>posborne <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#issuecomment-3189832604">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>:</p>
+<blockquote>
+<p>Testing with thread parallelism, process parallelism (and no parallelism) yields interesting results.  It definitely appears that the PAGEMAP_SCAN ioctl suffers from lock contention issues, especially in the multi-threaded case but, at least as setup in this benchmark, doing a scan/memset may fair better than madvise for some multi-process cases.=</p>
+<p>Full report from a set of benchmark runs (select region size in dropdown) here: <a href="https://github.com/user-attachments/files/21780239/interactive_pagemap_benchmarks_by_size.html.zip">interactive_pagemap_benchmarks_by_size.html.zip</a></p>
+<p>Here's the plot with a 1MB pool with 1 thread/process, 16 threads, and 16 processes running the benchmarks concurrently.  My current suspicion is that this is capturing some IPIs and lock contention issues (there are some per-process mm locks which I think account for the thread/process perf differences).</p>
+<p>![1024KB-Memory-Reset-Benchmarks](<a href="https://github.com/user-attachments/assets/5e48d0c3-de06-468d-9402-ba09b33bb5d4">https://github.com/user-attachments/assets/5e48d0c3-de06-468d-9402-ba09b33bb5d4</a>)</p>
+</blockquote>
+
+
+
+<a name="534560135"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/534560135" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#534560135">(Aug 14 2025 at 21:06)</a>:</h4>
+<p>posborne <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#issuecomment-3189874596">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>:</p>
+<blockquote>
+<p>@alexcrichton pointed at that the current benchmarks results in a bunch of concurrent memory mapping for test setup which might be skewing things a bit; I'll try to reduce that noise as it is probably compromising the results here a bit.</p>
+</blockquote>
+
+
+
+<a name="534681224"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/534681224" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#534681224">(Aug 15 2025 at 16:37)</a>:</h4>
+<p>posborne <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#issuecomment-3192110368">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>:</p>
+<blockquote>
+<p>As suspected, changing up the benchmark to minimize mmap/munmap for the parallel tests greatly reduces the noise on the syscalls; here's the updated results @ <a href="https://github.com/posborne/pagemap-scan-benchmark/commit/d347f388dfea805fb12cc2043cc89106b295d141">https://github.com/posborne/pagemap-scan-benchmark/commit/d347f388dfea805fb12cc2043cc89106b295d141</a></p>
+<p><a href="https://github.com/user-attachments/files/21799297/interactive_pagemap_benchmarks_by_size.html.zip">interactive_pagemap_benchmarks_by_size.html.zip</a></p>
+<p>General Summary:</p>
+<ul>
+<li>Just zeroing the memory takes less time than pagemap below 512KB; there are probably indirect costs to always zeroing (memory bandwidth, overall cpu pressure) not shown here to consider, but this is some data.</li>
+<li>Many threads in a proc seems to have a penalty (relatively to the same number of threads) doing the benchmark for the syscalls, but it also seems to impact memset in some way as well in this test (don't have a full idea of why this is or if it is an issue with my test setup).</li>
+<li>In most cases, it does look like doing the pagemap scan + zeroing outperforms madvising the full range.  The end result of those ops is not identical in terms of resident memory, etc. so not an exact mapping to how we use these in tree.</li>
+</ul>
+<h2>1MB memory region size</h2>
+<p>![visualization(3)](<a href="https://github.com/user-attachments/assets/3aa4dd7e-9455-4c13-bd23-037446f6b9e2">https://github.com/user-attachments/assets/3aa4dd7e-9455-4c13-bd23-037446f6b9e2</a>)</p>
+<h2>128K memory region size</h2>
+<p>![visualization(4)](<a href="https://github.com/user-attachments/assets/b2e8a5f9-92ac-4531-bdc4-d352bc153e7d">https://github.com/user-attachments/assets/b2e8a5f9-92ac-4531-bdc4-d352bc153e7d</a>)</p>
+</blockquote>
+
+
+
+<a name="534686051"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/534686051" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#534686051">(Aug 15 2025 at 17:16)</a>:</h4>
+<p>tschneidereit <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#issuecomment-3192227711">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>:</p>
+<blockquote>
+<p>@posborne thank you for sharing this detailed analysis! I think the results are excellent validation of the viability of pagemap_scan as an approach to improve performance, and in case any of the <code>keep-resident</code> options are used usually also reduce memory usage.</p>
+<p>There's also one more benefit to the pagemap_scan strategy that isn't reflected in the benchmarks yet, relative to <code>madvise</code>: memory reset manually doesn't incur pagefaults the next time it's written to. Because of that, it might make sense to include the <code>region.make_dirty()</code> call in the measurements.</p>
+<p>Otherwise, I guess it might make sense to add an option to set a minimum heap size, under which we'd always just do a memset. I doubt anything much above 64KB would be useful there, though: doing needless memsets not only increases memory usage for CoW-backed pages, but also causes cache churn.</p>
+<p>I'd also expect most real-world modules/components not to be this small: anything using a shadow stack is probably going to reserve enough just for that to be too large. (Which also usually means that the overwhelming majority of the current <code>keep-resident</code> budgets will be wasted on the shadow stack, making the real-world impact of moving the <code>pagemap_scan</code> even better if <code>keep-resident</code> is already in use.)</p>
+</blockquote>
+
+
+
+<a name="534702053"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311372%20Add%20support%20for%20the%20Linux%20PAGEMAP_SC.../near/534702053" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311372.20Add.20support.20for.20the.20Linux.20PAGEMAP_SC.2E.2E.2E.html#534702053">(Aug 15 2025 at 19:24)</a>:</h4>
+<p>posborne <a href="https://github.com/bytecodealliance/wasmtime/pull/11372#issuecomment-3192513213">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11372">PR #11372</a>:</p>
+<blockquote>
+<p>@tschneidereit Thank you for the feedback.</p>
+<blockquote>
+<p>There's also one more benefit to the pagemap_scan strategy that isn't reflected in the benchmarks yet, relative to madvise: memory reset manually doesn't incur pagefaults the next time it's written to. Because of that, it might make sense to include the region.make_dirty() call in the measurements.</p>
+</blockquote>
+<p>Yeah, that's a good call; i've had those in and out at different periods of time, but the page fault is probably best to measure in all cases.  The point at which you pay that penalty is different but more impactful to actual execution (vs. refreshing the pool).</p>
+<blockquote>
+<p>Otherwise, I guess it might make sense to add an option to set a minimum heap size, under which we'd always just do a memset. I doubt anything much above 64KB would be useful there, though: doing needless memsets not only increases memory usage for CoW-backed pages, but also causes cache churn.</p>
+</blockquote>
+<p>I'm still building up my full intuition on what values are likely to be configured in practice; for regions on the smaller side, my initial thought was that tables might be more likely to fall in that range.  From out-of-band experience, the extra memsets do definitely cause undesirable cache behavior and cut into memory bandwidth which we've seen become a problem at a certain scale (not strictly driven by wasmtime but across the board).</p>
+<p>I do think having the option could make sense in order to try to find a value that performs optimally.  The other thing I've been considering, which would require some state tracking, would be whether to mark a region as not worth scanning (regardless of size).  If 100% of the pages are dirty (or maybe even 80% or some other number) then it may make more sense to just do the full memset and avoid the syscall (for regions where we are OK keeping resident).</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

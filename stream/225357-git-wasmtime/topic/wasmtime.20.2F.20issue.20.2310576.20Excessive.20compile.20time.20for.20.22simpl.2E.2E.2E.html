@@ -1,0 +1,76 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #10576 Excessive compile time for &quot;simpl... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310576.20Excessive.20compile.20time.20for.20.22simpl.2E.2E.2E.html">wasmtime / issue #10576 Excessive compile time for &quot;simpl...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="512126460"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310576%20Excessive%20compile%20time%20for%20%22simpl.../near/512126460" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310576.20Excessive.20compile.20time.20for.20.22simpl.2E.2E.2E.html#512126460">(Apr 14 2025 at 16:38)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/issues/10576">issue #10576</a>:</p>
+<blockquote>
+<p>OSS-Fuzz has had an <a href="https://oss-fuzz.com/testcase-detail/4971399285899264">open bug for this</a> for quite some time but I'm only just now getting around to filing an issue about this. The gist of the fuzz bug is that Wasmtime times out in the <code>compile</code> test target where the only thing that target does is compile a module. A timeout here means that the 60s time limit is exceeded, and the time limit here is with sanitizers and parallelism disabled on OSS-Fuzz infrastructure. This can be roughly approximated by running locally in release mode with <code>-Cparallel-compilation=n</code> and multiplying the result by ~30.</p>
+<p>The module in question is:</p>
+<div class="codehilite" data-code-language="wasm"><pre><span></span><code>(module
+    (func)
+    (func)
+    ;; ... 119248 times ...
+    (func)
+)
+</code></pre></div>
+<p>aka this is just a giant module of a lot of empty functions. <a href="https://github.com/user-attachments/files/19739342/foo.wasm.gz">foo.wasm.gz</a> is the compresed version of this module.</p>
+<p>Locally I see:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">time</span><span class="w"> </span><span class="n">wasmtime</span><span class="w"> </span><span class="n">compile</span><span class="w"> </span><span class="o">-</span><span class="n">C</span><span class="w"> </span><span class="n">parallel</span><span class="o">-</span><span class="n">compilation</span><span class="o">=</span><span class="n">n</span><span class="w"> </span><span class="n">foo</span><span class="p">.</span><span class="n">wasm</span>
+<span class="n">wasmtime</span><span class="w"> </span><span class="n">compile</span><span class="w"> </span><span class="o">-</span><span class="n">C</span><span class="w"> </span><span class="n">parallel</span><span class="o">-</span><span class="n">compilation</span><span class="o">=</span><span class="n">n</span><span class="w"> </span><span class="n">foo</span><span class="p">.</span><span class="n">wasm</span><span class="w">  </span><span class="mf">1.05</span><span class="n">s</span><span class="w"> </span><span class="n">user</span><span class="w"> </span><span class="mf">0.15</span><span class="n">s</span><span class="w"> </span><span class="n">system</span><span class="w"> </span><span class="mi">99</span><span class="o">%</span><span class="w"> </span><span class="n">cpu</span><span class="w"> </span><span class="mf">1.205</span><span class="w"> </span><span class="n">total</span>
+</code></pre></div>
+<p>which, for being a bunch of empty functions, is quite a lot! There's a lot of functions in this module but 10 microseconds for an empty function feels a bit excessive regardless. While optimizing this probably won't help out too too much in the long term, it's perhaps worthwhile to still try to improve this if not just for oss-fuzz timeouts and fuzzing.</p>
+<p>A profile of the compilation looks <a href="https://share.firefox.dev/4ikGBoK">like this</a> which notably spends the most amount of "self" time in memmove. There's also notably a fair amount of allocation traffic as well. I'm not sure how to improve the regalloc2 parts myself but for memmove that I do know how to improve.</p>
+<h2>Moving <code>MachBuffer</code> less</h2>
+<p>The basic problem I've seen is that we're pretty liberal in Cranelift about moving data structures by ownership between phases, notably the <code>MachBuffer&lt;T&gt;</code>. This type is very large (lots of <code>SmallVec</code>) and is created/moved quite a lot throughout a compilation. This I believe adds up to quite a lot of memmove costs.</p>
+<p>The movements I've seen are:</p>
+<ul>
+<li><a href="https://github.com/bytecodealliance/wasmtime/blob/e6e03c34cfb4f616e437bfcaa67575c3ab3a2e0c/cranelift/codegen/src/machinst/buffer.rs#L1539"><code>MachBuffer::finish</code></a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/blob/e6e03c34cfb4f616e437bfcaa67575c3ab3a2e0c/cranelift/codegen/src/isa/x64/mod.rs#L76-L96"><code>TargetIsa::compile_function</code></a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/blob/e6e03c34cfb4f616e437bfcaa67575c3ab3a2e0c/cranelift/codegen/src/context.rs#L124-L143"><code>Context::compile_stencil</code></a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/blob/e6e03c34cfb4f616e437bfcaa67575c3ab3a2e0c/cranelift/codegen/src/context.rs#L203-L217"><code>Context::compile</code></a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/blob/e6e03c34cfb4f616e437bfcaa67575c3ab3a2e0c/crates/cranelift/src/compiler.rs#L725-L733"><code>compile_uncached</code></a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/blob/e6e03c34cfb4f616e437bfcaa67575c3ab3a2e0c/crates/cranelift/src/compiler.rs#L1020"><code>Compiler::finish_with_info</code></a></li>
+</ul>
+<p>In general I don't think rustc/LLVM are even capable of eliding most of these copies which means that for each function we're copying a this very large structure ~6 times (ish). Multiply that by ~100k and the size of the structure and that's a lot of memory moving around and can probably explain at least a good portion of the second of compile time for this module.</p>
+<p>Ideally we would refactor cranelift to require much less movement of the <code>MachBuffer</code> type. In an ideal world we could even reuse <code>MachBuffer</code> structures between compiling functions too. In any case we can probably get a long-ish way restructuring things and ownership of the <code>MachBuffer</code></p>
+<h2>Other compiler structures</h2>
+<p>I've seen other compiler structures in the profile be quite large, such as <a href="https://github.com/bytecodealliance/wasmtime/blob/e6e03c34cfb4f616e437bfcaa67575c3ab3a2e0c/crates/cranelift/src/compiler.rs#L46-L51"><code>CompilerContext</code></a>, which are moved around a lot. Ideally we could perhaps <code>Box</code> up some contexts and or make movements cheaper to work with.</p>
+<hr>
+<p>I'm sure there's other parts of the profile to dig in to as well, but I wanted to at least file an issue in case anyone's interested in chipping away at some pieces here.</p>
+</blockquote>
+
+
+
+<a name="512126488"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310576%20Excessive%20compile%20time%20for%20%22simpl.../near/512126488" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310576.20Excessive.20compile.20time.20for.20.22simpl.2E.2E.2E.html#512126488">(Apr 14 2025 at 16:38)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the fuzz-bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/10576">Issue #10576</a>.</p>
+
+
+
+<a name="512126489"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310576%20Excessive%20compile%20time%20for%20%22simpl.../near/512126489" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310576.20Excessive.20compile.20time.20for.20.22simpl.2E.2E.2E.html#512126489">(Apr 14 2025 at 16:38)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the cranelift<span aria-label="goal" class="emoji emoji-1f945" role="img" title="goal">:goal:</span>compile-time label to <a href="https://github.com/bytecodealliance/wasmtime/issues/10576">Issue #10576</a>.</p>
+
+
+
+<a name="512202571"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310576%20Excessive%20compile%20time%20for%20%22simpl.../near/512202571" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310576.20Excessive.20compile.20time.20for.20.22simpl.2E.2E.2E.html#512202571">(Apr 15 2025 at 01:23)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/10576#issuecomment-2803479818">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10576">issue #10576</a>:</p>
+<blockquote>
+<p>The intent of <code>MachBuffer</code>'s inline <code>SmallVec</code>s was to avoid any allocations at all when on-stack, moved not at all or only once, and used for small-to-medium-sized functions, but that was a very speculative benefit when we sketched out the new backend framework in 2020, and it looks likely that refactors and added complexity through the years have adapted to moving it around liberally (as is more idiomatic).</p>
+<p>Perhaps a simple fix could be to <code>Box</code> it up? Alternately we convert all the <code>SmallVec</code>s to <code>Vec</code>s. I don't have the cycles to try and benchmark either at the moment -- this is just to say that there's no reason we should be wedded to the current approach other than legacy...</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

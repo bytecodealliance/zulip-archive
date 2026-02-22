@@ -1,0 +1,95 @@
+<html>
+<head><meta charset="utf-8"><title>Accepting an arbitrary number of plugins · wasi · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/index.html">wasi</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Accepting.20an.20arbitrary.20number.20of.20plugins.html">Accepting an arbitrary number of plugins</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="544155419"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Accepting%20an%20arbitrary%20number%20of%20plugins/near/544155419" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> zslayton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Accepting.20an.20arbitrary.20number.20of.20plugins.html#544155419">(Oct 10 2025 at 12:18)</a>:</h4>
+<p>I'm trying to design a toy system that supports plugins supplied by different authors. </p>
+<p>Based on my current understanding of the component model, a way to achieve this would be to define a world (<code>plugin</code>) and accept <code>.wasm</code> components that implement that world. I would then compose these together with the 'main' <code>.wasm</code> component to create my program. Unfortunately, I'm having difficulty finding a way to achieve this in practice.</p>
+<p>I can imagine rolling my own plugin registration system something like the following:</p>
+<div class="codehilite" data-code-language="wit"><pre><span></span><code>// There is a resource that defines the desired plugin API
+resource plugin-resource {
+  // ...methods...
+}
+
+// Plugin authors implement components that know how to initialize
+// their plugin-resource implementation.
+world plugin {
+    init: func() -&gt; plugin-resource;
+}
+
+// At composition time, some external logic chains together the provided
+// plugins into one big component that satisfies this API.
+world plugin-iterator {
+    next: func() -&gt; option&lt;plugin-resource&gt;;
+}
+</code></pre></div>
+<p>However, this feels pretty clunky. Before I go down that road, am I missing a supported way to achieve this? If there is no supported way to achieve this, is that a point-in-time limitation, or a design decision?</p>
+<p>Thanks!</p>
+
+
+
+<a name="544185228"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Accepting%20an%20arbitrary%20number%20of%20plugins/near/544185228" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Accepting.20an.20arbitrary.20number.20of.20plugins.html#544185228">(Oct 10 2025 at 14:37)</a>:</h4>
+<p>I think you'll run into a few limitations with this design. One is that, you're correct, dynamically composing a variable number of components to something that returns a list is not a simple <code>wac</code> command, for example, today. You'd have to have some sort of custom interposing component there.</p>
+<p>Another issue, however, is that if each plugin exports the <code>plugin-resource</code> type then despite having the same WIT type at runtime they all have distinct types and aren't interchangeable. That means that at a type-level you can't actually implement <code>plugin-iterator</code> because each plugin would return a uniquely-typed <code>plugin-resource</code>.</p>
+<p>What you might want instead is to have the host arbitrate this. The guest would import a single <code>plugin-resuorce</code> interface and would have a sort of "lookup" that the host would dispatch to other plugins. Basically "host magic"  to help do the dispatch</p>
+
+
+
+<a name="544206300"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Accepting%20an%20arbitrary%20number%20of%20plugins/near/544206300" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> zslayton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Accepting.20an.20arbitrary.20number.20of.20plugins.html#544206300">(Oct 10 2025 at 16:11)</a>:</h4>
+<blockquote>
+<p>Another issue, however, is that if each plugin exports the <code>plugin-resource</code> type then despite having the same WIT type at runtime they all have distinct types and aren't interchangeable. That means that at a type-level you can't actually implement <code>plugin-iterator</code> because each plugin would return a uniquely-typed <code>plugin-resource</code>.</p>
+</blockquote>
+<p>Oh, interesting. I had been thinking of resources as values using dynamic dispatch over their <code>resource {...}</code> methods. Thank you for pointing this out, it's important to know.</p>
+<blockquote>
+<p>What you might want instead is to have the host arbitrate this. The guest would import a single <code>plugin-resuorce</code> interface and would have a sort of "lookup" that the host would dispatch to other plugins. Basically "host magic" to help do the dispatch</p>
+</blockquote>
+<p>Sorry, I'm not quite sure what you mean. Could you give me an example?</p>
+
+
+
+<a name="544207175"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Accepting%20an%20arbitrary%20number%20of%20plugins/near/544207175" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Accepting.20an.20arbitrary.20number.20of.20plugins.html#544207175">(Oct 10 2025 at 16:16)</a>:</h4>
+<p>Effectively what you're imagining is dynamic dispatch could be implemented in the host. The component-model itself doesn't have that degree of dynamic dispatch but you on the host could have a trait which is implemented for each plugin. The guest would then import functionality that the host implements in terms of a list of trait objects. Or... something like that, not really an example per se as this is still pretty hand-wavy</p>
+
+
+
+<a name="544207964"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Accepting%20an%20arbitrary%20number%20of%20plugins/near/544207964" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> zslayton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Accepting.20an.20arbitrary.20number.20of.20plugins.html#544207964">(Oct 10 2025 at 16:21)</a>:</h4>
+<p>Ok, thanks! I'll do some experimenting and see what I can figure out. In the meantime, are there any WIT features coming in the future that might facilitate composing an arbitrary number of components?</p>
+
+
+
+<a name="544208216"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Accepting%20an%20arbitrary%20number%20of%20plugins/near/544208216" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Accepting.20an.20arbitrary.20number.20of.20plugins.html#544208216">(Oct 10 2025 at 16:23)</a>:</h4>
+<p>Not that I know of myself, no, unfortunately</p>
+
+
+
+<a name="544210306"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Accepting%20an%20arbitrary%20number%20of%20plugins/near/544210306" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Accepting.20an.20arbitrary.20number.20of.20plugins.html#544210306">(Oct 10 2025 at 16:34)</a>:</h4>
+<p>Some flavor of <a href="https://github.com/WebAssembly/component-model/issues/172">WIT templates</a> would probably help here.</p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/WebAssembly/component-model/issues/172" style="background-image: url(&quot;https://uploads.zulipusercontent.net/d66c7da2a5c0d9b5ea555816b5e71b0a8ff74114/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f383331656464393965383133313965656664306262663064323364633866303532303532326465326639613735336536643966366163663939383739383338352f576562417373656d626c792f636f6d706f6e656e742d6d6f64656c2f6973737565732f313732&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/WebAssembly/component-model/issues/172" title="Sketch: allow a variable number of imports/exports of fixed type in Wit · Issue #172 · WebAssembly/component-model">Sketch: allow a variable number of imports/exports of fixed type in Wit · Issue #172 · WebAssembly/component-model</a></div><div class="message_embed_description">Motivation Let's say I'd like to build a component that consumes 3 configuration values a, b and c (which in a 12-factor app I'd take as 3 environment variables). I could define a component with ty...</div></div></div>
+
+
+
+<a name="563720349"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Accepting%20an%20arbitrary%20number%20of%20plugins/near/563720349" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Zhefu <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Accepting.20an.20arbitrary.20number.20of.20plugins.html#563720349">(Dec 15 2025 at 00:10)</a>:</h4>
+<p>I had an idea for a possible workaround.</p>
+<p>Suppose a host application wants to load multiple plugins that use the same interface. The host could maintain multiple copies of that interface, each with a unique name (e.g., integer-suffixed interface names so they’re treated as distinct).</p>
+<p>Plugins themselves would be compiled against the “normal” interface (no suffixes). When loading a plugin, the host would select an unused interface copy and patch the plugin’s interface names so that they match, allowing composition/loading without conflicts.</p>
+<p>The main question is: <strong>is it feasible to do this kind of automated interface renaming on an already-compiled <code>.wasm</code> module?</strong></p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

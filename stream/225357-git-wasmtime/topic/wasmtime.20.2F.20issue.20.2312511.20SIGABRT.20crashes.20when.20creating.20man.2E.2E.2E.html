@@ -1,0 +1,311 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #12511 SIGABRT crashes when creating man... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312511.20SIGABRT.20crashes.20when.20creating.20man.2E.2E.2E.html">wasmtime / issue #12511 SIGABRT crashes when creating man...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="571797260"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312511%20SIGABRT%20crashes%20when%20creating%20man.../near/571797260" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312511.20SIGABRT.20crashes.20when.20creating.20man.2E.2E.2E.html#571797260">(Feb 04 2026 at 00:50)</a>:</h4>
+<p>zacharywhitley opened <a href="https://github.com/bytecodealliance/wasmtime/issues/12511">issue #12511</a>:</p>
+<blockquote>
+<h1>SIGABRT crashes when creating many engines/modules due to GLOBAL_CODE registry address reuse</h1>
+<h2>Summary</h2>
+<p>When creating and destroying many <code>wasmtime::Engine</code> and <code>wasmtime::Module</code> instances in a single process, the <code>GLOBAL_CODE</code> registry's <code>assert!()</code> statements cause SIGABRT crashes after approximately 350-400 iterations. This is caused by virtual address reuse before Arc references are fully released.</p>
+<h2>Environment</h2>
+<ul>
+<li><strong>Wasmtime version</strong>: 41.0.1 (also confirmed in recent main)</li>
+<li><strong>Platform</strong>: macOS Darwin 24.5.0, Linux</li>
+<li><strong>Configuration</strong>: <code>signals_based_traps(false)</code> (required for JVM integration)</li>
+</ul>
+<h2>Reproduction</h2>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">wasmtime</span><span class="p">::{</span><span class="n">Config</span><span class="p">,</span><span class="w"> </span><span class="n">Engine</span><span class="p">,</span><span class="w"> </span><span class="n">Module</span><span class="p">};</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">wat</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">"(module (func (export </span><span class="se">\"</span><span class="s">test</span><span class="se">\"</span><span class="s">) (result i32) i32.const 42))"</span><span class="p">;</span>
+
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="mi">0</span><span class="o">..</span><span class="mi">500</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">config</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Config</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="w">        </span><span class="n">config</span><span class="p">.</span><span class="n">signals_based_traps</span><span class="p">(</span><span class="kc">false</span><span class="p">);</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">engine</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Engine</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">config</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">_module</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Module</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span><span class="w"> </span><span class="n">wat</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="w">        </span><span class="c1">// Engine and module dropped here</span>
+
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="mi">100</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="fm">eprintln!</span><span class="p">(</span><span class="s">"Iteration {}"</span><span class="p">,</span><span class="w"> </span><span class="n">i</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"Completed all iterations"</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+<p><strong>Expected</strong>: All 500 iterations complete successfully.<br>
+<strong>Actual</strong>: Process aborts with SIGABRT around iteration 350-400.</p>
+<h2>Root Cause Analysis</h2>
+<h3>The Problem</h3>
+<p>In <code>crates/wasmtime/src/runtime/module/registry.rs</code>:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">register_code</span><span class="p">(</span><span class="n">image</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">Arc</span><span class="o">&lt;</span><span class="n">CodeMemory</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="n">address</span><span class="p">:</span><span class="w"> </span><span class="nc">Range</span><span class="o">&lt;</span><span class="kt">usize</span><span class="o">&gt;</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// ...</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">prev</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">global_code</span><span class="p">().</span><span class="n">write</span><span class="p">().</span><span class="n">insert</span><span class="p">(</span><span class="n">end</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="n">start</span><span class="p">,</span><span class="w"> </span><span class="n">image</span><span class="p">.</span><span class="n">clone</span><span class="p">()));</span>
+<span class="w">    </span><span class="fm">assert!</span><span class="p">(</span><span class="n">prev</span><span class="p">.</span><span class="n">is_none</span><span class="p">());</span><span class="w">  </span><span class="c1">// ABORTS if duplicate key</span>
+<span class="p">}</span>
+
+<span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">unregister_code</span><span class="p">(</span><span class="n">address</span><span class="p">:</span><span class="w"> </span><span class="nc">Range</span><span class="o">&lt;</span><span class="kt">usize</span><span class="o">&gt;</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// ...</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">code</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">global_code</span><span class="p">().</span><span class="n">write</span><span class="p">().</span><span class="n">remove</span><span class="p">(</span><span class="o">&amp;</span><span class="n">end</span><span class="p">);</span>
+<span class="w">    </span><span class="fm">assert!</span><span class="p">(</span><span class="n">code</span><span class="p">.</span><span class="n">is_some</span><span class="p">());</span><span class="w">  </span><span class="c1">// ABORTS if key not found</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3>Why This Happens</h3>
+<ol>
+<li>Engine A allocates code memory at virtual address range <code>[0x1000, 0x2000)</code></li>
+<li><code>register_code</code> registers this with key <code>0x1FFF</code> (end - 1)</li>
+<li>Engine A is "dropped" but <code>Arc&lt;CodeMemory&gt;</code> references may still exist (from Module, Store, etc.)</li>
+<li>Engine B is created; the OS reuses virtual address <code>[0x1000, 0x2000)</code> for its code</li>
+<li><code>register_code</code> tries to insert key <code>0x1FFF</code> again</li>
+<li><code>assert!(prev.is_none())</code> fails → <strong>SIGABRT</strong></li>
+</ol>
+<p>The reverse can also happen:</p>
+<ol>
+<li>Old <code>Arc&lt;CodeMemory&gt;</code> finally deallocates, calling <code>unregister_code</code></li>
+<li>But the new engine already re-registered at that address</li>
+<li><code>unregister_code</code> removes the new engine's registration</li>
+<li>Later, new engine's drop calls <code>unregister_code</code></li>
+<li><code>assert!(code.is_some())</code> fails → <strong>SIGABRT</strong></li>
+</ol>
+<h3>Why ~350-400 Iterations?</h3>
+<p>This threshold corresponds to when virtual address reuse becomes statistically likely given:</p>
+<ul>
+<li>macOS/Linux mmap allocation patterns</li>
+<li>Accumulated Arc references not yet fully released by Rust's deferred deallocation</li>
+</ul>
+<h2>Proposed Fix</h2>
+<p>Make <code>register_code</code> and <code>unregister_code</code> idempotent by tracking registered addresses:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">fn</span><span class="w"> </span><span class="nf">registered_addresses</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kp">&amp;</span><span class="o">'</span><span class="nb">static</span><span class="w"> </span><span class="nc">RwLock</span><span class="o">&lt;</span><span class="n">BTreeSet</span><span class="o">&lt;</span><span class="kt">usize</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">static</span><span class="w"> </span><span class="n">REGISTERED</span><span class="p">:</span><span class="w"> </span><span class="nc">OnceLock</span><span class="o">&lt;</span><span class="n">RwLock</span><span class="o">&lt;</span><span class="n">BTreeSet</span><span class="o">&lt;</span><span class="kt">usize</span><span class="o">&gt;&gt;&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">OnceLock</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="w">    </span><span class="n">REGISTERED</span><span class="p">.</span><span class="n">get_or_init</span><span class="p">(</span><span class="nb">Default</span><span class="p">::</span><span class="n">default</span><span class="p">)</span>
+<span class="p">}</span>
+
+<span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">register_code</span><span class="p">(</span><span class="n">image</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">Arc</span><span class="o">&lt;</span><span class="n">CodeMemory</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="n">address</span><span class="p">:</span><span class="w"> </span><span class="nc">Range</span><span class="o">&lt;</span><span class="kt">usize</span><span class="o">&gt;</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="n">address</span><span class="p">.</span><span class="n">is_empty</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">start</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">address</span><span class="p">.</span><span class="n">start</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">end</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">address</span><span class="p">.</span><span class="n">end</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// Check if already registered - make operation idempotent</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">tracked</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">registered_addresses</span><span class="p">().</span><span class="n">write</span><span class="p">();</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="n">tracked</span><span class="p">.</span><span class="n">contains</span><span class="p">(</span><span class="o">&amp;</span><span class="n">end</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">return</span><span class="p">;</span><span class="w"> </span><span class="c1">// Already registered, skip</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="n">tracked</span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="n">end</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="n">global_code</span><span class="p">().</span><span class="n">write</span><span class="p">().</span><span class="n">insert</span><span class="p">(</span><span class="n">end</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="n">start</span><span class="p">,</span><span class="w"> </span><span class="n">image</span><span class="p">.</span><span class="n">clone</span><span class="p">()));</span>
+<span class="p">}</span>
+
+<span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">unregister_code</span><span class="p">(</span><span class="n">address</span><span class="p">:</span><span class="w"> </span><span class="nc">Range</span><span class="o">&lt;</span><span class="kt">usize</span><span class="o">&gt;</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="n">address</span><span class="p">.</span><span class="n">is_empty</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">end</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">address</span><span class="p">.</span><span class="n">end</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// Check if registered - make operation idempotent</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">tracked</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">registered_addresses</span><span class="p">().</span><span class="n">write</span><span class="p">();</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="o">!</span><span class="n">tracked</span><span class="p">.</span><span class="n">contains</span><span class="p">(</span><span class="o">&amp;</span><span class="n">end</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">return</span><span class="p">;</span><span class="w"> </span><span class="c1">// Not registered, skip</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="n">tracked</span><span class="p">.</span><span class="n">remove</span><span class="p">(</span><span class="o">&amp;</span><span class="n">end</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="n">global_code</span><span class="p">().</span><span class="n">write</span><span class="p">().</span><span class="n">remove</span><span class="p">(</span><span class="o">&amp;</span><span class="n">end</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3>Why This Fix is Safe</h3>
+<ol>
+<li><strong>No functionality change</strong>: The registry still correctly tracks all live code regions</li>
+<li><strong>Minimal overhead</strong>: BTreeSet lookup is O(log n), same as the existing BTreeMap</li>
+<li><strong>Thread-safe</strong>: Uses the same RwLock pattern as the existing code</li>
+<li><strong>Backward compatible</strong>: No API changes</li>
+</ol>
+<h2>Impact</h2>
+<p>This issue affects:</p>
+<ul>
+<li><strong>JVM integrations</strong> (Java, Kotlin, Scala) where <code>signals_based_traps(false)</code> is required</li>
+<li><strong>Long-running servers</strong> that dynamically load/unload WASM modules</li>
+<li><strong>Test suites</strong> with many engine/module creation tests</li>
+<li><strong>Any application</strong> creating 350+ engines/modules in a single process</li>
+</ul>
+<h2>Workarounds</h2>
+<ol>
+<li><strong>Engine reuse</strong>: Share a singleton engine across the application (mitigates but doesn't eliminate)</li>
+<li><strong>Process isolation</strong>: Run tests in separate processes (inconvenient for CI)</li>
+</ol>
+<p>Neither workaround fully solves the issue for libraries that can't control caller behavior.</p>
+<h2>Related</h2>
+<ul>
+<li>Wasmtime's trap handling architecture in <code>docs/contributing-architecture.md</code></li>
+<li><code>ModuleRegistry</code> and <code>GLOBAL_MODULES</code> for similar patterns</li>
+</ul>
+<h2>Additional Context</h2>
+<p>We discovered this issue while building Java bindings for wasmtime (wasmtime4j). Our test suite has ~860 tests, many creating engines and modules. The suite consistently crashed around test 350-400 before we implemented this fix.</p>
+<p>We've been running with this fix in production and all tests now pass reliably.<br>
+</p>
+</blockquote>
+
+
+
+<a name="571801220"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312511%20SIGABRT%20crashes%20when%20creating%20man.../near/571801220" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312511.20SIGABRT.20crashes.20when.20creating.20man.2E.2E.2E.html#571801220">(Feb 04 2026 at 01:38)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/12511#issuecomment-3844750412">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12511">issue #12511</a>:</p>
+<blockquote>
+<p>Thanks for the report, but I'd like to ask you to set aside the LLM on this. This is a lot of text to wade through, much of it I think is inaccurate, and it detracts from the problem you're having.</p>
+<p>Can you share your reproduction steps for this issue? I ran the program on macOS and Linux in debug and release mode and never got a crash. I ran ~5.5M iterations on Linux and also never saw a crash. Are you able to reproduce with the program listed here? If not can you share a stack trace or similar?</p>
+<p>This might be a problem with bindings to wasmtime from the JVM, such as a use-after-free in the C API, or something like that. If you're able to share more details about that it might help narrow it down.</p>
+</blockquote>
+
+
+
+<a name="571939897"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312511%20SIGABRT%20crashes%20when%20creating%20man.../near/571939897" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312511.20SIGABRT.20crashes.20when.20creating.20man.2E.2E.2E.html#571939897">(Feb 04 2026 at 15:23)</a>:</h4>
+<p>zacharywhitley <a href="https://github.com/bytecodealliance/wasmtime/issues/12511#issuecomment-3848089974">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12511">issue #12511</a>:</p>
+<blockquote>
+<p>Sorry about the wall of text. I'm running the rust api on osx. I'll fire up my Linux machine when I get home and try it here and see if I can get some more information. </p>
+<p>I'm working on wasmtime JVM bindings. I have both JNI and Panama interfaces and it's coming along fairly well. I while ago I went to use <a href="https://github.com/kawamuray/wasmtime-java">https://github.com/kawamuray/wasmtime-java</a> and <a href="https://github.com/bluejekyll/wasmtime-java">https://github.com/bluejekyll/wasmtime-java</a> and they worked as a proof of concept but they are very minimal implementations for <a href="https://github.com/semantalytics/stardog-webfunction-plugin">https://github.com/semantalytics/stardog-webfunction-plugin</a> , They haven't been maintained in years and I always thought that they sold wasmtime short. I wanted to do something more than just a proof of concept and had a bunch of other ideas that I wanted to explore. </p>
+</blockquote>
+
+
+
+<a name="571949404"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312511%20SIGABRT%20crashes%20when%20creating%20man.../near/571949404" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312511.20SIGABRT.20crashes.20when.20creating.20man.2E.2E.2E.html#571949404">(Feb 04 2026 at 15:58)</a>:</h4>
+<p>zacharywhitley edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/12511#issuecomment-3848089974">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12511">issue #12511</a>:</p>
+<blockquote>
+<p>Sorry about the wall of text. I'm running the rust api on osx. I can't get to this until I get home this evening but when I do I'll get you some more information. </p>
+<p>I'm working on wasmtime JVM bindings. I have both JNI and Panama interfaces and it's coming along fairly well. I while ago I went to use <a href="https://github.com/kawamuray/wasmtime-java">https://github.com/kawamuray/wasmtime-java</a> and <a href="https://github.com/bluejekyll/wasmtime-java">https://github.com/bluejekyll/wasmtime-java</a> and they worked as a proof of concept but they are very minimal implementations for <a href="https://github.com/semantalytics/stardog-webfunction-plugin">https://github.com/semantalytics/stardog-webfunction-plugin</a> , They haven't been maintained in years and I always thought that they sold wasmtime short. I wanted to do something more than just a proof of concept and had a bunch of other ideas that I wanted to explore. </p>
+</blockquote>
+
+
+
+<a name="571949507"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312511%20SIGABRT%20crashes%20when%20creating%20man.../near/571949507" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312511.20SIGABRT.20crashes.20when.20creating.20man.2E.2E.2E.html#571949507">(Feb 04 2026 at 15:58)</a>:</h4>
+<p>zacharywhitley edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/12511#issuecomment-3848089974">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12511">issue #12511</a>:</p>
+<blockquote>
+<p>I can't get to this until I get home this evening but when I do I'll get you some more information. </p>
+<p>I'm working on wasmtime JVM bindings. I have both JNI and Panama interfaces and it's coming along fairly well. I while ago I went to use <a href="https://github.com/kawamuray/wasmtime-java">https://github.com/kawamuray/wasmtime-java</a> and <a href="https://github.com/bluejekyll/wasmtime-java">https://github.com/bluejekyll/wasmtime-java</a> and they worked as a proof of concept but they are very minimal implementations for <a href="https://github.com/semantalytics/stardog-webfunction-plugin">https://github.com/semantalytics/stardog-webfunction-plugin</a> , They haven't been maintained in years and I always thought that they sold wasmtime short. I wanted to do something more than just a proof of concept and had a bunch of other ideas that I wanted to explore. </p>
+</blockquote>
+
+
+
+<a name="571949754"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312511%20SIGABRT%20crashes%20when%20creating%20man.../near/571949754" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312511.20SIGABRT.20crashes.20when.20creating.20man.2E.2E.2E.html#571949754">(Feb 04 2026 at 15:59)</a>:</h4>
+<p>zacharywhitley edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/12511#issuecomment-3848089974">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12511">issue #12511</a>:</p>
+<blockquote>
+<p>I can't get to this until I get home this evening but when I do I'll get you some more information. </p>
+<p>I'm working on wasmtime JVM bindings. I have both JNI and Panama interfaces and it's coming along fairly well. I while ago I went to use <a href="https://github.com/kawamuray/wasmtime-java">https://github.com/kawamuray/wasmtime-java</a> and <a href="https://github.com/bluejekyll/wasmtime-java">https://github.com/bluejekyll/wasmtime-java</a> and they worked as a proof of concept but they are very minimal implementations for <a href="https://github.com/semantalytics/stardog-webfunction-plugin">https://github.com/semantalytics/stardog-webfunction-plugin</a> , They haven't been maintained in years and I always thought that they sold wasmtime short. I wanted to do something more than just a proof of concept and had a bunch of other ideas that I wanted to explore so I started working on this project. </p>
+</blockquote>
+
+
+
+<a name="572048764"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312511%20SIGABRT%20crashes%20when%20creating%20man.../near/572048764" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312511.20SIGABRT.20crashes.20when.20creating.20man.2E.2E.2E.html#572048764">(Feb 05 2026 at 02:41)</a>:</h4>
+<p>zacharywhitley <a href="https://github.com/bytecodealliance/wasmtime/issues/12511#issuecomment-3850759685">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12511">issue #12511</a>:</p>
+<blockquote>
+<p>I’m a bit burned out on this and may be missing some nuance in the mechanistic explanation. The concrete, reproducible issue is that Wasmtime can SIGABRT via assert!(prev.is_none()) / assert!(code.is_some()) in GLOBAL_CODE under repeated create/drop churn. I've added tests to my branch. The problem does not manifest with Rust but will for any FFI. </p>
+<p>I have a patch that prevents the host abort by making (un)registration tolerant to collisions / missing entries. I’m happy to revise the explanation and/or adjust the fix to match the intended invariants — the main goal is ensuring a production embedder cannot be taken down by internal asserts.</p>
+</blockquote>
+
+
+
+<a name="572131125"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312511%20SIGABRT%20crashes%20when%20creating%20man.../near/572131125" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312511.20SIGABRT.20crashes.20when.20creating.20man.2E.2E.2E.html#572131125">(Feb 05 2026 at 12:10)</a>:</h4>
+<p>tschneidereit <a href="https://github.com/bytecodealliance/wasmtime/issues/12511#issuecomment-3853249278">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12511">issue #12511</a>:</p>
+<blockquote>
+<p>@zacharywhitley I appreciate that you're trying what you can to address an issue you're running into, and we want to help as much as we can. However, precisely because Wasmtime is the kind of project where bugs can quickly turn into severe security or availability issues, we definitely can't land PRs that maintainers don't think are correct, and that no human (and in particular none of the project maintainers) fully understands. Otherwise we run the risk of the change causing unintended effects elsewhere.</p>
+<blockquote>
+<p>The problem does not manifest with Rust but will for any FFI.</p>
+</blockquote>
+<p>If you could provide a test case here that is reduced, ideally using a language like C or C++ that directly uses the FFI, and directly reproduces the issue, that would help greatly in understanding the underlying issue and fully addressing it. An LLM generated analysis of the cause isn't a replacement for that step, and puts a lot of burden on maintainers, as I'm sure you appreciate.</p>
+</blockquote>
+
+
+
+<a name="572136530"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312511%20SIGABRT%20crashes%20when%20creating%20man.../near/572136530" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312511.20SIGABRT.20crashes.20when.20creating.20man.2E.2E.2E.html#572136530">(Feb 05 2026 at 12:38)</a>:</h4>
+<p>zacharywhitley <a href="https://github.com/bytecodealliance/wasmtime/issues/12511#issuecomment-3853381178">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12511">issue #12511</a>:</p>
+<blockquote>
+<p>Totally appreciate that. I just wanted to make sure that I responded when I said that I would and I would be more than happy to assist as much as I can so that the wasmtime devs can devote as much time to wasmtime as possible. I'm a huge fan and have been using (and abusing) it quite a bit lately and having a great time. I just might take a little bit to work this up because this is a nights and weekends thing....for now. :) </p>
+</blockquote>
+
+
+
+<a name="572184760"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312511%20SIGABRT%20crashes%20when%20creating%20man.../near/572184760" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312511.20SIGABRT.20crashes.20when.20creating.20man.2E.2E.2E.html#572184760">(Feb 05 2026 at 15:46)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/12511#issuecomment-3854497830">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12511">issue #12511</a>:</p>
+<blockquote>
+<p>One thing I might recommend is taking a close look at memory management in the FFI layer. A double-free (e.g. calling <code>wasmtime_*_free</code> twice on the asme object) could likely cause an issue like this. I'm not aware of any way to trigger these asserts from typical API usage, but invalid API usage, which would result in UB, could trigger something like this.</p>
+</blockquote>
+
+
+
+<a name="572199366"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312511%20SIGABRT%20crashes%20when%20creating%20man.../near/572199366" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312511.20SIGABRT.20crashes.20when.20creating.20man.2E.2E.2E.html#572199366">(Feb 05 2026 at 16:40)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/12511#issuecomment-3854836860">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12511">issue #12511</a>:</p>
+<blockquote>
+<blockquote>
+<p>One thing I might recommend is taking a close look at memory management in the FFI layer. A double-free (e.g. calling <code>wasmtime_*_free</code> twice on the asme object) could likely cause an issue like this. I'm not aware of any way to trigger these asserts from typical API usage, but invalid API usage, which would result in UB, could trigger something like this.</p>
+</blockquote>
+<p>And running your FFI embedding with ASan can help surface these kinds of bugs in situations where they might otherwise silently go unnoticed in the moment and only cause problems much later down the line.</p>
+<p>FWIW, here are the cmake flags for building Wasmtime's C API with ASan:</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/72520ee5c2be0a01ea779d5fcde16d393973ba14/.github/workflows/main.yml#L691-L694">https://github.com/bytecodealliance/wasmtime/blob/72520ee5c2be0a01ea779d5fcde16d393973ba14/.github/workflows/main.yml#L691-L694</a></p>
+</blockquote>
+
+
+
+<a name="572423227"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312511%20SIGABRT%20crashes%20when%20creating%20man.../near/572423227" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312511.20SIGABRT.20crashes.20when.20creating.20man.2E.2E.2E.html#572423227">(Feb 06 2026 at 16:50)</a>:</h4>
+<p>zacharywhitley <a href="https://github.com/bytecodealliance/wasmtime/issues/12511#issuecomment-3861489550">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12511">issue #12511</a>:</p>
+<blockquote>
+<p>Thanks for the suggestions, I’ve reduced this to a pure C API repro (no JVM, no GC) and updated the branch here:</p>
+<p><a href="https://github.com/tegmentum/wasmtime/tree/codex/create-minimal-rust-test-for-global_code-error">https://github.com/tegmentum/wasmtime/tree/codex/create-minimal-rust-test-for-global_code-error</a></p>
+<p>Build + run (Linux):</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">cmake</span><span class="w"> </span><span class="o">-</span><span class="n">S</span><span class="w"> </span><span class="n">crates</span><span class="o">/</span><span class="n">c</span><span class="o">-</span><span class="n">api</span><span class="w"> </span><span class="o">-</span><span class="n">B</span><span class="w"> </span><span class="n">target</span><span class="o">/</span><span class="n">c</span><span class="o">-</span><span class="n">api</span><span class="o">-</span><span class="n">build</span><span class="o">-</span><span class="n">offline</span><span class="w"> </span><span class="o">-</span><span class="n">DBUILD_TESTS</span><span class="o">=</span><span class="n">ON</span><span class="w"> </span><span class="o">-</span><span class="n">DWASMTIME_CAPI_ENABLE_GTEST_TESTS</span><span class="o">=</span><span class="n">OFF</span>
+<span class="n">cmake</span><span class="w"> </span><span class="o">--</span><span class="n">build</span><span class="w"> </span><span class="n">target</span><span class="o">/</span><span class="n">c</span><span class="o">-</span><span class="n">api</span><span class="o">-</span><span class="n">build</span><span class="o">-</span><span class="n">offline</span><span class="w"> </span><span class="o">--</span><span class="n">target</span><span class="w"> </span><span class="n">test</span><span class="o">-</span><span class="n">global</span><span class="o">-</span><span class="n">code</span><span class="w"> </span><span class="o">-</span><span class="n">j4</span>
+<span class="n">ctest</span><span class="w"> </span><span class="o">--</span><span class="n">test</span><span class="o">-</span><span class="n">dir</span><span class="w"> </span><span class="n">target</span><span class="o">/</span><span class="n">c</span><span class="o">-</span><span class="n">api</span><span class="o">-</span><span class="n">build</span><span class="o">-</span><span class="n">offline</span><span class="w"> </span><span class="o">-</span><span class="n">R</span><span class="w"> </span><span class="n">test</span><span class="o">-</span><span class="n">global</span><span class="o">-</span><span class="n">code</span><span class="w"> </span><span class="o">--</span><span class="n">output</span><span class="o">-</span><span class="n">on</span><span class="o">-</span><span class="n">failure</span>
+</code></pre></div>
+<p>The test is contract-clean (each wasmtime_*_delete called exactly once; no use-after-delete; threads joined before teardown).</p>
+<p>On Linux this fails with a stable condition (expected 0 post-drop mapped addresses, got N) and under lldb consistently breaks in the threaded post-drop path.</p>
+<p>The /proc/self/maps check is included as extra evidence only. The core issue is that under repeated create/drop churn the GLOBAL_CODE invariants can be violated, leading to internal assert,</p>
+</blockquote>
+
+
+
+<a name="572430906"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312511%20SIGABRT%20crashes%20when%20creating%20man.../near/572430906" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312511.20SIGABRT.20crashes.20when.20creating.20man.2E.2E.2E.html#572430906">(Feb 06 2026 at 17:28)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/12511#issuecomment-3861712958">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12511">issue #12511</a>:</p>
+<blockquote>
+<p>Thanks! The <code>test_unregisters_under_threaded_pressure</code> is the culprit in that test and it's been helpful to read over and poke at that locally. Unfortunately though I'm not sure this is enough of a smoking gun to know what to do in Wasmtime. This is using <code>/proc/self/maps</code> to show that something is still mapped after a module/engine are destroyed, but that's "action at a distance" of a sort where it's showing that Wasmtime might have problems but the problem still isn't within Wasmtime. My guess, without knowing specifics, is that <code>/proc/self/maps</code> is showing something stale rather than something that's up-to-date. My rough guess for that is that it has something to do with the fact that other threads in the same process also have <code>/proc/self/maps</code> open and there might be some sort of caching/queueing/etc at the kernel level. In Wasmtime though, as far as I can tell, we're correctly purging all mappings related to all modules.</p>
+<p>If what I'm suspecting is the case, however, then it would also mean that this shouldn't be a problem in Wasmtime. The kernel is responsible for ensuring that it only hands out unmapped mappings when we ask for a new mapping, so nothing should be overlapping accidentally or anything like that.</p>
+<p>Are you able to write up a test which aborts/panics within Wasmtime itself?</p>
+</blockquote>
+
+
+
+<a name="572434961"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312511%20SIGABRT%20crashes%20when%20creating%20man.../near/572434961" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312511.20SIGABRT.20crashes.20when.20creating.20man.2E.2E.2E.html#572434961">(Feb 06 2026 at 17:50)</a>:</h4>
+<p>zacharywhitley <a href="https://github.com/bytecodealliance/wasmtime/issues/12511#issuecomment-3861813915">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12511">issue #12511</a>:</p>
+<blockquote>
+<p>Thanks for taking a look. That makes sense, and I agree that /proc/self/maps is indirect evidence and not something Wasmtime should treat as a contract. I included it only as supporting information while trying to localize the behavior under pressure.</p>
+<p>The original symptom that led me here was Wasmtime aborting internally via the GLOBAL_CODE assertions (assert!(prev.is_none()) / assert!(code.is_some())) under repeated create/drop churn. The /proc/self/maps checks were added later to help understand timing and reuse, not as the primary failure condition.</p>
+<p>I can work on reducing this further to a test that triggers a panic/abort within Wasmtime itself (via the registry invariants), without relying on /proc/self/maps at all. I’ll follow up once I have that.</p>
+<p>Appreciate you digging into this, the feedback is helpful for narrowing what’s actually actionable on the Wasmtime side.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

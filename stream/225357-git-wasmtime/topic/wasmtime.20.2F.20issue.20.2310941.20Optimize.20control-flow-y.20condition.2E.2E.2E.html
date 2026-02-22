@@ -1,0 +1,179 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #10941 Optimize control-flow-y condition... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310941.20Optimize.20control-flow-y.20condition.2E.2E.2E.html">wasmtime / issue #10941 Optimize control-flow-y condition...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="522676272"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310941%20Optimize%20control-flow-y%20condition.../near/522676272" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310941.20Optimize.20control-flow-y.20condition.2E.2E.2E.html#522676272">(Jun 05 2025 at 22:10)</a>:</h4>
+<p>fitzgen opened <a href="https://github.com/bytecodealliance/wasmtime/issues/10941">issue #10941</a>:</p>
+<blockquote>
+<p>Wasm does not have conditional trap instructions, just control flow and unconditional traps. CLIF does have conditional trap instructions, but we do not translate the control-flow-y Wasm equivalent into these single conditionally-trapping instructions. This is unfortunate because Cranelift's mid-end cannot currently turn control-flow-y conditional traps into single <code>trap[n]z</code> instructions either, but the single instructions allow the optimizer to do more and also ultimately get better codegen in the backend.</p>
+<p>I'm sure that conditional traps show up frequently in real Wasm code. They additionally show up frequently in the fused adapters we generate when linking components together.</p>
+<p>Might be worth identifying blocks that contain a single unconditional trap instruction and rewrite conditional branches to these blocks during egraph construction or something.</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/pull/10940">https://github.com/bytecodealliance/wasmtime/pull/10940</a> introduced the following disas tests that highlight the problem:</p>
+<p><div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="c1">;; This function body should ideally get compiled down into a single `trapz`</span>
+  <span class="c1">;; CLIF instruction.</span>
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"trapnz"</span><span class="p">)</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="nb">local.get</span> <span class="mi">0</span>
+    <span class="k">if</span>
+      <span class="nb">unreachable</span>
+    <span class="k">end</span>
+  <span class="p">)</span>
+
+  <span class="c1">;; And this one into a single `trapnz` instruction.</span>
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"trapz"</span><span class="p">)</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="nb">local.get</span> <span class="mi">0</span>
+    <span class="nb">i32.eqz</span>
+    <span class="k">if</span>
+      <span class="nb">unreachable</span>
+    <span class="k">end</span>
+  <span class="p">)</span>
+<span class="p">)</span>
+
+<span class="c1">;; function u0:0(i64 vmctx, i64, i32) tail {</span>
+<span class="c1">;;     gv0 = vmctx</span>
+<span class="c1">;;     gv1 = load.i64 notrap aligned readonly gv0+8</span>
+<span class="c1">;;     gv2 = load.i64 notrap aligned gv1+16</span>
+<span class="c1">;;     stack_limit = gv2</span>
+<span class="c1">;;</span>
+<span class="c1">;;                                 block0(v0: i64, v1: i64, v2: i32):</span>
+<span class="c1">;; @002f                               brif v2, block2, block3</span>
+<span class="c1">;;</span>
+<span class="c1">;;                                 block2:</span>
+<span class="c1">;; @0031                               trap user11</span>
+<span class="c1">;;</span>
+<span class="c1">;;                                 block3:</span>
+<span class="c1">;; @0033                               jump block1</span>
+<span class="c1">;;</span>
+<span class="c1">;;                                 block1:</span>
+<span class="c1">;; @0033                               return</span>
+<span class="c1">;; }</span>
+<span class="c1">;;</span>
+<span class="c1">;; function u0:1(i64 vmctx, i64, i32) tail {</span>
+<span class="c1">;;     gv0 = vmctx</span>
+<span class="c1">;;     gv1 = load.i64 notrap aligned readonly gv0+8</span>
+<span class="c1">;;     gv2 = load.i64 notrap aligned gv1+16</span>
+<span class="c1">;;     stack_limit = gv2</span>
+<span class="c1">;;</span>
+<span class="c1">;;                                 block0(v0: i64, v1: i64, v2: i32):</span>
+<span class="c1">;;                                     v5 = iconst.i32 0</span>
+<span class="c1">;; @0038                               v3 = icmp eq v2, v5  ; v5 = 0</span>
+<span class="c1">;; @0038                               v4 = uextend.i32 v3</span>
+<span class="c1">;; @0039                               brif v4, block2, block3</span>
+<span class="c1">;;</span>
+<span class="c1">;;                                 block2:</span>
+<span class="c1">;; @003b                               trap user11</span>
+<span class="c1">;;</span>
+<span class="c1">;;                                 block3:</span>
+<span class="c1">;; @003d                               jump block1</span>
+<span class="c1">;;</span>
+<span class="c1">;;                                 block1:</span>
+<span class="c1">;; @003d                               return</span>
+<span class="c1">;; }</span>
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="522676339"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310941%20Optimize%20control-flow-y%20condition.../near/522676339" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310941.20Optimize.20control-flow-y.20condition.2E.2E.2E.html#522676339">(Jun 05 2025 at 22:11)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the cranelift<span aria-label="goal" class="emoji emoji-1f945" role="img" title="goal">:goal:</span>optimize-speed label to <a href="https://github.com/bytecodealliance/wasmtime/issues/10941">Issue #10941</a>.</p>
+
+
+
+<a name="522676342"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310941%20Optimize%20control-flow-y%20condition.../near/522676342" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310941.20Optimize.20control-flow-y.20condition.2E.2E.2E.html#522676342">(Jun 05 2025 at 22:11)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the wasm-proposal:component-model label to <a href="https://github.com/bytecodealliance/wasmtime/issues/10941">Issue #10941</a>.</p>
+
+
+
+<a name="522852376"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310941%20Optimize%20control-flow-y%20condition.../near/522852376" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310941.20Optimize.20control-flow-y.20condition.2E.2E.2E.html#522852376">(Jun 06 2025 at 22:10)</a>:</h4>
+<p>fitzgen assigned fitzgen to <a href="https://github.com/bytecodealliance/wasmtime/issues/10941">issue #10941</a>.</p>
+
+
+
+<a name="523163949"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310941%20Optimize%20control-flow-y%20condition.../near/523163949" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310941.20Optimize.20control-flow-y.20condition.2E.2E.2E.html#523163949">(Jun 09 2025 at 20:37)</a>:</h4>
+<p>fitzgen closed <a href="https://github.com/bytecodealliance/wasmtime/issues/10941">issue #10941</a>:</p>
+<blockquote>
+<p>Wasm does not have conditional trap instructions, just control flow and unconditional traps. CLIF does have conditional trap instructions, but we do not translate the control-flow-y Wasm equivalent into these single conditionally-trapping instructions. This is unfortunate because Cranelift's mid-end cannot currently turn control-flow-y conditional traps into single <code>trap[n]z</code> instructions either, but the single instructions allow the optimizer to do more and also ultimately get better codegen in the backend.</p>
+<p>I'm sure that conditional traps show up frequently in real Wasm code. They additionally show up frequently in the fused adapters we generate when linking components together.</p>
+<p>Might be worth identifying blocks that contain a single unconditional trap instruction and rewrite conditional branches to these blocks during egraph construction or something.</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/pull/10940">https://github.com/bytecodealliance/wasmtime/pull/10940</a> introduced the following disas tests that highlight the problem:</p>
+<p><div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="c1">;; This function body should ideally get compiled down into a single `trapz`</span>
+  <span class="c1">;; CLIF instruction.</span>
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"trapnz"</span><span class="p">)</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="nb">local.get</span> <span class="mi">0</span>
+    <span class="k">if</span>
+      <span class="nb">unreachable</span>
+    <span class="k">end</span>
+  <span class="p">)</span>
+
+  <span class="c1">;; And this one into a single `trapnz` instruction.</span>
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"trapz"</span><span class="p">)</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="nb">local.get</span> <span class="mi">0</span>
+    <span class="nb">i32.eqz</span>
+    <span class="k">if</span>
+      <span class="nb">unreachable</span>
+    <span class="k">end</span>
+  <span class="p">)</span>
+<span class="p">)</span>
+
+<span class="c1">;; function u0:0(i64 vmctx, i64, i32) tail {</span>
+<span class="c1">;;     gv0 = vmctx</span>
+<span class="c1">;;     gv1 = load.i64 notrap aligned readonly gv0+8</span>
+<span class="c1">;;     gv2 = load.i64 notrap aligned gv1+16</span>
+<span class="c1">;;     stack_limit = gv2</span>
+<span class="c1">;;</span>
+<span class="c1">;;                                 block0(v0: i64, v1: i64, v2: i32):</span>
+<span class="c1">;; @002f                               brif v2, block2, block3</span>
+<span class="c1">;;</span>
+<span class="c1">;;                                 block2:</span>
+<span class="c1">;; @0031                               trap user11</span>
+<span class="c1">;;</span>
+<span class="c1">;;                                 block3:</span>
+<span class="c1">;; @0033                               jump block1</span>
+<span class="c1">;;</span>
+<span class="c1">;;                                 block1:</span>
+<span class="c1">;; @0033                               return</span>
+<span class="c1">;; }</span>
+<span class="c1">;;</span>
+<span class="c1">;; function u0:1(i64 vmctx, i64, i32) tail {</span>
+<span class="c1">;;     gv0 = vmctx</span>
+<span class="c1">;;     gv1 = load.i64 notrap aligned readonly gv0+8</span>
+<span class="c1">;;     gv2 = load.i64 notrap aligned gv1+16</span>
+<span class="c1">;;     stack_limit = gv2</span>
+<span class="c1">;;</span>
+<span class="c1">;;                                 block0(v0: i64, v1: i64, v2: i32):</span>
+<span class="c1">;;                                     v5 = iconst.i32 0</span>
+<span class="c1">;; @0038                               v3 = icmp eq v2, v5  ; v5 = 0</span>
+<span class="c1">;; @0038                               v4 = uextend.i32 v3</span>
+<span class="c1">;; @0039                               brif v4, block2, block3</span>
+<span class="c1">;;</span>
+<span class="c1">;;                                 block2:</span>
+<span class="c1">;; @003b                               trap user11</span>
+<span class="c1">;;</span>
+<span class="c1">;;                                 block3:</span>
+<span class="c1">;; @003d                               jump block1</span>
+<span class="c1">;;</span>
+<span class="c1">;;                                 block1:</span>
+<span class="c1">;; @003d                               return</span>
+<span class="c1">;; }</span>
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

@@ -1,0 +1,911 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #12077 fix(jit): Add MAP_JIT support for 10... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html">wasmtime / PR #12077 fix(jit): Add MAP_JIT support for 10...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="559041453"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559041453" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559041453">(Nov 24 2025 at 13:16)</a>:</h4>
+<p>darmie opened <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a> from <code>darmie:fix-plt-aarch64</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<h2>Title</h2>
+<p>fix(jit): Add MAP_JIT support for 100% stable JIT execution on ARM64 macOS</p>
+<p>Related Issue: <a href="https://github.com/bytecodealliance/wasmtime/issues/12076">https://github.com/bytecodealliance/wasmtime/issues/12076</a></p>
+<h2>Summary</h2>
+<p>This PR fixes non-deterministic JIT execution failures on Apple Silicon by implementing proper memory allocation and W^X mode handling required by the platform.</p>
+<p><strong>Before:</strong> ~56% success rate<br>
+<strong>After:</strong> 100% success rate (verified over 50+ consecutive runs)</p>
+<h2>Problem</h2>
+<p>JIT-compiled code on ARM64 macOS fails non-deterministically in multi-threaded scenarios. Symptoms include:</p>
+<table>
+<thead>
+<tr>
+<th>Failure Mode</th>
+<th>Frequency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SIGBUS on JIT function calls</td>
+<td>~30%</td>
+</tr>
+<tr>
+<td>Silent incorrect results</td>
+<td>~10%</td>
+</tr>
+<tr>
+<td>Segmentation fault</td>
+<td>~4%</td>
+</tr>
+</tbody>
+</table>
+<h3>Root Cause</h3>
+<p>Apple Silicon enforces W^X (Write XOR Execute) at the hardware level:</p>
+<ol>
+<li><strong>Memory must be allocated with <code>MAP_JIT</code> flag</strong> so the kernel can track it for W^X enforcement</li>
+<li><strong>Threads must switch to execute mode</strong> via <code>pthread_jit_write_protect_np(1)</code> before calling JIT code</li>
+<li><strong>Memory barriers are required</strong> due to independent instruction caches on P-cores and E-cores</li>
+</ol>
+<p>The current implementation:</p>
+<ul>
+<li>Uses standard allocator (no <code>MAP_JIT</code>)</li>
+<li>Doesn't call <code>pthread_jit_write_protect_np()</code></li>
+<li>Has insufficient memory barriers</li>
+</ul>
+<h2>Solution</h2>
+<h3>Changes to <code>cranelift/jit/src/memory/system.rs</code></h3>
+<ol>
+<li><strong>New ARM64 macOS-specific <code>with_size()</code></strong> - Uses <code>mmap</code> with <code>MAP_JIT</code> flag:</li>
+</ol>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#[cfg(all(target_arch = </span><span class="s">"aarch64"</span><span class="cp">, target_os = </span><span class="s">"macos"</span><span class="cp">, not(feature = </span><span class="s">"selinux-fix"</span><span class="cp">)))]</span>
+<span class="k">fn</span><span class="w"> </span><span class="nf">with_size</span><span class="p">(</span><span class="n">size</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">io</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="bp">Self</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="n">MAP_JIT</span><span class="p">:</span><span class="w"> </span><span class="nc">libc</span><span class="p">::</span><span class="n">c_int</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x0800</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">ptr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">libc</span><span class="p">::</span><span class="n">mmap</span><span class="p">(</span>
+<span class="w">            </span><span class="n">ptr</span><span class="p">::</span><span class="n">null_mut</span><span class="p">(),</span>
+<span class="w">            </span><span class="n">alloc_size</span><span class="p">,</span>
+<span class="w">            </span><span class="n">libc</span><span class="p">::</span><span class="n">PROT_READ</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">libc</span><span class="p">::</span><span class="n">PROT_WRITE</span><span class="p">,</span>
+<span class="w">            </span><span class="n">libc</span><span class="p">::</span><span class="n">MAP_PRIVATE</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">libc</span><span class="p">::</span><span class="n">MAP_ANON</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">MAP_JIT</span><span class="p">,</span>
+<span class="w">            </span><span class="o">-</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="p">)</span>
+<span class="w">    </span><span class="p">};</span>
+<span class="w">    </span><span class="c1">// ...</span>
+<span class="p">}</span>
+</code></pre></div>
+<ol start="2">
+<li><strong>New ARM64 macOS-specific <code>Drop</code></strong> - Uses <code>munmap</code> since memory was allocated with <code>mmap</code>:</li>
+</ol>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#[cfg(all(target_arch = </span><span class="s">"aarch64"</span><span class="cp">, target_os = </span><span class="s">"macos"</span><span class="cp">, not(feature = </span><span class="s">"selinux-fix"</span><span class="cp">)))]</span>
+<span class="k">impl</span><span class="w"> </span><span class="nb">Drop</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">PtrLen</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">drop</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="o">!</span><span class="bp">self</span><span class="p">.</span><span class="n">ptr</span><span class="p">.</span><span class="n">is_null</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="kd">let</span><span class="w"> </span><span class="n">_</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">region</span><span class="p">::</span><span class="n">protect</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">ptr</span><span class="p">,</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">len</span><span class="p">,</span><span class="w"> </span><span class="n">region</span><span class="p">::</span><span class="n">Protection</span><span class="p">::</span><span class="n">READ_WRITE</span><span class="p">);</span>
+<span class="w">                </span><span class="n">libc</span><span class="p">::</span><span class="n">munmap</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">ptr</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="o">*</span><span class="k">mut</span><span class="w"> </span><span class="n">libc</span><span class="p">::</span><span class="n">c_void</span><span class="p">,</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">len</span><span class="p">);</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<ol start="3">
+<li><strong>Memory barriers after finalize</strong> - Ensures icache coherency:</li>
+</ol>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#[cfg(all(target_arch = </span><span class="s">"aarch64"</span><span class="cp">, target_os = </span><span class="s">"macos"</span><span class="cp">))]</span>
+<span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">std</span><span class="p">::</span><span class="n">arch</span><span class="p">::</span><span class="fm">asm!</span><span class="p">(</span><span class="s">"dsb sy"</span><span class="p">,</span><span class="w"> </span><span class="n">options</span><span class="p">(</span><span class="n">nostack</span><span class="p">,</span><span class="w"> </span><span class="n">preserves_flags</span><span class="p">));</span>
+<span class="w">    </span><span class="n">std</span><span class="p">::</span><span class="n">arch</span><span class="p">::</span><span class="fm">asm!</span><span class="p">(</span><span class="s">"isb sy"</span><span class="p">,</span><span class="w"> </span><span class="n">options</span><span class="p">(</span><span class="n">nostack</span><span class="p">,</span><span class="w"> </span><span class="n">preserves_flags</span><span class="p">));</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3>Changes to <code>cranelift/jit/src/memory/mod.rs</code></h3>
+<ol>
+<li><strong>DSB SY before <code>clear_cache</code></strong> - Ensures data writes are visible before icache invalidation:</li>
+</ol>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#[cfg(all(target_arch = </span><span class="s">"aarch64"</span><span class="cp">, target_os = </span><span class="s">"macos"</span><span class="cp">))]</span>
+<span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">std</span><span class="p">::</span><span class="n">arch</span><span class="p">::</span><span class="fm">asm!</span><span class="p">(</span><span class="s">"dsb sy"</span><span class="p">,</span><span class="w"> </span><span class="n">options</span><span class="p">(</span><span class="n">nostack</span><span class="p">,</span><span class="w"> </span><span class="n">preserves_flags</span><span class="p">));</span>
+<span class="p">}</span>
+</code></pre></div>
+<ol start="2">
+<li><strong>Switch to execute mode</strong> - After making memory executable:</li>
+</ol>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#[cfg(all(target_arch = </span><span class="s">"aarch64"</span><span class="cp">, target_os = </span><span class="s">"macos"</span><span class="cp">))]</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="k">unsafe</span><span class="w"> </span><span class="k">extern</span><span class="w"> </span><span class="s">"C"</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">fn</span><span class="w"> </span><span class="nf">pthread_jit_write_protect_np</span><span class="p">(</span><span class="n">enabled</span><span class="p">:</span><span class="w"> </span><span class="nc">libc</span><span class="p">::</span><span class="n">c_int</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">pthread_jit_write_protect_np</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<ol start="3">
+<li><strong>Final barriers</strong> - After protection change and mode switch:</li>
+</ol>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#[cfg(all(target_arch = </span><span class="s">"aarch64"</span><span class="cp">, target_os = </span><span class="s">"macos"</span><span class="cp">))]</span>
+<span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">std</span><span class="p">::</span><span class="n">arch</span><span class="p">::</span><span class="fm">asm!</span><span class="p">(</span><span class="s">"dsb sy"</span><span class="p">,</span><span class="w"> </span><span class="n">options</span><span class="p">(</span><span class="n">nostack</span><span class="p">,</span><span class="w"> </span><span class="n">preserves_flags</span><span class="p">));</span>
+<span class="w">    </span><span class="n">std</span><span class="p">::</span><span class="n">arch</span><span class="p">::</span><span class="fm">asm!</span><span class="p">(</span><span class="s">"isb sy"</span><span class="p">,</span><span class="w"> </span><span class="n">options</span><span class="p">(</span><span class="n">nostack</span><span class="p">,</span><span class="w"> </span><span class="n">preserves_flags</span><span class="p">));</span>
+<span class="p">}</span>
+</code></pre></div>
+<h2>Testing</h2>
+<h3>Test Script</h3>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code><span class="ch">#!/bin/bash</span>
+<span class="nv">passed</span><span class="o">=</span><span class="m">0</span>
+<span class="nv">failed</span><span class="o">=</span><span class="m">0</span>
+
+<span class="k">for</span><span class="w"> </span>i<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="o">{</span><span class="m">1</span>..50<span class="o">}</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span><span class="nv">result</span><span class="o">=</span><span class="k">$(</span>timeout<span class="w"> </span><span class="m">120</span><span class="w"> </span>./target/release/jit_test<span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="k">)</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">"</span><span class="nv">$result</span><span class="s2">"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-q<span class="w"> </span><span class="s2">"All tests passed"</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">        </span><span class="nb">echo</span><span class="w"> </span><span class="s2">"Run </span><span class="nv">$i</span><span class="s2">: PASSED"</span>
+<span class="w">        </span><span class="nv">passed</span><span class="o">=</span><span class="k">$((</span><span class="nv">passed</span><span class="o">+</span><span class="m">1</span><span class="k">))</span>
+<span class="w">    </span><span class="k">else</span>
+<span class="w">        </span><span class="nb">echo</span><span class="w"> </span><span class="s2">"Run </span><span class="nv">$i</span><span class="s2">: FAILED"</span>
+<span class="w">        </span><span class="nv">failed</span><span class="o">=</span><span class="k">$((</span><span class="nv">failed</span><span class="o">+</span><span class="m">1</span><span class="k">))</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="k">done</span>
+
+<span class="nb">echo</span><span class="w"> </span><span class="s2">""</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">"=== RESULTS ==="</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">"Passed: </span><span class="nv">$passed</span><span class="s2">/50, Failed: </span><span class="nv">$failed</span><span class="s2">/50"</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">"Success rate: </span><span class="k">$((</span><span class="nv">passed</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">100</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="m">50</span><span class="k">))</span><span class="s2">%"</span>
+</code></pre></div>
+<h3>Results</h3>
+<p>Tested with the <a href="https://github.com/darmie/rayzor/blob/main/compiler/examples/test_rayzor_stdlib_e2e.rs">Rayzor compiler's stdlib e2e test suite</a> (50+ JIT-compiled runtime functions, multi-threaded):</p>
+<table>
+<thead>
+<tr>
+<th>Configuration</th>
+<th>Success Rate</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Before fix (standard allocator)</td>
+<td>~56% (28/50)</td>
+</tr>
+<tr>
+<td>After fix (MAP_JIT + pthread_jit_write_protect_np)</td>
+<td><strong>100%</strong> (50/50)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Note:</strong> Simple standalone tests may not reliably reproduce this issue. The failure is non-deterministic and depends on timing, memory layout, and CPU core scheduling (P-core vs E-core).</p>
+<h2>Platform Impact</h2>
+<ul>
+<li><strong>ARM64 macOS</strong>: Fixed (was broken)</li>
+<li><strong>x86_64 macOS</strong>: No change (not affected)</li>
+<li><strong>Linux (all arch)</strong>: No change (not affected)</li>
+<li><strong>Windows</strong>: No change (not affected)</li>
+</ul>
+<p>All changes are gated behind <code>#[cfg(all(target_arch = "aarch64", target_os = "macos"))]</code>.</p>
+<h2>Related Issues</h2>
+<ul>
+<li>Fixes <a href="https://github.com/bytecodealliance/wasmtime/issues/12076">https://github.com/bytecodealliance/wasmtime/issues/12076</a></li>
+<li>Related to #2735 - Support PLT entries in <code>cranelift-jit</code> crate on aarch64</li>
+<li>Related to #8852 - Cranelift: JIT assertion failure on macOS (A64)</li>
+<li>Related to #4000 - JIT relocations depend on system allocator behaviour</li>
+</ul>
+<h2>References</h2>
+<ul>
+<li><a href="https://developer.apple.com/documentation/xcode/writing_arm64_code_for_apple_platforms">Apple: Writing ARM64 Code for Apple Platforms</a></li>
+<li><a href="https://developer.apple.com/documentation/apple-silicon/porting-just-in-time-compilers-to-apple-silicon">Porting Just-In-Time Compilers to Apple Silicon</a></li>
+<li><a href="https://developer.apple.com/documentation/bundleresources/entitlements/com_apple_security_cs_allow-jit">MAP_JIT documentation</a></li>
+</ul>
+<h2>Notes for Reviewers</h2>
+<ol>
+<li>
+<p><strong>Thread safety consideration</strong>: The <code>pthread_jit_write_protect_np(1)</code> call in <code>mod.rs</code> handles the compiling thread. Applications spawning threads that call JIT code must also ensure those threads are in execute mode. This could be:</p>
+<ul>
+<li>Documented as a requirement for users</li>
+<li>Handled via a helper function in the public API</li>
+</ul>
+</li>
+<li>
+<p><strong>Memory barriers</strong>: DSB SY + ISB SY may seem aggressive, but Apple Silicon's heterogeneous architecture (P-cores + E-cores with independent icaches) requires explicit synchronization.</p>
+</li>
+<li>
+<p><strong>Deallocation</strong>: Memory allocated with <code>mmap</code> must be freed with <code>munmap</code>, hence the separate <code>Drop</code> implementation.</p>
+</li>
+</ol>
+<h2>Checklist</h2>
+<ul>
+<li>[x] Code compiles without warnings</li>
+<li>[x] All existing tests pass</li>
+<li>[x] New functionality tested (50+ stability runs)</li>
+<li>[x] Changes are platform-specific (no impact on other platforms)</li>
+</ul>
+</blockquote>
+
+
+
+<a name="559041454"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559041454" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559041454">(Nov 24 2025 at 13:16)</a>:</h4>
+<p><strong>darmie</strong> requested <a href="https://github.com/abrown">abrown</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>.</p>
+
+
+
+<a name="559041455"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559041455" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559041455">(Nov 24 2025 at 13:16)</a>:</h4>
+<p><strong>darmie</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>.</p>
+
+
+
+<a name="559042190"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559042190" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559042190">(Nov 24 2025 at 13:19)</a>:</h4>
+<p>bjorn3 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3500355229">PR review</a>.</p>
+
+
+
+<a name="559042192"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559042192" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559042192">(Nov 24 2025 at 13:19)</a>:</h4>
+<p>bjorn3 created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2556268846">PR review comment</a>:</p>
+<blockquote>
+<p>Please revert this change. It is unrelated to the rest of the changes in this PR and incorrect. Arm64 doesn't support <code>ArgumentPurpose::StructArgument</code> because the arm64 ABI doesn't make use of it at all.</p>
+</blockquote>
+
+
+
+<a name="559043235"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559043235" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559043235">(Nov 24 2025 at 13:23)</a>:</h4>
+<p>bjorn3 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3500370371">PR review</a>.</p>
+
+
+
+<a name="559043236"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559043236" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559043236">(Nov 24 2025 at 13:23)</a>:</h4>
+<p>bjorn3 created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2556281302">PR review comment</a>:</p>
+<blockquote>
+<p>The issue is not a missing barier before icache invalidation. The issue is that icache invalidation is currently only implemented on Linux and Windows arm64, not macOS arm64. A <code>dsb sy</code> doesn't ensure icache coherence in multi threaded environments, while the <code>membarrier</code> we use on Linux is already removes the need for <code>dsb sy</code> there.</p>
+</blockquote>
+
+
+
+<a name="559043908"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559043908" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559043908">(Nov 24 2025 at 13:26)</a>:</h4>
+<p>bjorn3 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3500380885">PR review</a>.</p>
+
+
+
+<a name="559043911"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559043911" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559043911">(Nov 24 2025 at 13:26)</a>:</h4>
+<p>bjorn3 created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2556289706">PR review comment</a>:</p>
+<blockquote>
+<div class="codehilite" data-code-language="suggestion"><pre><span></span><code>        if target_lexicon::Architecture::Aarch64(_) = self.isa.triple().architecture {
+</code></pre></div>
+<p>And probably just import <code>target_lexicon::Architecture</code>.</p>
+</blockquote>
+
+
+
+<a name="559044033"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559044033" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559044033">(Nov 24 2025 at 13:26)</a>:</h4>
+<p>bjorn3 created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2556291094">PR review comment</a>:</p>
+<blockquote>
+<p>All those PROBLEM/SOLUTION are unnecessarily verbose IMO.</p>
+</blockquote>
+
+
+
+<a name="559044035"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559044035" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559044035">(Nov 24 2025 at 13:26)</a>:</h4>
+<p>bjorn3 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3500382692">PR review</a>.</p>
+
+
+
+<a name="559044264"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559044264" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559044264">(Nov 24 2025 at 13:27)</a>:</h4>
+<p>bjorn3 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3500385679">PR review</a>.</p>
+
+
+
+<a name="559044266"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559044266" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559044266">(Nov 24 2025 at 13:27)</a>:</h4>
+<p>bjorn3 created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2556293676">PR review comment</a>:</p>
+<blockquote>
+<p>Same applies to the PR description, which is even worse. Did you use AI?</p>
+</blockquote>
+
+
+
+<a name="559047245"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559047245" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559047245">(Nov 24 2025 at 13:41)</a>:</h4>
+<p>darmie submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3500440333">PR review</a>.</p>
+
+
+
+<a name="559047249"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559047249" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559047249">(Nov 24 2025 at 13:41)</a>:</h4>
+<p>darmie created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2556335822">PR review comment</a>:</p>
+<blockquote>
+<p>Thanks for the clarification @bjorn3 .. You are right that the DSB SY barriers alone don't solve icache coherence in multi-threaded scenarios. It actually didn't improve the results of my test case.  The result only improved after adding the MAP_JIT flag and <code>pthread_jit_write_protect_np(1)</code>.  I will run the test again without the barriers and update the PR</p>
+</blockquote>
+
+
+
+<a name="559052694"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559052694" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559052694">(Nov 24 2025 at 14:03)</a>:</h4>
+<p>darmie updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>.</p>
+
+
+
+<a name="559054844"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559054844" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559054844">(Nov 24 2025 at 14:10)</a>:</h4>
+<p>darmie submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3500584185">PR review</a>.</p>
+
+
+
+<a name="559054845"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559054845" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559054845">(Nov 24 2025 at 14:10)</a>:</h4>
+<p>darmie created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2556441409">PR review comment</a>:</p>
+<blockquote>
+<blockquote>
+<p>Same applies to the PR description, which is even worse. Did you use AI?</p>
+</blockquote>
+<p>I was worried that my original description was too brief and lacking context :) </p>
+</blockquote>
+
+
+
+<a name="559056443"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559056443" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559056443">(Nov 24 2025 at 14:16)</a>:</h4>
+<p>darmie updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>.</p>
+
+
+
+<a name="559056445"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559056445" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559056445">(Nov 24 2025 at 14:16)</a>:</h4>
+<p><strong>darmie</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-default-reviewers">wasmtime-default-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>.</p>
+
+
+
+<a name="559057069"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559057069" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559057069">(Nov 24 2025 at 14:18)</a>:</h4>
+<p>darmie updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>.</p>
+
+
+
+<a name="559058550"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559058550" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559058550">(Nov 24 2025 at 14:23)</a>:</h4>
+<p>darmie updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>.</p>
+
+
+
+<a name="559060467"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559060467" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559060467">(Nov 24 2025 at 14:30)</a>:</h4>
+<p>darmie edited <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>:</p>
+<blockquote>
+<h2>Title</h2>
+<p>fix(jit): Add MAP_JIT support for 100% stable JIT execution on ARM64 macOS</p>
+<p>Related Issue: <a href="https://github.com/bytecodealliance/wasmtime/issues/12076">https://github.com/bytecodealliance/wasmtime/issues/12076</a></p>
+<h2>Summary</h2>
+<p>This PR fixes non-deterministic JIT execution failures on Apple Silicon by implementing proper memory allocation and W^X mode handling required by the platform.</p>
+<p><strong>Before:</strong> ~56% success rate<br>
+<strong>After:</strong> 100% success rate (verified over 50+ consecutive runs)</p>
+<h2>Problem</h2>
+<p>JIT-compiled code on ARM64 macOS fails non-deterministically in multi-threaded scenarios. Symptoms include:</p>
+<table>
+<thead>
+<tr>
+<th>Failure Mode</th>
+<th>Frequency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SIGBUS on JIT function calls</td>
+<td>~30%</td>
+</tr>
+<tr>
+<td>Silent incorrect results</td>
+<td>~10%</td>
+</tr>
+<tr>
+<td>Segmentation fault</td>
+<td>~4%</td>
+</tr>
+</tbody>
+</table>
+<h3>Root Cause</h3>
+<p>Apple Silicon enforces W^X (Write XOR Execute) at the hardware level:</p>
+<ol>
+<li><strong>Memory must be allocated with <code>MAP_JIT</code> flag</strong> so the kernel can track it for W^X enforcement</li>
+<li><strong>Threads must switch to execute mode</strong> via <code>pthread_jit_write_protect_np(1)</code> before calling JIT code</li>
+</ol>
+<p>The current implementation:</p>
+<ul>
+<li>Uses standard allocator (no <code>MAP_JIT</code>)</li>
+<li>Doesn't call <code>pthread_jit_write_protect_np()</code></li>
+</ul>
+<h2>Solution</h2>
+<h3><code>cranelift/jit/src/memory/system.rs</code></h3>
+<p>Added an ARM64 macOS-specific <code>PtrLen::with_size()</code> implementation that uses <code>mmap</code> with the <code>MAP_JIT</code> flag (0x0800) instead of the standard allocator. This allows macOS to properly track the memory for W^X policy enforcement.</p>
+<p>Also added a corresponding <code>Drop</code> implementation that uses <code>munmap</code> to deallocate the memory, since memory allocated with <code>mmap</code> cannot be freed with the standard allocator.</p>
+<h3><code>cranelift/jit/src/memory/mod.rs</code></h3>
+<p>After making memory executable in <code>set_readable_and_executable()</code>, added a call to <code>pthread_jit_write_protect_np(1)</code> to switch the current thread to execute mode. This is required by Apple's W^X enforcement - threads must explicitly opt into execute mode before running JIT code.</p>
+<h2>Testing</h2>
+<h3>Test Script</h3>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code><span class="ch">#!/bin/bash</span>
+<span class="nv">passed</span><span class="o">=</span><span class="m">0</span>
+<span class="nv">failed</span><span class="o">=</span><span class="m">0</span>
+
+<span class="k">for</span><span class="w"> </span>i<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="o">{</span><span class="m">1</span>..50<span class="o">}</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span><span class="nv">result</span><span class="o">=</span><span class="k">$(</span>timeout<span class="w"> </span><span class="m">120</span><span class="w"> </span>./target/release/jit_test<span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="k">)</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">"</span><span class="nv">$result</span><span class="s2">"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-q<span class="w"> </span><span class="s2">"All tests passed"</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">        </span><span class="nb">echo</span><span class="w"> </span><span class="s2">"Run </span><span class="nv">$i</span><span class="s2">: PASSED"</span>
+<span class="w">        </span><span class="nv">passed</span><span class="o">=</span><span class="k">$((</span><span class="nv">passed</span><span class="o">+</span><span class="m">1</span><span class="k">))</span>
+<span class="w">    </span><span class="k">else</span>
+<span class="w">        </span><span class="nb">echo</span><span class="w"> </span><span class="s2">"Run </span><span class="nv">$i</span><span class="s2">: FAILED"</span>
+<span class="w">        </span><span class="nv">failed</span><span class="o">=</span><span class="k">$((</span><span class="nv">failed</span><span class="o">+</span><span class="m">1</span><span class="k">))</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="k">done</span>
+
+<span class="nb">echo</span><span class="w"> </span><span class="s2">""</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">"=== RESULTS ==="</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">"Passed: </span><span class="nv">$passed</span><span class="s2">/50, Failed: </span><span class="nv">$failed</span><span class="s2">/50"</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">"Success rate: </span><span class="k">$((</span><span class="nv">passed</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">100</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="m">50</span><span class="k">))</span><span class="s2">%"</span>
+</code></pre></div>
+<h3>Results</h3>
+<p>Tested with the <a href="https://github.com/darmie/rayzor/blob/main/compiler/examples/test_rayzor_stdlib_e2e.rs">Rayzor compiler's stdlib e2e test suite</a> (50+ JIT-compiled runtime functions, multi-threaded):</p>
+<table>
+<thead>
+<tr>
+<th>Configuration</th>
+<th>Success Rate</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Before fix (standard allocator)</td>
+<td>~56% (28/50)</td>
+</tr>
+<tr>
+<td>After fix (MAP_JIT + pthread_jit_write_protect_np)</td>
+<td><strong>100%</strong> (50/50)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Note:</strong> Simple standalone tests may not reliably reproduce this issue. The failure is non-deterministic and depends on timing, memory layout, and CPU core scheduling (P-core vs E-core).</p>
+<h2>Platform Impact</h2>
+<ul>
+<li><strong>ARM64 macOS</strong>: Fixed (was broken)</li>
+<li><strong>x86_64 macOS</strong>: No change (not affected)</li>
+<li><strong>Linux (all arch)</strong>: No change (not affected)</li>
+<li><strong>Windows</strong>: No change (not affected)</li>
+</ul>
+<p>All changes are gated behind <code>#[cfg(all(target_arch = "aarch64", target_os = "macos"))]</code>.</p>
+<h2>Related Issues</h2>
+<ul>
+<li>Fixes <a href="https://github.com/bytecodealliance/wasmtime/issues/12076">https://github.com/bytecodealliance/wasmtime/issues/12076</a></li>
+<li>Related to #2735 - Support PLT entries in <code>cranelift-jit</code> crate on aarch64</li>
+<li>Related to #8852 - Cranelift: JIT assertion failure on macOS (A64)</li>
+<li>Related to #4000 - JIT relocations depend on system allocator behaviour</li>
+</ul>
+</blockquote>
+
+
+
+<a name="559068735"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559068735" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559068735">(Nov 24 2025 at 14:58)</a>:</h4>
+<p><strong>darmie</strong> requested <a href="https://github.com/fitzgen">fitzgen</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>.</p>
+
+
+
+<a name="559068736"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559068736" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559068736">(Nov 24 2025 at 14:58)</a>:</h4>
+<p><strong>darmie</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>.</p>
+
+
+
+<a name="559068737"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559068737" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559068737">(Nov 24 2025 at 14:58)</a>:</h4>
+<p>darmie updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>.</p>
+
+
+
+<a name="559069142"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559069142" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559069142">(Nov 24 2025 at 14:59)</a>:</h4>
+<p><strong>darmie</strong> requested <a href="https://github.com/bjorn3">bjorn3</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>.</p>
+
+
+
+<a name="559083062"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559083062" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559083062">(Nov 24 2025 at 15:48)</a>:</h4>
+<p>bjorn3 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3501084236">PR review</a>.</p>
+
+
+
+<a name="559083069"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559083069" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559083069">(Nov 24 2025 at 15:48)</a>:</h4>
+<p>bjorn3 created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2556815968">PR review comment</a>:</p>
+<blockquote>
+<p>This comment is still correct outside macOS.</p>
+</blockquote>
+
+
+
+<a name="559084139"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559084139" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559084139">(Nov 24 2025 at 15:52)</a>:</h4>
+<p>bjorn3 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3501104982">PR review</a>.</p>
+
+
+
+<a name="559084143"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559084143" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559084143">(Nov 24 2025 at 15:52)</a>:</h4>
+<p>bjorn3 created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2556833003">PR review comment</a>:</p>
+<blockquote>
+<p>You can use <code>libc::MAP_JIT</code>.</p>
+</blockquote>
+
+
+
+<a name="559084379"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559084379" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559084379">(Nov 24 2025 at 15:53)</a>:</h4>
+<p>bjorn3 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3501108129">PR review</a>.</p>
+
+
+
+<a name="559084380"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559084380" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559084380">(Nov 24 2025 at 15:53)</a>:</h4>
+<p>bjorn3 created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2556835413">PR review comment</a>:</p>
+<blockquote>
+<p>Mind making these regular comments? They don't describe the public api of the function, but rather the implementation.</p>
+</blockquote>
+
+
+
+<a name="559085005"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559085005" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559085005">(Nov 24 2025 at 15:55)</a>:</h4>
+<p>bjorn3 created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2556842311">PR review comment</a>:</p>
+<blockquote>
+<p>The <code>pthread_jit_write_protect_np(0)</code> before writing to the mapped memory is missing, isn't it?</p>
+</blockquote>
+
+
+
+<a name="559085006"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559085006" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559085006">(Nov 24 2025 at 15:55)</a>:</h4>
+<p>bjorn3 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3501116497">PR review</a>.</p>
+
+
+
+<a name="559089707"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559089707" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559089707">(Nov 24 2025 at 16:12)</a>:</h4>
+<p>darmie submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3501184266">PR review</a>.</p>
+
+
+
+<a name="559089710"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559089710" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559089710">(Nov 24 2025 at 16:12)</a>:</h4>
+<p>darmie created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2556896543">PR review comment</a>:</p>
+<blockquote>
+<p>Oh yes, that's supposed to be in the with_size function. </p>
+</blockquote>
+
+
+
+<a name="559092045"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559092045" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559092045">(Nov 24 2025 at 16:20)</a>:</h4>
+<p>darmie updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>.</p>
+
+
+
+<a name="559092307"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/559092307" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#559092307">(Nov 24 2025 at 16:21)</a>:</h4>
+<p><strong>darmie</strong> requested <a href="https://github.com/bjorn3">bjorn3</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>.</p>
+
+
+
+<a name="561999823"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/561999823" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#561999823">(Dec 05 2025 at 00:36)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#issuecomment-3614860356">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>:</p>
+<blockquote>
+<p>@bjorn3 are you willing to take on review here as an owner of the cranelift-jit crate? I've written up my thoughts <a href="https://github.com/bytecodealliance/wasmtime/issues/11989#issuecomment-3614857480">here</a> on how this would all affect Wasmtime but this doesn't actually touch wasmtime except for the jit-icache-coherence crate, so   my comment there is only tangentially applicable.</p>
+</blockquote>
+
+
+
+<a name="563560584"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/563560584" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#563560584">(Dec 12 2025 at 21:02)</a>:</h4>
+<p>bjorn3 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3573592719">PR review</a>.</p>
+
+
+
+<a name="563560585"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/563560585" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#563560585">(Dec 12 2025 at 21:02)</a>:</h4>
+<p>bjorn3 created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2615572084">PR review comment</a>:</p>
+<blockquote>
+<p><a href="https://github.com/bytecodealliance/wasmtime/pull/12133">https://github.com/bytecodealliance/wasmtime/pull/12133</a> implemented another approach for this.</p>
+</blockquote>
+
+
+
+<a name="563560787"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/563560787" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#563560787">(Dec 12 2025 at 21:03)</a>:</h4>
+<p>bjorn3 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3573595691">PR review</a>.</p>
+
+
+
+<a name="563560788"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/563560788" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#563560788">(Dec 12 2025 at 21:03)</a>:</h4>
+<p>bjorn3 created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2615574968">PR review comment</a>:</p>
+<blockquote>
+<p>Would it be possible to scope those pthread_jit_write_protect_np calls to the actual section that does the writes. That would be more secure.</p>
+</blockquote>
+
+
+
+<a name="563560864"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/563560864" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#563560864">(Dec 12 2025 at 21:04)</a>:</h4>
+<p>bjorn3 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3573597692">PR review</a>.</p>
+
+
+
+<a name="563560865"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/563560865" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#563560865">(Dec 12 2025 at 21:04)</a>:</h4>
+<p>bjorn3 created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2615575943">PR review comment</a>:</p>
+<blockquote>
+<p>We should only pass MAP_JIT for pages that will actually end up being executable in the end.</p>
+</blockquote>
+
+
+
+<a name="563563527"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/563563527" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#563563527">(Dec 12 2025 at 21:24)</a>:</h4>
+<p>cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3573644089">PR review</a>.</p>
+
+
+
+<a name="563563528"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/563563528" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#563563528">(Dec 12 2025 at 21:24)</a>:</h4>
+<p>cfallin created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2615616312">PR review comment</a>:</p>
+<blockquote>
+<p>Ah, yes, I had forgotten that this PR also handled this detail. Thanks for connecting the dots!</p>
+</blockquote>
+
+
+
+<a name="570279835"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/570279835" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#570279835">(Jan 27 2026 at 10:09)</a>:</h4>
+<p>darmie updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>.</p>
+
+
+
+<a name="570280413"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/570280413" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#570280413">(Jan 27 2026 at 10:12)</a>:</h4>
+<p>darmie submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3710280844">PR review</a>.</p>
+
+
+
+<a name="570280415"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/570280415" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#570280415">(Jan 27 2026 at 10:12)</a>:</h4>
+<p>darmie created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2731246164">PR review comment</a>:</p>
+<blockquote>
+<p>@bjorn3 Done!</p>
+</blockquote>
+
+
+
+<a name="570282988"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/570282988" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#570282988">(Jan 27 2026 at 10:24)</a>:</h4>
+<p>darmie submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3710338076">PR review</a>.</p>
+
+
+
+<a name="570282991"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/570282991" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#570282991">(Jan 27 2026 at 10:24)</a>:</h4>
+<p>darmie created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2731297223">PR review comment</a>:</p>
+<blockquote>
+<p>I have pulled @cfallin's fix </p>
+</blockquote>
+
+
+
+<a name="570283030"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/570283030" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#570283030">(Jan 27 2026 at 10:24)</a>:</h4>
+<p><strong>darmie</strong> requested <a href="https://github.com/bjorn3">bjorn3</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>.</p>
+
+
+
+<a name="570283085"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/570283085" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#570283085">(Jan 27 2026 at 10:25)</a>:</h4>
+<p>darmie submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3710340022">PR review</a>.</p>
+
+
+
+<a name="570283086"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/570283086" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#570283086">(Jan 27 2026 at 10:25)</a>:</h4>
+<p>darmie created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2731299006">PR review comment</a>:</p>
+<blockquote>
+<p>@bjorn3  Done!</p>
+</blockquote>
+
+
+
+<a name="570287273"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/570287273" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#570287273">(Jan 27 2026 at 10:46)</a>:</h4>
+<p>darmie edited <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>:</p>
+<blockquote>
+<h2>Title</h2>
+<p>fix(jit): Add MAP_JIT support for 100% stable JIT execution on ARM64 macOS</p>
+<p>Related Issue: <a href="https://github.com/bytecodealliance/wasmtime/issues/12076">https://github.com/bytecodealliance/wasmtime/issues/12076</a></p>
+<h2>Summary</h2>
+<p>This PR fixes non-deterministic JIT execution failures on Apple Silicon by implementing proper memory allocation and W^X mode handling required by the platform.</p>
+<p><strong>Before:</strong> ~56% success rate<br>
+<strong>After:</strong> 100% success rate (verified over 50+ consecutive runs)</p>
+<h2>Problem</h2>
+<p>JIT-compiled code on ARM64 macOS fails non-deterministically in multi-threaded scenarios. Symptoms include:</p>
+<table>
+<thead>
+<tr>
+<th>Failure Mode</th>
+<th>Frequency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SIGBUS on JIT function calls</td>
+<td>~30%</td>
+</tr>
+<tr>
+<td>Silent incorrect results</td>
+<td>~10%</td>
+</tr>
+<tr>
+<td>Segmentation fault</td>
+<td>~4%</td>
+</tr>
+</tbody>
+</table>
+<h3>Root Cause</h3>
+<p>Apple Silicon enforces W^X (Write XOR Execute) at the hardware level:</p>
+<ol>
+<li><strong>Memory must be allocated with <code>MAP_JIT</code> flag</strong> so the kernel can track it for W^X enforcement</li>
+<li><strong>Threads must switch to execute mode</strong> via <code>pthread_jit_write_protect_np(1)</code> before calling JIT code</li>
+</ol>
+<p>The current implementation:</p>
+<ul>
+<li>Uses standard allocator (no <code>MAP_JIT</code>)</li>
+<li>Doesn't call <code>pthread_jit_write_protect_np()</code></li>
+</ul>
+<h2>Solution</h2>
+<h3><code>cranelift/jit/src/memory/system.rs</code></h3>
+<p>Added an ARM64 macOS-specific <code>PtrLen::with_size()</code> implementation that uses <code>mmap</code> with the <code>MAP_JIT</code> flag (0x0800) instead of the standard allocator. This allows macOS to properly track the memory for W^X policy enforcement.</p>
+<p>Also added a corresponding <code>Drop</code> implementation that uses <code>munmap</code> to deallocate the memory, since memory allocated with <code>mmap</code> cannot be freed with the standard allocator.</p>
+<h3><code>cranelift/jit/src/memory/mod.rs</code></h3>
+<p>After making memory executable in <code>set_readable_and_executable()</code>, added a call to <code>pthread_jit_write_protect_np(1)</code> to switch the current thread to execute mode. This is required by Apple's W^X enforcement - threads must explicitly opt into execute mode before running JIT code.</p>
+<h2>Testing</h2>
+<h3>Test Script</h3>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code><span class="ch">#!/bin/bash</span>
+<span class="nv">passed</span><span class="o">=</span><span class="m">0</span>
+<span class="nv">failed</span><span class="o">=</span><span class="m">0</span>
+
+<span class="k">for</span><span class="w"> </span>i<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="o">{</span><span class="m">1</span>..50<span class="o">}</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span><span class="nv">result</span><span class="o">=</span><span class="k">$(</span>timeout<span class="w"> </span><span class="m">120</span><span class="w"> </span>./target/release/jit_test<span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="k">)</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">"</span><span class="nv">$result</span><span class="s2">"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-q<span class="w"> </span><span class="s2">"All tests passed"</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">        </span><span class="nb">echo</span><span class="w"> </span><span class="s2">"Run </span><span class="nv">$i</span><span class="s2">: PASSED"</span>
+<span class="w">        </span><span class="nv">passed</span><span class="o">=</span><span class="k">$((</span><span class="nv">passed</span><span class="o">+</span><span class="m">1</span><span class="k">))</span>
+<span class="w">    </span><span class="k">else</span>
+<span class="w">        </span><span class="nb">echo</span><span class="w"> </span><span class="s2">"Run </span><span class="nv">$i</span><span class="s2">: FAILED"</span>
+<span class="w">        </span><span class="nv">failed</span><span class="o">=</span><span class="k">$((</span><span class="nv">failed</span><span class="o">+</span><span class="m">1</span><span class="k">))</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="k">done</span>
+
+<span class="nb">echo</span><span class="w"> </span><span class="s2">""</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">"=== RESULTS ==="</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">"Passed: </span><span class="nv">$passed</span><span class="s2">/50, Failed: </span><span class="nv">$failed</span><span class="s2">/50"</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">"Success rate: </span><span class="k">$((</span><span class="nv">passed</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">100</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="m">50</span><span class="k">))</span><span class="s2">%"</span>
+</code></pre></div>
+<h3>Results</h3>
+<p>Tested with the <a href="https://github.com/darmie/rayzor/blob/main/compiler/examples/test_rayzor_stdlib_e2e.rs">Rayzor compiler's stdlib e2e test suite</a> (50+ JIT-compiled runtime functions, multi-threaded):</p>
+<table>
+<thead>
+<tr>
+<th>Configuration</th>
+<th>Success Rate</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Before fix (standard allocator)</td>
+<td>~56% (28/50)</td>
+</tr>
+<tr>
+<td>After fix (MAP_JIT + pthread_jit_write_protect_np)</td>
+<td><strong>100%</strong> (50/50)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Note:</strong> Simple standalone tests may not reliably reproduce this issue. The failure is non-deterministic and depends on timing, memory layout, and CPU core scheduling (P-core vs E-core).</p>
+<h2>Platform Impact</h2>
+<ul>
+<li><strong>ARM64 macOS</strong>: Fixed (was broken)</li>
+<li><strong>x86_64 macOS</strong>: No change (not affected)</li>
+<li><strong>Linux (all arch)</strong>: Adds Linux x86_64 mmap hint to keep JIT code within 2GB of<br>
+runtime symbols for PC-relative relocations</li>
+<li><strong>Windows</strong>: No change (not affected)</li>
+</ul>
+<p>All changes are gated behind <code>#[cfg(all(target_arch = "aarch64", target_os = "macos"))]</code>.</p>
+<h2>Related Issues</h2>
+<ul>
+<li>Fixes <a href="https://github.com/bytecodealliance/wasmtime/issues/12076">https://github.com/bytecodealliance/wasmtime/issues/12076</a></li>
+<li>Related to #2735 - Support PLT entries in <code>cranelift-jit</code> crate on aarch64</li>
+<li>Related to #8852 - Cranelift: JIT assertion failure on macOS (A64)</li>
+<li>Related to #4000 - JIT relocations depend on system allocator behaviour</li>
+</ul>
+</blockquote>
+
+
+
+<a name="574245296"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/574245296" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#574245296">(Feb 17 2026 at 09:17)</a>:</h4>
+<p>darmie <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#issuecomment-3913268812">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>:</p>
+<blockquote>
+<p>Hi @bjorn3 , just want to remind you of this PR </p>
+</blockquote>
+
+
+
+<a name="574258636"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/574258636" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#574258636">(Feb 17 2026 at 10:30)</a>:</h4>
+<p>bjorn3 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3813086297">PR review</a>.</p>
+
+
+
+<a name="574258637"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/574258637" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#574258637">(Feb 17 2026 at 10:30)</a>:</h4>
+<p>bjorn3 created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2816224370">PR review comment</a>:</p>
+<blockquote>
+<p>It is still not fully scoped. Fully scoping would be adding it around <a href="https://github.com/bytecodealliance/wasmtime/blob/f6418005cd282f32840483709c448cf2e8ac808a/cranelift/jit/src/compiled_blob.rs#L53-L55">https://github.com/bytecodealliance/wasmtime/blob/f6418005cd282f32840483709c448cf2e8ac808a/cranelift/jit/src/compiled_blob.rs#L53-L55</a> and the start and end of <a href="https://github.com/bytecodealliance/wasmtime/blob/f6418005cd282f32840483709c448cf2e8ac808a/cranelift/jit/src/compiled_blob.rs#L104">https://github.com/bytecodealliance/wasmtime/blob/f6418005cd282f32840483709c448cf2e8ac808a/cranelift/jit/src/compiled_blob.rs#L104</a> (when the memory kind is executable in both cases)</p>
+</blockquote>
+
+
+
+<a name="574366802"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/574366802" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#574366802">(Feb 17 2026 at 19:10)</a>:</h4>
+<p>darmie updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>.</p>
+
+
+
+<a name="574367194"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/574367194" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#574367194">(Feb 17 2026 at 19:12)</a>:</h4>
+<p>darmie submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3815809246">PR review</a>.</p>
+
+
+
+<a name="574367198"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/574367198" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#574367198">(Feb 17 2026 at 19:12)</a>:</h4>
+<p>darmie created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2818642812">PR review comment</a>:</p>
+<blockquote>
+<p>@bjorn3  W^X scoping fix has been moved to <a href="http://compiled_blob.rs">compiled_blob.rs</a>, now scoped around the sites you mentioned.</p>
+</blockquote>
+
+
+
+<a name="574504790"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/574504790" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#574504790">(Feb 18 2026 at 13:15)</a>:</h4>
+<p>darmie submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#pullrequestreview-3819856238">PR review</a>.</p>
+
+
+
+<a name="574504796"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/574504796" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#574504796">(Feb 18 2026 at 13:15)</a>:</h4>
+<p>darmie created <a href="https://github.com/bytecodealliance/wasmtime/pull/12077#discussion_r2822295062">PR review comment</a>:</p>
+<blockquote>
+<p>@bjorn3 let me know if this is sufficient</p>
+</blockquote>
+
+
+
+<a name="575153720"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312077%20fix%28jit%29%3A%20Add%20MAP_JIT%20support%20for%2010.../near/575153720" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312077.20fix.28jit.29.3A.20Add.20MAP_JIT.20support.20for.2010.2E.2E.2E.html#575153720">(Feb 22 2026 at 10:43)</a>:</h4>
+<p>darmie updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12077">PR #12077</a>.</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

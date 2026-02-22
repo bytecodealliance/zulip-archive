@@ -1,0 +1,412 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #1749 Use virtual memory tricks to make ... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html">wasmtime / issue #1749 Use virtual memory tricks to make ...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="488915631"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/488915631" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#488915631">(Dec 13 2024 at 20:30)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-2542264565">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>Brief summary of an evolution of this idea that came up from discussion between @cfallin, @aturon, and myself:</p>
+<ul>
+<li>Instead of removing read permissions from a well-known page, Wasmtime removes read and write permissions from the Wasm instance's stack(s). This will cause the Wasm guest to fault the next time it touches the stack.</li>
+<li>We don't need to emit any additional loads in function prologues (as long as the function touches the stack at any point, i.e. is not a leaf function) or loop headers (as long as the loop body touches the stack at some point).</li>
+<li>Otherwise, we emit dead loads from the stack in the necessary places (function prologue and loop headers). Note that this is still an improvement over what was described in the OP, which required chained loads through the vmctx.</li>
+<li>We need to be careful about when we are touching the Wasm stack from host code, for example when capturing a Wasm backtrace, and set a flag somewhere that means "we are running host code" that the signal handler can see and use to cooperate with the host code. In general there are a lot of potential TOCTOU bugs here between checking any flags and unmapping the stack.<ul>
+<li>If we unmap the stack and host code execution trips the signal handler, then in the signal handler we can set a interrupt-requested-during-host-code flag in the vmctx or somewhere, remap the stack, and then setcontext to the trapping host code and continue. Every call/return from host code to Wasm would check whether an interrupt was requested during the host code's execution and raise a trap or whatever as appropriate.</li>
+</ul>
+</li>
+</ul>
+<p>Compared to the current epoch system, this gets us faster Wasm execution at the cost of making interruption more expensive. Given that the performance trade offs are different, it may make sense to support both, rather than replace epochs with this proposed virtual memory system.</p>
+</blockquote>
+
+
+
+<a name="511498172"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/511498172" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#511498172">(Apr 10 2025 at 20:00)</a>:</h4>
+<p>posborne <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-2795031660">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>This question probably stems from a degree of naivety, but I'm wondering why, with appropriate guards in place, it would be preferred to have a trap be caused by accessing stack memory over just having a signal be raised on the thread executing guest code (e.g. using tkill on linux).</p>
+<p>In either case, I think we need some synchronization around guest entry/exit to indicate "we are running host code" which would seem like it _might_ be enough to guard against inadvertently guard against having the signal handler go off while in host code (but maybe not).</p>
+<p>If that approach was feasible, it seems like it would potentially have a couple benefits:</p>
+<ol>
+<li>We're able to preempt at points outside of when the guest code is touching the stack.  I can't think of specific cases where this would be problematic but I'm far from being an expert here and could see this being where there are problems.</li>
+<li>This would remove the need to insert dead loads or similar in leaf code that doesn't touch the stack.</li>
+</ol>
+<p>This definitely seems very promising regardless given that I think most production use cases have some need for preemption to enforce timeouts and/or interact better with async schedulers, etc.  I'm also curious to see if guest profiling accuracy is able to benefit from this for some workloads.</p>
+<p>I briefly reviewed the trap handling code but am still filling in a lot of knowledge gaps.</p>
+</blockquote>
+
+
+
+<a name="511500728"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/511500728" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#511500728">(Apr 10 2025 at 20:16)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-2795064416">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<blockquote>
+<p>I'm wondering why, with appropriate guards in place, it would be preferred to have a trap be caused by accessing stack memory over just having a signal be raised on the thread executing guest code (e.g. using tkill on linux).</p>
+</blockquote>
+<p>The tricky bits here are:</p>
+<ol>
+<li>Handling when VM or host code is running, rather than Wasm. We could probably use the same technique described in <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-2542264565">https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-2542264565</a> though.</li>
+<li>A Wasm guest isn't pinned to a particular thread, and can migrate across different threads between <code>poll</code>s, so we don't automatically know which thread to <code>tkill</code>. We could grab the thread id whenever we call into wasm, but that might add unacceptable overhead to our host-to-wasm call path. I don't have a sense of the overheads involved here.</li>
+</ol>
+<p>But if these hurdles can be overcome, then this sounds pretty promising, since we won't even need compiler changes to implement this, just runtime changes.</p>
+</blockquote>
+
+
+
+<a name="511500731"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/511500731" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#511500731">(Apr 10 2025 at 20:16)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-2795064469">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>@posborne that's a great question. In general we have shied away from signal-based solutions because (i) they're not as portable (to Windows at least?), (ii) signal-handler code is (as I'm sure you know!) very limited in what it can do, and has to be careful about race conditions. That said, the underlying mechanism to catch a page fault per this issue's idea is to catch a <code>SIGSEGV</code> so perhaps it's not so different -- the main thing is that in the case of a munmap-based approach, we have a deterministic location we know this trap will occur, while with a signal, it may come in odd places in trampolines, etc.</p>
+<p>I suppose the main question to answer would be: do we need signal-masking at any point to avoid race conditions when entering and leaving Wasm code; if so, that probably tips the balance away, as we want close to zero cost in the common (non-interrupting) case and syscalls on entry/exit would be fatal to that.</p>
+</blockquote>
+
+
+
+<a name="511501535"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/511501535" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#511501535">(Apr 10 2025 at 20:21)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-2795074049">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>Ah -- thread migration is an interesting case -- one needs some answer for the TOCTOU problem (I look up the tid running a guest; guest calls to host and host does an async suspend, and async executor thread goes off and does something completely different; then I send signal). I suppose signal handler registration is global to the ambient environment, so we would still catch the signal, and we would need to examine TLS and see that we're not active in Wasm (and just ignore the signal probably).</p>
+</blockquote>
+
+
+
+<a name="511502023"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/511502023" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#511502023">(Apr 10 2025 at 20:24)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-2795079749">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>One thing I can note is that our current signal handler is definitely not async-signal-safe. The signal handler calls <a href="https://github.com/bytecodealliance/wasmtime/blob/f1383ec6a09f84e214d78d9ce76fe351d48fac9f/crates/wasmtime/src/runtime/vm/sys/unix/signals.rs#L161"><code>test_if_trap</code></a> which <a href="https://github.com/bytecodealliance/wasmtime/blob/f1383ec6a09f84e214d78d9ce76fe351d48fac9f/crates/wasmtime/src/runtime/vm/traphandlers.rs#L729">calls <code>lookup_code</code></a> which <a href="https://github.com/bytecodealliance/wasmtime/blob/f1383ec6a09f84e214d78d9ce76fe351d48fac9f/crates/wasmtime/src/runtime/module/registry.rs#L262">acquires a global rwlock</a>. This is "mostly ok" for signals today where none of them are asynchronous and it'd only  be problematic if we segfaulted in the host while holding the write lock (which is unlikely). With async signals though this is naturally unsafe since we could get a signal during the write lock for the thread holding the write lock.</p>
+<p>I'd also second @cfallin's point ab out TOCTOU, historically I've never known how to safely construct a list of threads at any one point in time that need interruption. Coupled with the possible overhead of scheduling interruptions and synchronization around interruption it didn't seem the most appealing to me</p>
+</blockquote>
+
+
+
+<a name="511519641"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/511519641" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#511519641">(Apr 10 2025 at 22:30)</a>:</h4>
+<p>posborne <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-2795309713">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>Thanks for the responses, the reasoning seems solid to me, especially given that the host/guest transition is itself going to be hit pretty heavily in a lot of workloads.  I did a little bit of benchmarking with epoch interrupts enabled/disabled and the savings looked very promising (was seeing between ~2-15% improvement depending on the benchmark with many being &gt;10% improvement).  Given that we should still see an improvement even if we need to emit dead loads in loop headers I'm still anticipating we could see a very respectable improvement from the optimization based on munmap.</p>
+<p>Definitely don't want to add any significant overhead to the host/guest boundary since that's probably more relevant to a lot of real-world workloads than what we typically end up hitting with most synthetic benchmarks primarily focused on guest execution.</p>
+</blockquote>
+
+
+
+<a name="519873656"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/519873656" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#519873656">(May 22 2025 at 16:13)</a>:</h4>
+<p>erikrose <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-2901819980">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>Would someone assign this to me, please? Thanks!</p>
+</blockquote>
+
+
+
+<a name="519874119"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/519874119" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#519874119">(May 22 2025 at 16:15)</a>:</h4>
+<p>abrown assigned erikrose to <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>.</p>
+
+
+
+<a name="555409311"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/555409311" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#555409311">(Nov 13 2025 at 16:54)</a>:</h4>
+<p>erikrose <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3528767617">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>Here is my <a href="https://github.com/bytecodealliance/wasmtime/compare/main...erikrose:wasmtime:epoch-mmu">work in progress</a>. I am approaching it incrementally, first using the simpler "interrupt page" (per <code>Store</code>, i.e. per thread) method and then, once that works end to end, replacing it with a protected stack. It will be interesting to measure the difference between them.</p>
+<p>So far, I've added a new <code>epoch-interruption-via-mmu</code> option and got dead loads from the interrupt page generating in function prologues and loop headers. I'm now working on a way to trigger an interrupt (by protecting a page). Finally I'll see about the signal handler.</p>
+</blockquote>
+
+
+
+<a name="558265840"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/558265840" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#558265840">(Nov 19 2025 at 17:31)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3553893544">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>We had some more discussion about this in a meeting at some point a few moons ago and forgot to update here, but @erikrose before you go too far down the implementation road I wanted to try to recall what we were talking about long ago and write it down here too.</p>
+<p>The main concrete point I remember is that signal handlers are extremely tricky and their viability requires carefully balancing various other concerns too. As-is Wasmtime uses a sigaltstack for signals which means that it's not possible to implement interrupt checks with virtual tricks. An epoch change requires stack-switching off the wasm stack for example, and that's not possible to do from the shared resource of the sigaltstack in a signal handler. That would, for example, try to later resume to frames on the stack which have possibly been clobbered by other signals.</p>
+<p>A possible fix for this is to remove the sigaltstack, but that removes any sort of possible indicator when a stack overflow happens (e.g. as opposed to the "you overflowed the stack" message that's printed out by the Rust standard library). This is a relatively invasive fix though because I've found such a message to be extremely useful historically. This additionally requires total knowledge of the signal handler in the process so this would likely need to be an <code>unsafe</code> and off-by-default option because otherwise Wasmtime is designed to play nicely with other signal handlers in the process.</p>
+<p>Overall I'd recommend considering the signal handler side of things first rather than last because it's often the trickiest part of the system. Where possible I'd recommend doing anything nontrivial in signal handlers altogether. For example for debugging Chris is working on a Cranelift extension for breakpoints and something like that might be suitable here too. The ideal signal handler, IMO, resumes back to the wasm code, possibly with updated state, so that way the signal handler is entirely out of the picture. For example ideally the interrupt check could be a special CLIF instruction or something like that where metadata indicates how to resume it (e.g. a special stub, special ABI, etc). That way when an interrupt happens due to a fault the wasm code would be resumed, at a different location, and the new location would be the one that actually does the suspension.</p>
+</blockquote>
+
+
+
+<a name="558271482"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/558271482" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#558271482">(Nov 19 2025 at 18:03)</a>:</h4>
+<p>erikrose <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3554004468">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>Thanks, Alex. I'll take some time to meditate over this.</p>
+<blockquote>
+<p>Where possible I'd recommend doing anything nontrivial in signal handlers altogether.</p>
+</blockquote>
+<p>Can I assume you meant "recommend against" there?</p>
+</blockquote>
+
+
+
+<a name="558273445"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/558273445" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#558273445">(Nov 19 2025 at 18:13)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3554045738">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>Oh oops, indeed! We've basically had a trend so far of every time we do something nontrivial in a signal handler we end up having to walk it back as much as we can. For example historically we did a longjmp out of a signal handler but that was messy for a whole host of reasons so now signal handlers all return one way or another. Part of this is also the portability of what we do in signal handlers, but I realize that's also less of a concern here</p>
+</blockquote>
+
+
+
+<a name="558275368"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/558275368" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#558275368">(Nov 19 2025 at 18:24)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3554084409">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>To add a bit: in #11930 I worked out how to actually do the dance of "call injection" where, from a signal handler, one modifies the interrupted/paused state to return to some injected trampoline that can then do something else. You'd need something like this to make the unmapped-stack mechanism work: in the handler, remap the stack and update state so that it's as-if a yield hostcall were invoked.</p>
+<p>I ended up turning away from that approach for now because of complexity. It's along two main dimensions: first, platform support -- I got this working for Linux but macOS and Windows have mutually incompatible capabilities and requirements during the signal-handling phase (see the bullet points in <a href="https://github.com/bytecodealliance/wasmtime/pull/11930#issuecomment-3440174125">this comment</a>) that together with ABI variations mean we need something like ~8 assembly stubs and we have to be sure all are tested. Then there are gnarly pointer-provenance questions about getting a vmctx (which I think you need for yield?) for which I think I had a valid answer under tree-borrows, but not stack-borrows. In the end all of this wasn't worth it for debugging -- I'm going to actually patch in calls instead. The "ownership of store / pointer provenance" question is actually the biggest issue with any signal-based scheme IMHO -- we go to somewhat extreme lengths to use TLS and keep raw pointers to only the bits needed for trap handling, but the deeper one gets into the runtime's data structures and need to access them during a signal, the trickier the story becomes.</p>
+</blockquote>
+
+
+
+<a name="560488413"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/560488413" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#560488413">(Nov 26 2025 at 22:49)</a>:</h4>
+<p>erikrose <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3583465523">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>@alexcrichton @cfallin Thank you for your detailed writeups! The way this is slowly agglomerating in my head is something like…</p>
+<ul>
+<li>Keep the sigaltstack.</li>
+<li>
+<p>My dead loads at the tops of functions and loops become uses of a new "touch-interrupt-page" CLIF instruction instead, which spits out something like this:<br>
+<code>
+  Attempt a load from interrupt page.
+  Jump to CONTINUE.
+  Yield task.
+  CONTINUE:
+  …rest of normal wasm code
+  </code></p>
+</li>
+<li>
+<p>The signal handler jimmies its return address to land at <code>Yield task</code> instead of the <code>Jump to CONTINUE</code>. This lets the signal handler exit relatively normally, i.e. it's not around anymore when it comes time to yield. The yielding is then done as if it was part of the ordinary flow of wasm code.</p>
+</li>
+</ul>
+<p>Note that, while I've read Chris's linked ticket, I haven't gone through his code yet. Also, I need to understand how yielding is currently implemented (and thus what I'd need to get ahold of to do a yield).</p>
+<p>I imagine, as Chris enumerates, that the devil is in the details, though I hope this particular devil can be bargained with. Am I on a somewhat reasonable track, do you think? Thank you again!</p>
+</blockquote>
+
+
+
+<a name="560490778"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/560490778" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#560490778">(Nov 26 2025 at 23:09)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3583504332">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>I'll re-emphasize my takeaway from my adventures linked above, which is that I think an approach that works with signal frames like this has a significant maintenance burden that is hard to justify without really compelling performance numbers.</p>
+<p>Some proof-point questions to resolve early before investing a lot more time are:</p>
+<ul>
+<li>What state do you need to do the "epoch yield" hostcall?</li>
+<li>Does this state include anything related to the fiber currently on the stack? (I think the answer is "yes")</li>
+<li>Who owns that fiber? (The answer is somewhere between "the current store" and "random stack frames on-stack", neither of which is accessible from a signal context)</li>
+<li>Can you provide a UB-free ownership transfer story whereby the interrupt at a random point in compiled code safely gets a borrow of those fibers and can do a yield? Can you show this works in miri?</li>
+</ul>
+<p>Basically this is the "pointer provenance" question I mention above -- not just a "devil is in the details" to be optimistically charged toward but IMHO a fundamental design issue that prevents this kind of trick from working without a big refactor.</p>
+<p>If I were attempting to make this work my first step would be to figure out a way to keep the current store in TLS and be able to get it without the vmctx passed into hostcalls when host code takes control; and make miri happy while doing that. That then enables the rest of this to be possible. The trampoline plumbing and register-state-swapping is comparatively easy (and fun!) -- see my trampolines above.</p>
+<p>While we're discussing tradeoffs, I'm curious: what is the current delta you're observing between epoch-based performance and performance with the dead accesses to stack?</p>
+</blockquote>
+
+
+
+<a name="560494652"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/560494652" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#560494652">(Nov 26 2025 at 23:49)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3583571734">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>Given enough Cranelift intrinsics I think this wouldn't involve changing any provenance things, which might be worth exploring. For example doing something similar to the debug handling Chris you're doing:</p>
+<ul>
+<li>We could have a CLIF instruction which looks like a <code>call</code> with the "patchable" ABI which actually does a load</li>
+<li>If that load segfaults, the signal handler uses module metadata, which it already has, to go from "pc to patchable thing"</li>
+<li>The signal handler uses this metadata to redirect the pc to the known stub using the "patchable" ABI</li>
+<li>ABI-wise we can guarantee that vmctx is in a specific register (e.g. first argument) and we can also guarantee the return address is in a specific register (e.g. second argument)</li>
+<li>This stub would "push" a call frame, then do the normal new_epoch libcall. </li>
+</ul>
+<p>I'm not sure how best/feasible it would be to model this all in Cranelift, but that would at least keep the signal handler "clean" (no new state, it returns as usual today) as well as not dealing with provenance issues (no new state in the signal handler, so it's all as-is). Not the least of which is the current patchable ABI probably wouldn't work for this since something needs to be clobbered as the return address needs to be stored somewhere. And the fact that the ABI needs to set up the call frame on behalf of the caller too.</p>
+<p>That's a pretty significant Cranelift extension (to me at least), so I'd agree it'd be good to get some numbers on the possible delta first.</p>
+</blockquote>
+
+
+
+<a name="560497431"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/560497431" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#560497431">(Nov 27 2025 at 00:23)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3583628265">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>Expanding on that thought a bit...</p>
+<ul>
+<li>Assuming we can change the <code>patchable</code> ABI to clobber some registers</li>
+<li>Assuming we can add a CLIF instruction that looks like a <code>call</code> but codegens a <code>load</code></li>
+</ul>
+<p>in theory that's all the changes to CLIF necessary. Semantics-wise it's as if the function is called every time according to CLIF, but in actuality it's codegen'd as a load that sometimes "calls" via a signal handler. The signal handler would resume at an inline assembly stub which would push a call frame then jump to the Cranelift-generated function that has the <code>patchable</code> ABI and does the yield. So the purpose of the inline assembly would be "pretend a <code>call</code> actually got executed" and it would understand the <code>patchable</code> ABI to know that the vmctx is in a particular register, the return address is in a particular register, and probably the address of the "do the yield" patchable-ABI-CLIF-generated-function is in a register too. </p>
+<p>Whether that's reasonable to burn 3 registers on every loop is perhaps another question, but that's at least a rough idea to scope down the theoretical Cranelift changes to something more tractable.</p>
+</blockquote>
+
+
+
+<a name="560502420"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/560502420" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#560502420">(Nov 27 2025 at 01:38)</a>:</h4>
+<p>posborne <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3583887612">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>This was a smaller sightglass bench run with just the default suite comparing epoch disabled, enabled in v39, and enabled with Erik's changes (@ 1d94a21e2bd2a52126f6fcad6f29b49c6d3e00e3).  At least in it's present form, the improvement seems modest/mixed and still lots of gap room compared with epoch disabled.</p>
+<p>Relatively small sample size and all that -- I can do a more complete run with additional iterations if desired.</p>
+<p>&lt;img width="1836" height="422" alt="Image" src="<a href="https://github.com/user-attachments/assets/09b46aca-0a4b-4e09-ac50-ca59f9d2168a">https://github.com/user-attachments/assets/09b46aca-0a4b-4e09-ac50-ca59f9d2168a</a>" /&gt;</p>
+<p><a href="https://github.com/user-attachments/files/23781403/epoch-bench.html">epoch-bench.html</a></p>
+</blockquote>
+
+
+
+<a name="560503167"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/560503167" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#560503167">(Nov 27 2025 at 01:50)</a>:</h4>
+<p>posborne edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3583887612">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p><strong>EDIT: I missed that there was a new config flag to enable the alternate MMU behavior.  Will get new numbers shortly and update.</strong></p>
+<p>This was a smaller sightglass bench run with just the default suite comparing epoch disabled, enabled in v39, and enabled with Erik's changes (@ 1d94a21e2bd2a52126f6fcad6f29b49c6d3e00e3).  At least in it's present form, the improvement seems modest/mixed and still lots of gap room compared with epoch disabled.</p>
+<p>Relatively small sample size and all that -- I can do a more complete run with additional iterations if desired.</p>
+<p>&lt;img width="1836" height="422" alt="Image" src="<a href="https://github.com/user-attachments/assets/09b46aca-0a4b-4e09-ac50-ca59f9d2168a">https://github.com/user-attachments/assets/09b46aca-0a4b-4e09-ac50-ca59f9d2168a</a>" /&gt;</p>
+<p><a href="https://github.com/user-attachments/files/23781403/epoch-bench.html">epoch-bench.html</a></p>
+</blockquote>
+
+
+
+<a name="560503791"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/560503791" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#560503791">(Nov 27 2025 at 01:54)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3583912344">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>@posborne thanks for posting that data!</p>
+<p>So if I'm reading the table correctly, assuming that we want some interruption mechanism, we are choosing between the last two columns; middle column is status-quo today (vanilla epochs) and right column is the instrumentation required for VM tricks. Right column is ~0.5% faster for bz2, ~4.5% slower for pulldown-cmark, and ~1% faster for SpiderMonkey. Is that right?</p>
+<p>If that's the case, it doesn't seem worth the big complexity jump for 1% on SpiderMonkey, and the slowdown on pulldown is pretty concerning. Did y'all work out any explanations for this effect? E.g. perf counters showing that the stores are more expensive than the load-mostly-constant-data-compare-and-branch of epochs? (And remind me: why do we need stores rather than loads, if we're going to fully unmap the stack to interrupt?)</p>
+</blockquote>
+
+
+
+<a name="560506546"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/560506546" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#560506546">(Nov 27 2025 at 02:32)</a>:</h4>
+<p>posborne edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3583887612">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p><strong>EDIT: I missed that there was a new config flag to enable the alternate MMU behavior.  Will get new numbers shortly and update.  Numbers here are updated, though check my work on the flags @erikrose</strong></p>
+<p>This was a smaller sightglass bench run with just the default suite comparing epoch disabled, enabled, and enabled via mmu on the same commit (@ 1d94a21e2bd2a52126f6fcad6f29b49c6d3e00e3).</p>
+<p>Relatively small sample size and all that -- I can do a more complete run with additional iterations if desired.</p>
+<p>&lt;img width="2640" height="404" alt="Image" src="<a href="https://github.com/user-attachments/assets/32a54454-e1e7-42f7-b618-9f125951050a">https://github.com/user-attachments/assets/32a54454-e1e7-42f7-b618-9f125951050a</a>" /&gt;</p>
+<p><a href="https://github.com/user-attachments/files/23783469/report.html">report.html</a></p>
+</blockquote>
+
+
+
+<a name="560506634"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/560506634" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#560506634">(Nov 27 2025 at 02:33)</a>:</h4>
+<p>posborne <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3583979332">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>I updated my previous comments as I was not using the correct flag to do things via MMU; the delta there does seem much more promising coming very close to baseline performance if I gathered results correctly.</p>
+</blockquote>
+
+
+
+<a name="560506965"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/560506965" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#560506965">(Nov 27 2025 at 02:39)</a>:</h4>
+<p>posborne <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3583987666">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>@cfallin I had made a mistake with the earlier numbers, I had missed that @erikrose had added a new flag to hit the code path he added.  In adddition, I think v39 -&gt; main must have some unrelated improvements that helped the pulldown-cmark benchmark.</p>
+<p>I've updated my previously posted snapshot but could use confirmation from @erikrose that correct usage doesn't require specifying both <code>-Wepoch-interruption=y</code> and <code>-Wepoch-interruption-via-mmu=y</code>.</p>
+<p>In the earlier example and this one, the baseline displayed is with any form of epoch interrupts disabled to show the absolute best case with the differences displayed being the statistically significant variation from the baseline.</p>
+</blockquote>
+
+
+
+<a name="560517137"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/560517137" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#560517137">(Nov 27 2025 at 05:05)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3584219044">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>Ah, OK, that's much different data now, and more compelling!</p>
+<p>I agree with Alex that a special instruction with register constraints such that we can effectively make the signal a call would be much easier to implement. I think we'd want to scope this feature to Linux as well -- as discussed in the other threads about call injection on signals for debugging, call injection needs to take a slightly different shape for Linux, Windows, and macOS due to mutually incompatible constraints (no sigaltstack on Windows, different thread on macOS).</p>
+</blockquote>
+
+
+
+<a name="561227226"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/561227226" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#561227226">(Dec 01 2025 at 17:21)</a>:</h4>
+<p>erikrose <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3597854978">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>@posborne and I talked off to the side, but, to confirm in-thread: all you need is <code>epoch_interruption_via_mmu</code>. Atm, it and the existing <code>epoch_interruption</code> are orthogonal, but that's not the final state of things, as there should be no reason to use both at once.</p>
+<p>Thanks for doing the benchmarks, Paul! On our prod loads, we measured a difference of 15% back in January, so It's exciting (and darn convenient) to see that hold up locally.</p>
+</blockquote>
+
+
+
+<a name="561259213"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/561259213" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#561259213">(Dec 01 2025 at 19:39)</a>:</h4>
+<p>erikrose edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3597854978">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>@posborne and I talked off to the side, but, to confirm in-thread: all you need is <code>epoch_interruption_via_mmu</code>. Atm, it and the existing <code>epoch_interruption</code> are orthogonal, but that's not the final state of things, as there should be no reason to use both at once.</p>
+<p>Thanks for doing the benchmarks, Paul! On our prod loads, we measured a difference of 15% back in January (between epochs and nothing), so It's exciting (and darn convenient) to see that hold up locally.</p>
+</blockquote>
+
+
+
+<a name="561259243"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/561259243" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#561259243">(Dec 01 2025 at 19:39)</a>:</h4>
+<p>erikrose edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3597854978">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>@posborne and I talked off to the side, but, to confirm in-thread: all you need is <code>epoch_interruption_via_mmu</code>. Atm, it and the existing <code>epoch_interruption</code> are orthogonal, but that's not the final state of things, as there should be no reason to use both at once.</p>
+<p>Thanks for doing the benchmarks, Paul! On our prod loads, we measured a difference of 15% back in January (between deadline-based epochs and nothing), so It's exciting (and darn convenient) to see that hold up locally.</p>
+</blockquote>
+
+
+
+<a name="561555010"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/561555010" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#561555010">(Dec 03 2025 at 03:01)</a>:</h4>
+<p>erikrose <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3604837577">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>@cfallin Quoting from <a href="https://github.com/bytecodealliance/wasmtime/pull/12101#issuecomment-3598788048">https://github.com/bytecodealliance/wasmtime/pull/12101#issuecomment-3598788048</a> to continue discussion on a live ticket and tie these two together…</p>
+<blockquote>
+<p>@erikrose there's a potential epoch-yield mechanism that requires no dead loads/stores at all -- happy to discuss further.</p>
+</blockquote>
+<p>Sure thing! Are you thinking to have the embedder call some method on the <code>Store</code> that un-NOPs patchable yield calls?</p>
+<blockquote>
+<p>So I guess the instruction one would actually want for the epochs case is patchable_call_or_load %epoch_yield(v0), v1 with v1 being the page that gets unmapped to cause a SIGSEGV, then in that context do the patch (and there we do have the Store. Happy to sketch how that should look if @erikrose is curious.</p>
+</blockquote>
+<p>I will gratefully accept any sketches you care to render. The high-level view you give seems clear. I certainly have the <code>vmctx</code> and the interrupt page address around when I codegen my current dead loads. I don't yet see how, within the signal handler, to get a ptr to the instructions to un-NOP. On second thought, if we follow <a href="https://www.man7.org/linux/man-pages/man3/getcontext.3.html"><code>ucontext_t.uc_link-&gt;uc_stack</code></a> to find the return address, that's pretty much it, isn't it?</p>
+<p>I'm not clear on where the signal handler gets the instructions to patch in.</p>
+<p>Looking forward to chatting at tomorrow's Cranelift meeting!</p>
+</blockquote>
+
+
+
+<a name="561779575"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/561779575" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#561779575">(Dec 04 2025 at 01:28)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3609530740">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>To summarize what I think is a good approach with the help of a small Cranelift extension, based on discussion in the Cranelift meeting this morning:</p>
+<ul>
+<li>We should have an instruction <code>dead_load_with_context</code> that performs a "dead load" (does not def the result, but does have the side-effect of reading memory), and carries "context", that is, another SSA value placed in a fixed register so that a signal handler knows where to look. That fixed register should not be clobbered, and should live in the first argument register (<code>rdi</code>), probably: this allows compiled code from Wasmtime to, in the common case, use this for <code>vmctx</code> and keep <code>vmctx</code> in the first arg reg almost all of the time. The idea is that we'll need to get ownership of the <code>vmctx</code> and thus <code>Store</code> (via <code>Store::enter_host_from_wasm</code>) in order to do the yield, and absent any other information, we can't get this from the arbitrary register state at the faulting load.</li>
+<li>We should build some signal handler magic that, like my earlier PRs that did "call injection" on signals, overwrites the return address of a signal when we know the signal comes from an epoch-check load (we can add to the module metadata, produced alongside e.g. trap codes, to know this). We will need to save the original return address. Note from my comments on OS platform details around call-injection that we can't simulate a callframe by directly pushing onto the stack; we'll need to stash the true return address somewhere else. That will necessitate probably another fixed reg constraint on the <code>dead_load_with_context</code> to act as a scratch.</li>
+<li>Then on a SIGSEGV at this magic load, we update PC (<code>rip</code>) to point to a stub (see my earlier PRs for examples) that saves all context and invokes an actual hostcall with the vmctx value (similar to the existing epoch-yield hostcall).</li>
+</ul>
+<p>The concrete pieces you'll need to build are:</p>
+<ul>
+<li>the Cranelift instruction</li>
+<li>the unmapped-on-interrupt page and pointer to it in vmctx</li>
+<li>new metadata emitted by the Cranelift instruction, and put into compiled-artifact tables, to indicate that this is an interruption-point load</li>
+<li>special logic in the signal handler that, when seeing such PC, updates state to redirect to the stub, saving the original PC</li>
+<li>that stub, saving all register state and invoking a hostcall with the recovered vmctx</li>
+</ul>
+</blockquote>
+
+
+
+<a name="561930702"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%231749%20Use%20virtual%20memory%20tricks%20to%20make%20.../near/561930702" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.231749.20Use.20virtual.20memory.20tricks.20to.20make.20.2E.2E.2E.html#561930702">(Dec 04 2025 at 16:57)</a>:</h4>
+<p>erikrose <a href="https://github.com/bytecodealliance/wasmtime/issues/1749#issuecomment-3613238033">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/1749">issue #1749</a>:</p>
+<blockquote>
+<p>@cfallin Clear as a bell; thank you!</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

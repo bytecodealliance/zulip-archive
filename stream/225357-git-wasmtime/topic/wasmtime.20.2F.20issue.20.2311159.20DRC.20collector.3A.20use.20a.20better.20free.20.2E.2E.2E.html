@@ -1,0 +1,71 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #11159 DRC collector: use a better free ... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311159.20DRC.20collector.3A.20use.20a.20better.20free.20.2E.2E.2E.html">wasmtime / issue #11159 DRC collector: use a better free ...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="526465574"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311159%20DRC%20collector%3A%20use%20a%20better%20free%20.../near/526465574" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311159.20DRC.20collector.3A.20use.20a.20better.20free.20.2E.2E.2E.html#526465574">(Jun 30 2025 at 18:49)</a>:</h4>
+<p>fitzgen opened <a href="https://github.com/bytecodealliance/wasmtime/issues/11159">issue #11159</a>:</p>
+<blockquote>
+<p>We use a very simple, first-fit free list for allocation in the DRC collector right now:</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/57ba95e92eff1d02f6b05ab86b9e81b35bd69d28/crates/wasmtime/src/runtime/vm/gc/enabled/free_list.rs#L5">https://github.com/bytecodealliance/wasmtime/blob/57ba95e92eff1d02f6b05ab86b9e81b35bd69d28/crates/wasmtime/src/runtime/vm/gc/enabled/free_list.rs#L5</a></p>
+<p>We should use something better, that has size classes and good hueristics and all that.</p>
+<p>But also, we would ideally not write and maintain what is essentially our own <code>malloc</code> implementation ourselves, since getting all the details right and tuning them correctly for a variety of workloads is a lot of effort. The problem is that our malloc is outside the memory space that it is divvying up and parceling out: it is not inside the GC heap using and returning pointers within the GC heap, it is in the VM on the outside and is returning indices into the sandboxed region that makes up the GC heap, rather than pointers.</p>
+<p>But... why not just compile <code>dlmalloc</code> (or something) to Wasm, have <code>dlmalloc</code> use the GC heap as its linear memory, and make GC allocations call <code>dlmalloc</code>'s allocation and deallocation routines? That would give us a battle-hardened allocator that is most certainly faster than our free list pretty much For Free and with trivial long-term maintenance burden. Compiling <code>dlmalloc</code> to Wasm, with the right flags and exported symbols, results in a ~5-6 KiB binary that doesn't use any Wasm globals or <code>funcref</code> tables and uses only ~500 bytes of static data. It seems very doable.</p>
+<p>This will rely on a lot of the same kind of infrastructure we want to have for <a href="https://github.com/bytecodealliance/rfcs/pull/43">compile-time builtins</a>.</p>
+<p>Random kinks to work out:</p>
+<ul>
+<li>Do we compile <code>dlmalloc</code> into every GC-type-using module, similar to trampolines? (Including modules that just use <code>externref</code> and not full Wasm GC.)<ul>
+<li>This means there would be some duplicate copies of the code when you load multiple GC-type-using modules in the system, which is fine from a correctness POV, but is undesirable from a disk space usage POV, and a memory usage POV <em>if</em> you're on a system without virtual memory.</li>
+</ul>
+</li>
+<li>Or do we try and have only a single copy of <code>dlmalloc</code> in a system that is running multiple modules?<ul>
+<li>We could compile <code>dlmalloc-gc-heap.wasm</code> on demand the first time a gc-type-using module is compiled, but that requires that wasmtime was built with a compiler itself.</li>
+<li>We could compile <code>dlmalloc-gc-heap.wasm</code> at Wasmtime build time and <code>include_bytes!(...)</code> it into the Wasmtime binary, but that means additional, bootstrap-y, cyclic dependencies where you need a wasmtime to build wasmtime.</li>
+<li>We could require that configuring Wasmtime to use the DRC collector means you have to give a <code>wasmtime::Drc</code> object to the <code>wasmtime::Config::collector</code> method, and you can either <code>wasmtime::Drc::new()</code> when wasmtime is built with a compiler or <code>wasmtime::Drc::from_serialized(...)</code> otherwise. However, this raises questions about <code>impl Default for Config</code> since <code>Config</code> contains the configured collector, which by default is the DRC collector. Does it no longer impl <code>Default</code> when there is no compiler? Do we change the default collector when there is no compiler? Do we just remove that <code>Default</code> impl?</li>
+</ul>
+</li>
+</ul>
+</blockquote>
+
+
+
+<a name="526465575"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311159%20DRC%20collector%3A%20use%20a%20better%20free%20.../near/526465575" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311159.20DRC.20collector.3A.20use.20a.20better.20free.20.2E.2E.2E.html#526465575">(Jun 30 2025 at 18:49)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the performance label to <a href="https://github.com/bytecodealliance/wasmtime/issues/11159">Issue #11159</a>.</p>
+
+
+
+<a name="526465576"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311159%20DRC%20collector%3A%20use%20a%20better%20free%20.../near/526465576" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311159.20DRC.20collector.3A.20use.20a.20better.20free.20.2E.2E.2E.html#526465576">(Jun 30 2025 at 18:49)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the wasm-proposal:gc label to <a href="https://github.com/bytecodealliance/wasmtime/issues/11159">Issue #11159</a>.</p>
+
+
+
+<a name="526476969"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311159%20DRC%20collector%3A%20use%20a%20better%20free%20.../near/526476969" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311159.20DRC.20collector.3A.20use.20a.20better.20free.20.2E.2E.2E.html#526476969">(Jun 30 2025 at 19:49)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/11159#issuecomment-3020497313">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11159">issue #11159</a>:</p>
+<blockquote>
+<blockquote>
+<p>This will rely on a lot of the same kind of infrastructure we want to have for <a href="https://github.com/bytecodealliance/rfcs/pull/43">https://github.com/bytecodealliance/rfcs/pull/43</a>.</p>
+</blockquote>
+<p>I was thinking about this issue over the weekend I'm actually no longer certain that this is true. I believe that this can be implemented entirely independently of host builtins via a scheme such as:</p>
+<ul>
+<li>Add a new API requirement for Wasmtime that there's something along the lines of <code>Engine::prepare_gc_implementation</code> which compiles <code>dlmalloc.wasm</code> or deserializes it or similar. Basically an intentional step executed once at startup, after you have an <code>Engine</code>, which enables use of the GC. Trying to do anything GC-related before this is called just fails at runtime saying "go call that method"</li>
+<li>The <code>GcRuntime</code> implementations would have a <code>Module</code> which corresponds to <code>dlmalloc.wasm</code>. The <code>new_gc_heap</code> method would take a <code>&amp;mut StoreOpaque</code> which could be used to instantiate the <code>Module</code> into the store, allocating the GC heap and such.</li>
+<li>The <code>GcHeap</code> trait would either stay as-is or optionally change to returning <code>TypedFunc&lt;..., ...&gt;</code> for various accessors (e.g. alloc would return a <code>TypedFunc</code>, maybe gc-ing as well?</li>
+<li>The <code>GcHeap</code> would store various <code>VM*</code> data structures in its "gc-specific data area" which is accessible from wasm, and the <code>GcCompiler</code> would use all of these.</li>
+</ul>
+<p>Basically I don't think that any new trampolines are necessary, nor editing the compilation of any module. I think we could get away with this entirely with a <code>Module</code> stored in each GC implementation. Over time I think implementations like the current <code>gc</code>-or-maybe-grow logic would go entirely in <code>GcHeap</code> implementations to allow customizing that per-GC as necessary.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

@@ -1,0 +1,805 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #12156 Cranelift: improve egraph cost fu... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312156.20Cranelift.3A.20improve.20egraph.20cost.20fu.2E.2E.2E.html">wasmtime / issue #12156 Cranelift: improve egraph cost fu...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="563264747"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312156%20Cranelift%3A%20improve%20egraph%20cost%20fu.../near/563264747" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312156.20Cranelift.3A.20improve.20egraph.20cost.20fu.2E.2E.2E.html#563264747">(Dec 11 2025 at 19:11)</a>:</h4>
+<p>fitzgen opened <a href="https://github.com/bytecodealliance/wasmtime/issues/12156">issue #12156</a>:</p>
+<blockquote>
+<p><em>Note: I am forking off a new issue from <a href="https://github.com/bytecodealliance/wasmtime/issues/12106">https://github.com/bytecodealliance/wasmtime/issues/12106</a>. See that issue's discussion for a description of the issue of enode cost saturating to infinity due to extraction not "understanding" shared structure and how this problem is equivalent to weighted-set cover and therefore NP-hard. +cc @cfallin @bongjunj</em></p>
+<p>Chris and I were talking about extraction again yesterday. A couple things came out of it, which I will note down for our future selves and posterity:</p>
+<ul>
+<li>
+<blockquote>
+<p><a href="https://github.com/bytecodealliance/wasmtime/issues/12106#issuecomment-3618298815">We could divide/amortize the cost by the number of users of any given value. ... This maintains the phased aspect</a></p>
+</blockquote>
+<p>I kind of tried to explain this point <a href="https://github.com/bytecodealliance/wasmtime/issues/12106#issuecomment-3618446995">earlier</a> but don't think I was very clear so I will try again: The problem with this algorithm is that the "number of users" == "number of incoming edges <em>in the (a)egraph</em>", and for this to be a good algorithm in practice, it must be the case that the number of incoming edges in the (a)egraph approximates the number of incoming edges <em>in the set of actually-extracted expressions</em> in practice. It is not clear to me that property is generally true. In fact, I suspect that the more we do "egraph-y" things like add more canonicalizations and neutral rewrites with the hope that they will unlock further rewrites that <em>are</em> beneficial, then the less this property will hold!</p>
+</li>
+<li>
+<p>I had the realization that <em>if we topo-sort values before computing best costs, then we will reach a fix point in a single iteration.</em> This has some nice implications for <a href="https://github.com/bytecodealliance/wasmtime/issues/12106#issuecomment-3618446995">the "If we aren't maintaining phasing" algorithm</a> I sketched above. Bear with me for a second.</p>
+<p>Our current algorithm to compute the best enode (specific value) for each eclass (canonical value) is a fixpoint loop that looks roughly like this</p>
+<p><code>rust
+fn compute_best_values() {
+    let mut keep_going = true;
+    while keep_going {
+        for value in dfg.all_values() {
+            let orig_best_value = best[value];
+            best[value] = best_value(value, dfg);
+            keep_going |= best[value] != orig_best_value;
+        }
+    }
+}
+</code></p>
+<p>It will do <code>n + 1</code> iterations before returning where <code>n</code> is the length of the longest chain of <code>vNN -&gt; vMM</code> edges in the dataflow graph where <code>NN &lt; MM</code> (and the <code>+ 1</code> is to determine that we did actually reach the fixpoint and nothing else is changing anymore).[^typical] Note that at most <code>n == len(values)</code> so we do a pass over all <code>n</code> values <code>n</code> times, leading to an <code>O(n^2)</code> worst case runtime. But at minimum, in the best case, it will do at least two passes over all <code>n</code> values: once to compute the best values and then another to verify that we reached the fixpoint and nothing else is changing.</p>
+<p>Topologically sorting the values based on the DFG is also one pass over all <code>n</code> values. And then we can do one iteration of the inner loop from the previous algorithm, which is also one pass over all <code>n</code> values, and in this case we know that we will have reached a fixedpoint immediately because (a) the DFG is acyclic (we don't look through block params) and (b) we are processing uses before defs. So this gives us an <code>O(n)</code> worst case (and best case) runtime algorithm. Strictly better (in terms of worst case runtime) than what we do today!</p>
+<p>```rust<br>
+fn compute_best_values() {<br>
+    let sorted = topo_sort_values(dfg);<br>
+    compute_best_values_already_sorted(sorted);<br>
+}</p>
+<p>fn compute_best_values_already_sorted(sorted) {<br>
+    for value in sorted {<br>
+        best[value] = best_value(value, dfg);<br>
+    }<br>
+}<br>
+```</p>
+<p>But, this now plays nicely with incrementally updating costs to reflect certain sub-expressions getting cheaper because we've already extracted them! The following brings us back to <code>O(n^2)</code> but I think should give us a much better extraction algorithm that "understands" shared subexpressions:</p>
+<p>```rust<br>
+let sorted = topo_sort_values(dfg);</p>
+<p>for inst in skeleton {<br>
+    // Compute the best values. If this is the first iteration of the loop,<br>
+    // it is equivalent to what we had before. Otherwise, it will update the<br>
+    // best values based the adjusted cost of values we have already<br>
+    // extracted. <br>
+    compute_best_values_already_sorted(sorted);</p>
+<div class="codehilite"><pre><span></span><code>// Elaborate this instruction, extracting the best values for its
+// operands and inserting their defining instructions back into the
+// CFG&#39;s basic blocks.
+elaborate_inst(inst);
+
+// Update the cost for each value we extracted. It is ~free (modulo
+// register pressure) to reuse this value, since we have already computed
+// it and it is now available. The next iteration of the outer loop will
+// recompute best values to reflect these updated costs.
+for value in transitive_values_used_by(inst) {
+    // Or could do something very low but non-zero, like `1`, to reflect
+    // the cost of additional register pressure. Worth experimenting
+    // with, but is also somewhat orthogonal...
+    let new_cost = 0;
+    set_cost(value, new_cost);
+}
+</code></pre></div>
+
+<p>}<br>
+```</p>
+<p>It could be that this is fast enough to just be what we do by default. If not, it might be something we only use when configured to higher optimization levels.</p>
+</li>
+</ul>
+<p>[^typical]: Typically <code>n</code> is fairly small; it is affected by how much we created new instructions  and spliced their definitions into the middle of the DFG after the CLIF-producer gave us the initial CLIF. That is something we generally don't do a ton of, except in our legalization pass and NaN canonicalization and neither of them do it too much.</p>
+</blockquote>
+
+
+
+<a name="563264748"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312156%20Cranelift%3A%20improve%20egraph%20cost%20fu.../near/563264748" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312156.20Cranelift.3A.20improve.20egraph.20cost.20fu.2E.2E.2E.html#563264748">(Dec 11 2025 at 19:11)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the cranelift label to <a href="https://github.com/bytecodealliance/wasmtime/issues/12156">Issue #12156</a>.</p>
+
+
+
+<a name="563264751"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312156%20Cranelift%3A%20improve%20egraph%20cost%20fu.../near/563264751" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312156.20Cranelift.3A.20improve.20egraph.20cost.20fu.2E.2E.2E.html#563264751">(Dec 11 2025 at 19:11)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the cranelift<span aria-label="goal" class="emoji emoji-1f945" role="img" title="goal">:goal:</span>optimize-speed label to <a href="https://github.com/bytecodealliance/wasmtime/issues/12156">Issue #12156</a>.</p>
+
+
+
+<a name="564586916"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312156%20Cranelift%3A%20improve%20egraph%20cost%20fu.../near/564586916" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312156.20Cranelift.3A.20improve.20egraph.20cost.20fu.2E.2E.2E.html#564586916">(Dec 18 2025 at 23:37)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/12156#issuecomment-3672745587">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12156">issue #12156</a>:</p>
+<blockquote>
+<p>Update: I implemented the topo sorting without incremental updates in #12177, which didn't have any statistically significant affect on compilation or execution and has since merged. Then I made two branches implementing the two main approaches we've been discussing:</p>
+<ol>
+<li>
+<p><a href="https://github.com/bytecodealliance/wasmtime/compare/main...fitzgen:wasmtime:incrementally-update-enode-cost">**Incremental update and recompute:**</a> In this branch, after we elaborate a value, we update its cost to zero and then recompute all values' costs again to reflect that values we have already elaborated are already available and therefore "free" to reuse.</p>
+<p>This allows the cost function to understand shared substructure <em>across</em> operands to side-effectful skeleton instructions. It does not understand shared substructure <em>within</em> a single operand to a side-effectful skeleton instruction.</p>
+</li>
+<li>
+<p><a href="https://github.com/bytecodealliance/wasmtime/compare/main...fitzgen:wasmtime:inst-set-cost-function">**Maintain the set of instructions required to compute a value:**</a> In this branch, we track not just the best cost of each value, but the set of instructions that went into computing that best value. When computing new best costs based on operands, we only add the cost of instructions that aren't already present in the value's set.</p>
+<p>This allows the cost function to understand shared substructure both <em>across</em> and <em>within</em> operands to side-effectful skeleton instructions (and within any expression or subexpression).</p>
+</li>
+</ol>
+<h3>Illustrative CLIF Example</h3>
+<p>I've been using the following CLIF test case to see the effect of different cost functions:</p>
+<div class="codehilite" data-code-language="Common Lisp"><pre><span></span><code><span class="k">function</span><span class="w"> </span><span class="nv">%f</span><span class="p">(</span><span class="nv">i64</span><span class="p">)</span><span class="w"> </span><span class="nv">{</span>
+<span class="w">    </span><span class="nv">fn0</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">colocated</span><span class="w"> </span><span class="nv">%fn0</span><span class="p">(</span><span class="nv">i64</span><span class="p">)</span>
+
+<span class="w">    </span><span class="nv">block0</span><span class="p">(</span><span class="nv">v0:</span><span class="w"> </span><span class="nv">i64</span><span class="p">)</span><span class="err">:</span>
+<span class="w">        </span><span class="nv">v1</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v0,</span><span class="w"> </span><span class="nv">v0</span>
+<span class="w">        </span><span class="nv">v2</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v1,</span><span class="w"> </span><span class="nv">v1</span>
+<span class="w">        </span><span class="nv">v3</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v2,</span><span class="w"> </span><span class="nv">v2</span>
+<span class="w">        </span><span class="nv">v4</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v3,</span><span class="w"> </span><span class="nv">v3</span>
+<span class="w">        </span><span class="nv">v5</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v4,</span><span class="w"> </span><span class="nv">v4</span>
+<span class="w">        </span><span class="nv">v6</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v5,</span><span class="w"> </span><span class="nv">v5</span>
+<span class="w">        </span><span class="nv">v7</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v6,</span><span class="w"> </span><span class="nv">v6</span>
+<span class="w">        </span><span class="nv">v8</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v7,</span><span class="w"> </span><span class="nv">v7</span>
+<span class="w">        </span><span class="nv">v9</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v8,</span><span class="w"> </span><span class="nv">v8</span>
+<span class="w">        </span><span class="nv">v10</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v9,</span><span class="w"> </span><span class="nv">v9</span>
+<span class="w">        </span><span class="nv">v11</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v10,</span><span class="w"> </span><span class="nv">v10</span>
+<span class="w">        </span><span class="nv">v12</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v11,</span><span class="w"> </span><span class="nv">v11</span>
+<span class="w">        </span><span class="nv">v13</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v12,</span><span class="w"> </span><span class="nv">v12</span>
+<span class="w">        </span><span class="nv">v14</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v13,</span><span class="w"> </span><span class="nv">v13</span>
+<span class="w">        </span><span class="nv">v15</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v14,</span><span class="w"> </span><span class="nv">v14</span>
+<span class="w">        </span><span class="nv">v16</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v15,</span><span class="w"> </span><span class="nv">v15</span>
+<span class="w">        </span><span class="nv">v17</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v16,</span><span class="w"> </span><span class="nv">v16</span>
+<span class="w">        </span><span class="nv">v18</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v17,</span><span class="w"> </span><span class="nv">v17</span>
+<span class="w">        </span><span class="nv">v19</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v18,</span><span class="w"> </span><span class="nv">v18</span>
+<span class="w">        </span><span class="nv">v20</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v19,</span><span class="w"> </span><span class="nv">v19</span>
+<span class="w">        </span><span class="nv">v21</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v20,</span><span class="w"> </span><span class="nv">v20</span>
+<span class="w">        </span><span class="nv">v22</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v21,</span><span class="w"> </span><span class="nv">v21</span>
+<span class="w">        </span><span class="nv">v23</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v22,</span><span class="w"> </span><span class="nv">v22</span>
+<span class="w">        </span><span class="nv">v24</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v23,</span><span class="w"> </span><span class="nv">v23</span>
+<span class="w">        </span><span class="nv">v25</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v24,</span><span class="w"> </span><span class="nv">v24</span>
+<span class="w">        </span><span class="nv">v26</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v25,</span><span class="w"> </span><span class="nv">v25</span>
+<span class="w">        </span><span class="nv">v27</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v26,</span><span class="w"> </span><span class="nv">v26</span>
+<span class="w">        </span><span class="nv">v28</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v27,</span><span class="w"> </span><span class="nv">v27</span>
+<span class="w">        </span><span class="nv">v29</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v28,</span><span class="w"> </span><span class="nv">v28</span>
+<span class="w">        </span><span class="nv">v30</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v29,</span><span class="w"> </span><span class="nv">v29</span>
+<span class="w">        </span><span class="nv">v31</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v30,</span><span class="w"> </span><span class="nv">v30</span>
+<span class="w">        </span><span class="nv">v32</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v31,</span><span class="w"> </span><span class="nv">v31</span>
+<span class="w">        </span><span class="nv">v33</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v32,</span><span class="w"> </span><span class="nv">v32</span>
+
+<span class="w">        </span><span class="c1">;; With the old cost function, we should have `cost(v33) == infinite` at</span>
+<span class="w">        </span><span class="c1">;; this point. Of course, we *should* replace `v35`'s definition with</span>
+<span class="w">        </span><span class="c1">;; `ishl v33, 1`. But the (old) cost function cannot tell us to do that</span>
+<span class="w">        </span><span class="c1">;; because `x + infinity == y + infinity`, even when `x &lt; y`. So it must</span>
+<span class="w">        </span><span class="c1">;; arbitrarily choose one of the two. In practice, it happens to choose</span>
+<span class="w">        </span><span class="c1">;; the `ishl` (annoyingly for those us who are trying to show the</span>
+<span class="w">        </span><span class="c1">;; benefits of a new cost function).</span>
+
+<span class="w">        </span><span class="nv">v34</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iconst.i64</span><span class="w"> </span><span class="mi">2</span>
+<span class="w">        </span><span class="nv">v35</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">imul</span><span class="w"> </span><span class="nv">v33,</span><span class="w"> </span><span class="nv">v34</span>
+<span class="w">        </span><span class="nv">call</span><span class="w"> </span><span class="nv">fn0</span><span class="p">(</span><span class="nv">v35</span><span class="p">)</span>
+
+<span class="w">        </span><span class="c1">;; And then this undoes the multiply, and we *should* see through that</span>
+<span class="w">        </span><span class="c1">;; via `x * 2 =&gt; x + x` and `(x + y) - y =&gt; x` and ultimately recognize</span>
+<span class="w">        </span><span class="c1">;; that `v36 == v33`.</span>
+<span class="w">        </span><span class="c1">;;</span>
+<span class="w">        </span><span class="c1">;; The old cost function fails to do this, however. This is because it</span>
+<span class="w">        </span><span class="c1">;; considers `x * 2 - x` and `x` to have equal cost when `cost(x) ==</span>
+<span class="w">        </span><span class="c1">;; infinity`.</span>
+<span class="w">        </span><span class="c1">;;</span>
+<span class="w">        </span><span class="c1">;; Both the proposed incremental-update and inst-set cost functions do</span>
+<span class="w">        </span><span class="c1">;; manage to simplify `x * 2 - x` to `x` in this case because they do</span>
+<span class="w">        </span><span class="c1">;; not do _not_ have `cost(v35) = infinity` at the time that we are</span>
+<span class="w">        </span><span class="c1">;; elaborating this second call's operands.</span>
+<span class="w">        </span><span class="c1">;;</span>
+<span class="w">        </span><span class="c1">;; However, if we comment out the first `call fn0(v35)`, then the</span>
+<span class="w">        </span><span class="c1">;; incremental-update cost function does no better than the old cost</span>
+<span class="w">        </span><span class="c1">;; function, and will lead us to extracting `(x &lt;&lt; 2) - x` instead of</span>
+<span class="w">        </span><span class="c1">;; simply `x`, because it cannot "see" shared structure *within* a</span>
+<span class="w">        </span><span class="c1">;; side-effectful skeleton's operand, only *across* side-effectful</span>
+<span class="w">        </span><span class="c1">;; skeleton operands (because we only zero-and-update after elaborating</span>
+<span class="w">        </span><span class="c1">;; each side-effectful skeleton operand).</span>
+<span class="w">        </span><span class="c1">;;</span>
+<span class="w">        </span><span class="c1">;; The inst-set cost function, which does "see" shared structure</span>
+<span class="w">        </span><span class="c1">;; *within* a side-effectful skeleton instruction's operand, will still</span>
+<span class="w">        </span><span class="c1">;; report that `cost(x) &lt; cost(x * 2 - 1)` in this case.</span>
+
+<span class="w">        </span><span class="nv">v36</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">isub</span><span class="w"> </span><span class="nv">v35,</span><span class="w"> </span><span class="nv">v33</span>
+<span class="w">        </span><span class="nv">call</span><span class="w"> </span><span class="nv">fn0</span><span class="p">(</span><span class="nv">v36</span><span class="p">)</span>
+
+<span class="w">        </span><span class="nb">return</span>
+<span class="nv">}</span>
+</code></pre></div>
+<p>Here is the post-optimization CLIF for the current (old) cost function:</p>
+<div class="codehilite" data-code-language="Common Lisp"><pre><span></span><code><span class="w">    </span><span class="o">...</span>
+<span class="w">    </span><span class="nv">v33</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v32,</span><span class="w"> </span><span class="nv">v32</span>
+<span class="w">    </span><span class="nv">v38</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iconst.i64</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">    </span><span class="nv">v39</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">ishl</span><span class="w"> </span><span class="nv">v33,</span><span class="w"> </span><span class="nv">v38</span><span class="w">  </span><span class="c1">; v38 = 1</span>
+<span class="w">    </span><span class="nv">call</span><span class="w"> </span><span class="nv">fn0</span><span class="p">(</span><span class="nv">v39</span><span class="p">)</span>
+<span class="w">    </span><span class="nv">v36</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">isub</span><span class="w"> </span><span class="nv">v39,</span><span class="w"> </span><span class="nv">v33</span>
+<span class="w">    </span><span class="nv">call</span><span class="w"> </span><span class="nv">fn0</span><span class="p">(</span><span class="nv">v36</span><span class="p">)</span>
+<span class="w">    </span><span class="nb">return</span>
+</code></pre></div>
+<p>Here it is with the incremental-update and inst-set cost function:</p>
+<div class="codehilite" data-code-language="Common Lisp"><pre><span></span><code><span class="w">    </span><span class="o">...</span>
+<span class="w">    </span><span class="nv">v33</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v32,</span><span class="w"> </span><span class="nv">v32</span>
+<span class="w">    </span><span class="nv">v38</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iconst.i64</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">    </span><span class="nv">v39</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">ishl</span><span class="w"> </span><span class="nv">v33,</span><span class="w"> </span><span class="nv">v38</span><span class="w">  </span><span class="c1">; v38 = 1</span>
+<span class="w">    </span><span class="nv">call</span><span class="w"> </span><span class="nv">fn0</span><span class="p">(</span><span class="nv">v39</span><span class="p">)</span>
+<span class="w">    </span><span class="nv">call</span><span class="w"> </span><span class="nv">fn0</span><span class="p">(</span><span class="nv">v33</span><span class="p">)</span>
+<span class="w">    </span><span class="nb">return</span>
+</code></pre></div>
+<p>And if we comment out the first <code>call</code>, here is the CLIF for both the old cost function and the incremental-update cost function:</p>
+<div class="codehilite" data-code-language="Common Lisp"><pre><span></span><code><span class="w">    </span><span class="o">...</span>
+<span class="w">    </span><span class="nv">v33</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v32,</span><span class="w"> </span><span class="nv">v32</span>
+<span class="w">    </span><span class="nv">v38</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iconst.i64</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">    </span><span class="nv">v39</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">ishl</span><span class="w"> </span><span class="nv">v33,</span><span class="w"> </span><span class="nv">v38</span><span class="w">  </span><span class="c1">; v38 = 1</span>
+<span class="w">    </span><span class="nv">v36</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">isub</span><span class="w"> </span><span class="nv">v39,</span><span class="w"> </span><span class="nv">v33</span>
+<span class="w">    </span><span class="nv">call</span><span class="w"> </span><span class="nv">fn0</span><span class="p">(</span><span class="nv">v36</span><span class="p">)</span>
+<span class="w">    </span><span class="nb">return</span>
+</code></pre></div>
+<p>While the inst-set cost function can still see through <code>x * 2 - x</code>:</p>
+<div class="codehilite" data-code-language="Common Lisp"><pre><span></span><code><span class="w">    </span><span class="o">...</span>
+<span class="w">    </span><span class="nv">v33</span><span class="w"> </span><span class="nb">=</span><span class="w"> </span><span class="nv">iadd</span><span class="w"> </span><span class="nv">v32,</span><span class="w"> </span><span class="nv">v32</span>
+<span class="w">    </span><span class="nv">call</span><span class="w"> </span><span class="nv">fn0</span><span class="p">(</span><span class="nv">v33</span><span class="p">)</span>
+<span class="w">    </span><span class="nb">return</span>
+</code></pre></div>
+<p>Will post some Sightglass benchmark results in a little bit.</p>
+</blockquote>
+
+
+
+<a name="564598494"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312156%20Cranelift%3A%20improve%20egraph%20cost%20fu.../near/564598494" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312156.20Cranelift.3A.20improve.20egraph.20cost.20fu.2E.2E.2E.html#564598494">(Dec 19 2025 at 01:13)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/12156#issuecomment-3673006299">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12156">issue #12156</a>:</p>
+<blockquote>
+<h3>Initial Sightglass Results</h3>
+<p>I benchmarked compilation and execution times for</p>
+<ul>
+<li>bz2</li>
+<li>spidermonkey</li>
+<li>pulldown-cmark</li>
+<li>blake3-scalar</li>
+<li>blake3-simd</li>
+<li>shootout-keccak</li>
+<li>shootout-switch</li>
+</ul>
+<p>The raw results are below.</p>
+<p>Given that our benchmarks' execution isn't affected too much by any of these but is generally leaning positive towards the inst-set cost function, we (surprisingly) get a compilation <em>speedup</em> with it, and that it accounts for the most substructure sharing in theory out the three options, I'm going to continue pursuing that approach.</p>
+<h4>Compilation</h4>
+<h5><code>incr-cost-update.so</code> vs. <code>inst-set.so</code></h5>
+<p>&lt;details&gt;</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">pulldown</span><span class="o">-</span><span class="n">cmark</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">56736.35</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">28906.20</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.01</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">14348083</span><span class="w"> </span><span class="mf">14424211.45</span><span class="w"> </span><span class="mi">14508124</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">14285793</span><span class="w"> </span><span class="mf">14367475.10</span><span class="w"> </span><span class="mi">14484470</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">shootout</span><span class="o">/</span><span class="n">shootout</span><span class="o">-</span><span class="n">switch</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">7695.45</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">5606.84</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.01</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">2100829</span><span class="w"> </span><span class="mf">2115908.85</span><span class="w"> </span><span class="mi">2129910</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">2094815</span><span class="w"> </span><span class="mf">2108213.40</span><span class="w"> </span><span class="mi">2120720</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">blake3</span><span class="o">-</span><span class="n">scalar</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">23876.40</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">18942.83</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.01</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">8074884</span><span class="w"> </span><span class="mf">8159311.95</span><span class="w"> </span><span class="mi">8217976</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">8068552</span><span class="w"> </span><span class="mf">8135435.55</span><span class="w"> </span><span class="mi">8181995</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">bz2</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">9228.95</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">4846.06</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">3544513</span><span class="w"> </span><span class="mf">3560461.75</span><span class="w"> </span><span class="mi">3578035</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">3538490</span><span class="w"> </span><span class="mf">3551232.80</span><span class="w"> </span><span class="mi">3566901</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">blake3</span><span class="o">-</span><span class="n">simd</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">3458.40</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">2365.48</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">1830921</span><span class="w"> </span><span class="mf">1836239.40</span><span class="w"> </span><span class="mi">1840748</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">1829117</span><span class="w"> </span><span class="mf">1832781.00</span><span class="w"> </span><span class="mi">1848816</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">spidermonkey</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">808809.85</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">280559.15</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">492921665</span><span class="w"> </span><span class="mf">494078167.90</span><span class="w"> </span><span class="mi">494535116</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">492325966</span><span class="w"> </span><span class="mf">493269358.05</span><span class="w"> </span><span class="mi">493749431</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">shootout</span><span class="o">/</span><span class="n">shootout</span><span class="o">-</span><span class="n">keccak</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">615.45</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">381.06</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">680111</span><span class="w"> </span><span class="mf">681389.50</span><span class="w"> </span><span class="mi">683010</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">679956</span><span class="w"> </span><span class="mf">680774.05</span><span class="w"> </span><span class="mi">681474</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+</code></pre></div>
+<p>&lt;/details&gt;</p>
+<h5><code>main.so</code> vs. <code>inst-set.so</code></h5>
+<p>&lt;details&gt;</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">shootout</span><span class="o">/</span><span class="n">shootout</span><span class="o">-</span><span class="n">switch</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">7484.40</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">5754.15</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.01</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">2094815</span><span class="w"> </span><span class="mf">2108213.40</span><span class="w"> </span><span class="mi">2120720</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">2097021</span><span class="w"> </span><span class="mf">2115697.80</span><span class="w"> </span><span class="mi">2133060</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">blake3</span><span class="o">-</span><span class="n">scalar</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">22612.80</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">17853.16</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">8068552</span><span class="w"> </span><span class="mf">8135435.55</span><span class="w"> </span><span class="mi">8181995</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">8113305</span><span class="w"> </span><span class="mf">8158048.35</span><span class="w"> </span><span class="mi">8218755</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">blake3</span><span class="o">-</span><span class="n">simd</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">4569.35</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">2860.23</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">1829117</span><span class="w"> </span><span class="mf">1832781.00</span><span class="w"> </span><span class="mi">1848816</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">1831835</span><span class="w"> </span><span class="mf">1837350.35</span><span class="w"> </span><span class="mi">1853297</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">pulldown</span><span class="o">-</span><span class="n">cmark</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">34711.95</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">30446.18</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">14285793</span><span class="w"> </span><span class="mf">14367475.10</span><span class="w"> </span><span class="mi">14484470</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">14333253</span><span class="w"> </span><span class="mf">14402187.05</span><span class="w"> </span><span class="mi">14508930</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">spidermonkey</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">872967.45</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">245452.83</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">492325966</span><span class="w"> </span><span class="mf">493269358.05</span><span class="w"> </span><span class="mi">493749431</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">493441547</span><span class="w"> </span><span class="mf">494142325.50</span><span class="w"> </span><span class="mi">494562345</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">shootout</span><span class="o">/</span><span class="n">shootout</span><span class="o">-</span><span class="n">keccak</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">762.35</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">366.77</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">679956</span><span class="w"> </span><span class="mf">680774.05</span><span class="w"> </span><span class="mi">681474</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">680707</span><span class="w"> </span><span class="mf">681536.40</span><span class="w"> </span><span class="mi">683187</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">bz2</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="n">No</span><span class="w"> </span><span class="n">difference</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">performance</span><span class="p">.</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">3538490</span><span class="w"> </span><span class="mf">3551232.80</span><span class="w"> </span><span class="mi">3566901</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">3533856</span><span class="w"> </span><span class="mf">3556067.10</span><span class="w"> </span><span class="mi">3583550</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+</code></pre></div>
+<p>&lt;/details&gt;</p>
+<h5><code>main.so</code> vs. <code>incr-cost-update.so</code></h5>
+<p>&lt;details&gt;</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">pulldown</span><span class="o">-</span><span class="n">cmark</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="n">No</span><span class="w"> </span><span class="n">difference</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">performance</span><span class="p">.</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">14348083</span><span class="w"> </span><span class="mf">14424211.45</span><span class="w"> </span><span class="mi">14508124</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">14333253</span><span class="w"> </span><span class="mf">14402187.05</span><span class="w"> </span><span class="mi">14508930</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">bz2</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="n">No</span><span class="w"> </span><span class="n">difference</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">performance</span><span class="p">.</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">3544513</span><span class="w"> </span><span class="mf">3560461.75</span><span class="w"> </span><span class="mi">3578035</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">3533856</span><span class="w"> </span><span class="mf">3556067.10</span><span class="w"> </span><span class="mi">3583550</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">blake3</span><span class="o">-</span><span class="n">simd</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="n">No</span><span class="w"> </span><span class="n">difference</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">performance</span><span class="p">.</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">1830921</span><span class="w"> </span><span class="mf">1836239.40</span><span class="w"> </span><span class="mi">1840748</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">1831835</span><span class="w"> </span><span class="mf">1837350.35</span><span class="w"> </span><span class="mi">1853297</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">shootout</span><span class="o">/</span><span class="n">shootout</span><span class="o">-</span><span class="n">keccak</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="n">No</span><span class="w"> </span><span class="n">difference</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">performance</span><span class="p">.</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">680111</span><span class="w"> </span><span class="mf">681389.50</span><span class="w"> </span><span class="mi">683010</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">680707</span><span class="w"> </span><span class="mf">681536.40</span><span class="w"> </span><span class="mi">683187</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">blake3</span><span class="o">-</span><span class="n">scalar</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="n">No</span><span class="w"> </span><span class="n">difference</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">performance</span><span class="p">.</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">8074884</span><span class="w"> </span><span class="mf">8159311.95</span><span class="w"> </span><span class="mi">8217976</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">8113305</span><span class="w"> </span><span class="mf">8158048.35</span><span class="w"> </span><span class="mi">8218755</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">spidermonkey</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="n">No</span><span class="w"> </span><span class="n">difference</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">performance</span><span class="p">.</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">492921665</span><span class="w"> </span><span class="mf">494078167.90</span><span class="w"> </span><span class="mi">494535116</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">493441547</span><span class="w"> </span><span class="mf">494142325.50</span><span class="w"> </span><span class="mi">494562345</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">compilation</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">shootout</span><span class="o">/</span><span class="n">shootout</span><span class="o">-</span><span class="n">switch</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="n">No</span><span class="w"> </span><span class="n">difference</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">performance</span><span class="p">.</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">2100829</span><span class="w"> </span><span class="mf">2115908.85</span><span class="w"> </span><span class="mi">2129910</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">2097021</span><span class="w"> </span><span class="mf">2115697.80</span><span class="w"> </span><span class="mi">2133060</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+</code></pre></div>
+<p>&lt;/details&gt;</p>
+<h4>Execution</h4>
+<h5><code>incr-cost-update.so</code> vs. <code>inst-set.so</code></h5>
+<p>&lt;details&gt;</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">execution</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">pulldown</span><span class="o">-</span><span class="n">cmark</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">93581.75</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">43.16</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">20865519</span><span class="w"> </span><span class="mf">20865542.75</span><span class="w"> </span><span class="mi">20865749</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">20771935</span><span class="w"> </span><span class="mf">20771961.00</span><span class="w"> </span><span class="mi">20772154</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">execution</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">bz2</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">563843.20</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">7.84</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">221233136</span><span class="w"> </span><span class="mf">221233145.30</span><span class="w"> </span><span class="mi">221233181</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">221796977</span><span class="w"> </span><span class="mf">221796988.50</span><span class="w"> </span><span class="mi">221797031</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">execution</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">spidermonkey</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">2851242.00</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">41511.20</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">2112679982</span><span class="w"> </span><span class="mf">2112745727.45</span><span class="w"> </span><span class="mi">2112830546</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">2109813917</span><span class="w"> </span><span class="mf">2109894485.45</span><span class="w"> </span><span class="mi">2110054897</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">execution</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">blake3</span><span class="o">-</span><span class="n">simd</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">63.10</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">0.30</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">1432847</span><span class="w"> </span><span class="mf">1432847.35</span><span class="w"> </span><span class="mi">1432848</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">1432784</span><span class="w"> </span><span class="mf">1432784.25</span><span class="w"> </span><span class="mi">1432785</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">execution</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">blake3</span><span class="o">-</span><span class="n">scalar</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">12.05</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">0.25</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">1482967</span><span class="w"> </span><span class="mf">1482967.20</span><span class="w"> </span><span class="mi">1482968</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">1482955</span><span class="w"> </span><span class="mf">1482955.15</span><span class="w"> </span><span class="mi">1482956</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">execution</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">shootout</span><span class="o">/</span><span class="n">shootout</span><span class="o">-</span><span class="n">keccak</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="n">No</span><span class="w"> </span><span class="n">difference</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">performance</span><span class="p">.</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">77020130</span><span class="w"> </span><span class="mf">77020136.05</span><span class="w"> </span><span class="mi">77020159</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">77020130</span><span class="w"> </span><span class="mf">77020133.90</span><span class="w"> </span><span class="mi">77020151</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">execution</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">shootout</span><span class="o">/</span><span class="n">shootout</span><span class="o">-</span><span class="n">switch</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="n">No</span><span class="w"> </span><span class="n">difference</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">performance</span><span class="p">.</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">162345998</span><span class="w"> </span><span class="mf">162346008.80</span><span class="w"> </span><span class="mi">162346034</span><span class="p">]</span><span class="w"> </span><span class="n">incr</span><span class="o">-</span><span class="n">cost</span><span class="o">-</span><span class="n">update</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">162345996</span><span class="w"> </span><span class="mf">162346009.10</span><span class="w"> </span><span class="mi">162346036</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+</code></pre></div>
+<p>&lt;/details&gt;</p>
+<h5><code>main.so</code> vs. <code>inst-set.so</code></h5>
+<p>&lt;details&gt;</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">execution</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">bz2</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">524604.40</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">8.60</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">main</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">221796977</span><span class="w"> </span><span class="mf">221796988.50</span><span class="w"> </span><span class="mi">221797031</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">221272372</span><span class="w"> </span><span class="mf">221272384.10</span><span class="w"> </span><span class="mi">221272438</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">execution</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">spidermonkey</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">1875739.10</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">40441.13</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">2109813917</span><span class="w"> </span><span class="mf">2109894485.45</span><span class="w"> </span><span class="mi">2110054897</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">2111698119</span><span class="w"> </span><span class="mf">2111770224.55</span><span class="w"> </span><span class="mi">2111838249</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">execution</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">blake3</span><span class="o">-</span><span class="n">simd</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">65.10</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">0.30</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">1432784</span><span class="w"> </span><span class="mf">1432784.25</span><span class="w"> </span><span class="mi">1432785</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">1432849</span><span class="w"> </span><span class="mf">1432849.35</span><span class="w"> </span><span class="mi">1432850</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">execution</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">pulldown</span><span class="o">-</span><span class="n">cmark</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="err">Δ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">711.95</span><span class="w"> </span><span class="err">±</span><span class="w"> </span><span class="mf">33.91</span><span class="w"> </span><span class="p">(</span><span class="n">confidence</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">95</span><span class="o">%</span><span class="p">)</span>
+
+<span class="w">  </span><span class="n">main</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="mf">1.00</span><span class="n">x</span><span class="w"> </span><span class="n">faster</span><span class="w"> </span><span class="n">than</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span><span class="o">!</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">20771935</span><span class="w"> </span><span class="mf">20771961.00</span><span class="w"> </span><span class="mi">20772154</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">20771239</span><span class="w"> </span><span class="mf">20771249.05</span><span class="w"> </span><span class="mi">20771390</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">execution</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">shootout</span><span class="o">/</span><span class="n">shootout</span><span class="o">-</span><span class="n">switch</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="n">No</span><span class="w"> </span><span class="n">difference</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">performance</span><span class="p">.</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">162345996</span><span class="w"> </span><span class="mf">162346009.10</span><span class="w"> </span><span class="mi">162346036</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">162345994</span><span class="w"> </span><span class="mf">162346015.55</span><span class="w"> </span><span class="mi">162346081</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">execution</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">shootout</span><span class="o">/</span><span class="n">shootout</span><span class="o">-</span><span class="n">keccak</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="n">No</span><span class="w"> </span><span class="n">difference</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">performance</span><span class="p">.</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">77020130</span><span class="w"> </span><span class="mf">77020133.90</span><span class="w"> </span><span class="mi">77020151</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">77020130</span><span class="w"> </span><span class="mf">77020134.90</span><span class="w"> </span><span class="mi">77020160</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+
+<span class="n">execution</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">blake3</span><span class="o">-</span><span class="n">scalar</span><span class="o">/</span><span class="n">benchmark</span><span class="p">.</span><span class="n">wasm</span>
+
+<span class="w">  </span><span class="n">No</span><span class="w"> </span><span class="n">difference</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">performance</span><span class="p">.</span>
+
+<span class="w">  </span><span class="p">[</span><span class="mi">1482955</span><span class="w"> </span><span class="mf">1482955.15</span><span class="w"> </span><span class="mi">1482956</span><span class="p">]</span><span class="w"> </span><span class="n">inst</span><span class="o">-</span><span class="n">set</span><span class="p">.</span><span class="n">so</span>
+<span class="w">  </span><span class="p">[</span><span class="mi">1482955</span><span class="w"> </span><span class="mf">1482955.15</span><span class="w"> </span><span class="mi">1482956</span><span class="p">]</span><span class="w"> </span><span class="n">main</span><span class="p">.</span><span class="n">so</span>
+</code></pre></div>
+<p>&lt;/details&gt;</p>
+<h5><code>main.so</code> vs. <code>incr-cost-update.so</code></h5>
+<p>&lt;details&gt;</p>
+<p><div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">execution</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">instructions</span><span class="o">-</span><span class="n">retired</span><span class="w"> </span><span class="p">::</span><span class="w"> </span><span class="nc">benchmarks</span><span class="o">/</span><span class="n">pulldown</span><span class="o">-</span><span class="n">c</span>
+<span class="p">[</span><span class="n">message</span><span class="w"> </span><span class="n">truncated</span><span class="p">]</span>
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="564941239"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312156%20Cranelift%3A%20improve%20egraph%20cost%20fu.../near/564941239" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312156.20Cranelift.3A.20improve.20egraph.20cost.20fu.2E.2E.2E.html#564941239">(Dec 22 2025 at 06:20)</a>:</h4>
+<p>bongjunj <a href="https://github.com/bytecodealliance/wasmtime/issues/12156#issuecomment-3680640683">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12156">issue #12156</a>:</p>
+<blockquote>
+<p>The idea here is very interesting and the compilation speedup looks cool.</p>
+<p>We need to check if the problem of cost saturation went away (<a href="https://github.com/bytecodealliance/wasmtime/issues/12106#issuecomment-3615043494">https://github.com/bytecodealliance/wasmtime/issues/12106#issuecomment-3615043494</a>).<br>
+If this can prevent the cost from saturating to infinity in the benchmark, we can bring back the removed canonicalizations.</p>
+<p>I will look at some results with this strategy.</p>
+</blockquote>
+
+
+
+<a name="565554496"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312156%20Cranelift%3A%20improve%20egraph%20cost%20fu.../near/565554496" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312156.20Cranelift.3A.20improve.20egraph.20cost.20fu.2E.2E.2E.html#565554496">(Dec 28 2025 at 08:02)</a>:</h4>
+<p>bongjunj <a href="https://github.com/bytecodealliance/wasmtime/issues/12156#issuecomment-3694551407">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12156">issue #12156</a>:</p>
+<blockquote>
+<p>The infinity cost problem went away in the inst-set version.</p>
+<h3><code>shootout-keccak</code></h3>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="c1">// skipped the first part</span>
+<span class="p">[</span><span class="mi">2025</span><span class="o">-</span><span class="mi">12</span><span class="o">-</span><span class="mi">28</span><span class="n">T06</span><span class="p">:</span><span class="mi">19</span><span class="p">:</span><span class="mi">25</span><span class="n">Z</span><span class="w"> </span><span class="n">TRACE</span><span class="w"> </span><span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">egraph</span><span class="p">::</span><span class="n">elaborate</span><span class="p">]</span><span class="w">  </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">cost</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="n">v6922</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Cost</span><span class="p">::</span><span class="n">Finite</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">op_cost</span><span class="p">:</span><span class="w"> </span><span class="mi">13476</span><span class="p">,</span><span class="w"> </span><span class="n">depth</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">}</span>
+<span class="p">[</span><span class="mi">2025</span><span class="o">-</span><span class="mi">12</span><span class="o">-</span><span class="mi">28</span><span class="n">T06</span><span class="p">:</span><span class="mi">19</span><span class="p">:</span><span class="mi">25</span><span class="n">Z</span><span class="w"> </span><span class="n">TRACE</span><span class="w"> </span><span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">egraph</span><span class="p">::</span><span class="n">elaborate</span><span class="p">]</span><span class="w">  </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">cost</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="n">v6923</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Cost</span><span class="p">::</span><span class="n">Finite</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">op_cost</span><span class="p">:</span><span class="w"> </span><span class="mi">13555</span><span class="p">,</span><span class="w"> </span><span class="n">depth</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">}</span>
+<span class="p">[</span><span class="mi">2025</span><span class="o">-</span><span class="mi">12</span><span class="o">-</span><span class="mi">28</span><span class="n">T06</span><span class="p">:</span><span class="mi">19</span><span class="p">:</span><span class="mi">25</span><span class="n">Z</span><span class="w"> </span><span class="n">TRACE</span><span class="w"> </span><span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">egraph</span><span class="p">::</span><span class="n">elaborate</span><span class="p">]</span><span class="w">  </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">cost</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="n">v6930</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Cost</span><span class="p">::</span><span class="n">Finite</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">op_cost</span><span class="p">:</span><span class="w"> </span><span class="mi">13351</span><span class="p">,</span><span class="w"> </span><span class="n">depth</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">}</span>
+<span class="p">[</span><span class="mi">2025</span><span class="o">-</span><span class="mi">12</span><span class="o">-</span><span class="mi">28</span><span class="n">T06</span><span class="p">:</span><span class="mi">19</span><span class="p">:</span><span class="mi">25</span><span class="n">Z</span><span class="w"> </span><span class="n">TRACE</span><span class="w"> </span><span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">egraph</span><span class="p">::</span><span class="n">elaborate</span><span class="p">]</span><span class="w">  </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">cost</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="n">v8131</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Cost</span><span class="p">::</span><span class="n">Finite</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">op_cost</span><span class="p">:</span><span class="w"> </span><span class="mi">13350</span><span class="p">,</span><span class="w"> </span><span class="n">depth</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">}</span>
+<span class="p">[</span><span class="mi">2025</span><span class="o">-</span><span class="mi">12</span><span class="o">-</span><span class="mi">28</span><span class="n">T06</span><span class="p">:</span><span class="mi">19</span><span class="p">:</span><span class="mi">25</span><span class="n">Z</span><span class="w"> </span><span class="n">TRACE</span><span class="w"> </span><span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">egraph</span><span class="p">::</span><span class="n">elaborate</span><span class="p">]</span><span class="w">  </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">best</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="k">union</span><span class="p">(</span><span class="n">BestEntry</span><span class="p">(</span><span class="n">ImmCostMap</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">cost</span><span class="p">:</span><span class="w"> </span><span class="nc">Cost</span><span class="p">::</span><span class="n">Finite</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">op_cost</span><span class="p">:</span><span class="w"> </span><span class="mi">13351</span><span class="p">,</span><span class="w"> </span><span class="n">depth</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">},</span><span class="w"> </span><span class="n">insts</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="n">inst21</span><span class="p">,</span><span class="w"> </span><span class="o">..</span><span class="p">.</span><span class="w"> </span><span class="p">,</span><span class="w"> </span><span class="n">inst5388</span><span class="p">}</span><span class="w"> </span><span class="p">},</span><span class="w"> </span><span class="n">v8131</span><span class="p">)</span>
+<span class="p">[</span><span class="mi">2025</span><span class="o">-</span><span class="mi">12</span><span class="o">-</span><span class="mi">28</span><span class="n">T06</span><span class="p">:</span><span class="mi">19</span><span class="p">:</span><span class="mi">25</span><span class="n">Z</span><span class="w"> </span><span class="n">TRACE</span><span class="w"> </span><span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">egraph</span><span class="p">::</span><span class="n">elaborate</span><span class="p">]</span><span class="w">  </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">cost</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="n">v6931</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Cost</span><span class="p">::</span><span class="n">Finite</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">op_cost</span><span class="p">:</span><span class="w"> </span><span class="mi">13470</span><span class="p">,</span><span class="w"> </span><span class="n">depth</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">}</span>
+<span class="p">[</span><span class="mi">2025</span><span class="o">-</span><span class="mi">12</span><span class="o">-</span><span class="mi">28</span><span class="n">T06</span><span class="p">:</span><span class="mi">19</span><span class="p">:</span><span class="mi">25</span><span class="n">Z</span><span class="w"> </span><span class="n">TRACE</span><span class="w"> </span><span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">egraph</span><span class="p">::</span><span class="n">elaborate</span><span class="p">]</span><span class="w">  </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">cost</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="n">v6932</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Cost</span><span class="p">::</span><span class="n">Finite</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">op_cost</span><span class="p">:</span><span class="w"> </span><span class="mi">13548</span><span class="p">,</span><span class="w"> </span><span class="n">depth</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">}</span>
+</code></pre></div>
+<p>When I brought back the DeMorgan rules which caused the performance regression due to the poor judgement caused by the cost saturation, the cost saturation disappeared.</p>
+<p>All that remains is to check the perf regression from the no-opt version has been resolved with this.</p>
+<h3>Benchmark</h3>
+<table>
+<thead>
+<tr>
+<th>bench</th>
+<th>inst-set</th>
+<th>v-base</th>
+<th>Speedup</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>blake3-scalar</td>
+<td>316,666</td>
+<td>319,718</td>
+<td>0.96%</td>
+</tr>
+<tr>
+<td>blake3-simd</td>
+<td>307,564</td>
+<td>316,571</td>
+<td>2.93%</td>
+</tr>
+<tr>
+<td>bz2</td>
+<td>86,561,625</td>
+<td>87,697,336</td>
+<td>1.31%</td>
+</tr>
+<tr>
+<td>pulldown-cmark</td>
+<td>6,594,664</td>
+<td>6,850,795</td>
+<td>3.88%</td>
+</tr>
+<tr>
+<td>regex</td>
+<td>210,685,003</td>
+<td>210,205,862</td>
+<td>-0.23%</td>
+</tr>
+<tr>
+<td>shootout-ackermann</td>
+<td>7,759,800</td>
+<td>8,549,359</td>
+<td>10.17%</td>
+</tr>
+<tr>
+<td>shootout-base64</td>
+<td>351,116,296</td>
+<td>382,052,837</td>
+<td>8.81%</td>
+</tr>
+<tr>
+<td>shootout-ctype</td>
+<td>796,474,233</td>
+<td>831,090,155</td>
+<td>4.35%</td>
+</tr>
+<tr>
+<td>shootout-ed25519</td>
+<td>9,415,587,644</td>
+<td>9,595,743,123</td>
+<td>1.91%</td>
+</tr>
+<tr>
+<td>shootout-fib2</td>
+<td>3,012,767,106</td>
+<td>3,015,971,015</td>
+<td>0.11%</td>
+</tr>
+<tr>
+<td>shootout-gimli</td>
+<td>5,404,306</td>
+<td>5,334,580</td>
+<td>-1.29%</td>
+</tr>
+<tr>
+<td>shootout-heapsort</td>
+<td>2,378,935,527</td>
+<td>2,378,745,072</td>
+<td>-0.01%</td>
+</tr>
+<tr>
+<td>shootout-keccak</td>
+<td>21,137,129</td>
+<td>25,168,432</td>
+<td>19.07%</td>
+</tr>
+<tr>
+<td>shootout-matrix</td>
+<td>545,135,532</td>
+<td>541,156,378</td>
+<td>-0.73%</td>
+</tr>
+<tr>
+<td>shootout-memmove</td>
+<td>36,621,534</td>
+<td>38,439,632</td>
+<td>4.96%</td>
+</tr>
+<tr>
+<td>shootout-minicsv</td>
+<td>1,294,436,335</td>
+<td>1,498,544,688</td>
+<td>15.77%</td>
+</tr>
+<tr>
+<td>shootout-nestedloop</td>
+<td>673</td>
+<td>956</td>
+<td>41.94%</td>
+</tr>
+<tr>
+<td>shootout-random</td>
+<td>439,752,867</td>
+<td>630,876,317</td>
+<td>43.46%</td>
+</tr>
+<tr>
+<td>shootout-ratelimit</td>
+<td>39,836,311</td>
+<td>39,279,479</td>
+<td>-1.40%</td>
+</tr>
+<tr>
+<td>shootout-seqhash</td>
+<td>8,589,789,109</td>
+<td>8,838,928,513</td>
+<td>2.90%</td>
+</tr>
+<tr>
+<td>shootout-sieve</td>
+<td>841,599,406</td>
+<td>906,693,706</td>
+<td>7.73%</td>
+</tr>
+<tr>
+<td>shootout-switch</td>
+<td>153,847,745</td>
+<td>139,731,817</td>
+<td>-9.18%</td>
+</tr>
+<tr>
+<td>shootout-xblabla20</td>
+<td>2,918,569</td>
+<td>3,015,435</td>
+<td>3.32%</td>
+</tr>
+<tr>
+<td>shootout-xchacha20</td>
+<td>4,478,767</td>
+<td>4,398,827</td>
+<td>-1.78%</td>
+</tr>
+<tr>
+<td>spidermonkey</td>
+<td>642,585,002</td>
+<td>639,089,855</td>
+<td>-0.54%</td>
+</tr>
+</tbody>
+</table>
+<p><code>shoout-keccak</code> tells us that the performance regression induced by the cost saturation went away.<br>
+I think we can bring back the rules.<br>
+</p>
+</blockquote>
+
+
+
+<a name="565709428"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312156%20Cranelift%3A%20improve%20egraph%20cost%20fu.../near/565709428" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312156.20Cranelift.3A.20improve.20egraph.20cost.20fu.2E.2E.2E.html#565709428">(Dec 29 2025 at 18:41)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/12156#issuecomment-3697232332">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12156">issue #12156</a>:</p>
+<blockquote>
+<p>Cleaned up the inst-set branch and put up a PR: <a href="https://github.com/bytecodealliance/wasmtime/pull/12230">https://github.com/bytecodealliance/wasmtime/pull/12230</a></p>
+<blockquote>
+<p><code>shoout-keccak</code> tells us that the performance regression induced by the cost saturation went away.<br>
+I think we can bring back the rules.</p>
+</blockquote>
+<p>Fantastic! Thanks for looking into that. Would you like to make the PR bringing the rules back?</p>
+</blockquote>
+
+
+
+<a name="565749141"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312156%20Cranelift%3A%20improve%20egraph%20cost%20fu.../near/565749141" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312156.20Cranelift.3A.20improve.20egraph.20cost.20fu.2E.2E.2E.html#565749141">(Dec 30 2025 at 05:59)</a>:</h4>
+<p>bongjunj <a href="https://github.com/bytecodealliance/wasmtime/issues/12156#issuecomment-3698389972">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12156">issue #12156</a>:</p>
+<blockquote>
+<p>Sure thing! Thanks for the PR.</p>
+</blockquote>
+
+
+
+<a name="565757364"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312156%20Cranelift%3A%20improve%20egraph%20cost%20fu.../near/565757364" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312156.20Cranelift.3A.20improve.20egraph.20cost.20fu.2E.2E.2E.html#565757364">(Dec 30 2025 at 07:58)</a>:</h4>
+<p>bongjunj edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/12156#issuecomment-3698389972">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12156">issue #12156</a>:</p>
+<blockquote>
+<p>Sure thing! Thanks for the PR.<br>
+Will bring back the rules if your PR gets merged.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

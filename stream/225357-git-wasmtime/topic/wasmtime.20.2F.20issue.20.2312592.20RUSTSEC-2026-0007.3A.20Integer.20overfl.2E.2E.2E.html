@@ -1,0 +1,155 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #12592 RUSTSEC-2026-0007: Integer overfl... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312592.20RUSTSEC-2026-0007.3A.20Integer.20overfl.2E.2E.2E.html">wasmtime / issue #12592 RUSTSEC-2026-0007: Integer overfl...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="573846652"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312592%20RUSTSEC-2026-0007%3A%20Integer%20overfl.../near/573846652" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312592.20RUSTSEC-2026-0007.3A.20Integer.20overfl.2E.2E.2E.html#573846652">(Feb 14 2026 at 00:17)</a>:</h4>
+<p>github-actions[bot] opened <a href="https://github.com/bytecodealliance/wasmtime/issues/12592">issue #12592</a>:</p>
+<blockquote>
+<blockquote>
+<p>Integer overflow in <code>BytesMut::reserve</code></p>
+</blockquote>
+<table>
+<thead>
+<tr>
+<th>Details</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Package</td>
+<td><code>bytes</code></td>
+</tr>
+<tr>
+<td>Version</td>
+<td><code>1.10.1</code></td>
+</tr>
+<tr>
+<td>URL</td>
+<td><a href="https://github.com/advisories/GHSA-434x-w66g-qw3r">https://github.com/advisories/GHSA-434x-w66g-qw3r</a></td>
+</tr>
+<tr>
+<td>Date</td>
+<td>2026-02-03</td>
+</tr>
+<tr>
+<td>Patched versions</td>
+<td><code>&gt;=1.11.1</code></td>
+</tr>
+<tr>
+<td>Unaffected versions</td>
+<td><code>&lt;1.2.1</code></td>
+</tr>
+</tbody>
+</table>
+<p>In the unique reclaim path of <code>BytesMut::reserve</code>, the condition</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="n">v_capacity</span><span class="w"> </span><span class="o">&amp;</span><span class="n">gt</span><span class="p">;</span><span class="o">=</span><span class="w"> </span><span class="n">new_cap</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">offset</span>
+</code></pre></div>
+<p>uses an unchecked addition. When <code>new_cap + offset</code> overflows <code>usize</code> in release builds, this condition may incorrectly pass, causing <code>self.cap</code> to be set to a value that exceeds the actual allocated capacity. Subsequent APIs such as <code>spare_capacity_mut()</code> then trust this corrupted <code>cap</code> value and may create out-of-bounds slices, leading to UB.</p>
+<p>This behavior is observable in release builds (integer overflow wraps), whereas debug builds panic due to overflow checks.</p>
+<h2>PoC</h2>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">bytes</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">BytesMut</span><span class="p">::</span><span class="n">from</span><span class="p">(</span><span class="o">&amp;</span><span class="n">amp</span><span class="p">;</span><span class="n">b</span><span class="o">&amp;</span><span class="n">quot</span><span class="p">;</span><span class="n">hello</span><span class="w"> </span><span class="n">world</span><span class="o">&amp;</span><span class="n">quot</span><span class="p">;[</span><span class="o">..</span><span class="p">]);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">b</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">a</span><span class="p">.</span><span class="n">split_off</span><span class="p">(</span><span class="mi">5</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// Ensure b becomes the unique owner of the backing storage</span>
+<span class="w">    </span><span class="nb">drop</span><span class="p">(</span><span class="n">a</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// Trigger overflow in new_cap + offset inside reserve</span>
+<span class="w">    </span><span class="n">b</span><span class="p">.</span><span class="n">reserve</span><span class="p">(</span><span class="kt">usize</span><span class="p">::</span><span class="n">MAX</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">6</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// This call relies on the corrupted cap and may cause UB &amp;amp; HBO</span>
+<span class="w">    </span><span class="n">b</span><span class="p">.</span><span class="n">put_u8</span><span class="p">(</span><span class="n">b</span><span class="o">&amp;</span><span class="p">#</span><span class="mi">39</span><span class="p">;</span><span class="n">h</span><span class="o">&amp;</span><span class="p">#</span><span class="mi">39</span><span class="p">;);</span>
+<span class="p">}</span>
+</code></pre></div>
+<h1>Workarounds</h1>
+<p>Users of <code>BytesMut::reserve</code> are only affected if integer overflow checks are configured to wrap. When integer overflow is configured to panic, this issue does not apply.</p>
+<p>See <a href="https://rustsec.org/advisories/RUSTSEC-2026-0007.html">advisory page</a> for additional details.<br>
+</p>
+</blockquote>
+
+
+
+<a name="573855724"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312592%20RUSTSEC-2026-0007%3A%20Integer%20overfl.../near/573855724" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312592.20RUSTSEC-2026-0007.3A.20Integer.20overfl.2E.2E.2E.html#573855724">(Feb 14 2026 at 02:29)</a>:</h4>
+<p>alexcrichton closed <a href="https://github.com/bytecodealliance/wasmtime/issues/12592">issue #12592</a>:</p>
+<blockquote>
+<blockquote>
+<p>Integer overflow in <code>BytesMut::reserve</code></p>
+</blockquote>
+<table>
+<thead>
+<tr>
+<th>Details</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Package</td>
+<td><code>bytes</code></td>
+</tr>
+<tr>
+<td>Version</td>
+<td><code>1.10.1</code></td>
+</tr>
+<tr>
+<td>URL</td>
+<td><a href="https://github.com/advisories/GHSA-434x-w66g-qw3r">https://github.com/advisories/GHSA-434x-w66g-qw3r</a></td>
+</tr>
+<tr>
+<td>Date</td>
+<td>2026-02-03</td>
+</tr>
+<tr>
+<td>Patched versions</td>
+<td><code>&gt;=1.11.1</code></td>
+</tr>
+<tr>
+<td>Unaffected versions</td>
+<td><code>&lt;1.2.1</code></td>
+</tr>
+</tbody>
+</table>
+<p>In the unique reclaim path of <code>BytesMut::reserve</code>, the condition</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="n">v_capacity</span><span class="w"> </span><span class="o">&amp;</span><span class="n">gt</span><span class="p">;</span><span class="o">=</span><span class="w"> </span><span class="n">new_cap</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">offset</span>
+</code></pre></div>
+<p>uses an unchecked addition. When <code>new_cap + offset</code> overflows <code>usize</code> in release builds, this condition may incorrectly pass, causing <code>self.cap</code> to be set to a value that exceeds the actual allocated capacity. Subsequent APIs such as <code>spare_capacity_mut()</code> then trust this corrupted <code>cap</code> value and may create out-of-bounds slices, leading to UB.</p>
+<p>This behavior is observable in release builds (integer overflow wraps), whereas debug builds panic due to overflow checks.</p>
+<h2>PoC</h2>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">bytes</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">BytesMut</span><span class="p">::</span><span class="n">from</span><span class="p">(</span><span class="o">&amp;</span><span class="n">amp</span><span class="p">;</span><span class="n">b</span><span class="o">&amp;</span><span class="n">quot</span><span class="p">;</span><span class="n">hello</span><span class="w"> </span><span class="n">world</span><span class="o">&amp;</span><span class="n">quot</span><span class="p">;[</span><span class="o">..</span><span class="p">]);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">b</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">a</span><span class="p">.</span><span class="n">split_off</span><span class="p">(</span><span class="mi">5</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// Ensure b becomes the unique owner of the backing storage</span>
+<span class="w">    </span><span class="nb">drop</span><span class="p">(</span><span class="n">a</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// Trigger overflow in new_cap + offset inside reserve</span>
+<span class="w">    </span><span class="n">b</span><span class="p">.</span><span class="n">reserve</span><span class="p">(</span><span class="kt">usize</span><span class="p">::</span><span class="n">MAX</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">6</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// This call relies on the corrupted cap and may cause UB &amp;amp; HBO</span>
+<span class="w">    </span><span class="n">b</span><span class="p">.</span><span class="n">put_u8</span><span class="p">(</span><span class="n">b</span><span class="o">&amp;</span><span class="p">#</span><span class="mi">39</span><span class="p">;</span><span class="n">h</span><span class="o">&amp;</span><span class="p">#</span><span class="mi">39</span><span class="p">;);</span>
+<span class="p">}</span>
+</code></pre></div>
+<h1>Workarounds</h1>
+<p>Users of <code>BytesMut::reserve</code> are only affected if integer overflow checks are configured to wrap. When integer overflow is configured to panic, this issue does not apply.</p>
+<p>See <a href="https://rustsec.org/advisories/RUSTSEC-2026-0007.html">advisory page</a> for additional details.<br>
+</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

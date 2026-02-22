@@ -1,0 +1,122 @@
+<html>
+<head><meta charset="utf-8"><title>wasi_args propagation to linked module · wamr · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/290350-wamr/index.html">wamr</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/290350-wamr/topic/wasi_args.20propagation.20to.20linked.20module.html">wasi_args propagation to linked module</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="530833984"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/290350-wamr/topic/wasi_args%20propagation%20to%20linked%20module/near/530833984" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Boris Kreminski <a href="https://bytecodealliance.github.io/zulip-archive/stream/290350-wamr/topic/wasi_args.20propagation.20to.20linked.20module.html#530833984">(Jul 25 2025 at 19:13)</a>:</h4>
+<p>I've tried to call some socket api from within linked (dependency) module. I've followed the reactor/command pattern guide from here: <a href="https://github.com/bytecodealliance/wasm-micro-runtime/blob/main/doc/multi_module.md">https://github.com/bytecodealliance/wasm-micro-runtime/blob/main/doc/multi_module.md</a>, and my linked module is pretty much based on <code>addr_resolve.c</code> from samples.</p>
+<p>So, the command module has <code>main()</code> and calls <code>resolve()</code> function referenced from reactor module. I've used <code>iwasm</code> to run it: <code>iwasm --allow-resolve=localhost --addr-pool=0.0.0.0/0 command.wasm</code> (had to re-build it with <code>WAMR_BUILD_MULTI_MODULE=1</code>). I've supplied both <code>--allow-resolve</code> and <code>--addr-pool</code> switched, but was getting <code>getaddrinfo: Permission denied</code> error. <br>
+This behavior only happens whenever reactor module is linked. When reactor is instantiated directly and <code>resolve()</code> function is called, it works as expected. <br>
+Digging a bit deeper, I noticed that upon instantiation of a linked module, neither <code>addr_pool</code> nor <code>ns_lookup_pool</code> were not initialized. <br>
+Looking at <code>wasm_runtime_set_wasi_args_ex</code> function signature, I've noticed that it lacks <code>addr_pool</code> and <code>ns_lookup_pool</code> arguments (just like it has for map_dir_list and env_list for --dir and --env command-line arguments respectively). To debug it a bit further, I simply modified the <code>wasm_runtime_set_wasi_args_ex</code> signature to include both <code>addr_pool</code> and <code>ns_lookup_pool</code>, just to make a necessary assignment before a call to <code>wasm_propagate_wasi_args</code>:</p>
+<div class="codehilite" data-code-language="C"><pre><span></span><code><span class="w">    </span><span class="n">wasi_args</span><span class="o">-&gt;</span><span class="n">addr_pool</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">addr_pool</span><span class="p">;</span>
+<span class="w">    </span><span class="n">wasi_args</span><span class="o">-&gt;</span><span class="n">addr_count</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">addr_pool_size</span><span class="p">;</span>
+<span class="w">    </span><span class="n">wasi_args</span><span class="o">-&gt;</span><span class="n">ns_lookup_pool</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ns_lookup_pool</span><span class="p">;</span>
+<span class="w">    </span><span class="n">wasi_args</span><span class="o">-&gt;</span><span class="n">ns_lookup_count</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ns_lookup_pool_size</span><span class="p">;</span>
+</code></pre></div>
+<p>That worked for me (a linked module instantiated successfully with properly propagated  <code>wasi_args</code>), but I'm curious whether this looks like a missing part in current implementation, or some misconfiguration on my end? Is it by design? I am assuming that during the propagation, the linked module inherits all the permissions from main module, but please correct me if I am wrong.</p>
+<p>Any feedback is appreciated, thank you! The super basic example code is below:</p>
+<p>reactor.c:</p>
+<div class="codehilite" data-code-language="C"><pre><span></span><code><span class="cm">/*</span>
+<span class="cm"> * Copyright (C) 2022 Amazon.com, Inc. or its affiliates. All rights reserved.</span>
+<span class="cm"> * SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception</span>
+<span class="cm"> */</span>
+
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;arpa/inet.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdio.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdlib.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;string.h&gt;</span>
+<span class="cp">#ifdef __wasi__</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;wasi_socket_ext.h&gt;</span>
+<span class="cp">#else</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;netdb.h&gt;</span>
+<span class="cp">#endif</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">lookup_host</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">host</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">addrinfo</span><span class="w"> </span><span class="n">hints</span><span class="p">,</span><span class="w"> </span><span class="o">*</span><span class="n">res</span><span class="p">,</span><span class="w"> </span><span class="o">*</span><span class="n">result</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">errcode</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">addrstr</span><span class="p">[</span><span class="mi">100</span><span class="p">];</span>
+<span class="w">    </span><span class="kt">void</span><span class="w"> </span><span class="o">*</span><span class="n">ptr</span><span class="p">;</span>
+
+<span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"lookup_host: enter %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">host</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">memset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hints</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">hints</span><span class="p">));</span>
+<span class="w">    </span><span class="n">hints</span><span class="p">.</span><span class="n">ai_family</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">AF_INET</span><span class="p">;</span>
+<span class="w">    </span><span class="n">hints</span><span class="p">.</span><span class="n">ai_socktype</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SOCK_STREAM</span><span class="p">;</span>
+
+<span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"lookup_host: calling getaddrinfo</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">errcode</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">getaddrinfo</span><span class="p">(</span><span class="n">host</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">hints</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">result</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">errcode</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="n">perror</span><span class="p">(</span><span class="s">"getaddrinfo"</span><span class="p">);</span>
+<span class="w">        </span><span class="n">printf</span><span class="p">(</span><span class="s">"getaddrinfo error %d"</span><span class="p">,</span><span class="w"> </span><span class="n">errcode</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">-1</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"After getaddrinfo %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">host</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">res</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">result</span><span class="p">;</span>
+
+<span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"Host: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">host</span><span class="p">);</span>
+<span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">res</span><span class="p">)</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="k">switch</span><span class="w"> </span><span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">ai_family</span><span class="p">)</span>
+<span class="w">        </span><span class="p">{</span>
+<span class="w">        </span><span class="k">case</span><span class="w"> </span><span class="no">AF_INET</span><span class="p">:</span>
+<span class="w">            </span><span class="n">ptr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="p">((</span><span class="k">struct</span><span class="w"> </span><span class="nc">sockaddr_in</span><span class="w"> </span><span class="o">*</span><span class="p">)</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">ai_addr</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">sin_addr</span><span class="p">;</span>
+<span class="w">            </span><span class="k">break</span><span class="p">;</span>
+<span class="w">        </span><span class="k">case</span><span class="w"> </span><span class="no">AF_INET6</span><span class="p">:</span>
+<span class="w">            </span><span class="n">ptr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="p">((</span><span class="k">struct</span><span class="w"> </span><span class="nc">sockaddr_in6</span><span class="w"> </span><span class="o">*</span><span class="p">)</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">ai_addr</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">sin6_addr</span><span class="p">;</span>
+<span class="w">            </span><span class="k">break</span><span class="p">;</span>
+<span class="w">        </span><span class="k">default</span><span class="o">:</span>
+<span class="w">            </span><span class="n">printf</span><span class="p">(</span><span class="s">"Unsupported address family: %d</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">res</span><span class="o">-&gt;</span><span class="n">ai_family</span><span class="p">);</span>
+<span class="w">            </span><span class="k">continue</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="n">inet_ntop</span><span class="p">(</span><span class="n">res</span><span class="o">-&gt;</span><span class="n">ai_family</span><span class="p">,</span><span class="w"> </span><span class="n">ptr</span><span class="p">,</span><span class="w"> </span><span class="n">addrstr</span><span class="p">,</span><span class="w"> </span><span class="mi">100</span><span class="p">);</span>
+<span class="w">        </span><span class="n">printf</span><span class="p">(</span><span class="s">"IPv%d address: %s (%s)</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">res</span><span class="o">-&gt;</span><span class="n">ai_family</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">AF_INET6</span><span class="w"> </span><span class="o">?</span><span class="w"> </span><span class="mi">6</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
+<span class="w">               </span><span class="n">addrstr</span><span class="p">,</span><span class="w"> </span><span class="n">res</span><span class="o">-&gt;</span><span class="n">ai_socktype</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">SOCK_STREAM</span><span class="w"> </span><span class="o">?</span><span class="w"> </span><span class="s">"TCP"</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="s">"UDP"</span><span class="p">);</span>
+<span class="w">        </span><span class="n">res</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">res</span><span class="o">-&gt;</span><span class="n">ai_next</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="n">freeaddrinfo</span><span class="p">(</span><span class="n">result</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">EXIT_SUCCESS</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="n">__attribute__</span><span class="p">((</span><span class="n">export_name</span><span class="p">(</span><span class="s">"resolve"</span><span class="p">)))</span><span class="w"> </span><span class="kt">int</span>
+<span class="n">resolve</span><span class="p">()</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"reactor: resolve enter</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">lookup_host</span><span class="p">(</span><span class="s">"localhost"</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>command.c:</p>
+<div class="codehilite" data-code-language="C"><pre><span></span><code><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdio.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdlib.h&gt;</span>
+
+<span class="n">__attribute__</span><span class="p">((</span><span class="n">import_module</span><span class="p">(</span><span class="s">"reactor"</span><span class="p">)))</span>
+<span class="n">__attribute__</span><span class="p">((</span><span class="n">import_name</span><span class="p">(</span><span class="s">"resolve"</span><span class="p">)))</span><span class="w"> </span><span class="k">extern</span><span class="w"> </span><span class="kt">int</span>
+<span class="n">resolve</span><span class="p">();</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">main</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">argc</span><span class="p">,</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">argv</span><span class="p">[])</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="n">resolve</span><span class="p">();</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/wasm-micro-runtime/blob/main/doc/multi_module.md" style="background-image: url(&quot;https://uploads.zulipusercontent.net/48a302a0fe5c949c2378cb998be8138ad57634be/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f666266393531393330663164313739633666303238386365643930373663613739363362663465613864323265666365376437336366353537323333653837302f62797465636f6465616c6c69616e63652f7761736d2d6d6963726f2d72756e74696d65&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/wasm-micro-runtime/blob/main/doc/multi_module.md" title="wasm-micro-runtime/doc/multi_module.md at main · bytecodealliance/wasm-micro-runtime">wasm-micro-runtime/doc/multi_module.md at main · bytecodealliance/wasm-micro-runtime</a></div><div class="message_embed_description">WebAssembly Micro Runtime (WAMR). Contribute to bytecodealliance/wasm-micro-runtime development by creating an account on GitHub.</div></div></div>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

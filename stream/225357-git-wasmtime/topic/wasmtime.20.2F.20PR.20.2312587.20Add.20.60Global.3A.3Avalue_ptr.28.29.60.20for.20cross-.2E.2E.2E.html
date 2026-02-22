@@ -1,0 +1,483 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #12587 Add `Global::value_ptr()` for cross-... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html">wasmtime / PR #12587 Add `Global::value_ptr()` for cross-...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="573672287"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/573672287" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#573672287">(Feb 13 2026 at 06:19)</a>:</h4>
+<p>AlbertMarashi opened <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a> from <code>AlbertMarashi:patch-1</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<h2>Summary</h2>
+<ul>
+<li>Adds <code>unsafe fn value_ptr(&amp;self, store: impl AsContext) -&gt; *mut u8</code> to <code>Global</code></li>
+<li>Returns a raw pointer to a mutable numeric global's underlying <code>VMGlobalDefinition</code> storage</li>
+<li>Enables cross-thread cooperative scheduling without requiring <code>&amp;mut Store</code></li>
+</ul>
+<h2>Motivation</h2>
+<p>There is currently no way to signal a running WebAssembly instance from another thread using a wasm-visible global. The existing <code>Global::set()</code> requires <code>&amp;mut Store</code>,<br>
+which is exclusively held by the thread executing the module. This creates a deadlock in the API: you can't mutate the global until execution finishes, but execution won't<br>
+finish until the global is mutated.</p>
+<p>The concrete use case is <strong>cooperative suspend/resume</strong> (checkpoint/restore). A WASM transform inserts <code>global.get $flag; br_if $suspend</code> checks at loop heads and after<br>
+call sites. The host signals suspension by writing <code>1</code> to that flag from a control thread. The module sees the flag, saves its locals to a shadow stack, and returns. On<br>
+resume, the host clears the flag and re-calls the function, which restores locals and continues from where it left off.</p>
+<p>Wasmtime's existing interruption mechanisms don't solve this:</p>
+<ul>
+<li><strong>Epoch interruption</strong> traps the instance — the module never gets a chance to save its own state before stopping, so it can't be resumed.</li>
+<li><strong>Fuel</strong> has the same problem — exhaustion causes a trap, not a cooperative yield.</li>
+</ul>
+<p>What's needed is a way for the module itself to <em>observe</em> a host-written flag and <em>choose</em> to suspend, preserving its own stack. That requires the host to write to a global<br>
+ that the running module can read — without holding <code>&amp;mut Store</code>.</p>
+<h2>Design</h2>
+<p><code>value_ptr()</code> is deliberately narrow:</p>
+<ul>
+<li>
+<p><strong><code>unsafe</code></strong> — the caller is responsible for lifetime management (pointer is valid only while the <code>Store</code> lives) and data-race avoidance (<code>write_volatile</code> or<br>
+<code>AtomicI32::from_ptr</code>).</p>
+</li>
+<li>
+<p><strong>Restricted to numeric types</strong> — panics on <code>funcref</code>/<code>externref</code>, which require GC coordination.</p>
+</li>
+<li><strong>Restricted to mutable globals</strong> — panics on <code>Mutability::Const</code>.</li>
+<li><strong>Only needs <code>AsContext</code></strong> (shared ref) — the point is to obtain the pointer <em>before</em> moving the store to a worker thread. No <code>&amp;mut Store</code> required.</li>
+</ul>
+<h2>Example</h2>
+<p><div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="n">flag</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">instance</span><span class="p">.</span><span class="n">get_global</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="s">"suspending"</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">ptr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">flag</span><span class="p">.</span><span class="n">value_ptr</span><span class="p">(</span><span class="o">&amp;</span><span class="n">store</span><span class="p">)</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="o">*</span><span class="k">mut</span><span class="w"> </span><span class="kt">i32</span><span class="p">;</span>
+
+<span class="c1">// Move store to worker thread</span>
+<span class="n">std</span><span class="p">::</span><span class="n">thread</span><span class="p">::</span><span class="n">spawn</span><span class="p">(</span><span class="k">move</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">run</span><span class="p">.</span><span class="n">call</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="p">()).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="p">});</span>
+
+<span class="c1">// Signal from control thread</span>
+<span class="k">unsafe</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">ptr</span><span class="p">::</span><span class="n">write_volatile</span><span class="p">(</span><span class="n">ptr</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span><span class="w"> </span><span class="p">}</span>
+<span class="o">~~~</span>
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="573672288"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/573672288" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#573672288">(Feb 13 2026 at 06:19)</a>:</h4>
+<p><strong>AlbertMarashi</strong> requested <a href="https://github.com/fitzgen">fitzgen</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>.</p>
+
+
+
+<a name="573672289"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/573672289" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#573672289">(Feb 13 2026 at 06:19)</a>:</h4>
+<p><strong>AlbertMarashi</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>.</p>
+
+
+
+<a name="573672625"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/573672625" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#573672625">(Feb 13 2026 at 06:23)</a>:</h4>
+<p>AlbertMarashi edited <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<ul>
+<li>Adds <code>unsafe fn value_ptr(&amp;self, store: impl AsContext) -&gt; *mut u8</code> to <code>Global</code></li>
+<li>Returns a raw pointer to a mutable numeric global's underlying <code>VMGlobalDefinition</code> storage</li>
+<li>Enables cross-thread cooperative scheduling without requiring <code>&amp;mut Store</code></li>
+</ul>
+<h2>Motivation</h2>
+<p>There is currently no way to signal a running WebAssembly instance from another thread using a wasm-visible global. The existing <code>Global::set()</code> requires <code>&amp;mut Store</code>, which is exclusively held by the thread executing the module. This creates a deadlock in the API: you can't mutate the global until execution finishes, but execution won't finish until the global is mutated.</p>
+<p>The concrete use case is <strong>cooperative suspend/resume</strong> (checkpoint/restore). A WASM transform inserts <code>global.get $flag; br_if $suspend</code> checks at loop heads and after call sites. The host signals suspension by writing <code>1</code> to that flag from a control thread. The module sees the flag, saves its locals to a shadow stack, and returns. On resume, the host clears the flag and re-calls the function, which restores locals and continues from where it left off.</p>
+<p>Wasmtime's existing interruption mechanisms don't solve this:</p>
+<ul>
+<li><strong>Epoch interruption</strong> traps the instance — the module never gets a chance to save its own state before stopping, so it can't be resumed.</li>
+<li><strong>Fuel</strong> has the same problem — exhaustion causes a trap, not a cooperative yield.</li>
+</ul>
+<p>What's needed is a way for the module itself to <em>observe</em> a host-written flag and <em>choose</em> to suspend, preserving its own stack. That requires the host to write to a global that the running module can read — without holding <code>&amp;mut Store</code>.</p>
+<h2>Design</h2>
+<p><code>value_ptr()</code> is deliberately narrow:</p>
+<ul>
+<li><strong><code>unsafe</code></strong> — the caller is responsible for lifetime management (pointer is valid only while the <code>Store</code> lives) and data-race avoidance (<code>write_volatile</code> or <code>AtomicI32::from_ptr</code>).</li>
+<li><strong>Restricted to numeric types</strong> — panics on <code>funcref</code>/<code>externref</code>, which require GC coordination.</li>
+<li><strong>Restricted to mutable globals</strong> — panics on <code>Mutability::Const</code>.</li>
+<li><strong>Only needs <code>AsContext</code></strong> (shared ref) — the point is to obtain the pointer <em>before</em> moving the store to a worker thread. No <code>&amp;mut Store</code> required.</li>
+</ul>
+<h2>Example</h2>
+<p><div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="n">flag</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">instance</span><span class="p">.</span><span class="n">get_global</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="s">"suspending"</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">ptr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">flag</span><span class="p">.</span><span class="n">value_ptr</span><span class="p">(</span><span class="o">&amp;</span><span class="n">store</span><span class="p">)</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="o">*</span><span class="k">mut</span><span class="w"> </span><span class="kt">i32</span><span class="p">;</span>
+
+<span class="c1">// Move store to worker thread</span>
+<span class="n">std</span><span class="p">::</span><span class="n">thread</span><span class="p">::</span><span class="n">spawn</span><span class="p">(</span><span class="k">move</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">run</span><span class="p">.</span><span class="n">call</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="p">()).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="p">});</span>
+
+<span class="c1">// Signal from control thread</span>
+<span class="k">unsafe</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">ptr</span><span class="p">::</span><span class="n">write_volatile</span><span class="p">(</span><span class="n">ptr</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span><span class="w"> </span><span class="p">}</span>
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="573673055"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/573673055" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#573673055">(Feb 13 2026 at 06:28)</a>:</h4>
+<p>AlbertMarashi updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>.</p>
+
+
+
+<a name="573673463"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/573673463" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#573673463">(Feb 13 2026 at 06:33)</a>:</h4>
+<p>AlbertMarashi updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>.</p>
+
+
+
+<a name="573682648"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/573682648" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#573682648">(Feb 13 2026 at 07:51)</a>:</h4>
+<p>bjorn3 <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3895447538">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<p>I don't think this is sound. Globals are accessed through non-atomic loads and stores and thus a concurrent modification is UB.</p>
+</blockquote>
+
+
+
+<a name="573691470"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/573691470" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#573691470">(Feb 13 2026 at 08:45)</a>:</h4>
+<p>AlbertMarashi <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3895653039">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<blockquote>
+<p>I don't think this is sound. Globals are accessed through non-atomic loads and stores and thus a concurrent modification is UB.</p>
+</blockquote>
+<p>Aren't all writes to i32s atomic?</p>
+</blockquote>
+
+
+
+<a name="573695731"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/573695731" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#573695731">(Feb 13 2026 at 09:12)</a>:</h4>
+<p>bjorn3 <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3895837021">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<p>No. In Rust a store that is not explicitly marked as atomic concurrent with any other load or store (atomic or not) on the same memory is a data race, which is UB. And a store that is marked as atomic can only be done concurrently on the same memory with other atomic operations. The compiler is allowed to for example assume that if it duplicates a non-atomic load without any operation in between on the same thread that could modify the memory, that both loads will result in the same value. If another thread was allowed to do a store between both operations, that would be UB. Similarly, the compiler is allowed to fold successive non-atomic loads without stores in between. So for example <code>while(!done) {}</code> may optimize to an infinite loop as this is a non-atomic load, so no concurrent modifications are possible without UB.</p>
+<p>This is unlike wasm where data races in the linear memory are not UB when said linear memory is marked as shared. (if not marked as shared, the wasm runtime is required to deny concurrent accesses) However globals are not stored in the linear memory and current wasm versions do not support marking globals as shared.</p>
+</blockquote>
+
+
+
+<a name="573695892"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/573695892" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#573695892">(Feb 13 2026 at 09:13)</a>:</h4>
+<p>bjorn3 edited a <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3895837021">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<p>No. In Rust a store that is not explicitly marked as atomic concurrent with any other load or store (atomic or not) on the same memory is a data race, which is UB. And a store that is marked as atomic can only be done concurrently on the same memory with other atomic operations. The compiler is allowed to for example assume that if it duplicates a non-atomic load without any operation in between on the same thread that could modify the memory, that both loads will result in the same value. If another thread was allowed to do a store between both operations, that would be UB. Similarly, the compiler is allowed to fold successive non-atomic loads without stores in between. So for example <code>while(!done) {}</code> may optimize to an infinite loop as this is a non-atomic load, so no concurrent modifications are possible without UB.</p>
+<p>This is unlike wasm where data races in the linear memory are not UB when said linear memory is marked as shared. (if not marked as shared, the wasm runtime is required to deny concurrent accesses) However globals are not stored in the linear memory and current wasm versions do not support marking globals as shared. Also for example the Pulley interpreter does unconditionally use non-atomic accesses in rust code for globals and is thus subject to the rust data race rules.</p>
+</blockquote>
+
+
+
+<a name="573704177"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/573704177" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#573704177">(Feb 13 2026 at 09:55)</a>:</h4>
+<p>AlbertMarashi <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3896172900">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<p>Interesting...</p>
+<p>So, why don't we have global atomics in that case?</p>
+</blockquote>
+
+
+
+<a name="573704490"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/573704490" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#573704490">(Feb 13 2026 at 09:57)</a>:</h4>
+<p>AlbertMarashi edited a <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3896172900">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<p>Interesting... I didn't know that.</p>
+<p>So, why don't we have global atomics in that case?</p>
+<p>However, judging based on how globals are currently implemented in wasmtime, it appears that these types of globals are being loaded from the memory address each time no?</p>
+</blockquote>
+
+
+
+<a name="573705703"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/573705703" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#573705703">(Feb 13 2026 at 10:03)</a>:</h4>
+<p>AlbertMarashi <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3896223672">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<p>As it stands currently, there appears to be no way to communicate with the code running inside of a module once it's started running, except for doing an unsafe data mutation at a given index in the module's memory from another thread.</p>
+<p>This may likely have the same types of issues as you describe - so I am not particularly sure what the right approach is here - it might be valuable for me to have a look at how the <code>increment_epoch</code> functionality in the engine allows for the module running to stop running from another thread. I will report back</p>
+</blockquote>
+
+
+
+<a name="573707415"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/573707415" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#573707415">(Feb 13 2026 at 10:13)</a>:</h4>
+<p>bjorn3 <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3896283379">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<blockquote>
+<p>So, why don't we have global atomics in that case?</p>
+</blockquote>
+<p>Because wasm doesn't yet support sharing an instance between threads. <a href="https://github.com/webAssembly/shared-everything-threads">https://github.com/webAssembly/shared-everything-threads</a> is still a draft.</p>
+<blockquote>
+<p>However, judging based on how globals are currently implemented in wasmtime, it appears that these types of globals are being loaded from the memory address each time no?</p>
+</blockquote>
+<p>Using non-atomic loads, so the compiler is allowed to assume that the global won't change. Maybe Cranelift won't miscompile it, but for Pulley we are at the mercy of the compiler that compiled the interpreter, which does consider it UB: <a href="https://github.com/bytecodealliance/wasmtime/blob/92f1829e394f1921a5872f068286073b95d242fe/pulley/src/interp.rs#L1202">https://github.com/bytecodealliance/wasmtime/blob/92f1829e394f1921a5872f068286073b95d242fe/pulley/src/interp.rs#L1202</a> It is possible to make concurrent accesses to globals possible, but it did require auditing all places where globals are accessed to ensure atomic accesses are used. And it did technically be an extension of the wasm specification, which as I understand Wasmtime prefers not to do.</p>
+</blockquote>
+
+
+
+<a name="573708740"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/573708740" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#573708740">(Feb 13 2026 at 10:20)</a>:</h4>
+<p>AlbertMarashi <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3896328818">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<p>So, it appears that <code>wasmtime</code> currently uses these <code>Atomic</code> numbers to track the epoch</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/1adc57ea2768f78074879082fdd1ffe4fd50df62/crates/wasmtime/src/engine.rs#L820-L822">https://github.com/bytecodealliance/wasmtime/blob/1adc57ea2768f78074879082fdd1ffe4fd50df62/crates/wasmtime/src/engine.rs#L820-L822</a></p>
+<p>And here</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/92f1829e394f1921a5872f068286073b95d242fe/crates/wasmtime/src/runtime/vm/instance.rs#L500-L504">https://github.com/bytecodealliance/wasmtime/blob/92f1829e394f1921a5872f068286073b95d242fe/crates/wasmtime/src/runtime/vm/instance.rs#L500-L504</a></p>
+<p>So, I guess essentially what I am asking for, is to have an external API to do what wasmtime is currently already doing internally for epoch-based suspensions, as I am working on a crate that will allow for snapshotting instances and arbitrary resumability.</p>
+<p>Would this require our globals to become atomic? A new global atomic type? etc.</p>
+<p>What are your thoughts?</p>
+</blockquote>
+
+
+
+<a name="573737191"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/573737191" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#573737191">(Feb 13 2026 at 13:03)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>.</p>
+
+
+
+<a name="573769370"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/573769370" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#573769370">(Feb 13 2026 at 15:27)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3897820056">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<p>@AlbertMarashi bjorn3 is correct in all of the above: what you have built here is fundamentally at odds with the thread safety of core Wasmtime. A <code>Store</code> uniquely owns all storage used by the Wasm instance while running. We cannot provide the API as written in this PR, because it is incorrect.</p>
+<p>Two ways out that I can think of:</p>
+<ul>
+<li>You could make use of <code>SharedMemory</code>, arrange for your module to import that memory, and use atomic reads within Wasm. This will require work on the toolchain end and will also not work with components.</li>
+<li>You could import a host function that itself has an <code>Arc&lt;AtomicBool&gt;</code> in its closure and reads that. Calling this will be a lot slower than reading a global, however.</li>
+</ul>
+<p>Taking a step back, though: what are you actually trying to achieve? When you say suspend/resume do you mean that the Wasm guest saves its state somewhere and returns? Is the goal to timeslice multiple Wasm invocations into a single instance?</p>
+<p>If so, you will be interested in the new async component model features (see e.g. <code>Store::run_concurrent</code> and <code>Func::call_concurrent</code>), as well as the in-progress component model cooperative threading work. That work has done the hard part of thinking through state ownership handoffs that you're plowing through/disregarding here.</p>
+</blockquote>
+
+
+
+<a name="573872984"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/573872984" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#573872984">(Feb 14 2026 at 07:09)</a>:</h4>
+<p>AlbertMarashi <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3901292163">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<blockquote>
+<p>Taking a step back, though: what are you actually trying to achieve? When you say suspend/resume do you mean that the Wasm guest saves its state somewhere and returns? Is the goal to timeslice multiple Wasm invocations into a single instance?</p>
+<p>If so, you will be interested in the new async component model features (see e.g. <code>Store::run_concurrent</code> and <code>Func::call_concurrent</code>), as well as the in-progress component model cooperative threading work. That work has done the hard part of thinking through state ownership handoffs that you're plowing through/disregarding here.</p>
+</blockquote>
+<p>Can you tell me more about this?</p>
+<p>How does it address things that may never yield back to the host, such as infinite loops, or exponential function bombs, etc.</p>
+<hr>
+<p>To clarify, what I am attempting to achieve is near native-speed transformation of WASM modules to support arbitrary suspend + snapshot + resume capabilities for WASM instances.</p>
+<p>The business use case is a generic cloud execution platform that supports "durable" persistent functions/instances that have the ability for modules to suspend their execution for unbounded amounts of time.</p>
+<p>This requires us to have a way to serialize all of the module state into a data file somewhere, to be later resumed by our orchestrator when a new request or event is triggered.</p>
+<p>This requires us to be able to:</p>
+<ol>
+<li>Augment WASM code (or compiled output) to inject fast-check <code>test + bnz</code>-like instructions inside of their code at ideally either function call/loop boundaries, or even at the instruction level, if possible.</li>
+<li>Snapshot, and serialize the instance state once suspended, which requires the ability for us to serialize the stack trace, linear memory, module code, and other resources and objects.</li>
+<li>To reload and deserialize the instance state in a consistent and deterministic manner, ready to continue executing the code that we effectively left off at.</li>
+</ol>
+<blockquote>
+<p>Note: Not all resources of course will be able to be fully serialized. (e.g. TCP connections / websocket connection) - however we intend for our host to maintain these types of connections in the background whilst the module is "sleeping" until a new packet/event comes in.</p>
+</blockquote>
+</blockquote>
+
+
+
+<a name="573930961"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/573930961" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#573930961">(Feb 14 2026 at 22:41)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3902711739">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<p>In addition to the Wasmtime-specific thread-safety properties, I think that this problem can also be viewed from a spec-level of "this isn't possible to do in wasm right now".</p>
+<p>Let's say that a wasm has a big call stack which bottoms out in an infinite loop. If I understand @AlbertMarashi this PR correctly what you're thinking of doing is that this infinite loop would be instrumented (externally, via a wasm-&gt;wasm transformation) to have a global.get at the loop header which spills state and then returns back down the stack triggering everything else to spill state too. Semantically what this would look like to wasm, however, is that the value of the global changes between iterations of the loop without wasm doing anything (e.g. no calls to the host, no mutations of the global, nothing). My understanding is that this is a violation of WebAssembly semantics and would be spec-noncompliant behavior were Wasmtime to allow it.</p>
+<p>In theory the best-fitting feature here you want is a shared global. This is part of the shared-everything-threads proposal that <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3896283379">bjorn3 mentioned</a> and it is not yet implemented in Wasmtime. This would require atomic loads/stores to the global and would correctly model the ability for external actors to mutate the global during wasm execution. The next-best-fitting feature is what @cfallin mentioned using shared memory. This is a somewhat heavyweight feature to use here since you'd need a full 64k of memory just for this one global, but it would work because the wasm would read a byte in memory to see if it should return and the host would mutate that byte when it wanted to inject a yield.</p>
+<blockquote>
+<p>Can you tell me more about this?</p>
+<p>How does it address things that may never yield back to the host, such as infinite loops, or exponential function bombs, etc.</p>
+</blockquote>
+<p>Wasmtime's support for async-invoking wasm is <a href="https://docs.rs/wasmtime/41.0.3/wasmtime/struct.Config.html#method.async_support">documented here</a>. In short with either epochs or fuel we force wasm to time-slice itself during infinite loops and exponential function bombs. It works very similarly to what you're thinking, we inject checks in loop headers and function headers.</p>
+<p>What Wasmtime doesn't support, however, is mutation of the store while WebAssembly is suspended or time-sliced. Wasmtime also doesn't support serializing this state to get resumed later on. </p>
+<hr>
+<p>All that's to say: I think your best path forward right now is the same wasm-&gt;wasm transformation you have today to inject instrumentation. Instead of using a global to signal "please spill and suspend" you would instead use a shared memory and some byte within that shared memory. That should all work on Wasmtime as-is today and require no Wasmtime modifications.</p>
+</blockquote>
+
+
+
+<a name="574086912"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/574086912" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#574086912">(Feb 16 2026 at 11:19)</a>:</h4>
+<p>AlbertMarashi <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3907910168">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<p>That makes sense.</p>
+<p>Should this issue remain open should there be a future proposal for atomic globals implemented in WASM?</p>
+</blockquote>
+
+
+
+<a name="574159561"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/574159561" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#574159561">(Feb 16 2026 at 17:45)</a>:</h4>
+<p>alexcrichton closed without merge <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>.</p>
+
+
+
+<a name="574159564"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/574159564" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#574159564">(Feb 16 2026 at 17:45)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3909765973">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<p>I'll close this in favor of <a href="https://github.com/bytecodealliance/wasmtime/issues/9466">https://github.com/bytecodealliance/wasmtime/issues/9466</a> which is loosely the tracking issue for shared-everything-threads which would include atomic globals.</p>
+</blockquote>
+
+
+
+<a name="574360301"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/574360301" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#574360301">(Feb 17 2026 at 18:32)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3916447603">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<blockquote>
+<p>All that's to say: I think your best path forward right now is the same wasm-&gt;wasm transformation you have today to inject instrumentation. Instead of using a global to signal "please spill and suspend" you would instead use a shared memory and some byte within that shared memory. That should all work on Wasmtime as-is today and require no Wasmtime modifications.</p>
+</blockquote>
+<p>Agreed although I would say that you could potentially represent the interrupt check with a call to an imported component function and use compile-time builtins to lower that to the tight code that you are chasing. We would need to add unsafe intrinsics for atomic loads, but that seems pretty reasonable to me.</p>
+<ul>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.CodeBuilder.html#method.compile_time_builtins_binary">https://docs.rs/wasmtime/latest/wasmtime/struct.CodeBuilder.html#method.compile_time_builtins_binary</a></li>
+<li><a href="https://docs.rs/wasmtime/latest/wasmtime/struct.CodeBuilder.html#method.expose_unsafe_intrinsics">https://docs.rs/wasmtime/latest/wasmtime/struct.CodeBuilder.html#method.expose_unsafe_intrinsics</a></li>
+</ul>
+<hr>
+<p>The final thing I would add is that your Wasm-to-Wasm transformation will need to unwind and rewind the stack (if you aren't relying on your Wasm programs cooperating with this interruption and state-saving stuff themselves) which is basically the same thing that binaryen's asyncify is doing, so it is worth looking into their implementation for inspiration if not even something you can reuse or fork. Also look into continuation-passing style transforms, which enable similar things. Both are going to add execution overheads compared to the original, uninstrumented Wasm program, however. That is pretty inescapable.</p>
+</blockquote>
+
+
+
+<a name="574633510"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/574633510" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#574633510">(Feb 19 2026 at 01:25)</a>:</h4>
+<p>AlbertMarashi <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3924152473">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<blockquote>
+<p>which is basically the same thing that binaryen's asyncify is doing<br>
+That's correct, in fact, that's pretty much the approach I was trying to implement before running into this roadblock.</p>
+</blockquote>
+<blockquote>
+<p>Both are going to add execution overheads compared to the original, uninstrumented Wasm program, however. That is pretty inescapable</p>
+</blockquote>
+<p>This is largely true, however, I did come up with a potential solution I am experimenting with currently that provides a zero-cost approach to suspendability/resumability with support for universal serializable instance snapshots via cross-thread signalling/interrupts.</p>
+<p><strong>The idea behind that is essentially this:</strong></p>
+<ol>
+<li>Leave the compiled code as-is.</li>
+<li>At compile time, track compilation information and program metadata to construct side tables that provide us the necessary information to perform arbitrary resumability at any WASM PC.</li>
+<li>For native code, this would involve tracking live variable state and logic to convert register state at native PCs into a more universal VM-like program stack.</li>
+<li>When an interrupt occurs (e.g. either by page table fault, or by means of thread kill/interrupt), we'd receive the register state of the running instance. From here, we map register state/locals into a stack-based representation of state.</li>
+<li>Next, we could snapshot the module, serialize or persist it, or alternatively proceed to the next step (Resume)</li>
+<li>Resume would be the inverse of suspending, and would involve reading the program's stack to reload live values back into their respective registers as expected by the native code, and proceed instance execution from where we left off (in ideally the same identical state as before)</li>
+</ol>
+<p>This approach keeps the hot code execution path free from code augmentations and checks, and rely on the CPU's native capabilities to stop program execution. The cold path (suspend) would occur at far less frequent intervals (e.g. time-based instance scheduling), so the cost of suspending, serializing and resuming modules is amortized over the main execution time.</p>
+<p>The only extra cost would be the memory/disk requirements to store dense side tables that give our engine the necessary information to map registers to stacks at arbitrary PC points - which may potentially double the generated code size (although all of this could exist on disk/mmap'd code files due to the infrequent access and random access)</p>
+<hr>
+<p>I've dropped this wasmtime zulip conversation chat log here for anyone that finds this in the future.</p>
+<p><a href="#narrow/channel/206238-general/topic/WASM.20Snapshotting.20and.20Resumability/with/572493057">#general &gt; WASM Snapshotting and Resumability</a></p>
+</blockquote>
+
+
+
+<a name="574647989"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/574647989" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#574647989">(Feb 19 2026 at 04:26)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3924621044">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<p>@AlbertMarashi you're correct that having the ability to map from native machine state to Wasm VM state (locals and operand stack), and then from Wasm VM state back to native machine code, would let you take a portable snapshot.</p>
+<p>However it's an enormous undertaking from a compiler and runtime perspective:</p>
+<ul>
+<li>This means that you need to preserve all values that exist in the Wasm bytecode, or alternately a way to "recover" (recompute) them at any interruption point. The latter is a structural property of all compiler passes (they need to be "reversible" in the sense that they generate a recovery path when deleting code). If you don't take the recovery-code approach, you're not actually zero-overhead.</li>
+<li>This means that you need to modify the register allocator to provide a fully precise mapping from register state to SSA (and then separately map SSA, via recovery code, to Wasm VM state) at every interruptible program point. Again possible, and regalloc2 even has some support for this via the debug-labels mechanism, but it's very expensive at compile time, and somewhat finicky in the presence of liverange merging.</li>
+<li>This means that you need to essentially support <em>on-stack replacement</em>, i.e., the ability to generate a stack frame to "side-enter" a function when you resume it. This is even harder than the register-state-to-Wasm-state mapping, because the registers are an <em>arbitrary superset</em> of the Wasm state: you may have e.g. intermediate results that have been computed and kept in registers by register allocation, live across interruption points, and you need some way of dumping the expressions that can recompute them for every register in the machine.<ul>
+<li>You can sort of model this in a somewhat principled way by having an extra entrypoint in the IR's CFG for every resume-point (or equivalently, a single virtual entry block that has out-edges to every resume block), but that significantly pessimizes codegen: it means that the function preamble doesn't dominate most code anymore (anything past a resume point), so you're going to have oodles of recomputation of basic things like the memory base loaded from vmctx. Not to mention all of this is also a major change to fundamental invariants in the compiler.</li>
+<li>Then you have the <em>relocation problem</em>: some of those values that are live in the compiler IR are going to be native pointers, and Cranelift doesn't preserve pointer provenance (for simplicity, by design), so they're just integers in a soup of computation once produced; you have no way to find them and update them if things are mapped at different addresses on resume.</li>
+</ul>
+</li>
+</ul>
+<p>I think you could approach this in a somewhat tractable way by starting from what I did for debug instrumentation, and going the other way for resume -- always loading values back from the stackslots after every interruption point; together with something to ensure that you never have other live values across these points. That's more or less what I describe in the debugging RFC v2 <a href="https://github.com/bytecodealliance/rfcs/blob/main/accepted/wasmtime-debugging-v2.md">here</a>, around "<em>As a final interesting note: if we ever want to implement on-stack replacement (OSR) ...</em>". But note that the instrumentation approach is decidedly <em>not</em> zero-overhead: it is something like a 2x slowdown. So it's great for debugging, but not something you'd deploy transparently.</p>
+<p>tl;dr: "construct some side tables so I can simply read out and reconstitute the native register state" has these "side tables" doing a <em>lot</em> of heavy lifting in a way that requires fundamental changes to the compiler, because you need a fully accurate <em>bijection</em> from Wasm state to register state, with no register left out and all native address dependencies accounted for.</p>
+</blockquote>
+
+
+
+<a name="574863388"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/574863388" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#574863388">(Feb 20 2026 at 04:11)</a>:</h4>
+<p>AlbertMarashi <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3931502035">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<p>@cfallin thank you very much for your detailed thoughts and perspectives, they provide an invaluable perspective to many of the same questions and challenges I've pondered, and I am largely on the same page as you with many things.</p>
+<p>One note:</p>
+<blockquote>
+<p>instrumentation approach is decidedly not zero-overhead<br>
+In my experiments (recursive fibonnaci function - compute heavy) approach, I manually hand-augmented some of the binary code where the idea was to effectively add a <code>test</code> + <code>bnz</code> check at each suspend point.</p>
+</blockquote>
+<p>Thanks to CPU branch prediction, the costs of these checks was measured and estimated to be around ~3%-15%. And the cost to code size would also be in a similar range (<code>test</code> + <code>bnz</code> at each natural suspend/branch point (e.g. loops, function calls))</p>
+<p>However, my instrumentation-free approach would be 0% in the hot path, and there would only be a memory/disk and compile cost associated with the dense side tables that would be needed to support conversion of program state into a canonical/universal stack representation</p>
+<p>That being said, it is without doubt, no easy undertaking (major compiler changes, etc would all be involved).</p>
+<p>I may share my results in the future as I proceed with my own WASM runtime engine implementation and approach <span aria-label="laughing" class="emoji emoji-1f606" role="img" title="laughing">:laughing:</span> </p>
+</blockquote>
+
+
+
+<a name="574864262"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/574864262" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#574864262">(Feb 20 2026 at 04:24)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3931551359">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<p>The instrumentation overhead I was referring to is the overhead of storing Wasm VM-level values to stackslots, to allow for a perfect bijection between native code-level state and Wasm VM state. The 2x overhead is an actual measured number from my implementation that is in-tree under the <code>guest-debug</code> compile flag.</p>
+<p>If you assume that you can have the overhead of only a test+branch, then you run into all of the issues I mentioned: I don't think you'll be able to construct a perfect bijection to allow state resume without essentially rewriting all of Cranelift's mid-end and back-end to account for "recovery instructions". I'd encourage you to read about OSR and how it's implemented in e.g. JavaScript JITs: the problem of extracting VM-level state from one version of a compiled function and injecting it into another (presumably higher-tier-compiled) version of the function is essentially the same as what you're trying to solve. I don't want to discourage you so much as give you an accurate view of the work involved: this is probably an engineer-year of effort to get right, for someone who already knows Cranelift. Happy to see what you work out, of course -- best of luck.</p>
+</blockquote>
+
+
+
+<a name="574891946"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/574891946" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#574891946">(Feb 20 2026 at 08:55)</a>:</h4>
+<p>AlbertMarashi <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3932501811">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<p>Ah yes, I get you now, and yes, thank you a lot.</p>
+<blockquote>
+<p>The 2x overhead<br>
+Yes, I suspect that this will be the only cost consideration with my approach - however, I think that this extra memory cost might not be as real as one might imagine, if we instead memory map the "side table"/bijection data to disk, given how infrequently and sparsely it might actually be accessed.</p>
+</blockquote>
+<p>The approach that I currently opted into is to actually just use a custom stack implementation that matches more closely to something like a universal/canonical WASM stack as opposed to using a more native approach.</p>
+<p>My first goal in my JIT engine is to make instructions operate through stack-based (memory read/write) transformations similar to what an interpreted WASM VM might do, so that I don't have to worry a whole lot about register allocations - with my hope being that the CPU's L1 cache would reduce a lot of the costs associated to memory reads and writes.</p>
+<p>I expect this would likely probably involve a significant slowdown, but honestly for proof of concept and business-need requirements something between 2-5x slowdown is totally acceptable for the benefits that snapshotting and persistence offer me.</p>
+<p>Additional optimizations could be made in my code to fuse various kinds of WASM instruction operations together for the varying archs.</p>
+<p>Anyways, thanks again for your feedback, I will share my results down the line down the line if successful.</p>
+</blockquote>
+
+
+
+<a name="574891997"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/574891997" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#574891997">(Feb 20 2026 at 08:55)</a>:</h4>
+<p>AlbertMarashi edited a <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3932501811">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<p>Ah yes, I get you now, and yes, thank you a lot.</p>
+<blockquote>
+<p>The 2x overhead<br>
+Yes, I suspect that this will be the only cost consideration with my approach - however, I think that this extra memory cost might not be as real as one might imagine, if we instead memory map the "side table"/bijection data to disk, given how infrequently and sparsely it might actually be accessed.</p>
+</blockquote>
+<p>The approach that I currently opted into is to actually just use a custom stack implementation that matches more closely to something like a universal/canonical WASM stack as opposed to using a more native approach.</p>
+<p>My first goal in my JIT engine is to make instructions operate through stack-based (memory read/write) transformations similar to what an interpreted WASM VM might do, so that I don't have to worry a whole lot about register allocations - with my hope being that the CPU's L1 cache would reduce a lot of the costs associated to memory reads and writes.</p>
+<p>I expect this would likely probably result in a significant slowdown, but honestly for proof of concept and business-need requirements something between 2-5x slowdown is totally acceptable for the benefits that snapshotting and persistence offer me.</p>
+<p>Additional optimizations could be made in my code to fuse various kinds of WASM instruction operations together for the varying archs.</p>
+<p>Anyways, thanks again for your feedback, I will share my results down the line down the line if successful.</p>
+</blockquote>
+
+
+
+<a name="574892117"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312587%20Add%20%60Global%3A%3Avalue_ptr%28%29%60%20for%20cross-.../near/574892117" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312587.20Add.20.60Global.3A.3Avalue_ptr.28.29.60.20for.20cross-.2E.2E.2E.html#574892117">(Feb 20 2026 at 08:56)</a>:</h4>
+<p>AlbertMarashi edited a <a href="https://github.com/bytecodealliance/wasmtime/pull/12587#issuecomment-3932501811">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">PR #12587</a>:</p>
+<blockquote>
+<p>Ah yes, I get you now, and yes, thank you a lot.</p>
+<blockquote>
+<p>The 2x overhead</p>
+</blockquote>
+<p>Yes, I suspect that this will be the only cost consideration with my approach - however, I think that this extra memory cost might not be as real as one might imagine, if we instead memory map the "side table"/bijection data to disk, given how infrequently and sparsely it might actually be accessed.</p>
+<p>The approach that I currently opted into is to actually just use a custom stack implementation that matches more closely to something like a universal/canonical WASM stack as opposed to using a more native approach.</p>
+<p>My first goal in my JIT engine is to make instructions operate through stack-based (memory read/write) transformations similar to what an interpreted WASM VM might do, so that I don't have to worry a whole lot about register allocations - with my hope being that the CPU's L1 cache would reduce a lot of the costs associated to memory reads and writes.</p>
+<p>I expect this would likely probably result in a significant slowdown, but honestly for proof of concept and business-need requirements something between 2-5x slowdown is totally acceptable for the benefits that snapshotting and persistence offer me.</p>
+<p>Additional optimizations could be made in my code to fuse various kinds of WASM instruction operations together for the varying archs.</p>
+<p>Anyways, thanks again for your feedback, I will share my results down the line down the line if successful.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

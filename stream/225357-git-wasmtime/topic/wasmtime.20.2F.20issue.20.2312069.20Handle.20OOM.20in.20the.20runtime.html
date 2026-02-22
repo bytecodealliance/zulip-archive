@@ -1,0 +1,324 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #12069 Handle OOM in the runtime · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312069.20Handle.20OOM.20in.20the.20runtime.html">wasmtime / issue #12069 Handle OOM in the runtime</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="558743369"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312069%20Handle%20OOM%20in%20the%20runtime/near/558743369" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312069.20Handle.20OOM.20in.20the.20runtime.html#558743369">(Nov 21 2025 at 20:07)</a>:</h4>
+<p>fitzgen opened <a href="https://github.com/bytecodealliance/wasmtime/issues/12069">issue #12069</a>:</p>
+<blockquote>
+<p>We have been discussing this in a couple recent Wasmtime meetings[^0] and <a href="#narrow/channel/217126-wasmtime/topic/OOM.20handling.20in.20.28parts.20of.29.20Wasmtime">on Zulip</a> and I figured it was time to centralize discussion in a tracking issue.</p>
+<p>[^0]: See <a href="https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-10-23.md">https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-10-23.md</a> and <a href="https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-11-20.md">https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-11-20.md</a></p>
+<p>What does handling OOM mean in this case? It means turning allocation failure into an <code>Err(...)</code> return and ultimately propagating that up to the Wasmtime embedder. It may even involve poisoning various data structures if necessary, maybe up to a whole store if necessary, but we haven't fleshed out the details completely yet. That will happen in discussions on this issue and various PRs during implementation.</p>
+<p>Various, unordered sketches of things that will be involved:</p>
+<ul>
+<li>[ ] Replace <code>anyhow::Error</code> with a custom <code>wasmtime::Error</code>. At its most bare-bones, with all cargo features disabled, we will want this to basically be an <code>enum</code> without any data payloads in its variants. As we enable more cargo features, we can start adding support for formatting and error context and ultimately get to something like <code>anyhow::Error</code> with all features enabled.</li>
+<li>[ ] Create a <code>wasmtime-collections</code> crate that exposes fallible <code>Vec</code>, <code>HashMap</code>, etc... This is probably just going to be newtypes over the types we already use today, but <code>wasmtime_collections::Vec::push</code> will return a <code>Result</code> and be implemented via something like <code>self.0.try_reserve(1)?; self.0.push(item); Ok(())</code>, for example.</li>
+<li>[ ] We will need custom <code>serde::Deserialize</code> implementations that handle OOM failure for the <code>wasmtime-collections</code> types we use in our metadata that gets serialized into elf sections in our compiled code.</li>
+<li>[ ] We would ideally like to statically analyze our code and make sure that we aren't allocating infallibly in the relevant code paths. It seems like we can probably use clippy for this, or at least for a 95% solution to this that is Good Enough in practice.</li>
+<li>[ ] We need a way to dynamically test/fuzz our OOM handling to make sure we are actually getting it right in practice.</li>
+</ul>
+<p>We will initially focus on supporting the following code paths:</p>
+<ul>
+<li>Creating a <code>Config</code></li>
+<li>Creating an <code>Engine</code></li>
+<li>Creating a <code>Linker</code></li>
+<li>Creating <code>InstancePre</code>s</li>
+<li>Deserializing pre-compiled <code>Module</code>s and <code>Component</code>s (<em>not</em> compiling new ones!)</li>
+<li>Creating <code>Store</code>s</li>
+<li>Creating <code>Instance</code>s</li>
+<li>Creating <code>Memory</code>s, <code>Table</code>s, <code>Global</code>s, etc...</li>
+<li>Running Wasm</li>
+</ul>
+<p>Basically, everything that is supported in our no-std/pulley builds now: a basic runtime without the compiler, that can only run pre-compiled Wasm. We will not initially support async or the pooling allocator either, for example. I have vague ideas about how we might be able to refactor the pooling allocator for greater flexibility and enable its use in no-std / no-virtual-memory environments, but that is a bit orthogonal.</p>
+<p>Eventually we will want to support async Wasm, yielding on out-of-fuel, ..., and the component model's async functionality. That is going to be a larger project on top of this already large project, so I'm going to delay talking about how we will cross that bridge until we get closer to it.</p>
+<p>In practice, I expect that we will start with the OOM testing/fuzzing, create something very simple that fails immediately, and land that as "expected to fail". Then we can get that passing, which will be quite a bunch of work for this first iteration. Then we can remove the failure expectation. Then we can do a little bit more stuff inside the OOM testing/fuzzing and reveal new places we need to fix, and then we can fix those. We can continue this process until things are starting to look more and more complete. At some point we will add the clippy lints, initially to smaller modules and eventually to bigger regions of code. But the testing can be the forcing function for what area of code we add OOM handling to each step of the way.</p>
+<p>The best way to dynamically test/fuzz OOM handling that I know of is <a href="https://firefox-source-docs.mozilla.org/js/hacking_tips.html#how-to-debug-oomtest-failures">the approach taken by SpiderMonkey's <code>oomTest()</code> helper</a>: run a piece of code (potentially written by humans or generated by a fuzzer) with a special allocator that will return null on the first allocation made and check that the code didn't fail to handle the OOM, then run that code again but failing on the second allocation, then the third, etc... up to your time/compute budget. Starting by building this infrastructure is my rough plan. I've done a little bit of digging for other approaches to ensuring that your OOM-handling is correct, and I haven't really found anything, just people arguing about whether you should even check for null returns from <code>malloc</code> or not, which is not very helpful. That is to say, if anyone has any other ideas or knows of any other prior art here, I'd love to hear about it!</p>
+</blockquote>
+
+
+
+<a name="558743371"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312069%20Handle%20OOM%20in%20the%20runtime/near/558743371" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312069.20Handle.20OOM.20in.20the.20runtime.html#558743371">(Nov 21 2025 at 20:07)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the wasmtime:platform-support label to <a href="https://github.com/bytecodealliance/wasmtime/issues/12069">Issue #12069</a>.</p>
+
+
+
+<a name="558750081"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312069%20Handle%20OOM%20in%20the%20runtime/near/558750081" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312069.20Handle.20OOM.20in.20the.20runtime.html#558750081">(Nov 21 2025 at 20:58)</a>:</h4>
+<p>bjorn3 <a href="https://github.com/bytecodealliance/wasmtime/issues/12069#issuecomment-3564570910">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12069">issue #12069</a>:</p>
+<blockquote>
+<p>I suspect you are going to have a hard time ensuring that all dependencies can also handle OOM. For example for parsing ELF files you are using the object crate which allocates. Symbolizing backtraces allocates a debuginfo cache. async-trait allocates boxes for all futures. Serde allocates (and I don't think it is possible to support handling OOM in there without making an api breaking change)</p>
+<p>The unstable <code>std::alloc::set_alloc_error_hook</code> would almost certainly be much easier to use. It is unstable pending a decision if unwinding out of it would be allowed though and if we should even allow running user code on <code>handle_alloc_error</code>. (the argument for not allowing it is that there may be unsafe code that is unsound under the extra reentrancy that this would allow)</p>
+</blockquote>
+
+
+
+<a name="558750228"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312069%20Handle%20OOM%20in%20the%20runtime/near/558750228" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312069.20Handle.20OOM.20in.20the.20runtime.html#558750228">(Nov 21 2025 at 20:59)</a>:</h4>
+<p>bjorn3 edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/12069#issuecomment-3564570910">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12069">issue #12069</a>:</p>
+<blockquote>
+<p>I suspect you are going to have a hard time ensuring that all dependencies can also handle OOM. For example for parsing ELF files you are using the object crate which allocates. Symbolizing backtraces allocates a debuginfo cache. async-trait allocates boxes for all futures. Serde allocates when deserializing common types like <code>Vec</code> (and I don't think it is possible to support handling OOM in there without making an api breaking change)</p>
+<p>The unstable <code>std::alloc::set_alloc_error_hook</code> would almost certainly be much easier to use. It is unstable pending a decision if unwinding out of it would be allowed though and if we should even allow running user code on <code>handle_alloc_error</code>. (the argument for not allowing it is that there may be unsafe code that is unsound under the extra reentrancy that this would allow)</p>
+</blockquote>
+
+
+
+<a name="558751284"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312069%20Handle%20OOM%20in%20the%20runtime/near/558751284" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312069.20Handle.20OOM.20in.20the.20runtime.html#558751284">(Nov 21 2025 at 21:07)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/12069#issuecomment-3564591091">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12069">issue #12069</a>:</p>
+<blockquote>
+<p>@bjorn3 thanks for the thoughts; we have thought pretty extensively about this and we think the unwinding-based approach is probably not viable in our no-std embedding (see Zulip thread that Nick linked for more). Nick covered serde above; we can turn off symbolization in our embedding; boxed futures are going to be a big hassle when we get to async but in principle there should be ways to define enough of our own version of dependencies to make this work.</p>
+</blockquote>
+
+
+
+<a name="558752854"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312069%20Handle%20OOM%20in%20the%20runtime/near/558752854" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312069.20Handle.20OOM.20in.20the.20runtime.html#558752854">(Nov 21 2025 at 21:19)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/12069#issuecomment-3564623419">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12069">issue #12069</a>:</p>
+<blockquote>
+<p>Personally I view this direction for Wasmtime as a high-level decision point for the project. On one hand we have a proposal like @fitzgen has laid out where the pros are "highly portable" and the cons are "big changes, unknown impact on maintainabiilty". On the other hand could go the route of something like <code>set_alloc_error_hook</code> and/or unwinding which inverts the pros/cons here a bit -- e.g. few changes but much less portable.</p>
+<p>In my opinion it's worthwhile to shoot for the more portable version of things. We can all agree it's going to be a big chunk of work, but the portability of such a solution is highly attractive I believe. I'm also somewhat confident that we can thread the needle on the maintainability and runtime cost of this solution so I'm less worried about that.</p>
+<p>If, however, the strategy of "check for oom everywhere" doesn't work out then we can go back to the drawing board and think harder about unwinding perhaps, but in lieu of that I'd like to pull on the design thread @fitzgen is proposing here and see how far it gets us.</p>
+</blockquote>
+
+
+
+<a name="558754848"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312069%20Handle%20OOM%20in%20the%20runtime/near/558754848" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312069.20Handle.20OOM.20in.20the.20runtime.html#558754848">(Nov 21 2025 at 21:36)</a>:</h4>
+<p>bjorn3 <a href="https://github.com/bytecodealliance/wasmtime/issues/12069#issuecomment-3564663572">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12069">issue #12069</a>:</p>
+<blockquote>
+<p>I'm afraid you will have to basically forego like half of all wasmtime dependencies and write replacements for them. (I wrote this before I did the inventarization below. turns out I was pretty much spot on. 20 allocating vs 18 non-allocating)</p>
+<p>With <code>cargo check --no-default-features --features "runtime async component-model component-model-async stack-switching"</code> I'm getting the following runtime dependencies (checked means likely unconditionally allocates) excluding Wasmtime controlled ones:</p>
+<ul>
+<li>[x] anyhow</li>
+<li>[ ] bitflags</li>
+<li>[x] bumpalo</li>
+<li>[ ] cfg_if</li>
+<li>[ ] cobs</li>
+<li>[ ] encoding_rs</li>
+<li>[ ] equivalent</li>
+<li>[ ] foldhash</li>
+<li>[ ] futures</li>
+<li>[x] futures_channel</li>
+<li>[ ] futures_core</li>
+<li>[ ] futures_io</li>
+<li>[ ] futures_sink</li>
+<li>[ ] futures_task</li>
+<li>[ ] futures_util</li>
+<li>[x] gimli</li>
+<li>[x] hashbrown</li>
+<li>[x] indexmap</li>
+<li>[ ] libc</li>
+<li>[ ] libm</li>
+<li>[ ] linux_raw_sys</li>
+<li>[ ] log</li>
+<li>[ ] memchr</li>
+<li>[x] memfd (through rustix)</li>
+<li>[x] object (unless limiting yourself to the few apis that don't)</li>
+<li>[ ] once_cell</li>
+<li>[ ] pin_project_lite</li>
+<li>[ ] pin_utils</li>
+<li>[x] postcard (if serde impls do)</li>
+<li>[x] rustix (allocates C string for filename)</li>
+<li>[x] semver</li>
+<li>[x] serde (unless deserializing into types that handle OOM)</li>
+<li>[x] serde_core (unless deserializing into types that handle OOM)</li>
+<li>[x] slab</li>
+<li>[x] smallvec</li>
+<li>[x] target_lexicon</li>
+<li>[x] thiserror</li>
+<li>[x] wasmparser (validator uses <code>Arc</code>, bunch of other things also allocate)</li>
+</ul>
+</blockquote>
+
+
+
+<a name="558755987"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312069%20Handle%20OOM%20in%20the%20runtime/near/558755987" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312069.20Handle.20OOM.20in.20the.20runtime.html#558755987">(Nov 21 2025 at 21:46)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/12069#issuecomment-3564689735">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12069">issue #12069</a>:</p>
+<blockquote>
+<p>@bjorn3 thanks for this analysis. Most of these we have answers to already, I think.</p>
+<ul>
+<li>Nick covered anyhow above. (Replace our error types with non-allocating versions, and layer allocations for backtraces and error messages on top.)</li>
+<li>We control bumpalo (it's Nick's crate) but I suspect its uses fall in the same bucket as "data structures in general" for which we have the plan with the wasmtime-specific collection.</li>
+<li>Futures-related crates: yes, we'll need to build fallible-boxing versions of futures abstractions.</li>
+<li>gimli: we can forego all backtracing and native-debug support in the OOM-friendly build.</li>
+<li>hashbrown, indexmap: data structures, plan above.</li>
+<li>memfd: in our no-std environment we don't use memfd (or any Linux abstractions).</li>
+<li>object: yes, we'll need to ensure we have fallible allocation paths.</li>
+<li>postcard: Nick looked into this in the Zulip thread.</li>
+<li>rustix: N/A (no-std build)</li>
+<li>semver: I suspect our uses of this are relatively scoped (module version checks?) and we can probably either stub out or fix semver?</li>
+<li>serde, serde_core: see Zulip thread; custom containers</li>
+<li>slab, smallvec: custom data structures</li>
+<li>target_lexicon: we (BA) control this and can fix if needed</li>
+<li>thiserror: see story for error messages above</li>
+<li>wasmparser: compilation is not within scope</li>
+</ul>
+<p>Basically: yes, it will be expensive. But in the context we (Nick and I at least) are employed to use Wasmtime, we <em>need</em> to be OOM-friendly to continue using Wasmtime at all, and we likely cannot make unwind work easily (and we would not want its complexity in the critical path of a possibly-frequent failure mode in high-traffic scenarios), so it will take more than "this might be a lot of work" to convince us otherwise.</p>
+</blockquote>
+
+
+
+<a name="560060620"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312069%20Handle%20OOM%20in%20the%20runtime/near/560060620" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312069.20Handle.20OOM.20in.20the.20runtime.html#560060620">(Nov 25 2025 at 03:18)</a>:</h4>
+<p>Soto-J <a href="https://github.com/bytecodealliance/wasmtime/issues/12069#issuecomment-3573624377">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12069">issue #12069</a>:</p>
+<blockquote>
+<p>Hi! I’m interested in contributing to this effort and would love to help with the OOM-handling work.<br>
+If there are any recommended starting points or areas that would be most helpful for a new contributor, I’m happy to take them on.</p>
+</blockquote>
+
+
+
+<a name="568079177"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312069%20Handle%20OOM%20in%20the%20runtime/near/568079177" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312069.20Handle.20OOM.20in.20the.20runtime.html#568079177">(Jan 14 2026 at 20:59)</a>:</h4>
+<p>fitzgen edited <a href="https://github.com/bytecodealliance/wasmtime/issues/12069">issue #12069</a>:</p>
+<blockquote>
+<p>We have been discussing this in a couple recent Wasmtime meetings[^0] and <a href="#narrow/channel/217126-wasmtime/topic/OOM.20handling.20in.20.28parts.20of.29.20Wasmtime">on Zulip</a> and I figured it was time to centralize discussion in a tracking issue.</p>
+<p>[^0]: See <a href="https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-10-23.md">https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-10-23.md</a> and <a href="https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-11-20.md">https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-11-20.md</a></p>
+<p>What does handling OOM mean in this case? It means turning allocation failure into an <code>Err(...)</code> return and ultimately propagating that up to the Wasmtime embedder. It may even involve poisoning various data structures if necessary, maybe up to a whole store if necessary, but we haven't fleshed out the details completely yet. That will happen in discussions on this issue and various PRs during implementation.</p>
+<p>Various, unordered sketches of things that will be involved:</p>
+<ul>
+<li>[x] Replace <code>anyhow::Error</code> with a custom <code>wasmtime::Error</code>. At its most bare-bones, with all cargo features disabled, we will want this to basically be an <code>enum</code> without any data payloads in its variants. As we enable more cargo features, we can start adding support for formatting and error context and ultimately get to something like <code>anyhow::Error</code> with all features enabled.</li>
+<li>[ ] Create a <code>wasmtime-collections</code> crate that exposes fallible <code>Vec</code>, <code>HashMap</code>, etc... This is probably just going to be newtypes over the types we already use today, but <code>wasmtime_collections::Vec::push</code> will return a <code>Result</code> and be implemented via something like <code>self.0.try_reserve(1)?; self.0.push(item); Ok(())</code>, for example.</li>
+<li>[ ] We will need custom <code>serde::Deserialize</code> implementations that handle OOM failure for the <code>wasmtime-collections</code> types we use in our metadata that gets serialized into elf sections in our compiled code.</li>
+<li>[ ] We would ideally like to statically analyze our code and make sure that we aren't allocating infallibly in the relevant code paths. It seems like we can probably use clippy for this, or at least for a 95% solution to this that is Good Enough in practice.</li>
+<li>[ ] We need a way to dynamically test/fuzz our OOM handling to make sure we are actually getting it right in practice.</li>
+</ul>
+<p>We will initially focus on supporting the following code paths:</p>
+<ul>
+<li>Creating a <code>Config</code></li>
+<li>Creating an <code>Engine</code></li>
+<li>Creating a <code>Linker</code></li>
+<li>Creating <code>InstancePre</code>s</li>
+<li>Deserializing pre-compiled <code>Module</code>s and <code>Component</code>s (<em>not</em> compiling new ones!)</li>
+<li>Creating <code>Store</code>s</li>
+<li>Creating <code>Instance</code>s</li>
+<li>Creating <code>Memory</code>s, <code>Table</code>s, <code>Global</code>s, etc...</li>
+<li>Running Wasm</li>
+</ul>
+<p>Basically, everything that is supported in our no-std/pulley builds now: a basic runtime without the compiler, that can only run pre-compiled Wasm. We will not initially support async or the pooling allocator either, for example. I have vague ideas about how we might be able to refactor the pooling allocator for greater flexibility and enable its use in no-std / no-virtual-memory environments, but that is a bit orthogonal.</p>
+<p>Eventually we will want to support async Wasm, yielding on out-of-fuel, ..., and the component model's async functionality. That is going to be a larger project on top of this already large project, so I'm going to delay talking about how we will cross that bridge until we get closer to it.</p>
+<p>In practice, I expect that we will start with the OOM testing/fuzzing, create something very simple that fails immediately, and land that as "expected to fail". Then we can get that passing, which will be quite a bunch of work for this first iteration. Then we can remove the failure expectation. Then we can do a little bit more stuff inside the OOM testing/fuzzing and reveal new places we need to fix, and then we can fix those. We can continue this process until things are starting to look more and more complete. At some point we will add the clippy lints, initially to smaller modules and eventually to bigger regions of code. But the testing can be the forcing function for what area of code we add OOM handling to each step of the way.</p>
+<p>The best way to dynamically test/fuzz OOM handling that I know of is <a href="https://firefox-source-docs.mozilla.org/js/hacking_tips.html#how-to-debug-oomtest-failures">the approach taken by SpiderMonkey's <code>oomTest()</code> helper</a>: run a piece of code (potentially written by humans or generated by a fuzzer) with a special allocator that will return null on the first allocation made and check that the code didn't fail to handle the OOM, then run that code again but failing on the second allocation, then the third, etc... up to your time/compute budget. Starting by building this infrastructure is my rough plan. I've done a little bit of digging for other approaches to ensuring that your OOM-handling is correct, and I haven't really found anything, just people arguing about whether you should even check for null returns from <code>malloc</code> or not, which is not very helpful. That is to say, if anyone has any other ideas or knows of any other prior art here, I'd love to hear about it!</p>
+</blockquote>
+
+
+
+<a name="569814686"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312069%20Handle%20OOM%20in%20the%20runtime/near/569814686" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312069.20Handle.20OOM.20in.20the.20runtime.html#569814686">(Jan 23 2026 at 22:53)</a>:</h4>
+<p>fitzgen edited <a href="https://github.com/bytecodealliance/wasmtime/issues/12069">issue #12069</a>:</p>
+<blockquote>
+<p>We have been discussing this in a couple recent Wasmtime meetings[^0] and <a href="#narrow/channel/217126-wasmtime/topic/OOM.20handling.20in.20.28parts.20of.29.20Wasmtime">on Zulip</a> and I figured it was time to centralize discussion in a tracking issue.</p>
+<p>[^0]: See <a href="https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-10-23.md">https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-10-23.md</a> and <a href="https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-11-20.md">https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-11-20.md</a></p>
+<p>What does handling OOM mean in this case? It means turning allocation failure into an <code>Err(...)</code> return and ultimately propagating that up to the Wasmtime embedder. It may even involve poisoning various data structures if necessary, maybe up to a whole store if necessary, but we haven't fleshed out the details completely yet. That will happen in discussions on this issue and various PRs during implementation.</p>
+<p>Various, unordered sketches of things that will be involved:</p>
+<ul>
+<li>[x] Replace <code>anyhow::Error</code> with a custom <code>wasmtime::Error</code>. At its most bare-bones, with all cargo features disabled, we will want this to basically be an <code>enum</code> without any data payloads in its variants. As we enable more cargo features, we can start adding support for formatting and error context and ultimately get to something like <code>anyhow::Error</code> with all features enabled.</li>
+<li>[x] Create a <code>wasmtime-collections</code> crate that exposes fallible <code>Vec</code>, <code>HashMap</code>, etc... This is probably just going to be newtypes over the types we already use today, but <code>wasmtime_collections::Vec::push</code> will return a <code>Result</code> and be implemented via something like <code>self.0.try_reserve(1)?; self.0.push(item); Ok(())</code>, for example.</li>
+<li>[ ] We will need custom <code>serde::Deserialize</code> implementations that handle OOM failure for the <code>wasmtime-collections</code> types we use in our metadata that gets serialized into elf sections in our compiled code.</li>
+<li>[ ] We would ideally like to statically analyze our code and make sure that we aren't allocating infallibly in the relevant code paths. It seems like we can probably use clippy for this, or at least for a 95% solution to this that is Good Enough in practice.</li>
+<li>[ ] We need a way to dynamically test/fuzz our OOM handling to make sure we are actually getting it right in practice.</li>
+</ul>
+<p>We will initially focus on supporting the following code paths:</p>
+<ul>
+<li>Creating a <code>Config</code></li>
+<li>Creating an <code>Engine</code></li>
+<li>Creating a <code>Linker</code></li>
+<li>Creating <code>InstancePre</code>s</li>
+<li>Deserializing pre-compiled <code>Module</code>s and <code>Component</code>s (<em>not</em> compiling new ones!)</li>
+<li>Creating <code>Store</code>s</li>
+<li>Creating <code>Instance</code>s</li>
+<li>Creating <code>Memory</code>s, <code>Table</code>s, <code>Global</code>s, etc...</li>
+<li>Running Wasm</li>
+</ul>
+<p>Basically, everything that is supported in our no-std/pulley builds now: a basic runtime without the compiler, that can only run pre-compiled Wasm. We will not initially support async or the pooling allocator either, for example. I have vague ideas about how we might be able to refactor the pooling allocator for greater flexibility and enable its use in no-std / no-virtual-memory environments, but that is a bit orthogonal.</p>
+<p>Eventually we will want to support async Wasm, yielding on out-of-fuel, ..., and the component model's async functionality. That is going to be a larger project on top of this already large project, so I'm going to delay talking about how we will cross that bridge until we get closer to it.</p>
+<p>In practice, I expect that we will start with the OOM testing/fuzzing, create something very simple that fails immediately, and land that as "expected to fail". Then we can get that passing, which will be quite a bunch of work for this first iteration. Then we can remove the failure expectation. Then we can do a little bit more stuff inside the OOM testing/fuzzing and reveal new places we need to fix, and then we can fix those. We can continue this process until things are starting to look more and more complete. At some point we will add the clippy lints, initially to smaller modules and eventually to bigger regions of code. But the testing can be the forcing function for what area of code we add OOM handling to each step of the way.</p>
+<p>The best way to dynamically test/fuzz OOM handling that I know of is <a href="https://firefox-source-docs.mozilla.org/js/hacking_tips.html#how-to-debug-oomtest-failures">the approach taken by SpiderMonkey's <code>oomTest()</code> helper</a>: run a piece of code (potentially written by humans or generated by a fuzzer) with a special allocator that will return null on the first allocation made and check that the code didn't fail to handle the OOM, then run that code again but failing on the second allocation, then the third, etc... up to your time/compute budget. Starting by building this infrastructure is my rough plan. I've done a little bit of digging for other approaches to ensuring that your OOM-handling is correct, and I haven't really found anything, just people arguing about whether you should even check for null returns from <code>malloc</code> or not, which is not very helpful. That is to say, if anyone has any other ideas or knows of any other prior art here, I'd love to hear about it!</p>
+</blockquote>
+
+
+
+<a name="573164305"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312069%20Handle%20OOM%20in%20the%20runtime/near/573164305" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312069.20Handle.20OOM.20in.20the.20runtime.html#573164305">(Feb 10 2026 at 22:41)</a>:</h4>
+<p>fitzgen edited <a href="https://github.com/bytecodealliance/wasmtime/issues/12069">issue #12069</a>:</p>
+<blockquote>
+<p>We have been discussing this in a couple recent Wasmtime meetings[^0] and <a href="#narrow/channel/217126-wasmtime/topic/OOM.20handling.20in.20.28parts.20of.29.20Wasmtime">on Zulip</a> and I figured it was time to centralize discussion in a tracking issue.</p>
+<p>[^0]: See <a href="https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-10-23.md">https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-10-23.md</a> and <a href="https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-11-20.md">https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-11-20.md</a></p>
+<p>What does handling OOM mean in this case? It means turning allocation failure into an <code>Err(...)</code> return and ultimately propagating that up to the Wasmtime embedder. It may even involve poisoning various data structures if necessary, maybe up to a whole store if necessary, but we haven't fleshed out the details completely yet. That will happen in discussions on this issue and various PRs during implementation.</p>
+<p>Various, unordered sketches of things that will be involved:</p>
+<ul>
+<li>[x] Replace <code>anyhow::Error</code> with a custom <code>wasmtime::Error</code>. At its most bare-bones, with all cargo features disabled, we will want this to basically be an <code>enum</code> without any data payloads in its variants. As we enable more cargo features, we can start adding support for formatting and error context and ultimately get to something like <code>anyhow::Error</code> with all features enabled.</li>
+<li>[x] Create a <code>wasmtime-collections</code> crate that exposes fallible <code>Vec</code>, <code>HashMap</code>, etc... This is probably just going to be newtypes over the types we already use today, but <code>wasmtime_collections::Vec::push</code> will return a <code>Result</code> and be implemented via something like <code>self.0.try_reserve(1)?; self.0.push(item); Ok(())</code>, for example.</li>
+<li>[x] We will need custom <code>serde::Deserialize</code> implementations that handle OOM failure for the <code>wasmtime-collections</code> types we use in our metadata that gets serialized into elf sections in our compiled code.</li>
+<li>[ ] We would ideally like to statically analyze our code and make sure that we aren't allocating infallibly in the relevant code paths. It seems like we can probably use clippy for this, or at least for a 95% solution to this that is Good Enough in practice.</li>
+<li>[ ] We need a way to dynamically test/fuzz our OOM handling to make sure we are actually getting it right in practice.</li>
+</ul>
+<p>We will initially focus on supporting the following code paths:</p>
+<ul>
+<li>Creating a <code>Config</code></li>
+<li>Creating an <code>Engine</code></li>
+<li>Creating a <code>Linker</code></li>
+<li>Creating <code>InstancePre</code>s</li>
+<li>Deserializing pre-compiled <code>Module</code>s and <code>Component</code>s (<em>not</em> compiling new ones!)</li>
+<li>Creating <code>Store</code>s</li>
+<li>Creating <code>Instance</code>s</li>
+<li>Creating <code>Memory</code>s, <code>Table</code>s, <code>Global</code>s, etc...</li>
+<li>Running Wasm</li>
+</ul>
+<p>Basically, everything that is supported in our no-std/pulley builds now: a basic runtime without the compiler, that can only run pre-compiled Wasm. We will not initially support async or the pooling allocator either, for example. I have vague ideas about how we might be able to refactor the pooling allocator for greater flexibility and enable its use in no-std / no-virtual-memory environments, but that is a bit orthogonal.</p>
+<p>Eventually we will want to support async Wasm, yielding on out-of-fuel, ..., and the component model's async functionality. That is going to be a larger project on top of this already large project, so I'm going to delay talking about how we will cross that bridge until we get closer to it.</p>
+<p>In practice, I expect that we will start with the OOM testing/fuzzing, create something very simple that fails immediately, and land that as "expected to fail". Then we can get that passing, which will be quite a bunch of work for this first iteration. Then we can remove the failure expectation. Then we can do a little bit more stuff inside the OOM testing/fuzzing and reveal new places we need to fix, and then we can fix those. We can continue this process until things are starting to look more and more complete. At some point we will add the clippy lints, initially to smaller modules and eventually to bigger regions of code. But the testing can be the forcing function for what area of code we add OOM handling to each step of the way.</p>
+<p>The best way to dynamically test/fuzz OOM handling that I know of is <a href="https://firefox-source-docs.mozilla.org/js/hacking_tips.html#how-to-debug-oomtest-failures">the approach taken by SpiderMonkey's <code>oomTest()</code> helper</a>: run a piece of code (potentially written by humans or generated by a fuzzer) with a special allocator that will return null on the first allocation made and check that the code didn't fail to handle the OOM, then run that code again but failing on the second allocation, then the third, etc... up to your time/compute budget. Starting by building this infrastructure is my rough plan. I've done a little bit of digging for other approaches to ensuring that your OOM-handling is correct, and I haven't really found anything, just people arguing about whether you should even check for null returns from <code>malloc</code> or not, which is not very helpful. That is to say, if anyone has any other ideas or knows of any other prior art here, I'd love to hear about it!</p>
+</blockquote>
+
+
+
+<a name="573618617"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312069%20Handle%20OOM%20in%20the%20runtime/near/573618617" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312069.20Handle.20OOM.20in.20the.20runtime.html#573618617">(Feb 12 2026 at 21:15)</a>:</h4>
+<p>fitzgen edited <a href="https://github.com/bytecodealliance/wasmtime/issues/12069">issue #12069</a>:</p>
+<blockquote>
+<p>We have been discussing this in a couple recent Wasmtime meetings[^0] and <a href="#narrow/channel/217126-wasmtime/topic/OOM.20handling.20in.20.28parts.20of.29.20Wasmtime">on Zulip</a> and I figured it was time to centralize discussion in a tracking issue.</p>
+<p>[^0]: See <a href="https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-10-23.md">https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-10-23.md</a> and <a href="https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-11-20.md">https://github.com/bytecodealliance/meetings/blob/main/wasmtime/2025/wasmtime-11-20.md</a></p>
+<p>What does handling OOM mean in this case? It means turning allocation failure into an <code>Err(...)</code> return and ultimately propagating that up to the Wasmtime embedder. It may even involve poisoning various data structures if necessary, maybe up to a whole store if necessary, but we haven't fleshed out the details completely yet. That will happen in discussions on this issue and various PRs during implementation.</p>
+<p>Various, unordered sketches of things that will be involved:</p>
+<ul>
+<li>[x] Replace <code>anyhow::Error</code> with a custom <code>wasmtime::Error</code>. At its most bare-bones, with all cargo features disabled, we will want this to basically be an <code>enum</code> without any data payloads in its variants. As we enable more cargo features, we can start adding support for formatting and error context and ultimately get to something like <code>anyhow::Error</code> with all features enabled.</li>
+<li>[x] Create a <code>wasmtime-collections</code> crate that exposes fallible <code>Vec</code>, <code>HashMap</code>, etc... This is probably just going to be newtypes over the types we already use today, but <code>wasmtime_collections::Vec::push</code> will return a <code>Result</code> and be implemented via something like <code>self.0.try_reserve(1)?; self.0.push(item); Ok(())</code>, for example.</li>
+<li>[x] We will need custom <code>serde::Deserialize</code> implementations that handle OOM failure for the <code>wasmtime-collections</code> types we use in our metadata that gets serialized into elf sections in our compiled code.</li>
+<li>[ ] We would ideally like to statically analyze our code and make sure that we aren't allocating infallibly in the relevant code paths. It seems like we can probably use clippy for this, or at least for a 95% solution to this that is Good Enough in practice.</li>
+<li>[ ] We need a way to dynamically test/fuzz our OOM handling to make sure we are actually getting it right in practice.</li>
+</ul>
+<p>We will initially focus on supporting the following code paths:</p>
+<ul>
+<li>[x] Creating a <code>Config</code></li>
+<li>[x] Creating an <code>Engine</code></li>
+<li>[x] Creating a <code>Linker</code></li>
+<li>[ ] Creating <code>InstancePre</code>s</li>
+<li>[ ] Deserializing pre-compiled <code>Module</code>s and <code>Component</code>s (<em>not</em> compiling new ones!)</li>
+<li>[x] Creating <code>Store</code>s</li>
+<li>[ ] Creating <code>Instance</code>s</li>
+<li>[ ] Creating <code>Memory</code>s</li>
+<li>[ ] Creating <code>Table</code>s</li>
+<li>[ ] Creating <code>Global</code>s</li>
+<li>[ ] Creating <code>Func</code>s</li>
+<li>[ ] Running Wasm</li>
+</ul>
+<p>Basically, everything that is supported in our no-std/pulley builds now: a basic runtime without the compiler, that can only run pre-compiled Wasm. We will not initially support async or the pooling allocator either, for example. I have vague ideas about how we might be able to refactor the pooling allocator for greater flexibility and enable its use in no-std / no-virtual-memory environments, but that is a bit orthogonal.</p>
+<p>Eventually we will want to support async Wasm, yielding on out-of-fuel, ..., and the component model's async functionality. That is going to be a larger project on top of this already large project, so I'm going to delay talking about how we will cross that bridge until we get closer to it.</p>
+<p>In practice, I expect that we will start with the OOM testing/fuzzing, create something very simple that fails immediately, and land that as "expected to fail". Then we can get that passing, which will be quite a bunch of work for this first iteration. Then we can remove the failure expectation. Then we can do a little bit more stuff inside the OOM testing/fuzzing and reveal new places we need to fix, and then we can fix those. We can continue this process until things are starting to look more and more complete. At some point we will add the clippy lints, initially to smaller modules and eventually to bigger regions of code. But the testing can be the forcing function for what area of code we add OOM handling to each step of the way.</p>
+<p>The best way to dynamically test/fuzz OOM handling that I know of is <a href="https://firefox-source-docs.mozilla.org/js/hacking_tips.html#how-to-debug-oomtest-failures">the approach taken by SpiderMonkey's <code>oomTest()</code> helper</a>: run a piece of code (potentially written by humans or generated by a fuzzer) with a special allocator that will return null on the first allocation made and check that the code didn't fail to handle the OOM, then run that code again but failing on the second allocation, then the third, etc... up to your time/compute budget. Starting by building this infrastructure is my rough plan. I've done a little bit of digging for other approaches to ensuring that your OOM-handling is correct, and I haven't really found anything, just people arguing about whether you should even check for null returns from <code>malloc</code> or not, which is not very helpful. That is to say, if anyone has any other ideas or knows of any other prior art here, I'd love to hear about it!</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

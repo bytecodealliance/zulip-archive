@@ -1,0 +1,67 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #12157 x64: enable APX in Cranelift · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312157.20x64.3A.20enable.20APX.20in.20Cranelift.html">wasmtime / issue #12157 x64: enable APX in Cranelift</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="563265640"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312157%20x64%3A%20enable%20APX%20in%20Cranelift/near/563265640" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312157.20x64.3A.20enable.20APX.20in.20Cranelift.html#563265640">(Dec 11 2025 at 19:16)</a>:</h4>
+<p>abrown opened <a href="https://github.com/bytecodealliance/wasmtime/issues/12157">issue #12157</a>:</p>
+<blockquote>
+<h4>Feature</h4>
+<p>Add support for APX instructions in Cranelift's x64 backend. For a description of APX and links to the specification, see this [white paper].</p>
+<p>[white paper]: <a href="https://www.intel.com/content/www/us/en/developer/articles/technical/advanced-performance-extensions-apx.html">https://www.intel.com/content/www/us/en/developer/articles/technical/advanced-performance-extensions-apx.html</a></p>
+<h4>Benefit</h4>
+<p>If APX were available in Cranelift it would provide:</p>
+<ul>
+<li><em>more registers</em>: for legacy instructions (not VEX or EVEX), we could now use the REX2 prefix to access 32 registers instead of 16; Cranelift certainly could benefit from more registers to allocate, reducing register pressure (e.g., faster regalloc at compile time, fewer spills and reloads at runtime).</li>
+<li><em>three operands</em>: switching legacy instructions to use APX's EVEX changes not only gives access to all 32 registers (like REX2), but also allows instructions to use three operands (i.e., new data destination, NDD); Cranelift already expects three operands to instructions and currently hacks the x64 backend to pretend, so this is also a desirable change.</li>
+<li><em>backwards compatibility</em>: in Cranelift, we would perform a CPUID check and only emit APX instructions when the target allows them; Cranelift would continue to emit the current set of instructions (i.e., REX, VEX, and EVEX) for older targets. This approach would allow mixing APX and legacy instructions.</li>
+</ul>
+<h4>Implementation</h4>
+<p>Much work has already been accomplished to support this. Cranelift has a new assembler, <code>cranelift-assembler-x64</code>, that can emit the EVEX encodings APX will need; it does not yet have logic for the REX2 encodings but this can fit in beside the other encodings (REX, VEX, EVEX). <code>regalloc2</code> has a new operand constraint, <code>Limit</code>, that will allow us to control how many registers each instruction can allocate to (<a href="https://github.com/bytecodealliance/regalloc2/pull/239">https://github.com/bytecodealliance/regalloc2/pull/239</a>). And the assembler can communicate this information, via <code>Inst::num_registers_avaliable</code>, up to Cranelift (<a href="https://github.com/bytecodealliance/wasmtime/pull/11714">https://github.com/bytecodealliance/wasmtime/pull/11714</a>). What remains is to wire these things together (no trivial task!).</p>
+<p>Here is how I would do it:</p>
+<ul>
+<li>[ ] enable fuzzing of <code>Limit</code> constraints in <code>regalloc2</code> (see my [<code>fuzz-limit-constraints-rebased</code>] branch)</li>
+<li>[ ] conditionally extend the number of registers available in Cranelift (see my [<code>apx-extend-registers</code>] branch)</li>
+<li>[ ] allow existing AVX512 instructions to use 32 registers; with <code>Limit</code>, allow EVEX-encoded instructions to allocate to all available registers &mdash; this is a good intermediate proof point</li>
+<li>[ ] design a way to link x64 legacy instructions to their APX equivalent; this could reuse the existing <code>.alt(...)</code> API and something similar to the ISLE <code>...or_avx</code> helpers</li>
+<li>[ ] add some initial subset of APX instructions</li>
+<li>[ ] enable testing in CI (@rahulchaphalkar has a PoC using an emulator)</li>
+<li>[ ] add remaining APX instructions</li>
+</ul>
+<p>[<code>fuzz-limit-constraints-rebased</code>]: <a href="https://github.com/abrown/regalloc2/tree/fuzz-limit-constraints-rebased">https://github.com/abrown/regalloc2/tree/fuzz-limit-constraints-rebased</a><br>
+[<code>apx-extend-registers</code>]: <a href="https://github.com/abrown/wasmtime/tree/apx-extend-registers">https://github.com/abrown/wasmtime/tree/apx-extend-registers</a></p>
+<p>What I described above assumes the use of EVEX to encode instructions since this allows the use of three operands via the NDD flag. This encoding, however, could increase code size, so there is a decision to be made whether to use the REX2 prefix (a) instead or (b) alongside those instructions. The REX2 prefix would allow allocating to 32 registers but not three operands. If we chose to go down approach (b), it would complicate the instruction selection helper somewhat: do we use the legacy form? the REX2 form? the EVEX form? I would propose measuring code size between some pair of steps above to make this decision with actual data before finishing the last few steps.</p>
+</blockquote>
+
+
+
+<a name="563266212"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312157%20x64%3A%20enable%20APX%20in%20Cranelift/near/563266212" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312157.20x64.3A.20enable.20APX.20in.20Cranelift.html#563266212">(Dec 11 2025 at 19:20)</a>:</h4>
+<p>abrown <a href="https://github.com/bytecodealliance/wasmtime/issues/12157#issuecomment-3643425451">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12157">issue #12157</a>:</p>
+<blockquote>
+<p>cc: @rahulchaphalkar, @jlb6740</p>
+</blockquote>
+
+
+
+<a name="564518015"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312157%20x64%3A%20enable%20APX%20in%20Cranelift/near/564518015" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312157.20x64.3A.20enable.20APX.20in.20Cranelift.html#564518015">(Dec 18 2025 at 17:17)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the cranelift:area:x64 label to <a href="https://github.com/bytecodealliance/wasmtime/issues/12157">Issue #12157</a>.</p>
+
+
+
+<a name="564518175"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312157%20x64%3A%20enable%20APX%20in%20Cranelift/near/564518175" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312157.20x64.3A.20enable.20APX.20in.20Cranelift.html#564518175">(Dec 18 2025 at 17:17)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the cranelift<span aria-label="goal" class="emoji emoji-1f945" role="img" title="goal">:goal:</span>optimize-speed label to <a href="https://github.com/bytecodealliance/wasmtime/issues/12157">Issue #12157</a>.</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

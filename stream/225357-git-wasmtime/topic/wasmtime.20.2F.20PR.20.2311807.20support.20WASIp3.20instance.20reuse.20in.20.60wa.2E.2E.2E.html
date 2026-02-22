@@ -1,0 +1,1067 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #11807 support WASIp3 instance reuse in `wa... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html">wasmtime / PR #11807 support WASIp3 instance reuse in `wa...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="543630820"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/543630820" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#543630820">(Oct 07 2025 at 22:22)</a>:</h4>
+<p>dicej opened <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a> from <code>dicej:p3-instance-reuse</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>This is a draft implementation of WASIp3 instance reuse.  Previously, we used one store and one instance per request for both p2 and p3 handlers, discarding the store and instance immediately after the request was handled.  Now we attempt to reuse p3 instances and their stores instead, both serially and concurrently.</p>
+<p>Advantages of reuse:</p>
+<ul>
+<li>Higher throughput: We can amortize the time spent creating and disposing of instances and stores over a number of requests.</li>
+<li>Lower memory and address space usage: Concurrent instance reuse allows us to handle more requests with fewer instances, especially when the handler is I/O bound.</li>
+<li>Developers will presumably need to make changes to their applications anyway when migrating from p2 to p3, so this is an ideal time to change the default from no reuse to (some) reuse, assuming we want to do it at all.</li>
+</ul>
+<p>Disadvantages of reuse:</p>
+<ul>
+<li>Reduced isolation: When the same instance is used to handle multiple requests, the blast radius of bugs in the guest is larger; a trap can affect unrelated requests, and a security flaw could leak state across requests.</li>
+<li>Host implementation complexity: There's more code to manage and more configuration knobs to tune.</li>
+<li>Guest implementation complexity: You can't just stash state in a global variable and call it a day.  Similarly, shortcuts like using a leaking GC require additional thought.</li>
+</ul>
+<p>Given the tradeoffs, we'll definitely need to provide components a way to opt out of reuse if desired.  See<br>
+<a href="https://github.com/WebAssembly/wasi-http/issues/190">https://github.com/WebAssembly/wasi-http/issues/190</a> for related discussion.</p>
+<p>Implementation details:</p>
+<p>I've moved <code>ProxyHandler</code> from <code>wasmtime_cli::commands::serve</code> to <code>wasmtime_wasi_http::handler</code> (so it can be reused by custom embedders), abstracted away the <code>serve</code>-specific parts, and added support for instance reuse via a new <code>ProxyHandler::push</code> function.  The <code>push</code> function takes a work item representing an incoming request and dispatches it to a dynamically sized pool of worker tasks, each with its own store and <code>wasi:http/handler@0.3.x</code> instance. Worker tasks accept work items as capacity allows until they either reach a maximum total reuse count or hit an idle timeout, at which point they exit.</p>
+<p>Performance:</p>
+<p>I've run a few benchmarks using <code>wasmtime-serve-rps.sh</code> and <a href="https://github.com/dicej/hello-wasip3-http/blob/main/src/lib.rs">hello-wasip3-http</a> (a simple "hello, world" request handler).  Highlights:</p>
+<ul>
+<li>45% more requests per second with instance reuse enabled vs. disabled</li>
+<li>64% fewer concurrent instances required for an I/O-bound handler<br>
+    - Here I added a 40ms delay to the "hello, world" handler to simulate I/O</li>
+</ul>
+<p>TODOs:</p>
+<ul>
+<li>Support host-enforced request timeouts.  Note that we can't simply use the epoch-based trap-on-timeout approach we've traditionally used since a given instance may be responsible for a number of concurrent requests.  This will require adding a public API to the <code>wasmtime</code> crate for cleanly cancelling a guest task without affecting other ones.</li>
+<li>Add CLI options for the configuration knobs (e.g. max request count per instance, idle timeout, etc.)</li>
+<li>Use guest signals like <code>backpressure</code>, explicit <code>wasi:cli/exit/exit</code>, <a href="https://github.com/WebAssembly/wasi-http/issues/190">https://github.com/WebAssembly/wasi-http/issues/190</a>, etc. to drive reuse decisions</li>
+</ul>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+</blockquote>
+
+
+
+<a name="543632520"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/543632520" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#543632520">(Oct 07 2025 at 22:39)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="543633356"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/543633356" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#543633356">(Oct 07 2025 at 22:48)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="543634279"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/543634279" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#543634279">(Oct 07 2025 at 22:58)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="543723273"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/543723273" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#543723273">(Oct 08 2025 at 11:31)</a>:</h4>
+<p>tschneidereit <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#issuecomment-3381093518">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>:</p>
+<blockquote>
+<blockquote>
+<ul>
+<li>64% fewer concurrent instances required for an I/O-bound handler</li>
+</ul>
+</blockquote>
+<p>A 2/3rds reduction is less than I'd expect, given the max concurrency is set to 16, and all of these instances should be able to easily absorb 16 concurrent requests, given that they spent 99+% of their time waiting for that timeout to resolve.</p>
+</blockquote>
+
+
+
+<a name="543744372"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/543744372" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#543744372">(Oct 08 2025 at 13:11)</a>:</h4>
+<p>dicej <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#issuecomment-3381479706">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>:</p>
+<blockquote>
+<blockquote>
+<blockquote>
+<ul>
+<li>64% fewer concurrent instances required for an I/O-bound handler</li>
+</ul>
+</blockquote>
+<p>A 2/3rds reduction is less than I'd expect, given the max concurrency is set to 16, and all of these instances should be able to easily absorb 16 concurrent requests, given that they spent 99+% of their time waiting for that timeout to resolve.</p>
+</blockquote>
+<p>I think that's at least partially due to the algorithm I'm using to decide when a worker will accept concurrent requests (and indicate it's ready to the request dispatcher), which balances the goal of concurrent reuse against the goal of maximizing throughput for guests which do little or no I/O.</p>
+<p>Specifically, as soon as a guest has accepted a work item (i.e. a request to be handled), it marks itself unavailable to the dispatcher and will not accept another task (nor mark itself available again) until the store's event loop returns <code>Poll::Pending</code>, meaning all work items it has accepted are blocked on I/O.  In practice, this means that the number of available workers will go to zero more often than if they each accepted tasks unconditionally up to the max concurrency level, and when the dispatcher sees the available worker count at zero it starts another worker with its own instance.</p>
+<p>The advantage of the above algorithm is that new work items are never (or at least very rarely) left waiting for a worker to free up from whatever CPU-bound work item(s) it is occupied with.  The disadvantage is we use more instances.  Perhaps there are ways to tweak the algorithm so it can reduce the instance count without affecting latency?</p>
+</blockquote>
+
+
+
+<a name="543751805"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/543751805" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#543751805">(Oct 08 2025 at 13:44)</a>:</h4>
+<p>tschneidereit <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#issuecomment-3381622295">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>:</p>
+<blockquote>
+<p>I think that algorithm does make sense. My strong intuition would still be that it'd lead to better results than you're seeing. I wonder if part of the explanation could be the artificial nature of the load test, where a lot of requests come in at the same time with little variation? Maybe a load generation scheme that starts additional concurrent requests in a staggered manner would show different results?</p>
+</blockquote>
+
+
+
+<a name="543752932"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/543752932" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#543752932">(Oct 08 2025 at 13:49)</a>:</h4>
+<p>tschneidereit <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#issuecomment-3381643740">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>:</p>
+<blockquote>
+<p>It looks like <a href="https://www.joedog.org/siege-home/">Siege</a> supports this, and in fact does it by default—see the <code>--delay</code> option. By default, Siege will apparently delay individual requests' start times by up to <code>delay</code> seconds, and ramp up to the defined number of concurrent clients.</p>
+</blockquote>
+
+
+
+<a name="543769304"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/543769304" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#543769304">(Oct 08 2025 at 14:53)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3315237084">PR review</a>.</p>
+
+
+
+<a name="543769306"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/543769306" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#543769306">(Oct 08 2025 at 14:53)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2414146264">PR review comment</a>:</p>
+<blockquote>
+<p>Perhaps not the most critical thing, but I'm getting more and more wary of the solution of "just slap <code>FuturesUnordered</code> to get concurrency". With the addition of this we now have these layers of <code>FuturesUnordered</code>:</p>
+<ul>
+<li>In the guest, <code>FuturesUnordered</code> is used for spawned tasks and the main task.</li>
+<li>In the store, there's a <code>FuturesUnordered</code> for concurrent tasks in the store.</li>
+<li>Here there's another <code>FuturesUnordered</code> for concurrent requests.</li>
+<li>Tokio more-or-less has a <code>FuturesUnordered</code> for all spawned tokio tasks.</li>
+</ul>
+<p>This is getting to be a bit excessive IMO and I feel like we're going to start seeing perf cliffs as a result in various scaling situations. I don't have anything concrete I know of necessarily but I feel like we can't just keep slapping a <code>FuturesUnordered</code> everywhere and assume it'll all work out and scale well...</p>
+<p>Unfortunately though I don't have a great solution off the top of my head. I realize what this is doing is maintaining concurrency within a store and API-wise we haven't given many other options here.</p>
+</blockquote>
+
+
+
+<a name="544204006"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544204006" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544204006">(Oct 10 2025 at 15:59)</a>:</h4>
+<p>dicej <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#issuecomment-3390931899">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>:</p>
+<blockquote>
+<blockquote>
+<p>It looks like <a href="https://www.joedog.org/siege-home/">Siege</a> supports this, and in fact does it by default—see the <code>--delay</code> option. By default, Siege will apparently delay individual requests' start times by up to <code>delay</code> seconds, and ramp up to the defined number of concurrent clients.</p>
+</blockquote>
+<p>I just ran a test using <code>siege -c 50 -t 30s -d 0.5</code> and got the exact same peak concurrent instance count as with <code>hey</code>.  Siege doesn't appear to be applying any jitter to the delay, nor does it appear to vary when each user starts, and I'm not seeing any options to enable such things.  I suspect we'll either need to keep looking or write our own load test tool <span aria-label="shrug" class="emoji emoji-1f937" role="img" title="shrug">:shrug:</span> </p>
+</blockquote>
+
+
+
+<a name="544204113"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544204113" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544204113">(Oct 10 2025 at 16:00)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="544207083"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544207083" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544207083">(Oct 10 2025 at 16:16)</a>:</h4>
+<p>tschneidereit <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#issuecomment-3391008935">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>:</p>
+<blockquote>
+<p>Interesting. I guess either the Siege docs are incorrect or my reading of them is. Either way, as mentioned in our call I think the results you already have are entirely sufficient performance motivation for going ahead, so there's no blocking need to get additional ones, given that I'd only ever expect them to be better.</p>
+</blockquote>
+
+
+
+<a name="544244873"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544244873" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544244873">(Oct 10 2025 at 20:46)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="544245178"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544245178" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544245178">(Oct 10 2025 at 20:49)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="544247643"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544247643" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544247643">(Oct 10 2025 at 21:09)</a>:</h4>
+<p>dicej <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#issuecomment-3392314098">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>:</p>
+<blockquote>
+<p>While implementing new CLI options to control reuse (i.e. max reuse count, max concurrent reuse count, and idle instance timeout), I noticed that setting the max reuse count to 1 (which effectively disables reuse) reduced <code>wasmtime-serve-rps.sh</code> performance by 86% vs. the <code>main</code> branch.  I was able to fix that by cheating: falling back to the normal request handling path and not using the new reuse-enabled path when the max reuse count is 1.</p>
+<p>The upshot is that if you're setting max reuse count &gt;1, you need to set it pretty high (e.g. &gt;16) to actually get a performance benefit, since the overhead of the reuse-enabled code path will dominate otherwise.  That suggests we might be leaving significant performance on the table even when the max reuse count is high.  I don't know what the bottleneck is -- maybe <code>tokio::spawn</code>; maybe <code>FuturesUnordered</code> like Alex mentioned; maybe cache coherency traffic due to atomics; maybe something else <span aria-label="shrug" class="emoji emoji-1f937" role="img" title="shrug">:shrug:</span> .</p>
+<p>Anyway, I'm going to mark this ready-for-review now, since the major TODO items have been addressed, and both the default settings and the reuse-disabled mode provide performance that's at least as good as <code>main</code>.</p>
+</blockquote>
+
+
+
+<a name="544247649"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544247649" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544247649">(Oct 10 2025 at 21:09)</a>:</h4>
+<p><strong>dicej</strong> has marked <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a> as ready for review.</p>
+
+
+
+<a name="544247650"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544247650" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544247650">(Oct 10 2025 at 21:09)</a>:</h4>
+<p><strong>dicej</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-wasi-reviewers">wasmtime-wasi-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="544247653"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544247653" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544247653">(Oct 10 2025 at 21:09)</a>:</h4>
+<p><strong>dicej</strong> requested <a href="https://github.com/alexcrichton">alexcrichton</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="544247655"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544247655" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544247655">(Oct 10 2025 at 21:09)</a>:</h4>
+<p><strong>dicej</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="544247656"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544247656" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544247656">(Oct 10 2025 at 21:09)</a>:</h4>
+<p><strong>dicej</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-default-reviewers">wasmtime-default-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="544332197"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544332197" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544332197">(Oct 11 2025 at 16:12)</a>:</h4>
+<p>dicej <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#issuecomment-3393461833">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>:</p>
+<blockquote>
+<blockquote>
+<p>I don't know what the bottleneck is -- maybe <code>tokio::spawn</code>; maybe <code>FuturesUnordered</code> like Alex mentioned; maybe cache coherency traffic due to atomics; maybe something else <span aria-label="shrug" class="emoji emoji-1f937" role="img" title="shrug">:shrug:</span> .</p>
+</blockquote>
+<p>Thinking about this a bit more last night, I realized that at least part of the problem is how the code decides whether to create a new instance for a given request; the way that currently works when a bunch of requests come in at the same time is suboptimal from a latency perspective.  I'll experiment with some variations on Monday.</p>
+</blockquote>
+
+
+
+<a name="544561528"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544561528" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544561528">(Oct 13 2025 at 14:02)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="544563070"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544563070" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544563070">(Oct 13 2025 at 14:09)</a>:</h4>
+<p>dicej <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#issuecomment-3397698188">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>:</p>
+<blockquote>
+<blockquote>
+<blockquote>
+<p>I don't know what the bottleneck is -- maybe <code>tokio::spawn</code>; maybe <code>FuturesUnordered</code> like Alex mentioned; maybe cache coherency traffic due to atomics; maybe something else <span aria-label="shrug" class="emoji emoji-1f937" role="img" title="shrug">:shrug:</span> .</p>
+</blockquote>
+<p>Thinking about this a bit more last night, I realized that at least part of the problem is how the code decides whether to create a new instance for a given request; the way that currently works when a bunch of requests come in at the same time is suboptimal from a latency perspective. I'll experiment with some variations on Monday.</p>
+</blockquote>
+<p>This is mostly addressed; the performance penalty is now less than 20%.  I've left the fast path in place for when reuse is completely disabled, so there's no penalty there at all.  For small, but greater-than-one max reuse counts, performance is much better than before.</p>
+<p>The tradeoff is now the code is more aggressive about creating new instances when a bunch of requests arrive simultaneously, so the peak instance count can be nearly as high as with reuse disabled.  However, I think that's the correct tradeoff to maximize throughput in that scenario, and it should be pretty rare in practice anyway.</p>
+</blockquote>
+
+
+
+<a name="544589392"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544589392" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544589392">(Oct 13 2025 at 16:28)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3332032057">PR review</a>.</p>
+
+
+
+<a name="544589393"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544589393" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544589393">(Oct 13 2025 at 16:28)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426642163">PR review comment</a>:</p>
+<blockquote>
+<p>Since this already forwards all the arguments of the script itself, could these extra options be relegated to <code>"$@"</code> to avoid tampering with defaults too much?</p>
+</blockquote>
+
+
+
+<a name="544589394"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544589394" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544589394">(Oct 13 2025 at 16:28)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426640982">PR review comment</a>:</p>
+<blockquote>
+<p>With <a href="https://github.com/bytecodealliance/wasmtime/pull/11822">https://github.com/bytecodealliance/wasmtime/pull/11822</a> this I think is no longer necessary</p>
+</blockquote>
+
+
+
+<a name="544589395"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544589395" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544589395">(Oct 13 2025 at 16:28)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426669326">PR review comment</a>:</p>
+<blockquote>
+<p>The synchronization and implementation here is subtle enough that I've got no idea, on first pass, why this is constructed the way it is. I see from Tokio's documentation, however, that this is a copy/paste of the examples they recommend for a mpmc channel. Could this function have a comment pointing to said docs indicating that this is the documented method of doing this?</p>
+</blockquote>
+
+
+
+<a name="544589397"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544589397" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544589397">(Oct 13 2025 at 16:28)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426761320">PR review comment</a>:</p>
+<blockquote>
+<p>Would it be possible to go ahead and resolve this TODO in this PR? I think it'd be nice to see this in action for both p2/p3 to avoid having to maintain multiple separate paths.</p>
+</blockquote>
+
+
+
+<a name="544589398"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544589398" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544589398">(Oct 13 2025 at 16:28)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426757530">PR review comment</a>:</p>
+<blockquote>
+<p>Could this be inlined above since it's only called once? </p>
+</blockquote>
+
+
+
+<a name="544589399"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544589399" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544589399">(Oct 13 2025 at 16:28)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426798999">PR review comment</a>:</p>
+<blockquote>
+<p>In lieu of this TODO being resolved, I think that the entire store must be thrown away right? Otherwise cancelling a task leaves a store in an effectively indeterminate state?</p>
+</blockquote>
+
+
+
+<a name="544589400"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544589400" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544589400">(Oct 13 2025 at 16:28)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426795454">PR review comment</a>:</p>
+<blockquote>
+<p>Naively I'd expect a signal like this would be updated on "major events" like a task being completed or a new task coming in. Is there a reason though that this needs to be updated on each turn of the event loop more-or-less?</p>
+</blockquote>
+
+
+
+<a name="544589401"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544589401" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544589401">(Oct 13 2025 at 16:28)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426644260">PR review comment</a>:</p>
+<blockquote>
+<p>This is a fair bit of <code>#[cfg]</code> traffic, could that be relegated to a submodule perhaps to handle concurrency or something like that? (basically seeking out if there's a way to reduce the total amount of <code>#[cfg]</code>)</p>
+</blockquote>
+
+
+
+<a name="544589402"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544589402" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544589402">(Oct 13 2025 at 16:28)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426763588">PR review comment</a>:</p>
+<blockquote>
+<p>How come this spawns a worker vs letting the handler at the top-level be in charge of that?</p>
+</blockquote>
+
+
+
+<a name="544589403"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544589403" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544589403">(Oct 13 2025 at 16:28)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426758452">PR review comment</a>:</p>
+<blockquote>
+<p>Instead of duplicating code, could this call <code>Worker::run</code> directly?</p>
+</blockquote>
+
+
+
+<a name="544589404"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544589404" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544589404">(Oct 13 2025 at 16:28)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426806157">PR review comment</a>:</p>
+<blockquote>
+<p>Personally I find nested/multiple uses of <code>future::poll_fn</code> quite confusing as I have to keep going back-and-forth trying to figure out what's polling what and what's doing what. For example here I need to jump back above to look at the loop, see where it's pending, etc. Would it be possible to simplify this by managing <code>accept_concurrent</code> within the loop itself? For example waiting for a lull between tasks or something like that.</p>
+<p>I also find it pretty hard to reverse-engineer when this variable is set, unset, etc, and what are the state transitions for something like this.</p>
+</blockquote>
+
+
+
+<a name="544589405"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544589405" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544589405">(Oct 13 2025 at 16:28)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426809339">PR review comment</a>:</p>
+<blockquote>
+<p>I would ideally like to not have duplication like this currently has, so if possible I'd like to move the p2 handling into the handler added in the wasi-http crate. Previously the difference between these two branches was localized to just here and was, in theory, pretty easy to audit and see that they're doing the same thing. Now that they're so spread out across crates it's much more difficult to verify that both end up doing the same thing. In theory it should be possible for the new handler to pretty easily handle p2 modules, right?</p>
+</blockquote>
+
+
+
+<a name="544589406"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544589406" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544589406">(Oct 13 2025 at 16:28)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426801220">PR review comment</a>:</p>
+<blockquote>
+<p>Is this right to propagate an error here? I would expect that a task timing out results in a lot or tweaking of heuristics as it does right now by not accepting more tasks. Otherwise though for the entire worker I wouldn't expect it to fail just because one task timed out.</p>
+</blockquote>
+
+
+
+<a name="544590898"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544590898" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544590898">(Oct 13 2025 at 16:38)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="544591185"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544591185" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544591185">(Oct 13 2025 at 16:40)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="544592280"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544592280" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544592280">(Oct 13 2025 at 16:46)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3332320874">PR review</a>.</p>
+
+
+
+<a name="544592281"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544592281" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544592281">(Oct 13 2025 at 16:46)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426842010">PR review comment</a>:</p>
+<blockquote>
+<p>It _could_, but <code>Worker::run</code> does a lot more than this code does, including polling the mpmc channel, fiddling with atomic variables, using a <code>FuturesUnordered</code>, etc., none of which is needed here.</p>
+</blockquote>
+
+
+
+<a name="544592795"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544592795" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544592795">(Oct 13 2025 at 16:50)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3332329540">PR review</a>.</p>
+
+
+
+<a name="544592796"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544592796" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544592796">(Oct 13 2025 at 16:50)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426847969">PR review comment</a>:</p>
+<blockquote>
+<p>Because that could lead to orphan requests such that <code>maybe_start_worker</code> sees a non-zero <code>worker_count</code> and therefore makes no attempt to start a new one, but then the last worker exits right after that.  This code ensures that, when the last worker exits and there is work to do, then a new worker will be started.</p>
+</blockquote>
+
+
+
+<a name="544593082"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544593082" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544593082">(Oct 13 2025 at 16:52)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3332336011">PR review</a>.</p>
+
+
+
+<a name="544593083"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544593083" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544593083">(Oct 13 2025 at 16:52)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426852741">PR review comment</a>:</p>
+<blockquote>
+<p>The code in <code>set_available</code> short-circuits if the state hasn't actually changed, so this is a pretty light-weight operation.  The reason we're doing it here is that <code>accept_concurrent</code> could change from outside the <code>async</code> block any time it's polled.</p>
+</blockquote>
+
+
+
+<a name="544593396"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544593396" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544593396">(Oct 13 2025 at 16:55)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426859318">PR review comment</a>:</p>
+<blockquote>
+<p>Yes, and that's exactly what we do as soon as <code>futures.len()</code> has gone to zero; i.e. once every not-yet-timed-out task has finished or timed out (which will take at most one more timeout interval from the point of the first timeout), we drop the instance and store.</p>
+</blockquote>
+
+
+
+<a name="544593397"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544593397" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544593397">(Oct 13 2025 at 16:55)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3332350246">PR review</a>.</p>
+
+
+
+<a name="544593617"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544593617" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544593617">(Oct 13 2025 at 16:57)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3332360002">PR review</a>.</p>
+
+
+
+<a name="544593618"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544593618" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544593618">(Oct 13 2025 at 16:57)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426864274">PR review comment</a>:</p>
+<blockquote>
+<p>I was trying to approximate the existing behavior in the non-reuse case where we return an error on timeout, but I don't have a strong opinion about doing that vs. just logging immediately and returning <code>Ok(())</code></p>
+</blockquote>
+
+
+
+<a name="544594638"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544594638" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544594638">(Oct 13 2025 at 17:04)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3332387862">PR review</a>.</p>
+
+
+
+<a name="544594641"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544594641" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544594641">(Oct 13 2025 at 17:04)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426879480">PR review comment</a>:</p>
+<blockquote>
+<blockquote>
+<p>Would it be possible to simplify this by managing <code>accept_concurrent</code> within the loop itself? For example waiting for a lull between tasks or something like that.</p>
+</blockquote>
+<p>Currently, there's no way to determine whether the store's event loop has gone idle from within a <code>Future</code> passed to <code>run_concurrent</code> -- the only way to know is based on when the <code>Future</code> returned by <code>run_concurrent</code> itself returns <code>Pending</code>.  In other words, just because <code>FuturesUnordered::next</code> returns <code>Pending</code> doesn't mean we're ready to accept another task -- it may only mean that it's waiting on deferred work which will be done during the next turn of the store's event loop.</p>
+<p>I'll think some more about what sort of API(s) we could add to Wasmtime to expose store event loop lulls in a way that's accessible from within a <code>Future</code> passed to <code>run_concurrent</code>, but it's not obvious to me what that would look like.</p>
+</blockquote>
+
+
+
+<a name="544595477"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544595477" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544595477">(Oct 13 2025 at 17:10)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3332408557">PR review</a>.</p>
+
+
+
+<a name="544595480"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544595480" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544595480">(Oct 13 2025 at 17:10)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2426890592">PR review comment</a>:</p>
+<blockquote>
+<p>At a minimum, I can move this code into <code>handler.rs</code>, for sure.  Actually supporting p2 reuse is less trivial, but I'll give it a shot.</p>
+</blockquote>
+
+
+
+<a name="544609093"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544609093" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544609093">(Oct 13 2025 at 19:09)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3332729604">PR review</a>.</p>
+
+
+
+<a name="544609094"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544609094" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544609094">(Oct 13 2025 at 19:09)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2427113081">PR review comment</a>:</p>
+<blockquote>
+<p>While true, does that factor into the 20% improvement this duplication earns? I would expect that those constructs are small peanuts, but that's also just a guess</p>
+</blockquote>
+
+
+
+<a name="544609176"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544609176" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544609176">(Oct 13 2025 at 19:10)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3332732436">PR review</a>.</p>
+
+
+
+<a name="544609177"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544609177" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544609177">(Oct 13 2025 at 19:10)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2427114703">PR review comment</a>:</p>
+<blockquote>
+<p>Ah ok makes sense, mind leaving a comment to that effect?</p>
+</blockquote>
+
+
+
+<a name="544609295"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544609295" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544609295">(Oct 13 2025 at 19:11)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3332738269">PR review</a>.</p>
+
+
+
+<a name="544609298"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544609298" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544609298">(Oct 13 2025 at 19:11)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2427118431">PR review comment</a>:</p>
+<blockquote>
+<p>Hm ok I think my attempts to understand how this implementation works are basically all in failure. Given the comments below I've seriously misunderstood how this loop works and I already stared at it for an hour...</p>
+</blockquote>
+
+
+
+<a name="544609846"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544609846" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544609846">(Oct 13 2025 at 19:17)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3332764149">PR review</a>.</p>
+
+
+
+<a name="544609848"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544609848" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544609848">(Oct 13 2025 at 19:17)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2427135429">PR review comment</a>:</p>
+<blockquote>
+<p>Given the comments above this one, I think I've basically reached the conclusion that I don't really have any idea how this is all piecing together. The combinations and subtelties of <code>poll_fn</code>, plus <code>FuturesUnordered</code>, plus the multiple layers here (e.g. two <code>poll_fn</code>), plus the variables used to control behavior ... I am basically just totally lost.</p>
+<p>I do think this would be much, much more readable if this was all written without <code>poll_fn</code>. Once the transition is made from async/await to futures internals things get extremely tricky. In contrast it's basically trivial to read async/await code. Overall <code>poll_fn</code> is fine IMO only when the internal closure is a handful of lines long as opposed to taking up most of the function.</p>
+<p>Is it possible to rewrite most of this in an async/await style? Maybe not preserving the exact same behavior but something similar? For example the idle time could be replaced with "here's something which takes up to N messagse from the incoming queue, ending early if M time elapses between messages taken". That's not an exact correlation to the idle time implemented here (I think) but I feel like that captures the intent well enough and is in theory much easier to understand where that entire computation could be in an <code>async</code> block and forgotten about (or something like that)</p>
+</blockquote>
+
+
+
+<a name="544609994"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544609994" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544609994">(Oct 13 2025 at 19:19)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2427137938">PR review comment</a>:</p>
+<blockquote>
+<p>Overall I'm basically just wary of tacking on more and more featuers of "here's the p3 thing over there we're going to just ignore the p2 thing over here". It spreads out the implementation burden and means that we end up having a bunch of untested code because most things preexisting are p2. </p>
+<p>I would naively expect integration to be pretty simple because p2 functions can be <code>call_concurrent</code>'d just the same as p3 functions. One simplification, perhaps, is that <code>wasmtime serve</code> should unconditionally depend on the <code>component-model-async</code> proposal. I don't think there's any point in supporting it with component-model but not <code>component-model-async</code> compiled in.</p>
+</blockquote>
+
+
+
+<a name="544609997"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544609997" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544609997">(Oct 13 2025 at 19:19)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3332767822">PR review</a>.</p>
+
+
+
+<a name="544610664"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544610664" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544610664">(Oct 13 2025 at 19:25)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3332781035">PR review</a>.</p>
+
+
+
+<a name="544610665"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544610665" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544610665">(Oct 13 2025 at 19:25)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2427148087">PR review comment</a>:</p>
+<blockquote>
+<p>Are you proposing that we generate the p2 bindings in <code>wasmtime-wasi-http</code> with <code>exports: { default: async | store }</code>?  Or generate them with <code>exports: { default: async }</code> like we do today, but also generate another set with <code>| store</code>?  Or something else?</p>
+</blockquote>
+
+
+
+<a name="544611283"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544611283" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544611283">(Oct 13 2025 at 19:31)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3332793935">PR review</a>.</p>
+
+
+
+<a name="544611285"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544611285" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544611285">(Oct 13 2025 at 19:31)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2427157725">PR review comment</a>:</p>
+<blockquote>
+<p>I wasn't really thinking that far myself. My thinking was that we should make it work to have one implementation of <code>wasmtime serve</code>, and other goals should all be secondary. So for example if a second set of bindings is needed that seems fine to me. Either that or "get the function from bindings" accessor so a direct call is made to the <code>TypedFunc</code> or something like that.</p>
+<p>Put another way, I don't personally care how the bindings work out, but I do care much more that there's only one "meat" implementation that we have to test/verify/audit/etc.</p>
+</blockquote>
+
+
+
+<a name="544624543"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544624543" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544624543">(Oct 13 2025 at 21:45)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="544625349"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544625349" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544625349">(Oct 13 2025 at 21:55)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="544626033"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544626033" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544626033">(Oct 13 2025 at 22:01)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3333131358">PR review</a>.</p>
+
+
+
+<a name="544626035"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544626035" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544626035">(Oct 13 2025 at 22:01)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2427401181">PR review comment</a>:</p>
+<blockquote>
+<p>Done.</p>
+</blockquote>
+
+
+
+<a name="544626444"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544626444" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544626444">(Oct 13 2025 at 22:03)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3333134883">PR review</a>.</p>
+
+
+
+<a name="544626445"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544626445" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544626445">(Oct 13 2025 at 22:03)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2427403966">PR review comment</a>:</p>
+<blockquote>
+<p>Ok, I went ahead and generated a third set of p3 bindings (in addition to the existing async and sync ones) which enable <code>call_concurrent</code>.  I considered using <code>TypedFunc</code> directly, but found myself duplicating the function index pre-instance lookup code; easier just to let <code>wasmtime-wit-bindgen</code> handle that.</p>
+</blockquote>
+
+
+
+<a name="544627849"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544627849" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544627849">(Oct 13 2025 at 22:12)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="544752612"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544752612" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544752612">(Oct 14 2025 at 13:41)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="544753098"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544753098" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544753098">(Oct 14 2025 at 13:43)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3335776250">PR review</a>.</p>
+
+
+
+<a name="544753099"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544753099" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544753099">(Oct 14 2025 at 13:43)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2429255578">PR review comment</a>:</p>
+<blockquote>
+<p>I just pushed an update which bypasses the task queue when there are no already-available workers, which narrowed the performance gap to just 2%; that seems close enough to justify removing the duplication.  It also points to an opportunity to switch to a faster MPMC channel if we can find (or build) one.</p>
+</blockquote>
+
+
+
+<a name="544756437"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544756437" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544756437">(Oct 14 2025 at 13:56)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="544847971"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/544847971" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#544847971">(Oct 14 2025 at 22:37)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="545113860"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545113860" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545113860">(Oct 15 2025 at 19:34)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#issuecomment-3407973522">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>:</p>
+<blockquote>
+<p>Unfortunately I do continue to be basically ever-yet-more-lost on the internals of the implementation here. I'm trying to poke at things locally to see if I can improve my understanding, though.</p>
+<p>I've run across something that seems to me like a serious bug in the design of component-model-async APIs in Wasmtime. I started trying to explore the sort of "outer timeout". here and the whole <code>BTreeMap</code> that was recently added. That feels quite surprising to me and naively I would not expect it to be necessary. I see now why it was done (sort of), but the inherent need for it, to me, indicates a serious bug in how we're exposing async things.</p>
+<p>Currently <code>run_concurrent</code> takes an <code>AsyncFnOnce</code>, but in reality it's not actually behaving the way that I would expect an <code>AsyncFnOnce</code> to behave. Specifically if the guest calls <code>std::thread::sleep</code> then that blocks all other async operations in that <code>AsyncFnOnce</code>, including host timeouts (e.g. the <code>tokio::time::timeout</code>-per-request). That to me is a pretty big violation of what one would expect from async APIs in Rust.</p>
+<p>Can you speak more to why this behavior is happening? I understand why all wasm would be blocked, but I don't understand why all other host interactions are also blocked.</p>
+</blockquote>
+
+
+
+<a name="545116388"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545116388" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545116388">(Oct 15 2025 at 19:50)</a>:</h4>
+<p>dicej <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#issuecomment-3408019531">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>:</p>
+<blockquote>
+<blockquote>
+<p>Can you speak more to why this behavior is happening? I understand why all wasm would be blocked, but I don't understand why all other host interactions are also blocked.</p>
+</blockquote>
+<p>If you want to trace though the code, <code>run_concurrent</code> calls <code>poll_until</code> calls <code>handle_work_item</code> calls <code>resume_fiber</code> calls <code>fiber::resolve_or_release</code>.  In this case, the fiber ends up suspending _without_ releasing the store, so the <code>resolve_or_release</code> <code>Future::poll</code> returns <code>Pending</code>, which bubbles all the way back up to <code>run_concurrent</code>.  At this point, nothing can be done with the <code>Store</code> -- the fiber has exclusive access, so we can't run the event loop, can't call <code>tls::set</code>, can't run the <code>AsyncFnOnce</code>, etc.  It's like the <code>Store</code> is locked, and there's nothing we can do except either wait for the fiber to resume and release the store or give up and drop everything; we do the latter to enforce the timeout.</p>
+<p>One way out of this would be to rewrite all of <code>wasmtime-wasi</code>'s p2 support to use <code>async | store</code> when generating import bindings for any blocking operation, in which case the fiber would release access to the <code>Store</code> when the guest sleeps, meaning none of the above would be an issue.  Not sure we have an appetite for that right now, though.</p>
+</blockquote>
+
+
+
+<a name="545116790"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545116790" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545116790">(Oct 15 2025 at 19:53)</a>:</h4>
+<p>dicej edited a <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#issuecomment-3408019531">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>:</p>
+<blockquote>
+<blockquote>
+<p>Can you speak more to why this behavior is happening? I understand why all wasm would be blocked, but I don't understand why all other host interactions are also blocked.</p>
+</blockquote>
+<p>If you want to trace though the code, <code>run_concurrent</code> calls <code>poll_until</code> calls <code>handle_work_item</code> calls <code>resume_fiber</code> calls <code>fiber::resolve_or_release</code>.  In this case, the fiber ends up suspending _without_ releasing the store, so the <code>resolve_or_release</code> <code>Future::poll</code> returns <code>Pending</code>, which bubbles all the way back up to <code>run_concurrent</code>.  At this point, nothing can be done with the <code>Store</code> -- the fiber has exclusive access, so we can't run the event loop, can't call <code>tls::set</code>, can't run the <code>AsyncFnOnce</code>, etc.  It's like the <code>Store</code> is locked, and there's nothing we can do except either wait for the fiber to resume and release the store or give up and drop everything; we do the latter to enforce the timeout.</p>
+<p>One way out of this would be to rewrite parts of <code>wasmtime-wasi</code>'s p2 support to use <code>async | store</code> when generating import bindings for any blocking operation, in which case the fiber would release access to the <code>Store</code> when the guest sleeps, meaning none of the above would be an issue.  Not sure we have an appetite for that right now, though.</p>
+</blockquote>
+
+
+
+<a name="545383399"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545383399" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545383399">(Oct 16 2025 at 16:00)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="545395363"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545395363" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545395363">(Oct 16 2025 at 16:31)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="545660944"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545660944" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545660944">(Oct 17 2025 at 18:53)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="545661959"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545661959" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545661959">(Oct 17 2025 at 18:56)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3341785633">PR review</a>.</p>
+
+
+
+<a name="545661962"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545661962" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545661962">(Oct 17 2025 at 18:56)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2440940345">PR review comment</a>:</p>
+<blockquote>
+<p>Ok after thinking more about this, I think the main substantial change I'd like to see is the removal of this timeout. Given what we clarified in <a href="https://github.com/bytecodealliance/wasmtime/pull/11871">https://github.com/bytecodealliance/wasmtime/pull/11871</a> it means that this timeout effectively cannot work, so I don't think we should be relying on it. for anything here. </p>
+<p>Otherwise while I'd still like to tweak things about this loop I don't think it's necessarily worth it at this time.</p>
+</blockquote>
+
+
+
+<a name="545661963"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545661963" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545661963">(Oct 17 2025 at 18:56)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2433610772">PR review comment</a>:</p>
+<blockquote>
+<p>s/SeqCst/Relaxed/</p>
+</blockquote>
+
+
+
+<a name="545661964"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545661964" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545661964">(Oct 17 2025 at 18:56)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2433589984">PR review comment</a>:</p>
+<blockquote>
+<p>This can be private, right? (ideally it wouldn't be exposed)</p>
+</blockquote>
+
+
+
+<a name="545681675"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545681675" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545681675">(Oct 17 2025 at 20:08)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3351845610">PR review</a>.</p>
+
+
+
+<a name="545681677"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545681677" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545681677">(Oct 17 2025 at 20:08)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2441110735">PR review comment</a>:</p>
+<blockquote>
+<p>Are you sure about that?  The ordering of this operation relative to the <code>Queue::push</code> that happens before this must be preserved, whereas <code>Relaxed</code> is documented to have "No ordering constraints, only atomic operations".  I imagine we could get away with something less strict than <code>SeqCst</code> here (maybe <code>Release</code>?), but <code>Relaxed</code> seems to weak in this case.</p>
+</blockquote>
+
+
+
+<a name="545681742"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545681742" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545681742">(Oct 17 2025 at 20:09)</a>:</h4>
+<p>dicej edited <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2441110735">PR review comment</a>.</p>
+
+
+
+<a name="545682884"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545682884" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545682884">(Oct 17 2025 at 20:12)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3351861879">PR review</a>.</p>
+
+
+
+<a name="545682886"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545682886" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545682886">(Oct 17 2025 at 20:12)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2441123766">PR review comment</a>:</p>
+<blockquote>
+<p><code>serve.rs</code> (which is in a different crate) needs access to it; not sure if there's a way around that.</p>
+</blockquote>
+
+
+
+<a name="545683776"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545683776" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545683776">(Oct 17 2025 at 20:16)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3351877338">PR review</a>.</p>
+
+
+
+<a name="545683780"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545683780" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545683780">(Oct 17 2025 at 20:16)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2441134493">PR review comment</a>:</p>
+<blockquote>
+<p>(and not just <code>serve.rs</code>, but anyone who wants to use this module, presumably)</p>
+</blockquote>
+
+
+
+<a name="545691556"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545691556" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545691556">(Oct 17 2025 at 20:49)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3352025347">PR review</a>.</p>
+
+
+
+<a name="545691558"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545691558" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545691558">(Oct 17 2025 at 20:49)</a>:</h4>
+<p>alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2441216008">PR review comment</a>:</p>
+<blockquote>
+<p>In this case <code>worker_count</code> isn't protecting anything <code>unsafe</code> or anything like that so AFAIK <code>Relaxed</code> is all that's needed. Anything stronger is only required typically when <code>unsafe</code> is involved or it's specifically trying to synchronize with some other modification of <code>worker_count</code> to see updates made somewhere else, but in this case the state is in a mutex anyway so I don't think that's required</p>
+</blockquote>
+
+
+
+<a name="545691850"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545691850" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545691850">(Oct 17 2025 at 20:50)</a>:</h4>
+<p>alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3352029903">PR review</a>:</p>
+<blockquote>
+<p>Talked some more with @dicej offline about this, and more-or-less it's not really worth spending more time bikeshedding things. This is working well-enough as-is and while I'm not perfectly satisfied it's not worth continuing to refine things at this point. The API is solid enough that it's fine to iterate in-tree.</p>
+</blockquote>
+
+
+
+<a name="545692718"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545692718" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545692718">(Oct 17 2025 at 20:53)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3352044852">PR review</a>.</p>
+
+
+
+<a name="545692719"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545692719" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545692719">(Oct 17 2025 at 20:53)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2441225163">PR review comment</a>:</p>
+<blockquote>
+<p>Alex and I chatted about this synchronously.  He actually meant to say he wanted to remove the _other_ timeout in this closure.  I pointed out that the other timeout is guaranteeing the invariant that we never kill an instance with at least once task that has not yet reached its timeout; it ensures that by setting <code>reuse_count = max_instance_reuse_count</code> as soon as any task reaches the timeout.</p>
+<p>The cost of guaranteeing that invariant is that the code is more complicated than it otherwise would be, and more subtle, which is unfortunate, but abandoning the invariant would make it unusable for practical purposes, and it's not clear there's a better way to structure the code that still provides the same guarantee.</p>
+<p>I'll add some more code comments to point out the subtleties here, which should help with future maintenance.</p>
+</blockquote>
+
+
+
+<a name="545694517"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545694517" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545694517">(Oct 17 2025 at 21:00)</a>:</h4>
+<p>lann submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3352069359">PR review</a>.</p>
+
+
+
+<a name="545694519"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545694519" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545694519">(Oct 17 2025 at 21:00)</a>:</h4>
+<p>lann created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2441241653">PR review comment</a>:</p>
+<blockquote>
+<p>What is <code>req_id</code>?</p>
+</blockquote>
+
+
+
+<a name="545701308"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545701308" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545701308">(Oct 17 2025 at 21:30)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="545702178"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545702178" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545702178">(Oct 17 2025 at 21:34)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3352178274">PR review</a>.</p>
+
+
+
+<a name="545702179"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545702179" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545702179">(Oct 17 2025 at 21:34)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2441316211">PR review comment</a>:</p>
+<blockquote>
+<p><code>wasmtime serve</code> uses it to prefix lines emitted by the guest to <code>stderr</code> and <code>stdout</code>, so we plumb it through.  It will only be non-<code>None</code> if <code>max_instance_reuse_count == 1</code>; otherwise, we can't reliably do that prefixing given that the store will be reused (although I suppose we could make it work for sequential-only reuse with more effort).</p>
+</blockquote>
+
+
+
+<a name="545702388"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545702388" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545702388">(Oct 17 2025 at 21:35)</a>:</h4>
+<p>dicej edited <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2441316211">PR review comment</a>.</p>
+
+
+
+<a name="545702521"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545702521" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545702521">(Oct 17 2025 at 21:36)</a>:</h4>
+<p>dicej edited <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2441225163">PR review comment</a>.</p>
+
+
+
+<a name="545702790"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545702790" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545702790">(Oct 17 2025 at 21:37)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3352188545">PR review</a>.</p>
+
+
+
+<a name="545702792"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545702792" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545702792">(Oct 17 2025 at 21:37)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2441322079">PR review comment</a>:</p>
+<blockquote>
+<p>I'll expand the doc comment.</p>
+</blockquote>
+
+
+
+<a name="545705329"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545705329" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545705329">(Oct 17 2025 at 21:48)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="545705725"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545705725" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545705725">(Oct 17 2025 at 21:51)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3352247889">PR review</a>.</p>
+
+
+
+<a name="545705727"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545705727" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545705727">(Oct 17 2025 at 21:51)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2441349741">PR review comment</a>:</p>
+<blockquote>
+<p>Ok, taking another look at this, I've realized I glossed over that this is a <code>load</code> rather than a <code>store</code>, in which case what I wrote above doesn't apply.  I'll study this a bit more.</p>
+</blockquote>
+
+
+
+<a name="545705786"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545705786" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545705786">(Oct 17 2025 at 21:52)</a>:</h4>
+<p>dicej edited <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2441110735">PR review comment</a>.</p>
+
+
+
+<a name="545707143"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545707143" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545707143">(Oct 17 2025 at 22:07)</a>:</h4>
+<p>lann submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3352273292">PR review</a>.</p>
+
+
+
+<a name="545707144"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545707144" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545707144">(Oct 17 2025 at 22:07)</a>:</h4>
+<p>lann created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2441368536">PR review comment</a>:</p>
+<blockquote>
+<p>It might be nice if these allowed for more flexible logic, maybe even with default impls, e.g.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">fn</span><span class="w"> </span><span class="nf">should_reuse_instance</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">reuse_count</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">bool</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kc">true</span>
+<span class="p">}</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">should_reuse_concurrently</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">reuse_count</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">,</span><span class="w"> </span><span class="n">current_tasks</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">bool</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kc">false</span>
+<span class="p">}</span>
+</code></pre></div>
+</blockquote>
+
+
+
+<a name="545707699"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545707699" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545707699">(Oct 17 2025 at 22:13)</a>:</h4>
+<p>lann submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3352283585">PR review</a>.</p>
+
+
+
+<a name="545707700"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545707700" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545707700">(Oct 17 2025 at 22:13)</a>:</h4>
+<p>lann created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2441375635">PR review comment</a>:</p>
+<blockquote>
+<p>Actually the things I would have in mind for this would be more global and could be managed by whatever is calling <code>Worker::spawn</code>, but now it isn't clear to me why these limits should be managed by <code>Worker</code> at all... <span aria-label="thinking" class="emoji emoji-1f914" role="img" title="thinking">:thinking:</span> </p>
+</blockquote>
+
+
+
+<a name="545708400"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545708400" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545708400">(Oct 17 2025 at 22:21)</a>:</h4>
+<p>lann edited <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2441375635">PR review comment</a>.</p>
+
+
+
+<a name="545708434"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545708434" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545708434">(Oct 17 2025 at 22:22)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<a name="545708484"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545708484" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545708484">(Oct 17 2025 at 22:22)</a>:</h4>
+<p>lann edited <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2441375635">PR review comment</a>.</p>
+
+
+
+<a name="545708691"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545708691" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545708691">(Oct 17 2025 at 22:24)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#discussion_r2441386214">PR review comment</a>:</p>
+<blockquote>
+<p>Okay, I just pushed an update with more comments and also changed a _different_ <code>SeqCst</code> to <code>Relaxed</code>.  I'm guessing the remaining <code>SeqCst</code>s are stronger than we actually need, but the ordering requirements between the <code>Queue</code> operations involving a <code>Mutex</code> and the <code>worker_count</code> <code>AtomicUsize</code> operations are a bit subtle, and I'm erring on the side of paranoia here.</p>
+</blockquote>
+
+
+
+<a name="545708692"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545708692" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545708692">(Oct 17 2025 at 22:24)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#pullrequestreview-3352296091">PR review</a>.</p>
+
+
+
+<a name="545709362"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/545709362" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#545709362">(Oct 17 2025 at 22:32)</a>:</h4>
+<p>dicej <a href="https://github.com/bytecodealliance/wasmtime/pull/11807#issuecomment-3417426586">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>:</p>
+<blockquote>
+<p>I'm going to hold off until Monday to merge this, just in case any other concerns come up.  Thanks for the attentive review!</p>
+</blockquote>
+
+
+
+<a name="546008984"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2311807%20support%20WASIp3%20instance%20reuse%20in%20%60wa.../near/546008984" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2311807.20support.20WASIp3.20instance.20reuse.20in.20.60wa.2E.2E.2E.html#546008984">(Oct 20 2025 at 15:18)</a>:</h4>
+<p>alexcrichton merged <a href="https://github.com/bytecodealliance/wasmtime/pull/11807">PR #11807</a>.</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

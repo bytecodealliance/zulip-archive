@@ -1,0 +1,349 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime pulley and opcode info/dwarf · wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/index.html">wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html">wasmtime pulley and opcode info/dwarf</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="511453402"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511453402" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511453402">(Apr 10 2025 at 16:14)</a>:</h4>
+<p>Hey! we're researching for wasm  interpreters which are easy to patch as part of our recording/debugging tools. Wasmtime has a permissive Apache2 License, and the <code>pulley</code> intrerpreter: many interpreters don't really propagate info about the original wasm binary offsets of the instructions to their internal IR/interpreter loops; <br>
+this is a problem for us, as we want to match them with their DWARF info: does <code>pulley</code> propagate/preserve this?</p>
+
+
+
+<a name="511456378"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511456378" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> bjorn3 <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511456378">(Apr 10 2025 at 16:29)</a>:</h4>
+<p>Yes, it does, but the information is only useful for traps and debuginfo. Pulley internally follows basically the same compilation pipeline as when compiling for native architectures. It uses the same code to lower wasm to Cranelift IR, optimizes this using the regular Cranelift optimization passes (which can merge clif ir instructions from multiple wasm instructions together, losing information about which actual wasm instruction was executed) and only at the end compiles to Pulley bytecode rather than conventional machine code. If you only need it for debuginfo, this is obviously fine, but if you also want to manipulate execution or have a guaranteed 100% correct extraction of the full wasm-level state, this won't cut it.</p>
+
+
+
+<a name="511456604"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511456604" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> fitzgen (he/him) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511456604">(Apr 10 2025 at 16:30)</a>:</h4>
+<p>DWARF isn't enabled for pulley because we haven't defined a DWARF register mapping. it also isn't clear to me what value it would provide since the DWARF is usually used by the system's native tools like <code>gdb</code> and <code>perf</code> but those don't apply to pulley.</p>
+<p>we do have address maps that we use internally to map trapping instructions to source locations:</p>
+<div class="codehilite" data-code-language="Bash Session"><pre><span></span><code><span class="gp">$ </span>wasmtime<span class="w"> </span>compile<span class="w"> </span>-D<span class="w"> </span>address-map<span class="o">=</span>y<span class="w"> </span>--target<span class="w"> </span>pulley64<span class="w"> </span>~/scratch/foo.wat<span class="w"> </span>-o<span class="w"> </span>~/scratch/foo.cwasm
+
+<span class="gp">$ </span>wasmtime<span class="w"> </span>objdump<span class="w"> </span>--addrmap<span class="w"> </span>~/scratch/foo.cwasm
+<span class="go">wasm[0]::function[0]:</span>
+<span class="go">            push_frame</span>
+<span class="go">            ╰─╼ trap: StackOverflow</span>
+<span class="go">            vconst128 v0, 32768</span>
+<span class="go">            ╰─╼ addrmap: 0x28</span>
+<span class="go">            call2 x0, x0, 0x9    // target = 0x1e</span>
+<span class="go">            ╰─╼ addrmap: 0x3a</span>
+<span class="go">            pop_frame</span>
+<span class="go">            ╰─╼ addrmap: 0x3c</span>
+<span class="go">            ret</span>
+
+<span class="go">wasm[0]::function[1]:</span>
+<span class="go">            push_frame</span>
+<span class="go">            ╰─╼ trap: StackOverflow</span>
+<span class="go">            vwidenlow8x16_s v5, v0</span>
+<span class="go">            ╰─╼ addrmap: 0x41</span>
+<span class="go">            vwidenhigh8x16_s v6, v0</span>
+<span class="go">            vaddpairwisei16x8_s v0, v5, v6</span>
+<span class="go">            pop_frame</span>
+<span class="go">            ╰─╼ addrmap: 0x43</span>
+<span class="go">            ret</span>
+</code></pre></div>
+<p>but this is really an internal implementation detail.</p>
+<p>can you share more about your goals here? patching pulley bytecode is not something that is supported. pulley is very low level, basically the same as an actual ISA like x86 or riscv64, so patching the bytecode will very easily lead to wild unsafety. any attempt to patch it under the covers is pretty scary. additionally, the bytecode is usually mapped read-only from disk, and so any attempt to write to it will trap.</p>
+
+
+
+<a name="511457185"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511457185" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> bjorn3 <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511457185">(Apr 10 2025 at 16:32)</a>:</h4>
+<blockquote>
+<p>DWARF isn't enabled for pulley because we haven't defined a DWARF register mapping. it also isn't clear to me what value it would provide since the DWARF is usually used by the system's native tools like <code>gdb</code> and <code>perf</code> but those don't apply to pulley.</p>
+</blockquote>
+<p>The pulley interpreter could have a gdbstub to which you would attach gdb to as opposed to attaching gdb to the wasmtime process as a whole. The <a href="https://docs.rs/gdbstub/latest/gdbstub/">gdbstub</a> crate allows implementing a gdbstub by implementing a bunch of traits.</p>
+
+
+
+<a name="511457293"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511457293" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> fitzgen (he/him) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511457293">(Apr 10 2025 at 16:33)</a>:</h4>
+<p>interesting, TIL!</p>
+
+
+
+<a name="511457583"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511457583" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> bjorn3 <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511457583">(Apr 10 2025 at 16:34)</a>:</h4>
+<p>This is also how for example qemu and valgrind allow debugging emulated cq instrumented code as if the original code was running rather than their jitted code.</p>
+
+
+
+<a name="511475253"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511475253" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511475253">(Apr 10 2025 at 17:48)</a>:</h4>
+<p><span class="user-mention" data-user-id="264278">@bjorn3</span> thanks, this makes sense</p>
+
+
+
+<a name="511475524"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511475524" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511475524">(Apr 10 2025 at 17:49)</a>:</h4>
+<p><span class="user-mention" data-user-id="253990">@fitzgen (he/him)</span> hey, you're one of the <code>gimli</code> guys!</p>
+
+
+
+<a name="511475792"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511475792" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511475792">(Apr 10 2025 at 17:50)</a>:</h4>
+<p>yes: we don't want to patch the bytecode, but the interpreter itself</p>
+
+
+
+<a name="511476250"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511476250" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511476250">(Apr 10 2025 at 17:51)</a>:</h4>
+<p>the goal is to produce full execution traces for some wasm-based programs for our CodeTracer environment</p>
+
+
+
+<a name="511477218"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511477218" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511477218">(Apr 10 2025 at 17:51)</a>:</h4>
+<p>so that's where the DWARF info is useful: it lets us map the executed steps easily to high level code, and to know where certain local variables are, etc</p>
+
+
+
+<a name="511477522"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511477522" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511477522">(Apr 10 2025 at 17:53)</a>:</h4>
+<p>currently, from the interpreter impls we've tried to look at, we've found mostly the wazero interpreter to propagate the original wasm binary instruction offsets to their final  representation, because they seem to use DWARF in limited cases</p>
+
+
+
+<a name="511478041"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511478041" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511478041">(Apr 10 2025 at 17:56)</a>:</h4>
+<p>btw years ago, bjorn has been answering me a similar question for the rust/llvm call instrumentation hooks here in zulip, it really seems the debugging world is small</p>
+
+
+
+<a name="511480377"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511480377" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> bjorn3 <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511480377">(Apr 10 2025 at 18:09)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="898244">Alexander Ivanov</span> <a href="#narrow/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf/near/511478041">said</a>:</p>
+<blockquote>
+<p>btw years ago, bjorn has been answering me a similar question for the rust/llvm call instrumentation hooks here in zulip, it really seems the debugging world is small</p>
+</blockquote>
+<p>The way I got involved with rustc is through writing the rustc_codegen_cranelift rustc backend, which as the name says depends on Cranelift, just like Wasmtime does.</p>
+
+
+
+<a name="511481281"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511481281" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> bjorn3 <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511481281">(Apr 10 2025 at 18:15)</a>:</h4>
+<p><span class="user-mention" data-user-id="898244">@Alexander Ivanov</span> Assuming you are referring to <a href="https://github.com/metacraft-labs/codetracer">https://github.com/metacraft-labs/codetracer</a>, once it supports loading rr traces, everything should work with native compilation rather than Pulley if you enable debuginfo generation in Wasmtime and you implement the gdb jit protocol in CodeTracer to get the DWARF debuginfo generated by Wasmtime out of the recorded trace.</p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/metacraft-labs/codetracer" style="background-image: url(&quot;https://uploads.zulipusercontent.net/10d0ded32c6e8ac0be06428d562e6354f42977fd/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f663264633433653236333639653231336138386266386135313235383661376565363031333333383833323432623630366264643030343132643835313363652f6d65746163726166742d6c6162732f636f6465747261636572&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/metacraft-labs/codetracer" title="GitHub - metacraft-labs/codetracer: CodeTracer is a user-friendly time-traveling debugger designed to support a wide range of programming languages.">GitHub - metacraft-labs/codetracer: CodeTracer is a user-friendly time-traveling debugger designed to support a wide range of programming languages.</a></div><div class="message_embed_description">CodeTracer is a user-friendly time-traveling debugger designed to support a wide range of programming languages. - metacraft-labs/codetracer</div></div></div>
+
+
+
+<a name="511484301"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511484301" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511484301">(Apr 10 2025 at 18:32)</a>:</h4>
+<p>yes: the rr traces are somewhat supported internally,just in a proprietary separate backend; (and yes: this backend is not stable yet)</p>
+
+
+
+<a name="511484464"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511484464" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511484464">(Apr 10 2025 at 18:33)</a>:</h4>
+<p>they do have some tradeoffs compared to the "db-backend"-based one-s, but the needs of some clients are related to producing specifically this kind of open source-based db trace mechanism</p>
+
+
+
+<a name="511484742"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511484742" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511484742">(Apr 10 2025 at 18:34)</a>:</h4>
+<p>otherwise what you're saying is possible indeed</p>
+
+
+
+<a name="511484958"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511484958" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511484958">(Apr 10 2025 at 18:36)</a>:</h4>
+<p>btw we tried a more weird approach for the db backend: just running the natively compiled wasm under lldb, and producing such a trace(however that's extremely slow indeed: but it's a valuable xp in assessing that kind of dwarf for natively compiled wasm indeed: it works well)</p>
+
+
+
+<a name="511485636"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511485636" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511485636">(Apr 10 2025 at 18:39)</a>:</h4>
+<blockquote>
+<p>we do have address maps that we use internally to map trapping instructions to source locations:</p>
+</blockquote>
+
+
+
+<a name="511485914"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511485914" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511485914">(Apr 10 2025 at 18:41)</a>:</h4>
+<p>ok, i have to look at the source i guess: I assume this might be sufficient, if they do indeed preserve the original offset/equivalent info at the final interpreter point</p>
+
+
+
+<a name="511487976"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511487976" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511487976">(Apr 10 2025 at 18:50)</a>:</h4>
+<p>Note that we don't guarantee that every original Wasm opcode has a corresponding location in the final interpreter bytecode: Pulley's compilation is an optimizing one, which means that we may hoist code, GVN it, DCE it, etc. If you're looking to build a record/replay infrastructure on top of this at the Wasm virtual machine level, it's probably not what you want</p>
+
+
+
+<a name="511488081"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511488081" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511488081">(Apr 10 2025 at 18:50)</a>:</h4>
+<p>FWIW, we do have a roadmap in our debugging RFC (merged, but work hasn't really started yet) aiming at our own record/replay infrastructure, and the plan there is to use Winch, since it does preserve program-point-for-program-point</p>
+
+
+
+<a name="511489366"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511489366" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511489366">(Apr 10 2025 at 18:59)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="264278">bjorn3</span> <a href="#narrow/channel/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf/near/511457185">said</a>:</p>
+<blockquote>
+<p>The pulley interpreter could have a gdbstub to which you would attach gdb to as opposed to attaching gdb to the wasmtime process as a whole.</p>
+</blockquote>
+<p>I'll note that this still requires gdb to have an understanding of the "native architecture", and afaik gdb doesn't understand wasm and definitely doesn't understand pulley, so this would be of limited use I think.</p>
+<p><span class="user-mention silent" data-user-id="898244">Alexander Ivanov</span> <a href="#narrow/channel/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf/near/511477218">said</a>:</p>
+<blockquote>
+<p>so that's where the DWARF info is useful: it lets us map the executed steps easily to high level code, and to know where certain local variables are, etc</p>
+</blockquote>
+<p>For this Wasmtime sort of and sort of doesn't have this info with Pulley. As others have mentioned this is the goal of the DWARF that Wasmtime emits. The wasm module itself has its own DWARF, which is wasm-relative, translated to native-relative DWARF. This has all the pitfalls Chris and Nick have mentioned of as an optimizing compiler we can't translate the wasm-dwarf 1:1 to native-dwarf.</p>
+<p>Additionally though there is no implementation of mapping wasm-dwarf to pulley-dwarf because pulley has no meaning in dwarf. It probably wouldn't be too too hard to add this though! That would enable you to read the pulley-dwarf and then couple that with pulley interpreter state to go back to the high-level program. With the understanding of course that this would be lossy in the same way that the wasm-to-native-dwarf translation is lossy.</p>
+
+
+
+<a name="511499648"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511499648" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511499648">(Apr 10 2025 at 20:09)</a>:</h4>
+<p>thank you! some level of optimizatation might be ok, if it preserves the original source for at least the final operands, even if some were left out</p>
+
+
+
+<a name="511499772"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511499772" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511499772">(Apr 10 2025 at 20:10)</a>:</h4>
+<p>however i do assume it might not be done like that, if it wasn't specifically written with that in mind</p>
+
+
+
+<a name="511499959"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511499959" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511499959">(Apr 10 2025 at 20:11)</a>:</h4>
+<p>Cranelift does have <code>-Oopt-level=0</code> which disables most optimizations. While that still doesn't preserve precise 1:1 mapping with wasm instructions it can work better than <code>-Oopt-level=2</code>,  the default</p>
+
+
+
+<a name="511500039"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511500039" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511500039">(Apr 10 2025 at 20:12)</a>:</h4>
+<p><span class="user-mention" data-user-id="254389">@Chris Fallin</span> interesting: it seems <code>winch</code> is a compilator, so do you plan to do something like <code>rr</code>? recording and replaying only the outside effects?</p>
+
+
+
+<a name="511500139"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511500139" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511500139">(Apr 10 2025 at 20:12)</a>:</h4>
+<p>Yes, exactly, that's the plan</p>
+
+
+
+<a name="511500714"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511500714" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511500714">(Apr 10 2025 at 20:16)</a>:</h4>
+<p><span class="user-mention" data-user-id="253994">@Alex Crichton</span> i see, still going through that many layers does seem a bit harder to ensure that exact info gets mapped in the end; some interpreters directly implement/use a wasm reader and do simple transformations after that, maybe that's a bit closer to the specific usage</p>
+
+
+
+<a name="511500739"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511500739" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511500739">(Apr 10 2025 at 20:16)</a>:</h4>
+<p><span class="user-mention" data-user-id="254389">@Chris Fallin</span> interesting, i'll search for it</p>
+
+
+
+<a name="511500918"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511500918" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511500918">(Apr 10 2025 at 20:17)</a>:</h4>
+<p>Right, the main thing to understand about Pulley is that it is not what one would first expect when imagining a "Wasm interpreter": it does not interpret Wasm bytecode; it interprets the result of our usual compilation pipeline, to a new ISA we've invented; so all the usual pitfalls of that re: observability will apply</p>
+
+
+
+<a name="511500953"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511500953" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511500953">(Apr 10 2025 at 20:17)</a>:</h4>
+<p>our usecase is more specific currently, initially for certain kinds of wasm-based contracts: only by accident it seems it would be applicable to wasm programs overally , this wasn't entirely our initial focus</p>
+
+
+
+<a name="511501151"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511501151" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511501151">(Apr 10 2025 at 20:19)</a>:</h4>
+<p><span class="user-mention" data-user-id="254389">@Chris Fallin</span> yes, makes sense, we're going through all kinds of runtimes to compare them in those aspects, learned a lot</p>
+
+
+
+<a name="511501451"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511501451" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511501451">(Apr 10 2025 at 20:20)</a>:</h4>
+<p>I assume that's the record/replay &amp; debugging doc: <a href="https://github.com/bytecodealliance/rfcs/blob/main/accepted/wasmtime-debugging.md">https://github.com/bytecodealliance/rfcs/blob/main/accepted/wasmtime-debugging.md</a></p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/rfcs/blob/main/accepted/wasmtime-debugging.md" style="background-image: url(&quot;https://uploads.zulipusercontent.net/d3e0527c125bdf510d70198a49c2adf9e114bcd4/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f663233623165666333333331663535333135393137663564643035616330323635626164613461303736346336613135333638386237343231663230316339632f62797465636f6465616c6c69616e63652f72666373&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/rfcs/blob/main/accepted/wasmtime-debugging.md" title="rfcs/accepted/wasmtime-debugging.md at main · bytecodealliance/rfcs">rfcs/accepted/wasmtime-debugging.md at main · bytecodealliance/rfcs</a></div><div class="message_embed_description">RFC process for Bytecode Alliance projects. Contribute to bytecodealliance/rfcs development by creating an account on GitHub.</div></div></div>
+
+
+
+<a name="511501571"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511501571" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511501571">(Apr 10 2025 at 20:21)</a>:</h4>
+<p>Yep, that's the one</p>
+
+
+
+<a name="511501711"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511501711" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511501711">(Apr 10 2025 at 20:22)</a>:</h4>
+<p>interesting</p>
+
+
+
+<a name="511501781"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511501781" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511501781">(Apr 10 2025 at 20:22)</a>:</h4>
+<p>a <code>re-execution</code> strategy works well with wasm indeed</p>
+
+
+
+<a name="511502062"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511502062" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511502062">(Apr 10 2025 at 20:24)</a>:</h4>
+<p>in our current case we need to produce a different kind of record though, with different trade-offs, but it would be great to try with some real wasm programs</p>
+
+
+
+<a name="511502202"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511502202" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511502202">(Apr 10 2025 at 20:25)</a>:</h4>
+<blockquote>
+<p>We will need to either maintain a mapping from locals to register/stack slot for all Wasm PC points that we might hit a breakpoint or watchpoint, or force winch to unconditionally spill locals to the stack. The latter would greatly simplify tracking local locations, while the former would greatly increase the amount of context we would need to pass into the utility function for inspecting the execution state.</p>
+</blockquote>
+
+
+
+<a name="511502325"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511502325" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511502325">(Apr 10 2025 at 20:26)</a>:</h4>
+<p>that's a very good observation, haven't thought about this case enough: we assumed that DWARF contains correct info for locals location</p>
+
+
+
+<a name="511502424"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511502424" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511502424">(Apr 10 2025 at 20:27)</a>:</h4>
+<p>but i assume what is meant here, is that certain implementations can obviously store them in a different way in optimized mode</p>
+
+
+
+<a name="511502857"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511502857" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511502857">(Apr 10 2025 at 20:30)</a>:</h4>
+<p>our plan was to simply match the interpreter pc with the wasm binary offset and this with DWARF, and to produce a trace based on combination of interpreter state and the debuginfo</p>
+
+
+
+<a name="511503145"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511503145" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alexander Ivanov <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511503145">(Apr 10 2025 at 20:32)</a>:</h4>
+<p>there are some things we'd need a bit later, for which an interpreter is a better fit than adapting a native binary/the compilation</p>
+
+
+
+<a name="511505117"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511505117" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> bjorn3 <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511505117">(Apr 10 2025 at 20:45)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="253994">Alex Crichton</span> <a href="#narrow/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf/near/511489366">said</a>:</p>
+<blockquote>
+<p><span class="user-mention silent" data-user-id="264278">bjorn3</span> <a href="#narrow/channel/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf/near/511457185">said</a>:</p>
+<blockquote>
+<p>The pulley interpreter could have a gdbstub to which you would attach gdb to as opposed to attaching gdb to the wasmtime process as a whole.</p>
+</blockquote>
+<p>I'll note that this still requires gdb to have an understanding of the "native architecture", and afaik gdb doesn't understand wasm and definitely doesn't understand pulley, so this would be of limited use I think.</p>
+</blockquote>
+<p>If you do the same DWARF translation as for native you only need Pulley support. I guess you could pretend that the target arch is actually riscv and then map the pulley registers to riscv registers. Disassembling obviously won't work, you need to do the same remapping in the debuginfo and you will need to force usage of "hardware" breakpoints as opposed to software breakpoints (as the latter would try to insert riscv trap instructions at the breakpoint location), but everything else should work I think.</p>
+
+
+
+<a name="511505226"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/wasmtime%20pulley%20and%20opcode%20info/dwarf/near/511505226" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf.html#511505226">(Apr 10 2025 at 20:46)</a>:</h4>
+<p>true!</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

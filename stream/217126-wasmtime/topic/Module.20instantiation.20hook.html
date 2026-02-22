@@ -1,0 +1,60 @@
+<html>
+<head><meta charset="utf-8"><title>Module instantiation hook · wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/index.html">wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Module.20instantiation.20hook.html">Module instantiation hook</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="539799397"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Module%20instantiation%20hook/near/539799397" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Module.20instantiation.20hook.html#539799397">(Sep 16 2025 at 15:25)</a>:</h4>
+<p>Hey everyone, in short, I'm working on inline Wasm module instrumentation, which is relying on a single global "fuel" counter.</p>
+<p>The module is parsed ahead-of-time and the global is injected along with an export of it under a well-known name.<br>
+This approach works great for almost all use cases, except one: a trap in module's <code>start</code> function.</p>
+<p>Using the existing Wasmtime API, the runtime can set up a call hook to observe the global value, however to do that the <code>Global</code> has to be either closed over or passed through the <code>Store</code> state.</p>
+<p>The challenge is that the <code>Global</code> can only be accessed either <em>after instantiation</em>, by looking it up from the <code>Instance</code> or, if the module invokes a host function, the host could access the global via the <code>Caller::get_module_export</code>, even during instantiation.</p>
+<p>The challenge is the case when the module traps in <code>start</code> function - it appears that existing API is insufficient to observe the value of the global in that case.</p>
+<p>It seems that one fairly non-intrusive way of making this work could be exposing the <code>Caller</code> (or just <code>Instance</code>/similar construct) in a new <em>module instantiation</em> hook API. E.g. <code>Linker::instantiate_with_hook(store, module, |caller| {})</code>. The hook would be called <em>before</em> invoking <code>start</code>.</p>
+<p>What do you all think?<br>
+Are there any other ways to solve this issue I have not thought about?</p>
+<p>I'd be happy to work on this feature</p>
+
+
+
+<a name="539881774"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Module%20instantiation%20hook/near/539881774" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Module.20instantiation.20hook.html#539881774">(Sep 16 2025 at 19:43)</a>:</h4>
+<p>Another possible implementation would be to move the <code>start</code> function to a well-known name which is invoked manually by the embedder as well, which if you're already mutating the module may not be too too difficult to do. Would that be reasonable to integrate?</p>
+
+
+
+<a name="539881930"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Module%20instantiation%20hook/near/539881930" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Module.20instantiation.20hook.html#539881930">(Sep 16 2025 at 19:43)</a>:</h4>
+<p>The current API design is intended to somewhat closely follow the web which also doesn't provide access to anything if the <code>start</code> function traps, but it's not like we can't add an API like the one you've described I mostly just think it'd be nice to avoid if we could</p>
+
+
+
+<a name="539885516"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Module%20instantiation%20hook/near/539885516" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Module.20instantiation.20hook.html#539885516">(Sep 16 2025 at 20:08)</a>:</h4>
+<p>Interesting, I haven't thought of that - I guess the runtime should just be careful about always running the custom <code>start</code> before accessing any exports this way.</p>
+<p>The current workaround I went with is injecting an <code>init</code> import call in the <code>start</code>, where the <code>init</code> in thr host looks up the global via <code>Caller</code> and keeps it in the <code>Store</code> for the call hook to keep in-sync. Just wanted to call out this gap to see if there's interest in adding something like this.</p>
+<p>A custom start would probably be both faster and simpler though. <span aria-label="thinking" class="emoji emoji-1f914" role="img" title="thinking">:thinking:</span> Thanks for the feedback, I will double-check with the spec on the potential side-effects of doing this, but it sounds like a great idea!</p>
+
+
+
+<a name="539893018"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Module%20instantiation%20hook/near/539893018" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Pat Hickey <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Module.20instantiation.20hook.html#539893018">(Sep 16 2025 at 21:01)</a>:</h4>
+<p>start section should have never been in wasm and if there was a way to turn it off without "breaking the web" i think a supermajority of the cg would</p>
+
+
+
+<a name="539893061"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Module%20instantiation%20hook/near/539893061" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Pat Hickey <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Module.20instantiation.20hook.html#539893061">(Sep 16 2025 at 21:01)</a>:</h4>
+<p>so doing anything possible to avoid using it is the way to go imo</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

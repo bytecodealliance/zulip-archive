@@ -1,0 +1,123 @@
+<html>
+<head><meta charset="utf-8"><title>Should StringLift be emitted for async return values? · general · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/index.html">general</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/Should.20StringLift.20be.20emitted.20for.20async.20return.20values.3F.html">Should StringLift be emitted for async return values?</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="560900366"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/Should%20StringLift%20be%20emitted%20for%20async%20return%20values%3F/near/560900366" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> ktz_alias <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/Should.20StringLift.20be.20emitted.20for.20async.20return.20values.3F.html#560900366">(Nov 29 2025 at 09:46)</a>:</h4>
+<p>I'm seeing a problem when using <code>jco transpile</code> on a minimal async string-returning export.</p>
+<p>Minimal WIT:</p>
+<div class="codehilite"><pre><span></span><code>package example:async-exports;
+
+world w {
+    export get-literal: async func() -&gt; string;
+}
+</code></pre></div>
+
+<p>Rust implementation:</p>
+<div class="codehilite"><pre><span></span><code>async fn get_literal() -&gt; String {
+    &quot;hello&quot;.into()
+}
+</code></pre></div>
+
+<p>This compiles to Wasm successfully.</p>
+<p>However, when running <code>jco transpile</code>, the generated JS fails at runtime.</p>
+<p>The generated JS includes a trampoline like:</p>
+<div class="codehilite"><pre><span></span><code>const trampoline17 = taskReturn.bind(
+    null,
+    0,
+    true,
+    memory0,
+    null,
+    [_liftFlatStringUTF8],
+);
+</code></pre></div>
+
+<p><code>_liftFlatStringUTF8</code> internally uses <code>utf8Decoder</code>, but the generated JS<br>
+never defines:</p>
+<div class="codehilite"><pre><span></span><code>const utf8Decoder = new TextDecoder();
+</code></pre></div>
+
+<p>As a result, calling the export throws:</p>
+<div class="codehilite"><pre><span></span><code>ReferenceError: utf8Decoder is not defined
+</code></pre></div>
+
+<p>After debugging, I found that the wasm instructions do not contain a<br>
+<code>StringLift</code> instruction. <code>Generator::lift</code> inside wit-bindgen is private,<br>
+and <code>StringLift</code> is only emitted in specific cases. For this async export,<br>
+no lift instruction is emitted, so jco never generates the decoding code.</p>
+<p>My question:</p>
+<p>**Should wit-bindgen be emitting a <code>StringLift</code> instruction for an async<br>
+function returning <code>string</code>? Or is jco expected to generate the string-lift<br>
+code for returned strings even when wit-bindgen doesn't emit <code>StringLift</code>?**</p>
+<p>At the moment, the result is that any async export returning <code>string</code><br>
+causes runtime failure due to missing UTF-8 decoder initialization.</p>
+<p>Would appreciate clarification on where the responsibility lies.</p>
+
+
+
+<a name="561132225"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/Should%20StringLift%20be%20emitted%20for%20async%20return%20values%3F/near/561132225" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/Should.20StringLift.20be.20emitted.20for.20async.20return.20values.3F.html#561132225">(Dec 01 2025 at 11:24)</a>:</h4>
+<p>Hey <span class="user-mention" data-user-id="1001980">@ktz_alias</span> so currently async P3 work in Jco is experimental, but this is a case that <em>should</em> work. There is a question of which version of the tooling you used to produce this component as well, since there have been recent changes to make <code>async</code> part of the function rather than a hint which we're not compatible with <em>at all</em> right now. I'm going to assume you're using just slightly older tooling that is still compatible (please let me know if I'm wrong here -- IIRC if you weren't lots of things would have broken before you could run of this, if you're using the Rust toolchain).</p>
+<p>I think you raise a good point here about upstream wit-bindgen's behavior (please feel free to jump in <span class="user-mention" data-user-id="509936">@Joel Dice</span>  / <span class="user-mention" data-user-id="253994">@Alex Crichton</span> ), as the resulting <code>string</code> is lifted "dynamically" during <a href="https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md#-canon-taskreturn"><code>task.return</code></a>. <code>StringLift</code> is basically <code>ListCanonLift</code> which is <em>supposedly</em> called to deal with values by popping them off the stack -- I think in this case the async code is writing those values directly to the memory (the results storage area). This goes through <code>lift_from_memory</code>, and as you mentioned, <a href="https://github.com/bytecodealliance/wit-bindgen/blob/369bbb052c14feef54a10060fd93b0e5bf3c6f2a/crates/core/src/abi.rs#L2003"><code>String</code> does not emit when it reads</a>, where as <a href="https://github.com/bytecodealliance/wit-bindgen/blob/369bbb052c14feef54a10060fd93b0e5bf3c6f2a/crates/core/src/abi.rs#L2024">others (eg.<code>Record</code>s) do</a> (and they have the same blurb about stacks). </p>
+<p>The thing is, string lifting code there has been in place for 2 years (!), so reads from memory don't seem to have done this for a while.</p>
+<p>(While we're here, <code>ErrorContext</code> also maybe should be emitting an <code>ErrorContextLift</code>...)</p>
+<p>Regardless of whether the tooling should be changed or not (it <em>seems</em> like it should!) on the Jco side I think we should fix the lifting function here to require the decoder intrinsic every time we see see the flat string lift happen, since we really can't have one without the other in any case and the shared text decoder is a jco-side optimization.</p>
+<p>Will have a patch up for this soon.</p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md#-canon-taskreturn" style="background-image: url(&quot;https://uploads.zulipusercontent.net/86d79d885cc78e36e204908364456bcc1796b539/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f666333343531333135346261333262353262393361653037396338666434356162306461356565356439643431316639653062316133663338343461313930322f576562417373656d626c792f636f6d706f6e656e742d6d6f64656c&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md#-canon-taskreturn" title="component-model/design/mvp/CanonicalABI.md at main · WebAssembly/component-model">component-model/design/mvp/CanonicalABI.md at main · WebAssembly/component-model</a></div><div class="message_embed_description">Repository for design and specification of the Component Model - WebAssembly/component-model</div></div></div><div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/wit-bindgen/blob/369bbb052c14feef54a10060fd93b0e5bf3c6f2a/crates/core/src/abi.rs#L2003" style="background-image: url(&quot;https://uploads.zulipusercontent.net/cddb263b456df496dfc86a85967ddf51096c1fb8/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f306564393330353339646462636134663964633539353235333138303232636330353363623431333562376666636361626135376434653136636461303761322f62797465636f6465616c6c69616e63652f7769742d62696e6467656e&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/wit-bindgen/blob/369bbb052c14feef54a10060fd93b0e5bf3c6f2a/crates/core/src/abi.rs#L2003" title="wit-bindgen/crates/core/src/abi.rs at 369bbb052c14feef54a10060fd93b0e5bf3c6f2a · bytecodealliance/wit-bindgen">wit-bindgen/crates/core/src/abi.rs at 369bbb052c14feef54a10060fd93b0e5bf3c6f2a · bytecodealliance/wit-bindgen</a></div><div class="message_embed_description">A language binding generator for WebAssembly interface types - bytecodealliance/wit-bindgen</div></div></div><div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/wit-bindgen/blob/369bbb052c14feef54a10060fd93b0e5bf3c6f2a/crates/core/src/abi.rs#L2024" style="background-image: url(&quot;https://uploads.zulipusercontent.net/cddb263b456df496dfc86a85967ddf51096c1fb8/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f306564393330353339646462636134663964633539353235333138303232636330353363623431333562376666636361626135376434653136636461303761322f62797465636f6465616c6c69616e63652f7769742d62696e6467656e&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/wit-bindgen/blob/369bbb052c14feef54a10060fd93b0e5bf3c6f2a/crates/core/src/abi.rs#L2024" title="wit-bindgen/crates/core/src/abi.rs at 369bbb052c14feef54a10060fd93b0e5bf3c6f2a · bytecodealliance/wit-bindgen">wit-bindgen/crates/core/src/abi.rs at 369bbb052c14feef54a10060fd93b0e5bf3c6f2a · bytecodealliance/wit-bindgen</a></div><div class="message_embed_description">A language binding generator for WebAssembly interface types - bytecodealliance/wit-bindgen</div></div></div>
+
+
+
+<a name="561133290"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/Should%20StringLift%20be%20emitted%20for%20async%20return%20values%3F/near/561133290" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/Should.20StringLift.20be.20emitted.20for.20async.20return.20values.3F.html#561133290">(Dec 01 2025 at 11:30)</a>:</h4>
+<p>If you wouldn't mind submitting an issue to jco along with a reproduction component that would be fantastic -- happy to include this as part of the test suite since it's an external toolchain interop bug.</p>
+
+
+
+<a name="561133720"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/Should%20StringLift%20be%20emitted%20for%20async%20return%20values%3F/near/561133720" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/Should.20StringLift.20be.20emitted.20for.20async.20return.20values.3F.html#561133720">(Dec 01 2025 at 11:32)</a>:</h4>
+<p><a href="https://github.com/bytecodealliance/jco/pull/1142">PR for the jco-side fix</a> is up, I'll either get that reproduction from you or make one and add a test on to the PR</p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/jco/pull/1142" style="background-image: url(&quot;https://uploads.zulipusercontent.net/7dc99c9cedd6ae273abb5daab3cadbf31afd339c/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f383430613933653134346363376633316534376138366663653137383334323934666139316633346166613432613964336462653630663337666437656165332f62797465636f6465616c6c69616e63652f6a636f2f70756c6c2f31313432&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/jco/pull/1142" title="fix(jco): require utf8 decoder for flat string lifts by vados-cosmonic · Pull Request #1142 · bytecodealliance/jco">fix(jco): require utf8 decoder for flat string lifts by vados-cosmonic · Pull Request #1142 · bytecodealliance/jco</a></div><div class="message_embed_description">This commit fixes a bug by which strings loaded from memory during async returns did not have the shared decoder (created via intrinsic) present.
+This commit stops short of reworking the dependency...</div></div></div>
+
+
+
+<a name="561154353"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/Should%20StringLift%20be%20emitted%20for%20async%20return%20values%3F/near/561154353" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/Should.20StringLift.20be.20emitted.20for.20async.20return.20values.3F.html#561154353">(Dec 01 2025 at 13:09)</a>:</h4>
+<p>Another <a href="https://github.com/bytecodealliance/jco/pull/1143">jco side fix</a> was required -- a patch release will be out soon, should be out within the next hour!</p>
+<p>Note that <em>for now</em> you should be using (and I assume you <em>already are</em> using) a version of <code>wit-bindgen</code> strictly earlier than 0.48.0. This is what <code>jco</code> is pinned to, for now until we absorb the aforementioned function async-ness changes!</p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/jco/pull/1143" style="background-image: url(&quot;https://uploads.zulipusercontent.net/43ca06f50ee9a8694a11a3d3e368c518baa33ad5/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f613237376361306636343639356561303436333434643365623464303164643462623939646462646335633231373534653162396163633066663863623564382f62797465636f6465616c6c69616e63652f6a636f2f70756c6c2f31313433&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/jco/pull/1143" title="fix(jco): async return writing for caller memory by vados-cosmonic · Pull Request #1143 · bytecodealliance/jco">fix(jco): async return writing for caller memory by vados-cosmonic · Pull Request #1143 · bytecodealliance/jco</a></div><div class="message_embed_description">This commit fixes a bug where the memory for writing to was being retrieved too eagerly (@ trampoline fn binding time), and was not available properly when performing async task.returns.</div></div></div>
+
+
+
+<a name="561168410"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/Should%20StringLift%20be%20emitted%20for%20async%20return%20values%3F/near/561168410" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> ktz_alias <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/Should.20StringLift.20be.20emitted.20for.20async.20return.20values.3F.html#561168410">(Dec 01 2025 at 14:04)</a>:</h4>
+<p>Thanks!<br>
+Here are the versions of the toolchain I used to build the component:</p>
+<p>rust: 1.91.1 (ea2d97820 2025-10-10)<br>
+wit-bindgen: 0.47.0<br>
+wit-bindgen-cli: 0.47.0<br>
+wasm-tools: 1.240.0 (dafe42f8f 2025-10-08)</p>
+<p>These were used to build the small test component (<code>async func() -&gt; string</code>) that reproduces the issue.<br>
+The component was compiled for the <code>wasm32-wasip1</code> target and then componentized using <code>wasm-tools component new</code>.</p>
+
+
+
+<a name="561168633"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/206238-general/topic/Should%20StringLift%20be%20emitted%20for%20async%20return%20values%3F/near/561168633" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> ktz_alias <a href="https://bytecodealliance.github.io/zulip-archive/stream/206238-general/topic/Should.20StringLift.20be.20emitted.20for.20async.20return.20values.3F.html#561168633">(Dec 01 2025 at 14:04)</a>:</h4>
+<blockquote>
+<p>Note that for now you should be using (and I assume you already are using) a version of wit-bindgen strictly earlier than 0.48.0. This is what jco is pinned to, for now until we absorb the aforementioned function async-ness changes!</p>
+</blockquote>
+<p>Yes, I was indeed using wit-bindgen 0.47.0 (the version jco is pinned to).<br>
+I didn’t use 0.48.0 or later.</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

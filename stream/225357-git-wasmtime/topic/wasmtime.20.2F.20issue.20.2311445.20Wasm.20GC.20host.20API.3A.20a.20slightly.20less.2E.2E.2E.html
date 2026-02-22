@@ -1,0 +1,456 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #11445 Wasm GC host API: a slightly less... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html">wasmtime / issue #11445 Wasm GC host API: a slightly less...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="534731341"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/534731341" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#534731341">(Aug 16 2025 at 02:09)</a>:</h4>
+<p>cfallin opened <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<p>Upon pondering the various rooting options in #11326, and reading through the discussion of API tradeoffs <a href="https://github.com/bytecodealliance/wasmtime/blob/82f3b2a16c139297684ae0c84a7568a30c762f41/crates/wasmtime/src/runtime/gc/enabled/rooting.rs#L6">here</a>, it occurs to me that there may be a possible addition to the API, which offers more natural "owned root" semantics in Rust but is still pay-as-you-go, which I'd like to sketch here.</p>
+<h1>Background and Motivation</h1>
+<p>Currently, we have two types, <code>Rooted&lt;T&gt;</code> and <code>ManuallyRooted&lt;T&gt;</code>. The former has a LIFO discipline, implicitly attaching to the deepest <code>RootScope</code> in a stack of scopes on the store, and the latter is completely manual. Notably, the latter does <em>not</em> have a <code>Drop</code> impl that actually unroots, because doing so would require holding a reference to the <code>Store</code> somehow -- implicitly with <code>Arc</code>s somehow, because actual borrows of the <code>Store</code> would preclude any other operations.</p>
+<p>The LIFO discipline of <code>Rooted</code> works well when it works, i.e., when the user is aware of their scopes, but in <a href="https://github.com/bytecodealliance/wasmtime/pull/11326#issuecomment-3192952035">this comment</a> I outline a few of the realizations I've had around ergonomics when it combines with other features -- in particular, Rust's <code>?</code> operator, which pushes users to naturally "propagate errors upward without explicit thought". The usual expectation is that the <code>E</code> type in the <code>Result</code> somehow owns its info. So a dynamic failure (a panic, no less!) when that <code>E</code> crosses over a scope is quite surprising. Exceptional returns are the most obvious example to me right now, but I believe some of the surprise here may also occur wit, h users who naively (but understandably) expect that "GC" means they don't have to worry about lifetimes. Said more succinctly, a type named <code>Rooted</code> in a language like Rust where types often imply ownership might imply that it keeps a root as long as it exists. I know I certainly had that expectation at first. (The docs are very good, but "least surprise" still applies here!)</p>
+<p>We provide the "escape hatch", as the docs describe, of <code>ManuallyRooted</code>, and this can certainly work well if the user has extreme discipline -- unfortunately, the requirement of a manual unrooting step means that it is <em>very</em> easy to get wrong, again as the docs describe well.</p>
+<p>The middle ground, of a type that somehow unregisters itself on <code>Drop</code> by keeping enough of a handle on the engine's internal state to do so, is described as impractical: it would require an <code>Arc&lt;Mutex&lt;...&gt;&gt;</code> to track internal handle state/registration, as the docs say. This would create synchronization overhead, and potentially pessimize common-case GC operations too. Is there a better way?</p>
+<h2>Idea: Pay-as-you-Go "Arc'd liveness flags"</h2>
+<p>Ideally, I want something that:</p>
+<ul>
+<li>Acts as an "owned root", i.e., keeps the referent alive as long as the root type exists and the store exists</li>
+<li>Has a proper <code>Drop</code> such that dropping the root type ensures the referent is not leaked(*)</li>
+<li>Imposes zero overhead on GC if these roots are not used, and imposes only small overhead proportional to the number of such roots if they are</li>
+</ul>
+<p>Note the sneaky (*) above: I want to avoid leaks, not to eagerly detect when an unregistration occurs. In other words, let's permit deferring some action from the <code>Drop</code> to, say, the next time a GC runs.</p>
+<p>Then to avoid synchronization overhead and contention, rather than a large monolithic registry under a single mutex, let's have some small shared state per owned root.</p>
+<p>The idea is: keep a "liveness flag" in an <code>Arc&lt;AtomicBool&gt;</code>. In steady state, when live, there are <em>two</em> references to this <code>Arc</code>: from the owned root type, and from a <code>owned_roots: Vec&lt;(Option&lt;VMGcRef&gt;, Arc&lt;AtomicBool&gt;)&gt;</code> in the GC roots list. When the owned root drops, it sets its atomic bool to false, and drops its <code>Arc</code> reference. When the GC scans roots, it reads out the liveness flags, and removes those roots that the owner has dropped. (E.g. via a <code>retain</code> on the <code>Vec</code>.)[^1]</p>
+<p>[^1]: Slight variant: the tuple above could instead be a single <code>Arc&lt;OwnedRootData&gt;</code> with liveness and the <code>VMGcRef</code>, and maybe that's cleaner; I haven't thought too much about how this would live alongside <code>ManuallyRooted</code> and whether it would want to share a GC-ref root array somewhere else or not...</p>
+<p>Two realizations make this more efficient than the <code>Arc&lt;Mutex&lt;whole root list&gt;&gt;</code> approach: (i) we <em>do</em> have a mut borrow to the store when we <em>create</em>, so it's fine to have a normal <code>Vec</code> of roots registered -- only <code>Drop</code> is "remote" without the store; (ii) we have a <em>separate</em> bit of state per root, and it's just an atomic bool, which on common architectures (x86 and Apple Silicon's aarch64 at least) has atomic loads that are exactly as cheap as normal loads.</p>
+<p>It's also fully safe Rust (<code>Arc</code> makes it so), and is pay-as-you-go: with no such roots existing, GC root scanning has one check of vec-is-empty and a never-taken branch; as close to zero-overhead as we can make it. There is no mutex contention anywhere, because the only "meeting point" is the <code>Vec</code> that's mutated under a <code>&amp;mut Store</code>. In terms of memory allocation, it's certainly more expensive than a LIFO root (which is just an index into an array!), because there's the separate <code>Arc</code> allocation, but I suspect most uses of these roots are likely to be relatively high-level "entry points" or cases like exception returns where scopes don't map well to usage patterns; we can encourage use of LIFO scopes where possible.</p>
+<h2>Naming</h2>
+<p>I've called this an "owned root" and I'd gently suggest considering different names for our current <code>Rooted</code>, to more explicitly describe the difference, if we adopt this -- something like <code>ScopedRooted</code> vs. <code>OwnedRooted</code>?</p>
+</blockquote>
+
+
+
+<a name="534731355"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/534731355" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#534731355">(Aug 16 2025 at 02:09)</a>:</h4>
+<p>cfallin edited <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<p>Upon pondering the various rooting options in #11326, and reading through the discussion of API tradeoffs <a href="https://github.com/bytecodealliance/wasmtime/blob/82f3b2a16c139297684ae0c84a7568a30c762f41/crates/wasmtime/src/runtime/gc/enabled/rooting.rs#L6">here</a>, it occurs to me that there may be a possible addition to the API, which offers more natural "owned root" semantics in Rust but is still pay-as-you-go, which I'd like to sketch here.</p>
+<h2>Background and Motivation</h2>
+<p>Currently, we have two types, <code>Rooted&lt;T&gt;</code> and <code>ManuallyRooted&lt;T&gt;</code>. The former has a LIFO discipline, implicitly attaching to the deepest <code>RootScope</code> in a stack of scopes on the store, and the latter is completely manual. Notably, the latter does <em>not</em> have a <code>Drop</code> impl that actually unroots, because doing so would require holding a reference to the <code>Store</code> somehow -- implicitly with <code>Arc</code>s somehow, because actual borrows of the <code>Store</code> would preclude any other operations.</p>
+<p>The LIFO discipline of <code>Rooted</code> works well when it works, i.e., when the user is aware of their scopes, but in <a href="https://github.com/bytecodealliance/wasmtime/pull/11326#issuecomment-3192952035">this comment</a> I outline a few of the realizations I've had around ergonomics when it combines with other features -- in particular, Rust's <code>?</code> operator, which pushes users to naturally "propagate errors upward without explicit thought". The usual expectation is that the <code>E</code> type in the <code>Result</code> somehow owns its info. So a dynamic failure (a panic, no less!) when that <code>E</code> crosses over a scope is quite surprising. Exceptional returns are the most obvious example to me right now, but I believe some of the surprise here may also occur wit, h users who naively (but understandably) expect that "GC" means they don't have to worry about lifetimes. Said more succinctly, a type named <code>Rooted</code> in a language like Rust where types often imply ownership might imply that it keeps a root as long as it exists. I know I certainly had that expectation at first. (The docs are very good, but "least surprise" still applies here!)</p>
+<p>We provide the "escape hatch", as the docs describe, of <code>ManuallyRooted</code>, and this can certainly work well if the user has extreme discipline -- unfortunately, the requirement of a manual unrooting step means that it is <em>very</em> easy to get wrong, again as the docs describe well.</p>
+<p>The middle ground, of a type that somehow unregisters itself on <code>Drop</code> by keeping enough of a handle on the engine's internal state to do so, is described as impractical: it would require an <code>Arc&lt;Mutex&lt;...&gt;&gt;</code> to track internal handle state/registration, as the docs say. This would create synchronization overhead, and potentially pessimize common-case GC operations too. Is there a better way?</p>
+<h2>Idea: Pay-as-you-Go "Arc'd liveness flags"</h2>
+<p>Ideally, I want something that:</p>
+<ul>
+<li>Acts as an "owned root", i.e., keeps the referent alive as long as the root type exists and the store exists</li>
+<li>Has a proper <code>Drop</code> such that dropping the root type ensures the referent is not leaked(*)</li>
+<li>Imposes zero overhead on GC if these roots are not used, and imposes only small overhead proportional to the number of such roots if they are</li>
+</ul>
+<p>Note the sneaky (*) above: I want to avoid leaks, not to eagerly detect when an unregistration occurs. In other words, let's permit deferring some action from the <code>Drop</code> to, say, the next time a GC runs.</p>
+<p>Then to avoid synchronization overhead and contention, rather than a large monolithic registry under a single mutex, let's have some small shared state per owned root.</p>
+<p>The idea is: keep a "liveness flag" in an <code>Arc&lt;AtomicBool&gt;</code>. In steady state, when live, there are <em>two</em> references to this <code>Arc</code>: from the owned root type, and from a <code>owned_roots: Vec&lt;(Option&lt;VMGcRef&gt;, Arc&lt;AtomicBool&gt;)&gt;</code> in the GC roots list. When the owned root drops, it sets its atomic bool to false, and drops its <code>Arc</code> reference. When the GC scans roots, it reads out the liveness flags, and removes those roots that the owner has dropped. (E.g. via a <code>retain</code> on the <code>Vec</code>.)[^1]</p>
+<p>[^1]: Slight variant: the tuple above could instead be a single <code>Arc&lt;OwnedRootData&gt;</code> with liveness and the <code>VMGcRef</code>, and maybe that's cleaner; I haven't thought too much about how this would live alongside <code>ManuallyRooted</code> and whether it would want to share a GC-ref root array somewhere else or not...</p>
+<p>Two realizations make this more efficient than the <code>Arc&lt;Mutex&lt;whole root list&gt;&gt;</code> approach: (i) we <em>do</em> have a mut borrow to the store when we <em>create</em>, so it's fine to have a normal <code>Vec</code> of roots registered -- only <code>Drop</code> is "remote" without the store; (ii) we have a <em>separate</em> bit of state per root, and it's just an atomic bool, which on common architectures (x86 and Apple Silicon's aarch64 at least) has atomic loads that are exactly as cheap as normal loads.</p>
+<p>It's also fully safe Rust (<code>Arc</code> makes it so), and is pay-as-you-go: with no such roots existing, GC root scanning has one check of vec-is-empty and a never-taken branch; as close to zero-overhead as we can make it. There is no mutex contention anywhere, because the only "meeting point" is the <code>Vec</code> that's mutated under a <code>&amp;mut Store</code>. In terms of memory allocation, it's certainly more expensive than a LIFO root (which is just an index into an array!), because there's the separate <code>Arc</code> allocation, but I suspect most uses of these roots are likely to be relatively high-level "entry points" or cases like exception returns where scopes don't map well to usage patterns; we can encourage use of LIFO scopes where possible.</p>
+<h2>Naming</h2>
+<p>I've called this an "owned root" and I'd gently suggest considering different names for our current <code>Rooted</code>, to more explicitly describe the difference, if we adopt this -- something like <code>ScopedRooted</code> vs. <code>OwnedRooted</code>?</p>
+</blockquote>
+
+
+
+<a name="534731484"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/534731484" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#534731484">(Aug 16 2025 at 02:11)</a>:</h4>
+<p><a href="https://github.com/cfallin">cfallin</a> added the wasm-proposal:gc label to <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">Issue #11445</a>.</p>
+
+
+
+<a name="534731485"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/534731485" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#534731485">(Aug 16 2025 at 02:11)</a>:</h4>
+<p><a href="https://github.com/cfallin">cfallin</a> added the enhancement label to <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">Issue #11445</a>.</p>
+
+
+
+<a name="534731487"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/534731487" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#534731487">(Aug 16 2025 at 02:11)</a>:</h4>
+<p><a href="https://github.com/cfallin">cfallin</a> added the wasmtime:api label to <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">Issue #11445</a>.</p>
+
+
+
+<a name="534731516"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/534731516" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#534731516">(Aug 16 2025 at 02:12)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/11445#issuecomment-3193195963">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<p>(cc @fitzgen @alexcrichton for thoughts -- this isn't on the critical path for exceptions in any way, but is an orthogonal thought that seemed worth writing up)</p>
+</blockquote>
+
+
+
+<a name="534731555"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/534731555" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#534731555">(Aug 16 2025 at 02:13)</a>:</h4>
+<p>cfallin edited <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<p>Upon pondering the various rooting options in #11326, and reading through the discussion of API tradeoffs <a href="https://github.com/bytecodealliance/wasmtime/blob/82f3b2a16c139297684ae0c84a7568a30c762f41/crates/wasmtime/src/runtime/gc/enabled/rooting.rs#L6">here</a>, it occurs to me that there may be a possible addition to the API, which offers more natural "owned root" semantics in Rust but is still pay-as-you-go, which I'd like to sketch here.</p>
+<h2>Background and Motivation</h2>
+<p>Currently, we have two types, <code>Rooted&lt;T&gt;</code> and <code>ManuallyRooted&lt;T&gt;</code>. The former has a LIFO discipline, implicitly attaching to the deepest <code>RootScope</code> in a stack of scopes on the store, and the latter is completely manual. Notably, the latter does <em>not</em> have a <code>Drop</code> impl that actually unroots, because doing so would require holding a reference to the <code>Store</code> somehow -- implicitly with <code>Arc</code>s somehow, because actual borrows of the <code>Store</code> would preclude any other operations.</p>
+<p>The LIFO discipline of <code>Rooted</code> works well when it works, i.e., when the user is aware of their scopes, but in <a href="https://github.com/bytecodealliance/wasmtime/pull/11326#issuecomment-3192952035">this comment</a> I outline a few of the realizations I've had around ergonomics when it combines with other features -- in particular, Rust's <code>?</code> operator, which pushes users to naturally "propagate errors upward without explicit thought". The usual expectation is that the <code>E</code> type in the <code>Result</code> somehow owns its info. So a dynamic failure (a panic, no less!) when that <code>E</code> crosses over a scope is quite surprising. Exceptional returns are the most obvious example to me right now, but I believe some of the surprise here may also occur with users who naively (but understandably) expect that "GC" means they don't have to worry about lifetimes. Said more succinctly, a type named <code>Rooted</code> in a language like Rust where types often imply ownership might imply that it keeps a root as long as it exists. I know I certainly had that expectation at first. (The docs are very good, but "least surprise" still applies here!)</p>
+<p>We provide the "escape hatch", as the docs describe, of <code>ManuallyRooted</code>, and this can certainly work well if the user has extreme discipline -- unfortunately, the requirement of a manual unrooting step means that it is <em>very</em> easy to get wrong, again as the docs describe well.</p>
+<p>The middle ground, of a type that somehow unregisters itself on <code>Drop</code> by keeping enough of a handle on the engine's internal state to do so, is described as impractical: it would require an <code>Arc&lt;Mutex&lt;...&gt;&gt;</code> to track internal handle state/registration, as the docs say. This would create synchronization overhead, and potentially pessimize common-case GC operations too. Is there a better way?</p>
+<h2>Idea: Pay-as-you-Go "Arc'd liveness flags"</h2>
+<p>Ideally, I want something that:</p>
+<ul>
+<li>Acts as an "owned root", i.e., keeps the referent alive as long as the root type exists and the store exists</li>
+<li>Has a proper <code>Drop</code> such that dropping the root type ensures the referent is not leaked(*)</li>
+<li>Imposes zero overhead on GC if these roots are not used, and imposes only small overhead proportional to the number of such roots if they are</li>
+</ul>
+<p>Note the sneaky (*) above: I want to avoid leaks, not to eagerly detect when an unregistration occurs. In other words, let's permit deferring some action from the <code>Drop</code> to, say, the next time a GC runs.</p>
+<p>Then to avoid synchronization overhead and contention, rather than a large monolithic registry under a single mutex, let's have some small shared state per owned root.</p>
+<p>The idea is: keep a "liveness flag" in an <code>Arc&lt;AtomicBool&gt;</code>. In steady state, when live, there are <em>two</em> references to this <code>Arc</code>: from the owned root type, and from a <code>owned_roots: Vec&lt;(Option&lt;VMGcRef&gt;, Arc&lt;AtomicBool&gt;)&gt;</code> in the GC roots list. When the owned root drops, it sets its atomic bool to false, and drops its <code>Arc</code> reference. When the GC scans roots, it reads out the liveness flags, and removes those roots that the owner has dropped. (E.g. via a <code>retain</code> on the <code>Vec</code>.)[^1]</p>
+<p>[^1]: Slight variant: the tuple above could instead be a single <code>Arc&lt;OwnedRootData&gt;</code> with liveness and the <code>VMGcRef</code>, and maybe that's cleaner; I haven't thought too much about how this would live alongside <code>ManuallyRooted</code> and whether it would want to share a GC-ref root array somewhere else or not...</p>
+<p>Two realizations make this more efficient than the <code>Arc&lt;Mutex&lt;whole root list&gt;&gt;</code> approach: (i) we <em>do</em> have a mut borrow to the store when we <em>create</em>, so it's fine to have a normal <code>Vec</code> of roots registered -- only <code>Drop</code> is "remote" without the store; (ii) we have a <em>separate</em> bit of state per root, and it's just an atomic bool, which on common architectures (x86 and Apple Silicon's aarch64 at least) has atomic loads that are exactly as cheap as normal loads.</p>
+<p>It's also fully safe Rust (<code>Arc</code> makes it so), and is pay-as-you-go: with no such roots existing, GC root scanning has one check of vec-is-empty and a never-taken branch; as close to zero-overhead as we can make it. There is no mutex contention anywhere, because the only "meeting point" is the <code>Vec</code> that's mutated under a <code>&amp;mut Store</code>. In terms of memory allocation, it's certainly more expensive than a LIFO root (which is just an index into an array!), because there's the separate <code>Arc</code> allocation, but I suspect most uses of these roots are likely to be relatively high-level "entry points" or cases like exception returns where scopes don't map well to usage patterns; we can encourage use of LIFO scopes where possible.</p>
+<h2>Naming</h2>
+<p>I've called this an "owned root" and I'd gently suggest considering different names for our current <code>Rooted</code>, to more explicitly describe the difference, if we adopt this -- something like <code>ScopedRooted</code> vs. <code>OwnedRooted</code>?</p>
+</blockquote>
+
+
+
+<a name="534974679"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/534974679" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#534974679">(Aug 18 2025 at 15:24)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/11445#issuecomment-3197385049">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<p>Something like this seems reasonable to me yeah, but I'd defer to @fitzgen. We don't really have a great benchmark or application of sorts to weigh this against though at this time in the sense of evaluating "is the <code>Arc</code> overhead acceptable?" Without that we're kind of just shooting in the dark and predicting. For example <code>Arc</code> is relatively expensive with an allocation plus strong/weak counts so there's synchronization not just on the <code>Drop</code>-sets-the-flag but also <code>Drop</code>-the-<code>Arc</code> itself. We could perhaps get that down with a custom <code>Arc</code> of sorts but then there's also the question of the allocation. (and so on and so forth agbout exact possible vectors we could tweak things, hard to weigh in my mind at least...)</p>
+</blockquote>
+
+
+
+<a name="534974723"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/534974723" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#534974723">(Aug 18 2025 at 15:25)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/11445#issuecomment-3197388287">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<p>Oh, sorry, I'm still waking up. Renaming <code>Rooted</code> I also think would be reasonable.</p>
+</blockquote>
+
+
+
+<a name="534984237"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/534984237" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#534984237">(Aug 18 2025 at 16:18)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/11445#issuecomment-3197579729">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<p>That's all true; allocation of an <code>Arc</code> is noted above as the main cost here. I'd note that the synchronization on the Arc itself is also "root-local", i.e. of a different character than the synchronization overhead noted in docs to argue against registered roots.</p>
+<p>High-level I suspect it'd be nice to provide <em>some</em> tool here, even with some cost when used (and zero cost when not), because right now there is no way in the public API to build something like this on top of it :-)</p>
+</blockquote>
+
+
+
+<a name="534994136"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/534994136" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#534994136">(Aug 18 2025 at 17:34)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/11445#issuecomment-3197829366">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<p>Good point yeah, and I'd agree with that. I'd prefer to avoid exposing any <code>Arc</code>-related details in the public API, and instead provide the constraint that "when you drop this root handle thing it'll eventually get GC'd if not rooted elsewhere". We could then refactor various details internally over time as necessary</p>
+</blockquote>
+
+
+
+<a name="534996659"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/534996659" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#534996659">(Aug 18 2025 at 17:53)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/11445#issuecomment-3197880073">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<p>Indeed, the above proposal doesn't expose any Arcs at all; the only public API is the proposed <code>OwnedRoot</code>. (I think you're agreeing with this but just for clarity to state it explicitly...)</p>
+</blockquote>
+
+
+
+<a name="535019522"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/535019522" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#535019522">(Aug 18 2025 at 20:43)</a>:</h4>
+<p>fitzgen closed <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<p>Upon pondering the various rooting options in #11326, and reading through the discussion of API tradeoffs <a href="https://github.com/bytecodealliance/wasmtime/blob/82f3b2a16c139297684ae0c84a7568a30c762f41/crates/wasmtime/src/runtime/gc/enabled/rooting.rs#L6">here</a>, it occurs to me that there may be a possible addition to the API, which offers more natural "owned root" semantics in Rust but is still pay-as-you-go, which I'd like to sketch here.</p>
+<h2>Background and Motivation</h2>
+<p>Currently, we have two types, <code>Rooted&lt;T&gt;</code> and <code>ManuallyRooted&lt;T&gt;</code>. The former has a LIFO discipline, implicitly attaching to the deepest <code>RootScope</code> in a stack of scopes on the store, and the latter is completely manual. Notably, the latter does <em>not</em> have a <code>Drop</code> impl that actually unroots, because doing so would require holding a reference to the <code>Store</code> somehow -- implicitly with <code>Arc</code>s somehow, because actual borrows of the <code>Store</code> would preclude any other operations.</p>
+<p>The LIFO discipline of <code>Rooted</code> works well when it works, i.e., when the user is aware of their scopes, but in <a href="https://github.com/bytecodealliance/wasmtime/pull/11326#issuecomment-3192952035">this comment</a> I outline a few of the realizations I've had around ergonomics when it combines with other features -- in particular, Rust's <code>?</code> operator, which pushes users to naturally "propagate errors upward without explicit thought". The usual expectation is that the <code>E</code> type in the <code>Result</code> somehow owns its info. So a dynamic failure (a panic, no less!) when that <code>E</code> crosses over a scope is quite surprising. Exceptional returns are the most obvious example to me right now, but I believe some of the surprise here may also occur with users who naively (but understandably) expect that "GC" means they don't have to worry about lifetimes. Said more succinctly, a type named <code>Rooted</code> in a language like Rust where types often imply ownership might imply that it keeps a root as long as it exists. I know I certainly had that expectation at first. (The docs are very good, but "least surprise" still applies here!)</p>
+<p>We provide the "escape hatch", as the docs describe, of <code>ManuallyRooted</code>, and this can certainly work well if the user has extreme discipline -- unfortunately, the requirement of a manual unrooting step means that it is <em>very</em> easy to get wrong, again as the docs describe well.</p>
+<p>The middle ground, of a type that somehow unregisters itself on <code>Drop</code> by keeping enough of a handle on the engine's internal state to do so, is described as impractical: it would require an <code>Arc&lt;Mutex&lt;...&gt;&gt;</code> to track internal handle state/registration, as the docs say. This would create synchronization overhead, and potentially pessimize common-case GC operations too. Is there a better way?</p>
+<h2>Idea: Pay-as-you-Go "Arc'd liveness flags"</h2>
+<p>Ideally, I want something that:</p>
+<ul>
+<li>Acts as an "owned root", i.e., keeps the referent alive as long as the root type exists and the store exists</li>
+<li>Has a proper <code>Drop</code> such that dropping the root type ensures the referent is not leaked(*)</li>
+<li>Imposes zero overhead on GC if these roots are not used, and imposes only small overhead proportional to the number of such roots if they are</li>
+</ul>
+<p>Note the sneaky (*) above: I want to avoid leaks, not to eagerly detect when an unregistration occurs. In other words, let's permit deferring some action from the <code>Drop</code> to, say, the next time a GC runs.</p>
+<p>Then to avoid synchronization overhead and contention, rather than a large monolithic registry under a single mutex, let's have some small shared state per owned root.</p>
+<p>The idea is: keep a "liveness flag" in an <code>Arc&lt;AtomicBool&gt;</code>. In steady state, when live, there are <em>two</em> references to this <code>Arc</code>: from the owned root type, and from a <code>owned_roots: Vec&lt;(Option&lt;VMGcRef&gt;, Arc&lt;AtomicBool&gt;)&gt;</code> in the GC roots list. When the owned root drops, it sets its atomic bool to false, and drops its <code>Arc</code> reference. When the GC scans roots, it reads out the liveness flags, and removes those roots that the owner has dropped. (E.g. via a <code>retain</code> on the <code>Vec</code>.)[^1]</p>
+<p>[^1]: Slight variant: the tuple above could instead be a single <code>Arc&lt;OwnedRootData&gt;</code> with liveness and the <code>VMGcRef</code>, and maybe that's cleaner; I haven't thought too much about how this would live alongside <code>ManuallyRooted</code> and whether it would want to share a GC-ref root array somewhere else or not...</p>
+<p>Two realizations make this more efficient than the <code>Arc&lt;Mutex&lt;whole root list&gt;&gt;</code> approach: (i) we <em>do</em> have a mut borrow to the store when we <em>create</em>, so it's fine to have a normal <code>Vec</code> of roots registered -- only <code>Drop</code> is "remote" without the store; (ii) we have a <em>separate</em> bit of state per root, and it's just an atomic bool, which on common architectures (x86 and Apple Silicon's aarch64 at least) has atomic loads that are exactly as cheap as normal loads.</p>
+<p>It's also fully safe Rust (<code>Arc</code> makes it so), and is pay-as-you-go: with no such roots existing, GC root scanning has one check of vec-is-empty and a never-taken branch; as close to zero-overhead as we can make it. There is no mutex contention anywhere, because the only "meeting point" is the <code>Vec</code> that's mutated under a <code>&amp;mut Store</code>. In terms of memory allocation, it's certainly more expensive than a LIFO root (which is just an index into an array!), because there's the separate <code>Arc</code> allocation, but I suspect most uses of these roots are likely to be relatively high-level "entry points" or cases like exception returns where scopes don't map well to usage patterns; we can encourage use of LIFO scopes where possible.</p>
+<h2>Naming</h2>
+<p>I've called this an "owned root" and I'd gently suggest considering different names for our current <code>Rooted</code>, to more explicitly describe the difference, if we adopt this -- something like <code>ScopedRooted</code> vs. <code>OwnedRooted</code>?</p>
+</blockquote>
+
+
+
+<a name="535019524"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/535019524" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#535019524">(Aug 18 2025 at 20:43)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/11445#issuecomment-3198360028">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<p>Yes, LIFO <code>Rooted</code>s are definitely a bit footgun-y with exceptions. I like the immediate solution for that (the <code>StoreContextMut::throw(&amp;mut self, &amp;Rooted&lt;ExnRef&gt;) -&gt; wasmtime::ThrownException</code> API or whatever) discussed on the exceptions PR, so I will focus on the general rooting ideas here.</p>
+<p>Also, I agree that this scheme would work to root GC objects and would ultimately provide users with a more-ergonomic API than what we have today.</p>
+<p>The big challenge that springs to mind when considering this <code>Arc&lt;AtomicBool&gt;</code> scheme is management of the <code>Vec&lt;(Option&lt;VMGcRef&gt;, Arc&lt;AtomicBool&gt;)&gt;</code> inside the roots list. How big do we let that <code>Vec</code> get? Do we trigger GC if it reaches some limit?</p>
+<p>The old <code>VMGcRefActivationsTable</code> had a bump region that did similar-ish things as proposed here, but in service of different ends, and managing its size/capacity proved to be difficult. We <em>wanted</em> to impose a size limit, but because cleanup happened on GC, this meant we needed to trigger full GCs even when it was unlikely we would have any productive work to do <em>other</em> than cleaning up that bump region. This was _very_ slow. We then adapted the limit to grow in an amortized fashion, and this sped things up some (still not as much as eventually removing the bump region completely did) but it also meant that memory overheads started getting bigger and bigger. We ideally want the pooling allocator and its config to control and pre-allocate ~all major allocations and things that are <code>O(wasm module)</code> or <code>O(wasm runtime)</code> or anything like that. If I say I want to give 128MiB to each GC heap in my pooling allocator, I don't want extra bookkeeping allocations outside of that, as much as possible.</p>
+<p>The size of this <code>Vec</code> would be more-directly correlated with the host's behavior than with the guest's, but I could imagine ways to indirectly control it from the guest, like throwing and catching in a loop.</p>
+<hr>
+<p>This is not a solution to the previous challenge, but miiiiight alleviate it a little: we could replace the <code>Vec</code> with <code>HashMap&lt;VMGcRef, Arc&lt;AtomicBool&gt;&gt;</code> so that we wouldn't ever create multiple <code>Arc&lt;AtomicBool&gt;</code> roots for the same object. In turn, it would make root-creation that much slower.</p>
+<hr>
+<p>We could also have a free list of available <code>Arc&lt;bool&gt;</code>s to help lower the cost of (some of) the <code>Arc</code>s' <code>malloc</code>s. Although the <code>malloc</code> implementation's size classes (that it presumably has) would probably already do most of that.</p>
+<hr>
+<p>Now that I think about it some more, I don't think we even need the <code>AtomicBool</code> and can just have <code>Arc&lt;()&gt;</code> and use the <code>Arc</code>'s reference count to keep track of whether the <code>OwnedRoot</code> or whatever is still alive. We could either hold a weak reference in our <code>Vec</code>/<code>HashMap</code> or else we could just subtract one from the reference count to get the "real" reference count.</p>
+<hr>
+<p>Also, this is starting to look very much like what we do with registered types, except with waiting for GC to clean up the "dead" roots rather than expecting callers of <code>decref</code> to do it when the ref count reaches zero. (With the type registry, we put types behind an <code>Arc</code> so that they can be accessed and their ref counts incremented and decremented without taking the registry's <code>RwLock</code>, and the lock is <em>only</em> taken once the teh ref count reaches zero for deregistration.)</p>
+<hr>
+<p>Oh the other challenge that springs to mind now is updating rooted references after a moving GC. I think we could handle this with <code>Arc&lt;AtomicU32&gt;</code> where the <code>AtomicU32</code> is the raw <code>VMGcRef</code>. We could maybe even have a helper that takes a <code>&amp;mut StoreOpaque</code> and then does a relaxed load because the only thing that could update that reference is </p>
+</blockquote>
+
+
+
+<a name="535019532"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/535019532" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#535019532">(Aug 18 2025 at 20:43)</a>:</h4>
+<p>fitzgen reopened <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<p>Upon pondering the various rooting options in #11326, and reading through the discussion of API tradeoffs <a href="https://github.com/bytecodealliance/wasmtime/blob/82f3b2a16c139297684ae0c84a7568a30c762f41/crates/wasmtime/src/runtime/gc/enabled/rooting.rs#L6">here</a>, it occurs to me that there may be a possible addition to the API, which offers more natural "owned root" semantics in Rust but is still pay-as-you-go, which I'd like to sketch here.</p>
+<h2>Background and Motivation</h2>
+<p>Currently, we have two types, <code>Rooted&lt;T&gt;</code> and <code>ManuallyRooted&lt;T&gt;</code>. The former has a LIFO discipline, implicitly attaching to the deepest <code>RootScope</code> in a stack of scopes on the store, and the latter is completely manual. Notably, the latter does <em>not</em> have a <code>Drop</code> impl that actually unroots, because doing so would require holding a reference to the <code>Store</code> somehow -- implicitly with <code>Arc</code>s somehow, because actual borrows of the <code>Store</code> would preclude any other operations.</p>
+<p>The LIFO discipline of <code>Rooted</code> works well when it works, i.e., when the user is aware of their scopes, but in <a href="https://github.com/bytecodealliance/wasmtime/pull/11326#issuecomment-3192952035">this comment</a> I outline a few of the realizations I've had around ergonomics when it combines with other features -- in particular, Rust's <code>?</code> operator, which pushes users to naturally "propagate errors upward without explicit thought". The usual expectation is that the <code>E</code> type in the <code>Result</code> somehow owns its info. So a dynamic failure (a panic, no less!) when that <code>E</code> crosses over a scope is quite surprising. Exceptional returns are the most obvious example to me right now, but I believe some of the surprise here may also occur with users who naively (but understandably) expect that "GC" means they don't have to worry about lifetimes. Said more succinctly, a type named <code>Rooted</code> in a language like Rust where types often imply ownership might imply that it keeps a root as long as it exists. I know I certainly had that expectation at first. (The docs are very good, but "least surprise" still applies here!)</p>
+<p>We provide the "escape hatch", as the docs describe, of <code>ManuallyRooted</code>, and this can certainly work well if the user has extreme discipline -- unfortunately, the requirement of a manual unrooting step means that it is <em>very</em> easy to get wrong, again as the docs describe well.</p>
+<p>The middle ground, of a type that somehow unregisters itself on <code>Drop</code> by keeping enough of a handle on the engine's internal state to do so, is described as impractical: it would require an <code>Arc&lt;Mutex&lt;...&gt;&gt;</code> to track internal handle state/registration, as the docs say. This would create synchronization overhead, and potentially pessimize common-case GC operations too. Is there a better way?</p>
+<h2>Idea: Pay-as-you-Go "Arc'd liveness flags"</h2>
+<p>Ideally, I want something that:</p>
+<ul>
+<li>Acts as an "owned root", i.e., keeps the referent alive as long as the root type exists and the store exists</li>
+<li>Has a proper <code>Drop</code> such that dropping the root type ensures the referent is not leaked(*)</li>
+<li>Imposes zero overhead on GC if these roots are not used, and imposes only small overhead proportional to the number of such roots if they are</li>
+</ul>
+<p>Note the sneaky (*) above: I want to avoid leaks, not to eagerly detect when an unregistration occurs. In other words, let's permit deferring some action from the <code>Drop</code> to, say, the next time a GC runs.</p>
+<p>Then to avoid synchronization overhead and contention, rather than a large monolithic registry under a single mutex, let's have some small shared state per owned root.</p>
+<p>The idea is: keep a "liveness flag" in an <code>Arc&lt;AtomicBool&gt;</code>. In steady state, when live, there are <em>two</em> references to this <code>Arc</code>: from the owned root type, and from a <code>owned_roots: Vec&lt;(Option&lt;VMGcRef&gt;, Arc&lt;AtomicBool&gt;)&gt;</code> in the GC roots list. When the owned root drops, it sets its atomic bool to false, and drops its <code>Arc</code> reference. When the GC scans roots, it reads out the liveness flags, and removes those roots that the owner has dropped. (E.g. via a <code>retain</code> on the <code>Vec</code>.)[^1]</p>
+<p>[^1]: Slight variant: the tuple above could instead be a single <code>Arc&lt;OwnedRootData&gt;</code> with liveness and the <code>VMGcRef</code>, and maybe that's cleaner; I haven't thought too much about how this would live alongside <code>ManuallyRooted</code> and whether it would want to share a GC-ref root array somewhere else or not...</p>
+<p>Two realizations make this more efficient than the <code>Arc&lt;Mutex&lt;whole root list&gt;&gt;</code> approach: (i) we <em>do</em> have a mut borrow to the store when we <em>create</em>, so it's fine to have a normal <code>Vec</code> of roots registered -- only <code>Drop</code> is "remote" without the store; (ii) we have a <em>separate</em> bit of state per root, and it's just an atomic bool, which on common architectures (x86 and Apple Silicon's aarch64 at least) has atomic loads that are exactly as cheap as normal loads.</p>
+<p>It's also fully safe Rust (<code>Arc</code> makes it so), and is pay-as-you-go: with no such roots existing, GC root scanning has one check of vec-is-empty and a never-taken branch; as close to zero-overhead as we can make it. There is no mutex contention anywhere, because the only "meeting point" is the <code>Vec</code> that's mutated under a <code>&amp;mut Store</code>. In terms of memory allocation, it's certainly more expensive than a LIFO root (which is just an index into an array!), because there's the separate <code>Arc</code> allocation, but I suspect most uses of these roots are likely to be relatively high-level "entry points" or cases like exception returns where scopes don't map well to usage patterns; we can encourage use of LIFO scopes where possible.</p>
+<h2>Naming</h2>
+<p>I've called this an "owned root" and I'd gently suggest considering different names for our current <code>Rooted</code>, to more explicitly describe the difference, if we adopt this -- something like <code>ScopedRooted</code> vs. <code>OwnedRooted</code>?</p>
+</blockquote>
+
+
+
+<a name="535019556"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/535019556" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#535019556">(Aug 18 2025 at 20:43)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/11445#issuecomment-3198360537">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<p>(Sorry mis-click)</p>
+</blockquote>
+
+
+
+<a name="535019698"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/535019698" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#535019698">(Aug 18 2025 at 20:45)</a>:</h4>
+<p>fitzgen edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/11445#issuecomment-3198360028">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<p>Yes, LIFO <code>Rooted</code>s are definitely a bit footgun-y with exceptions. I like the immediate solution for that (the <code>StoreContextMut::throw(&amp;mut self, &amp;Rooted&lt;ExnRef&gt;) -&gt; wasmtime::ThrownException</code> API or whatever) discussed on the exceptions PR, so I will focus on the general rooting ideas here.</p>
+<p>Also, I agree that this scheme would work to root GC objects and would ultimately provide users with a more-ergonomic API than what we have today.</p>
+<p>The big challenge that springs to mind when considering this <code>Arc&lt;AtomicBool&gt;</code> scheme is management of the <code>Vec&lt;(Option&lt;VMGcRef&gt;, Arc&lt;AtomicBool&gt;)&gt;</code> inside the roots list. How big do we let that <code>Vec</code> get? Do we trigger GC if it reaches some limit?</p>
+<p>The old <code>VMGcRefActivationsTable</code> had a bump region that did similar-ish things as proposed here, but in service of different ends, and managing its size/capacity proved to be difficult. We <em>wanted</em> to impose a size limit, but because cleanup happened on GC, this meant we needed to trigger full GCs even when it was unlikely we would have any productive work to do <em>other</em> than cleaning up that bump region. This was _very_ slow. We then adapted the limit to grow in an amortized fashion, and this sped things up some (still not as much as eventually removing the bump region completely did) but it also meant that memory overheads started getting bigger and bigger. We ideally want the pooling allocator and its config to control and pre-allocate ~all major allocations and things that are <code>O(wasm module)</code> or <code>O(wasm runtime)</code> or anything like that. If I say I want to give 128MiB to each GC heap in my pooling allocator, I don't want extra bookkeeping allocations outside of that, as much as possible.</p>
+<p>The size of this <code>Vec</code> would be more-directly correlated with the host's behavior than with the guest's, but I could imagine ways to indirectly control it from the guest, like throwing and catching in a loop.</p>
+<hr>
+<p>This is not a solution to the previous challenge, but miiiiight alleviate it a little: we could replace the <code>Vec</code> with <code>HashMap&lt;VMGcRef, Arc&lt;AtomicBool&gt;&gt;</code> so that we wouldn't ever create multiple <code>Arc&lt;AtomicBool&gt;</code> roots for the same object. In turn, it would make root-creation that much slower.</p>
+<hr>
+<p>We could also have a free list of available <code>Arc&lt;bool&gt;</code>s to help lower the cost of (some of) the <code>Arc</code>s' <code>malloc</code>s. Although the <code>malloc</code> implementation's size classes (that it presumably has) would probably already do most of that.</p>
+<hr>
+<p>Now that I think about it some more, I don't think we even need the <code>AtomicBool</code> and can just have <code>Arc&lt;()&gt;</code> and use the <code>Arc</code>'s reference count to keep track of whether the <code>OwnedRoot</code> or whatever is still alive. We could either hold a weak reference in our <code>Vec</code>/<code>HashMap</code> or else we could just subtract one from the reference count to get the "real" reference count.</p>
+<hr>
+<p>Also, this is starting to look very much like what we do with registered types, except with waiting for GC to clean up the "dead" roots rather than expecting callers of <code>decref</code> to do it when the ref count reaches zero. (With the type registry, we put types behind an <code>Arc</code> so that they can be accessed and their ref counts incremented and decremented without taking the registry's <code>RwLock</code>, and the lock is <em>only</em> taken once the teh ref count reaches zero for deregistration.)</p>
+<hr>
+<p>Oh the other challenge that springs to mind now is updating rooted references after a moving GC. I think we could handle this with <code>Arc&lt;AtomicU32&gt;</code> where the <code>AtomicU32</code> is the raw <code>VMGcRef</code>. We could maybe even have a helper that takes a <code>&amp;mut StoreOpaque</code> and then does a relaxed load because the only thing that could update that reference is a GC which takes a mutable store, so if you have a mutable store (and it is the correct store; probably we would need a <code>StoreId</code> soemwhere too) then you know the reference can't move out from under you for the time being.</p>
+</blockquote>
+
+
+
+<a name="535019892"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/535019892" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#535019892">(Aug 18 2025 at 20:46)</a>:</h4>
+<p>fitzgen edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/11445#issuecomment-3198360028">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<p>Yes, LIFO <code>Rooted</code>s are definitely a bit footgun-y with exceptions. I like the immediate solution for that (the <code>StoreContextMut::throw(&amp;mut self, &amp;Rooted&lt;ExnRef&gt;) -&gt; wasmtime::ThrownException</code> API or whatever) discussed on the exceptions PR, so I will focus on the general rooting ideas here.</p>
+<p>Also, I agree that this scheme would work to root GC objects and would ultimately provide users with a more-ergonomic API than what we have today.</p>
+<p>The big challenge that springs to mind when considering this <code>Arc&lt;AtomicBool&gt;</code> scheme is management of the <code>Vec&lt;(Option&lt;VMGcRef&gt;, Arc&lt;AtomicBool&gt;)&gt;</code> inside the roots list. How big do we let that <code>Vec</code> get? Do we trigger GC if it reaches some limit?</p>
+<p>The old <code>VMGcRefActivationsTable</code> had a bump region that did similar-ish things as proposed here, but in service of different ends, and managing its size/capacity proved to be difficult. We <em>wanted</em> to impose a size limit, but because cleanup happened on GC, this meant we needed to trigger full GCs even when it was unlikely we would have any productive work to do <em>other</em> than cleaning up that bump region. This was _very_ slow. We then adapted the limit to grow in an amortized fashion, and this sped things up some (still not as much as eventually removing the bump region completely did) but it also meant that memory overheads started getting bigger and bigger. We ideally want the pooling allocator and its config to control and pre-allocate ~all major allocations and things that are <code>O(wasm module)</code> or <code>O(wasm runtime)</code> or anything like that. If I say I want to give 128MiB to each GC heap in my pooling allocator, I don't want extra bookkeeping allocations outside of that, as much as possible.</p>
+<p>The size of this <code>Vec</code> would be more-directly correlated with the host's behavior than with the guest's, but I could imagine ways to indirectly control it from the guest, like throwing and catching in a loop.</p>
+<hr>
+<p>This is not a solution to the previous challenge, but miiiiight alleviate it a little: we could replace the <code>Vec</code> with <code>HashMap&lt;VMGcRef, Arc&lt;AtomicBool&gt;&gt;</code> so that we wouldn't ever create multiple <code>Arc&lt;AtomicBool&gt;</code> roots for the same object. In turn, it would make root-creation that much slower.</p>
+<hr>
+<p>We could also have a free list of available <code>Arc&lt;bool&gt;</code>s to help lower the cost of (some of) the <code>Arc</code>s' <code>malloc</code>s. Although the <code>malloc</code> implementation's size classes (that it presumably has) would probably already do most of that.</p>
+<hr>
+<p>Now that I think about it some more, I don't think we even need the <code>AtomicBool</code> and can just have <code>Arc&lt;()&gt;</code> and use the <code>Arc</code>'s reference count to keep track of whether the <code>OwnedRoot</code> or whatever is still alive. We could either hold a weak reference in our <code>Vec</code>/<code>HashMap</code> or else we could just subtract one from the reference count to get the "real" reference count.</p>
+<hr>
+<p>Also, this is starting to look very much like what we do with registered types, except with waiting for GC to clean up the "dead" roots rather than expecting callers of <code>decref</code> to do it when the ref count reaches zero. (With the type registry, we put types behind an <code>Arc</code> so that they can be accessed and their ref counts incremented and decremented without taking the registry's <code>RwLock</code>, and the lock is <em>only</em> taken once the teh ref count reaches zero for deregistration. Taking the lock there is roughly equivalent to accessing the store here. Something to mull over.)</p>
+<hr>
+<p>Oh the other challenge that springs to mind now is updating rooted references after a moving GC. I think we could handle this with <code>Arc&lt;AtomicU32&gt;</code> where the <code>AtomicU32</code> is the raw <code>VMGcRef</code>. We could maybe even have a helper that takes a <code>&amp;mut StoreOpaque</code> and then does a relaxed load because the only thing that could update that reference is a GC which takes a mutable store, so if you have a mutable store (and it is the correct store; probably we would need a <code>StoreId</code> soemwhere too) then you know the reference can't move out from under you for the time being.</p>
+</blockquote>
+
+
+
+<a name="535020831"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/535020831" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#535020831">(Aug 18 2025 at 20:55)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/11445#issuecomment-3198391699">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<p>It's possible I'm misunderstanding, or the thought is a follow-on from your mutations, but</p>
+<blockquote>
+<p>Oh the other challenge that springs to mind now is updating rooted references after a moving GC. I think we could handle this with <code>Arc&lt;AtomicU32&gt;</code> where the <code>AtomicU32</code> is the raw <code>VMGcRef</code></p>
+</blockquote>
+<p>isn't an issue in the scheme as proposed since the <code>VMGcRef</code>s are still in the store / GC roots list (indirected as with all other roots) -- only the liveness flag is accessible when one doesn't have a <code>&amp;mut Store</code>.</p>
+<hr>
+<p>Growth of the roots list is certainly a question; I suppose one could have a list trim step that is independent of a GC, essentially doing a pass with <code>Vec::retain</code> and unrooting the dead roots but doing no other work (and this would be in a context where we're creating a new root, so we have a <code>&amp;mut Store</code> already).</p>
+<hr>
+<p>That does, however, make me realize something I said above isn't true: one <em>can</em> actually build this abstraction on top of <code>ManuallyRooted</code> today; in essence one could have a <code>StoreWithNicerRoots&lt;T&gt;</code> that internally owns a <code>Store&lt;T&gt;</code> and carries a list of <code>ManuallyRooted</code> and the <code>Arc&lt;AtomicBool&gt;</code>; at any point it scans the root-list to clean it up, it has a <code>&amp;mut Store</code> and can do a <code>ManuallyRooted::unroot</code>. So then it's a question of whether we want to absorb such a library into <code>Store</code> or not...</p>
+</blockquote>
+
+
+
+<a name="535022441"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/535022441" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#535022441">(Aug 18 2025 at 21:11)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/11445#issuecomment-3198434747">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<blockquote>
+<p>isn't an issue in the scheme as proposed since the <code>VMGcRef</code>s are still in the store / GC roots list (indirected as with all other roots) -- only the liveness flag is accessible when one doesn't have a <code>&amp;mut Store</code>.</p>
+</blockquote>
+<p>Ah okay I think I misunderstood.</p>
+<p>Given an <code>OwnedRoot</code> and a store, how do Wasmtime internals get the raw <code>VMGcRef</code>? That is, what is inside the <code>OwnedRoot</code> other than an <code>Arc</code> handle that lets us get the <code>VMGcRef</code> in <code>O(1)</code> time? I'm assuming we don't want to do an <code>O(n)</code> linear scan through the <code>Vec</code>, comparing each entry's <code>Arc</code> pointer to the <code>OwnedRoot</code>'s <code>Arc</code> pointer. But I also don't know what it would be:</p>
+<ul>
+<li>
+<p>It can't be an index into the <code>Vec</code> unless we never shrink the <code>Vec</code>'s size[^0] which means we would pretty much have to do the full free list thing (e.g. by using <code>wasmtime_slab::Slab</code>) but also means that peak memory overheads would never go away once reached (unless we want to get into the game of having the free list try to hand out low indices when possible, keeping high indices vacant, and shrinking the <code>Vec</code> in an amortized way when we can, but this is getting into full-<code>malloc</code>-implementation territory which seems like more complexity than we probably want here)</p>
+</li>
+<li>
+<p>It also can't be a <code>VMGcRef</code> unless we do the <code>Arc&lt;AtomicU32&gt;</code> thing do deal with moving collectors.</p>
+</li>
+</ul>
+<p>[^0]: Or if we do shrink the <code>Vec</code>'s size but use indices inside <code>OwnedRoot</code>, then we need a way to fixup all the existing <code>OwnedRoot</code>'s indices after we shrink the <code>Vec</code>'s size. Basically the same problem as a moving GC.</p>
+</blockquote>
+
+
+
+<a name="535022644"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/535022644" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#535022644">(Aug 18 2025 at 21:13)</a>:</h4>
+<p>fitzgen edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/11445#issuecomment-3198434747">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<blockquote>
+<p>isn't an issue in the scheme as proposed since the <code>VMGcRef</code>s are still in the store / GC roots list (indirected as with all other roots) -- only the liveness flag is accessible when one doesn't have a <code>&amp;mut Store</code>.</p>
+</blockquote>
+<p>Ah okay I think I misunderstood.</p>
+<p>Given an <code>OwnedRoot</code> and a store, how do Wasmtime internals get the raw <code>VMGcRef</code>? That is, what is inside the <code>OwnedRoot</code> other than an <code>Arc&lt;AtomicBool&gt;</code> handle that lets us get the <code>VMGcRef</code> in <code>O(1)</code> time? I'm assuming we don't want to do an <code>O(n)</code> linear scan through the <code>Vec</code>, comparing each entry's <code>Arc</code> pointer to the <code>OwnedRoot</code>'s <code>Arc</code> pointer. But I also don't know what it would be:</p>
+<ul>
+<li>
+<p>It can't be an index into the <code>Vec</code> unless we never shrink the <code>Vec</code>'s size[^0] which means we would pretty much have to do the full free list thing (e.g. by using <code>wasmtime_slab::Slab</code>) but also means that peak memory overheads would never go away once reached (unless we want to get into the game of having the free list try to hand out low indices when possible, keeping high indices vacant, and shrinking the <code>Vec</code> in an amortized way when we can, but this is getting into full-<code>malloc</code>-implementation territory which seems like more complexity than we probably want here)</p>
+</li>
+<li>
+<p>It also can't be a <code>VMGcRef</code> unless we do the <code>Arc&lt;AtomicU32&gt;</code> thing do deal with moving collectors.</p>
+</li>
+</ul>
+<p>[^0]: Or if we do shrink the <code>Vec</code>'s size but use indices inside <code>OwnedRoot</code>, then we need a way to fixup all the existing <code>OwnedRoot</code>'s indices after we shrink the <code>Vec</code>'s size. Basically the same problem as a moving GC.</p>
+</blockquote>
+
+
+
+<a name="535022688"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/535022688" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#535022688">(Aug 18 2025 at 21:13)</a>:</h4>
+<p>fitzgen edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/11445#issuecomment-3198434747">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<blockquote>
+<p>isn't an issue in the scheme as proposed since the <code>VMGcRef</code>s are still in the store / GC roots list (indirected as with all other roots) -- only the liveness flag is accessible when one doesn't have a <code>&amp;mut Store</code>.</p>
+</blockquote>
+<p>Ah okay I think I misunderstood.</p>
+<p>Given an <code>OwnedRoot</code> and a store, how do Wasmtime internals get the raw <code>VMGcRef</code>? That is, what is inside the <code>OwnedRoot</code> other than an <code>Arc&lt;AtomicBool&gt;</code> handle that lets us get the <code>VMGcRef</code> in <code>O(1)</code> time? I'm assuming we don't want to do an <code>O(n)</code> linear scan through the <code>Vec</code>, comparing each entry's <code>Arc</code> pointer to the <code>OwnedRoot</code>'s <code>Arc</code> pointer. But I also don't know what it would be:</p>
+<ul>
+<li>
+<p>It can't be an index into the <code>Vec</code> unless we never shrink the <code>Vec</code>'s size[^0] which means we would pretty much have to do the full free list thing (e.g. by using <code>wasmtime_slab::Slab</code>) but also means that peak memory overheads would never go away once reached even after GC (unless we want to get into the game of having the free list try to hand out low indices when possible, keeping high indices vacant, and shrinking the <code>Vec</code> in an amortized way when we can, but this is getting into full-<code>malloc</code>-implementation territory which seems like more complexity than we probably want here)</p>
+</li>
+<li>
+<p>It also can't be a <code>VMGcRef</code> unless we do the <code>Arc&lt;AtomicU32&gt;</code> thing do deal with moving collectors.</p>
+</li>
+</ul>
+<p>[^0]: Or if we do shrink the <code>Vec</code>'s size but use indices inside <code>OwnedRoot</code>, then we need a way to fixup all the existing <code>OwnedRoot</code>'s indices after we shrink the <code>Vec</code>'s size. Basically the same problem as a moving GC.</p>
+</blockquote>
+
+
+
+<a name="535024129"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/535024129" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#535024129">(Aug 18 2025 at 21:28)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/11445#issuecomment-3198479976">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<p>It would be the secret third option: a <code>GcRootIndex</code>, just like today's <code>ManuallyRooted</code>. As long as the <code>OwnedRooted</code> exists, it will not set its liveness flag to false, so the index remains valid (same argument as <code>ManuallyRooted</code>, which explicitly deallocs its index when <code>unroot()</code> is called). I suppose the part I missed in the description is that the <code>Vec</code> really holds the <code>Arc</code> along with the associated <code>GcRootIndex</code> (or the external library holds a <code>ManuallyRooted</code>), not the raw <code>VMGcRef</code>.</p>
+</blockquote>
+
+
+
+<a name="535197940"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/535197940" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#535197940">(Aug 19 2025 at 20:21)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/11445#issuecomment-3202107214">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<blockquote>
+<p>It would be the secret third option: a <code>GcRootIndex</code>, just like today's <code>ManuallyRooted</code>. As long as the <code>OwnedRooted</code> exists, it will not set its liveness flag to false, so the index remains valid (same argument as <code>ManuallyRooted</code>, which explicitly deallocs its index when <code>unroot()</code> is called). I suppose the part I missed in the description is that the <code>Vec</code> really holds the <code>Arc</code> along with the associated <code>GcRootIndex</code> (or the external library holds a <code>ManuallyRooted</code>), not the raw <code>VMGcRef</code>.</p>
+</blockquote>
+<p>Ah okay, I've got it now, makes sense.</p>
+<blockquote>
+<p>I suppose one could have a list trim step that is independent of a GC, essentially doing a pass with <code>Vec::retain</code> and unrooting the dead roots but doing no other work (and this would be in a context where we're creating a new root, so we have a <code>&amp;mut Store</code> already).</p>
+</blockquote>
+<p>This makes sense. Will be slightly tricky tuning this well and making sure it is amortized and all that.</p>
+<p>Still slightly concerned about sizes but I think we have figured out enough of the details that it is worth putting up a PR for, where we can have more-concrete discussion.</p>
+</blockquote>
+
+
+
+<a name="535198136"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/535198136" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#535198136">(Aug 19 2025 at 20:23)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/11445#issuecomment-3202110836">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<p>And FWIW, I don't think this should be an external library thing. If it works well and provides better ergonomics than what we have, then we should just add it to Wasmtime and maybe replace our existing APIs.</p>
+</blockquote>
+
+
+
+<a name="536300353"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311445%20Wasm%20GC%20host%20API%3A%20a%20slightly%20less.../near/536300353" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311445.20Wasm.20GC.20host.20API.3A.20a.20slightly.20less.2E.2E.2E.html#536300353">(Aug 26 2025 at 19:34)</a>:</h4>
+<p>cfallin closed <a href="https://github.com/bytecodealliance/wasmtime/issues/11445">issue #11445</a>:</p>
+<blockquote>
+<p>Upon pondering the various rooting options in #11326, and reading through the discussion of API tradeoffs <a href="https://github.com/bytecodealliance/wasmtime/blob/82f3b2a16c139297684ae0c84a7568a30c762f41/crates/wasmtime/src/runtime/gc/enabled/rooting.rs#L6">here</a>, it occurs to me that there may be a possible addition to the API, which offers more natural "owned root" semantics in Rust but is still pay-as-you-go, which I'd like to sketch here.</p>
+<h2>Background and Motivation</h2>
+<p>Currently, we have two types, <code>Rooted&lt;T&gt;</code> and <code>ManuallyRooted&lt;T&gt;</code>. The former has a LIFO discipline, implicitly attaching to the deepest <code>RootScope</code> in a stack of scopes on the store, and the latter is completely manual. Notably, the latter does <em>not</em> have a <code>Drop</code> impl that actually unroots, because doing so would require holding a reference to the <code>Store</code> somehow -- implicitly with <code>Arc</code>s somehow, because actual borrows of the <code>Store</code> would preclude any other operations.</p>
+<p>The LIFO discipline of <code>Rooted</code> works well when it works, i.e., when the user is aware of their scopes, but in <a href="https://github.com/bytecodealliance/wasmtime/pull/11326#issuecomment-3192952035">this comment</a> I outline a few of the realizations I've had around ergonomics when it combines with other features -- in particular, Rust's <code>?</code> operator, which pushes users to naturally "propagate errors upward without explicit thought". The usual expectation is that the <code>E</code> type in the <code>Result</code> somehow owns its info. So a dynamic failure (a panic, no less!) when that <code>E</code> crosses over a scope is quite surprising. Exceptional returns are the most obvious example to me right now, but I believe some of the surprise here may also occur with users who naively (but understandably) expect that "GC" means they don't have to worry about lifetimes. Said more succinctly, a type named <code>Rooted</code> in a language like Rust where types often imply ownership might imply that it keeps a root as long as it exists. I know I certainly had that expectation at first. (The docs are very good, but "least surprise" still applies here!)</p>
+<p>We provide the "escape hatch", as the docs describe, of <code>ManuallyRooted</code>, and this can certainly work well if the user has extreme discipline -- unfortunately, the requirement of a manual unrooting step means that it is <em>very</em> easy to get wrong, again as the docs describe well.</p>
+<p>The middle ground, of a type that somehow unregisters itself on <code>Drop</code> by keeping enough of a handle on the engine's internal state to do so, is described as impractical: it would require an <code>Arc&lt;Mutex&lt;...&gt;&gt;</code> to track internal handle state/registration, as the docs say. This would create synchronization overhead, and potentially pessimize common-case GC operations too. Is there a better way?</p>
+<h2>Idea: Pay-as-you-Go "Arc'd liveness flags"</h2>
+<p>Ideally, I want something that:</p>
+<ul>
+<li>Acts as an "owned root", i.e., keeps the referent alive as long as the root type exists and the store exists</li>
+<li>Has a proper <code>Drop</code> such that dropping the root type ensures the referent is not leaked(*)</li>
+<li>Imposes zero overhead on GC if these roots are not used, and imposes only small overhead proportional to the number of such roots if they are</li>
+</ul>
+<p>Note the sneaky (*) above: I want to avoid leaks, not to eagerly detect when an unregistration occurs. In other words, let's permit deferring some action from the <code>Drop</code> to, say, the next time a GC runs.</p>
+<p>Then to avoid synchronization overhead and contention, rather than a large monolithic registry under a single mutex, let's have some small shared state per owned root.</p>
+<p>The idea is: keep a "liveness flag" in an <code>Arc&lt;AtomicBool&gt;</code>. In steady state, when live, there are <em>two</em> references to this <code>Arc</code>: from the owned root type, and from a <code>owned_roots: Vec&lt;(Option&lt;VMGcRef&gt;, Arc&lt;AtomicBool&gt;)&gt;</code> in the GC roots list. When the owned root drops, it sets its atomic bool to false, and drops its <code>Arc</code> reference. When the GC scans roots, it reads out the liveness flags, and removes those roots that the owner has dropped. (E.g. via a <code>retain</code> on the <code>Vec</code>.)[^1]</p>
+<p>[^1]: Slight variant: the tuple above could instead be a single <code>Arc&lt;OwnedRootData&gt;</code> with liveness and the <code>VMGcRef</code>, and maybe that's cleaner; I haven't thought too much about how this would live alongside <code>ManuallyRooted</code> and whether it would want to share a GC-ref root array somewhere else or not...</p>
+<p>Two realizations make this more efficient than the <code>Arc&lt;Mutex&lt;whole root list&gt;&gt;</code> approach: (i) we <em>do</em> have a mut borrow to the store when we <em>create</em>, so it's fine to have a normal <code>Vec</code> of roots registered -- only <code>Drop</code> is "remote" without the store; (ii) we have a <em>separate</em> bit of state per root, and it's just an atomic bool, which on common architectures (x86 and Apple Silicon's aarch64 at least) has atomic loads that are exactly as cheap as normal loads.</p>
+<p>It's also fully safe Rust (<code>Arc</code> makes it so), and is pay-as-you-go: with no such roots existing, GC root scanning has one check of vec-is-empty and a never-taken branch; as close to zero-overhead as we can make it. There is no mutex contention anywhere, because the only "meeting point" is the <code>Vec</code> that's mutated under a <code>&amp;mut Store</code>. In terms of memory allocation, it's certainly more expensive than a LIFO root (which is just an index into an array!), because there's the separate <code>Arc</code> allocation, but I suspect most uses of these roots are likely to be relatively high-level "entry points" or cases like exception returns where scopes don't map well to usage patterns; we can encourage use of LIFO scopes where possible.</p>
+<h2>Naming</h2>
+<p>I've called this an "owned root" and I'd gently suggest considering different names for our current <code>Rooted</code>, to more explicitly describe the difference, if we adopt this -- something like <code>ScopedRooted</code> vs. <code>OwnedRooted</code>?</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

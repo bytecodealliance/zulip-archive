@@ -1,0 +1,96 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #10923 Should Wasmtime be using `C-unwin... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310923.20Should.20Wasmtime.20be.20using.20.60C-unwin.2E.2E.2E.html">wasmtime / issue #10923 Should Wasmtime be using `C-unwin...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="522415248"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310923%20Should%20Wasmtime%20be%20using%20%60C-unwin.../near/522415248" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310923.20Should.20Wasmtime.20be.20using.20.60C-unwin.2E.2E.2E.html#522415248">(Jun 04 2025 at 17:33)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/issues/10923">issue #10923</a>:</p>
+<blockquote>
+<p>Spinning out the discussion from <a href="https://github.com/bytecodealliance/wasmtime/pull/10919#discussion_r2126137327">here</a> and today's Cranelift meeting. The question is should Wasmtime be using <code>C-unwind</code> in more locations?</p>
+<p>Current state of the world that this could apply to:</p>
+<ul>
+<li>When Wasmtime <a href="https://github.com/bytecodealliance/wasmtime/blob/5603ee7b099c837aa7194f1052e7c73cf4c36750/crates/wasmtime/src/runtime/vm/traphandlers.rs#L399-L413">calls <code>setjmp</code></a> the shim uses <code>extern "C"</code>.</li>
+<li>After calling <code>setjmp</code> Wasmtime makes its way to <a href="https://github.com/bytecodealliance/wasmtime/blob/5603ee7b099c837aa7194f1052e7c73cf4c36750/crates/wasmtime/src/runtime/vm/vmcontext.rs#L904-L924">here</a> (through exclusively Wasmtime-defined code) with <a href="https://github.com/bytecodealliance/wasmtime/blob/main/crates/wasmtime/src/runtime/vm/vmcontext.rs#L44">this definition of <code>VMArrayCallNative</code></a> which uses <code>extern "C"</code></li>
+<li>Signal handlers <a href="https://github.com/bytecodealliance/wasmtime/blob/5603ee7b099c837aa7194f1052e7c73cf4c36750/crates/wasmtime/src/runtime/vm/sys/unix/signals.rs#L129">are defined as <code>extern "C"</code></a> but will <a href="https://github.com/bytecodealliance/wasmtime/blob/5603ee7b099c837aa7194f1052e7c73cf4c36750/crates/wasmtime/src/runtime/vm/sys/unix/signals.rs#L219">call <code>longjmp</code></a></li>
+<li>Windows vectored exception handlers are <a href="https://github.com/bytecodealliance/wasmtime/blob/5603ee7b099c837aa7194f1052e7c73cf4c36750/crates/wasmtime/src/runtime/vm/sys/windows/vectored_exceptions.rs#L52">defined as <code>extern "system"</code></a> and <a href="https://github.com/bytecodealliance/wasmtime/blob/5603ee7b099c837aa7194f1052e7c73cf4c36750/crates/wasmtime/src/runtime/vm/sys/windows/vectored_exceptions.rs#L118">call <code>longjmp</code></a></li>
+<li>The <a href="https://github.com/bytecodealliance/wasmtime/blob/5603ee7b099c837aa7194f1052e7c73cf4c36750/crates/wasmtime/src/runtime/vm/libcalls.rs#L1464"><code>raise</code> libcall</a> transitively invokes <a href="https://github.com/bytecodealliance/wasmtime/blob/5603ee7b099c837aa7194f1052e7c73cf4c36750/crates/wasmtime/src/runtime/vm/traphandlers.rs#L659"><code>longjmp</code> here</a> but the entrypoint for <code>raise</code> is <a href="https://github.com/bytecodealliance/wasmtime/blob/5603ee7b099c837aa7194f1052e7c73cf4c36750/crates/wasmtime/src/runtime/vm/libcalls.rs#L118">defined here with <code>extern "C"</code></a></li>
+<li>The <a href="https://github.com/bytecodealliance/wasmtime/pull/10919">upcoming unwinder</a> uses <code>extern "C"</code> for <code>__cranelift_throw</code>, and this is presumably the same pattern we'll use in Wasmtime.</li>
+</ul>
+<p>Rust defines foreign unwinding <a href="https://doc.rust-lang.org/stable/reference/panic.html#unwinding-across-ffi-boundaries">here</a>, specifically:</p>
+<blockquote>
+<p>Unwinding with the wrong ABI is undefined behavior:</p>
+<ul>
+<li>Causing an unwind into Rust code from a foreign function that was called via a function declaration or pointer declared with a non-unwinding ABI, such as "C", "system", etc. (For example, this case occurs when such a function written in C++ throws an exception that is uncaught and propagates to Rust.)</li>
+</ul>
+</blockquote>
+<p>If "causing an unwind" includes longjmp and custom Cranelift-defined unwinds then every single location listed above is UB. @bjorn3 mentioned this shouldn't work at all on Windows right now, but something must work on Windows insofar that tests are passing, and we didn't bottom it out in the Cranelift meeting what was going on.</p>
+<hr>
+<p>In short, <code>extern "C"</code> guarantees that there's a aborting landing pad to catch unwinds, and we're guaranteed to skip it in all of the above cases as <code>longjmp</code> doesn't run this landing pad (nor does Cranelift-based unwinding). With <code>extern "C-unwind"</code>, however, it's still the case that <code>longjmp</code> and Cranelift don't run Rust landing pads which is still UB if they exist (in theory).</p>
+<p>In essence I'm not sure how best to proceed here. At the end of the day at a functional level we want a guarantee that when we <code>longjmp</code> in Wasmtime there's no Rust destructors on the stack, but even if that is the case (as we think it is today) it's still not clear whether this is all UB and needs to change one way or another. Will changing to <code>C-unwind</code> fix things? Do we need to use inline assembly stubs or similar more aggressively?</p>
+</blockquote>
+
+
+
+<a name="522416088"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310923%20Should%20Wasmtime%20be%20using%20%60C-unwin.../near/522416088" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310923.20Should.20Wasmtime.20be.20using.20.60C-unwin.2E.2E.2E.html#522416088">(Jun 04 2025 at 17:38)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/10923#issuecomment-2940857238">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10923">issue #10923</a>:</p>
+<blockquote>
+<p>One possibility to solve all of this is to move the responsibility of longjmp/setjmp into Cranelift. For example one could imagine:</p>
+<ul>
+<li>Entry trampolines bake in a <code>setjmp</code> call defined by Cranelift</li>
+<li>Invocations of the <code>raise</code> libcall are replaced by a <code>longjmp</code> defined by Cranelift</li>
+<li>Signal handlers, when catching a signal, update the execution context to resume at a Cranelift-defined stub to execute a Cranelift-defined longjmp</li>
+<li>The "throw" logic for exceptions would turn into a Cranelift intrinsic/instruction and wouldn't need inline assembly on the Wasmtime side of things</li>
+</ul>
+<p>In such a world I don't believe there's any unwinding at all defined in Wasmtime and everything happens exclusively through Cranelift. That's a pretty good deal of refactoring, however, and I'm not sure how easy it would be to model such intrinsics/etc in Cranelift.</p>
+</blockquote>
+
+
+
+<a name="542139612"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310923%20Should%20Wasmtime%20be%20using%20%60C-unwin.../near/542139612" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310923.20Should.20Wasmtime.20be.20using.20.60C-unwin.2E.2E.2E.html#542139612">(Sep 29 2025 at 21:04)</a>:</h4>
+<p>alexcrichton closed <a href="https://github.com/bytecodealliance/wasmtime/issues/10923">issue #10923</a>:</p>
+<blockquote>
+<p>Spinning out the discussion from <a href="https://github.com/bytecodealliance/wasmtime/pull/10919#discussion_r2126137327">here</a> and today's Cranelift meeting. The question is should Wasmtime be using <code>C-unwind</code> in more locations?</p>
+<p>Current state of the world that this could apply to:</p>
+<ul>
+<li>When Wasmtime <a href="https://github.com/bytecodealliance/wasmtime/blob/5603ee7b099c837aa7194f1052e7c73cf4c36750/crates/wasmtime/src/runtime/vm/traphandlers.rs#L399-L413">calls <code>setjmp</code></a> the shim uses <code>extern "C"</code>.</li>
+<li>After calling <code>setjmp</code> Wasmtime makes its way to <a href="https://github.com/bytecodealliance/wasmtime/blob/5603ee7b099c837aa7194f1052e7c73cf4c36750/crates/wasmtime/src/runtime/vm/vmcontext.rs#L904-L924">here</a> (through exclusively Wasmtime-defined code) with <a href="https://github.com/bytecodealliance/wasmtime/blob/main/crates/wasmtime/src/runtime/vm/vmcontext.rs#L44">this definition of <code>VMArrayCallNative</code></a> which uses <code>extern "C"</code></li>
+<li>Signal handlers <a href="https://github.com/bytecodealliance/wasmtime/blob/5603ee7b099c837aa7194f1052e7c73cf4c36750/crates/wasmtime/src/runtime/vm/sys/unix/signals.rs#L129">are defined as <code>extern "C"</code></a> but will <a href="https://github.com/bytecodealliance/wasmtime/blob/5603ee7b099c837aa7194f1052e7c73cf4c36750/crates/wasmtime/src/runtime/vm/sys/unix/signals.rs#L219">call <code>longjmp</code></a></li>
+<li>Windows vectored exception handlers are <a href="https://github.com/bytecodealliance/wasmtime/blob/5603ee7b099c837aa7194f1052e7c73cf4c36750/crates/wasmtime/src/runtime/vm/sys/windows/vectored_exceptions.rs#L52">defined as <code>extern "system"</code></a> and <a href="https://github.com/bytecodealliance/wasmtime/blob/5603ee7b099c837aa7194f1052e7c73cf4c36750/crates/wasmtime/src/runtime/vm/sys/windows/vectored_exceptions.rs#L118">call <code>longjmp</code></a></li>
+<li>The <a href="https://github.com/bytecodealliance/wasmtime/blob/5603ee7b099c837aa7194f1052e7c73cf4c36750/crates/wasmtime/src/runtime/vm/libcalls.rs#L1464"><code>raise</code> libcall</a> transitively invokes <a href="https://github.com/bytecodealliance/wasmtime/blob/5603ee7b099c837aa7194f1052e7c73cf4c36750/crates/wasmtime/src/runtime/vm/traphandlers.rs#L659"><code>longjmp</code> here</a> but the entrypoint for <code>raise</code> is <a href="https://github.com/bytecodealliance/wasmtime/blob/5603ee7b099c837aa7194f1052e7c73cf4c36750/crates/wasmtime/src/runtime/vm/libcalls.rs#L118">defined here with <code>extern "C"</code></a></li>
+<li>The <a href="https://github.com/bytecodealliance/wasmtime/pull/10919">upcoming unwinder</a> uses <code>extern "C"</code> for <code>__cranelift_throw</code>, and this is presumably the same pattern we'll use in Wasmtime.</li>
+</ul>
+<p>Rust defines foreign unwinding <a href="https://doc.rust-lang.org/stable/reference/panic.html#unwinding-across-ffi-boundaries">here</a>, specifically:</p>
+<blockquote>
+<p>Unwinding with the wrong ABI is undefined behavior:</p>
+<ul>
+<li>Causing an unwind into Rust code from a foreign function that was called via a function declaration or pointer declared with a non-unwinding ABI, such as "C", "system", etc. (For example, this case occurs when such a function written in C++ throws an exception that is uncaught and propagates to Rust.)</li>
+</ul>
+</blockquote>
+<p>If "causing an unwind" includes longjmp and custom Cranelift-defined unwinds then every single location listed above is UB. @bjorn3 mentioned this shouldn't work at all on Windows right now, but something must work on Windows insofar that tests are passing, and we didn't bottom it out in the Cranelift meeting what was going on.</p>
+<hr>
+<p>In short, <code>extern "C"</code> guarantees that there's a aborting landing pad to catch unwinds, and we're guaranteed to skip it in all of the above cases as <code>longjmp</code> doesn't run this landing pad (nor does Cranelift-based unwinding). With <code>extern "C-unwind"</code>, however, it's still the case that <code>longjmp</code> and Cranelift don't run Rust landing pads which is still UB if they exist (in theory).</p>
+<p>In essence I'm not sure how best to proceed here. At the end of the day at a functional level we want a guarantee that when we <code>longjmp</code> in Wasmtime there's no Rust destructors on the stack, but even if that is the case (as we think it is today) it's still not clear whether this is all UB and needs to change one way or another. Will changing to <code>C-unwind</code> fix things? Do we need to use inline assembly stubs or similar more aggressively?</p>
+</blockquote>
+
+
+
+<a name="542139615"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2310923%20Should%20Wasmtime%20be%20using%20%60C-unwin.../near/542139615" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2310923.20Should.20Wasmtime.20be.20using.20.60C-unwin.2E.2E.2E.html#542139615">(Sep 29 2025 at 21:04)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/10923#issuecomment-3349052151">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/10923">issue #10923</a>:</p>
+<blockquote>
+<p>I'm going to close this after recent refactorings with exceptions/trampolines/etc. Without setjmp/longjmp any more there's only a tiny handful of functions we skip over, the <code>raise</code> entrypoint plus macOS mach ports handling, and I think those are in a reasonable state.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

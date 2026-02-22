@@ -1,0 +1,300 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #12550 Refactor borrow state tracking for a... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312550.20Refactor.20borrow.20state.20tracking.20for.20a.2E.2E.2E.html">wasmtime / PR #12550 Refactor borrow state tracking for a...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="572872291"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312550%20Refactor%20borrow%20state%20tracking%20for%20a.../near/572872291" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312550.20Refactor.20borrow.20state.20tracking.20for.20a.2E.2E.2E.html#572872291">(Feb 09 2026 at 19:47)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/pull/12550">PR #12550</a> from <code>alexcrichton:remove-call-contexts</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>This commit is a somewhat deep refactoring of how the state of<br>
+<code>borrow&lt;T&gt;</code> is managed for both the host and the guest with respect to<br>
+async tasks. This additionally refactors how some async task management<br>
+is done for host-called functions.</p>
+<p>The fundamental problem being tackled here is <a href="https://github.com/bytecodealliance/wasmtime/issues/12510">https://github.com/bytecodealliance/wasmtime/issues/12510</a>. In that issue it<br>
+was discovered that the way <code>CallContext</code>, the borrow tracking mechanism<br>
+in Wasmtime, is managed is incompatible with async tasks. Specifically<br>
+the previous assumption of the scope being mutated for a borrow is<br>
+somewhere on the call stack is no longer true. It's possible for an<br>
+async task to be suspended, for example, and then a sibling task drops a<br>
+borrow which should update the scope of the suspended task. There were a<br>
+number of other small issues I noticed here and there which this PR<br>
+additionally has tests for, all of which failed before this change and<br>
+pass afterwards.</p>
+<p>The manner in which borrow state is manipulated is a pretty old part of<br>
+the component model implementation dating back to the original<br>
+implementation of resources. I decided to forgo any possible quick fix<br>
+and have attempted to more deeply refactor and integrate async tasks<br>
+into all of this infrastructure. A list of the changes made here are:</p>
+<ul>
+<li>
+<p>The <code>CallContexts</code> structure, a stack of <code>CallContext</code>, was removed.<br>
+  Tasks now directly store a <code>CallContext</code> which is the source of truth<br>
+  for borrow tracking for that call, and it does not move from this<br>
+  location. The store <code>CallContexts</code> is now deleted in favor of updating<br>
+  the <code>Option&lt;ConcurrentState&gt;</code> in the store to be an <code>enum</code> of either<br>
+  concurrent state or a stack. In this manner the old stack-based<br>
+  structure is still used sometimes, but it's impossible to reach when<br>
+  concurrency is enabled.</p>
+</li>
+<li>
+<p>Entry to the host from guests now reliably pushes a <code>HostTask</code> into<br>
+  the store. Previously where a frame were always pushed into a<br>
+<code>CallContext</code> a <code>HostTask</code> is pushed into the store. This is still<br>
+  expected to be a bit too expensive for cheap host calls, but it<br>
+  doesn't meaningfully change the performance profile of before.</p>
+</li>
+<li>
+<p>The <code>resource_enter_call</code> and <code>resource_exit_call</code> libcalls have been<br>
+  removed. These are now folded into the <code>enter_sync_call</code> and<br>
+<code>exit_sync_call</code> libcalls. Emission of these hooks has been updated<br>
+  accordingly. The concept of entering a call more generally has been<br>
+  removed. This is more formally known in the async world as a task<br>
+  starting, so the task creation is now responsible for the demarcation<br>
+  of entering a call. Additionally this means that the concept of<br>
+  exiting a call has somewhat gone away. Instead this method was renamed<br>
+  to <code>validate_scope_exit</code> which double-checks that a borrow-scope can<br>
+  be exited but doesn't actually remove the task. Task removal is<br>
+  deferred to preexisting mechanisms.</p>
+</li>
+<li>
+<p>Management of a <code>GuestTask</code>'s previous <code>Option&lt;CallContext&gt;</code> field,<br>
+  for example taking/restoring and pushing/popping onto <code>CallContexts</code><br>
+  is now all gone. All related code is outright deleted as the<br>
+<code>GuestTask</code>'s now non-optional <code>CallContext</code> field is the source of truth.</p>
+</li>
+<li>
+<p>The <code>ConcurrentState</code> structure now stores a <code>CurrentThread</code> enum<br>
+  instead of <code>Option&lt;QualifiedThreadId&gt;</code>. This represents how the<br>
+  currently executing thread could be a host thread, not just a guest<br>
+  thread, which is required for borrow-tracking.</p>
+</li>
+<li>
+<p><code>HostTask</code> creation in <code>poll_and_block</code> and <code>first_poll</code>, the two main<br>
+  entrypoints of async host tasks when called by the guest, is now<br>
+  externalized from these functions. Instead these functions assume that<br>
+  the currently running thread is already a <code>HostTask</code> of some kind.</p>
+</li>
+<li>
+<p>In <code>poll_and_block</code> the host's result is no longer stored in the guest<br>
+  task but in the host task instead.</p>
+</li>
+</ul>
+<p>Overall this enables the <code>*.wast</code> test for <a href="https://github.com/bytecodealliance/wasmtime/issues/12510">https://github.com/bytecodealliance/wasmtime/issues/12510</a> to fix the original<br>
+issue. This then adds new tests to ensure that cleanup of various<br>
+constructs happens appropriately, such as cancelling a host task should<br>
+clean up its associated resources. Additionally synchronously calling an<br>
+async host task no longer leaks resources in a <code>Store</code> and should<br>
+properly clean up everything.</p>
+<p>There is still more work to do in this area (e.g. <a href="https://github.com/bytecodealliance/wasmtime/issues/12544">https://github.com/bytecodealliance/wasmtime/issues/12544</a>) but that's<br>
+going to be deferred to a future PR at this point.</p>
+<p>Closes <a href="https://github.com/bytecodealliance/wasmtime/issues/12510">https://github.com/bytecodealliance/wasmtime/issues/12510</a></p>
+<p>Depends on <a href="https://github.com/bytecodealliance/wasmtime/pull/12545">https://github.com/bytecodealliance/wasmtime/pull/12545</a>, <a href="https://github.com/bytecodealliance/wasmtime/pull/12546">https://github.com/bytecodealliance/wasmtime/pull/12546</a>, <a href="https://github.com/bytecodealliance/wasmtime/pull/12547">https://github.com/bytecodealliance/wasmtime/pull/12547</a>, <a href="https://github.com/bytecodealliance/wasmtime/pull/12548">https://github.com/bytecodealliance/wasmtime/pull/12548</a>, and <a href="https://github.com/bytecodealliance/wasmtime/pull/12549">https://github.com/bytecodealliance/wasmtime/pull/12549</a></p>
+</blockquote>
+
+
+
+<a name="572872292"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312550%20Refactor%20borrow%20state%20tracking%20for%20a.../near/572872292" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312550.20Refactor.20borrow.20state.20tracking.20for.20a.2E.2E.2E.html#572872292">(Feb 09 2026 at 19:47)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/12550">PR #12550</a>.</p>
+
+
+
+<a name="572872296"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312550%20Refactor%20borrow%20state%20tracking%20for%20a.../near/572872296" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312550.20Refactor.20borrow.20state.20tracking.20for.20a.2E.2E.2E.html#572872296">(Feb 09 2026 at 19:47)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/fitzgen">fitzgen</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/12550">PR #12550</a>.</p>
+
+
+
+<a name="572872297"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312550%20Refactor%20borrow%20state%20tracking%20for%20a.../near/572872297" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312550.20Refactor.20borrow.20state.20tracking.20for.20a.2E.2E.2E.html#572872297">(Feb 09 2026 at 19:47)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/12550">PR #12550</a>.</p>
+
+
+
+<a name="572872377"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312550%20Refactor%20borrow%20state%20tracking%20for%20a.../near/572872377" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312550.20Refactor.20borrow.20state.20tracking.20for.20a.2E.2E.2E.html#572872377">(Feb 09 2026 at 19:47)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12550">PR #12550</a>.</p>
+
+
+
+<a name="572885196"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312550%20Refactor%20borrow%20state%20tracking%20for%20a.../near/572885196" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312550.20Refactor.20borrow.20state.20tracking.20for.20a.2E.2E.2E.html#572885196">(Feb 09 2026 at 20:57)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12550">PR #12550</a>.</p>
+
+
+
+<a name="572895906"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312550%20Refactor%20borrow%20state%20tracking%20for%20a.../near/572895906" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312550.20Refactor.20borrow.20state.20tracking.20for.20a.2E.2E.2E.html#572895906">(Feb 09 2026 at 22:02)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12550">PR #12550</a>.</p>
+
+
+
+<a name="572895952"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312550%20Refactor%20borrow%20state%20tracking%20for%20a.../near/572895952" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312550.20Refactor.20borrow.20state.20tracking.20for.20a.2E.2E.2E.html#572895952">(Feb 09 2026 at 22:02)</a>:</h4>
+<p>alexcrichton edited <a href="https://github.com/bytecodealliance/wasmtime/pull/12550">PR #12550</a>:</p>
+<blockquote>
+<p>This commit is a somewhat deep refactoring of how the state of<br>
+<code>borrow&lt;T&gt;</code> is managed for both the host and the guest with respect to<br>
+async tasks. This additionally refactors how some async task management<br>
+is done for host-called functions.</p>
+<p>The fundamental problem being tackled here is <a href="https://github.com/bytecodealliance/wasmtime/issues/12510">https://github.com/bytecodealliance/wasmtime/issues/12510</a>. In that issue it<br>
+was discovered that the way <code>CallContext</code>, the borrow tracking mechanism<br>
+in Wasmtime, is managed is incompatible with async tasks. Specifically<br>
+the previous assumption of the scope being mutated for a borrow is<br>
+somewhere on the call stack is no longer true. It's possible for an<br>
+async task to be suspended, for example, and then a sibling task drops a<br>
+borrow which should update the scope of the suspended task. There were a<br>
+number of other small issues I noticed here and there which this PR<br>
+additionally has tests for, all of which failed before this change and<br>
+pass afterwards.</p>
+<p>The manner in which borrow state is manipulated is a pretty old part of<br>
+the component model implementation dating back to the original<br>
+implementation of resources. I decided to forgo any possible quick fix<br>
+and have attempted to more deeply refactor and integrate async tasks<br>
+into all of this infrastructure. A list of the changes made here are:</p>
+<ul>
+<li>
+<p>The <code>CallContexts</code> structure, a stack of <code>CallContext</code>, was removed.<br>
+  Tasks now directly store a <code>CallContext</code> which is the source of truth<br>
+  for borrow tracking for that call, and it does not move from this<br>
+  location. The store <code>CallContexts</code> is now deleted in favor of updating<br>
+  the <code>Option&lt;ConcurrentState&gt;</code> in the store to be an <code>enum</code> of either<br>
+  concurrent state or a stack. In this manner the old stack-based<br>
+  structure is still used sometimes, but it's impossible to reach when<br>
+  concurrency is enabled.</p>
+</li>
+<li>
+<p>Entry to the host from guests now reliably pushes a <code>HostTask</code> into<br>
+  the store. Previously where a frame were always pushed into a<br>
+<code>CallContext</code> a <code>HostTask</code> is pushed into the store. This is still<br>
+  expected to be a bit too expensive for cheap host calls, but it<br>
+  doesn't meaningfully change the performance profile of before.</p>
+</li>
+<li>
+<p>The <code>resource_enter_call</code> and <code>resource_exit_call</code> libcalls have been<br>
+  removed. These are now folded into the <code>enter_sync_call</code> and<br>
+<code>exit_sync_call</code> libcalls. Emission of these hooks has been updated<br>
+  accordingly. The concept of entering a call more generally has been<br>
+  removed. This is more formally known in the async world as a task<br>
+  starting, so the task creation is now responsible for the demarcation<br>
+  of entering a call. Additionally this means that the concept of<br>
+  exiting a call has somewhat gone away. Instead this method was renamed<br>
+  to <code>validate_scope_exit</code> which double-checks that a borrow-scope can<br>
+  be exited but doesn't actually remove the task. Task removal is<br>
+  deferred to preexisting mechanisms.</p>
+</li>
+<li>
+<p>Management of a <code>GuestTask</code>'s previous <code>Option&lt;CallContext&gt;</code> field,<br>
+  for example taking/restoring and pushing/popping onto <code>CallContexts</code><br>
+  is now all gone. All related code is outright deleted as the<br>
+<code>GuestTask</code>'s now non-optional <code>CallContext</code> field is the source of truth.</p>
+</li>
+<li>
+<p>The <code>ConcurrentState</code> structure now stores a <code>CurrentThread</code> enum<br>
+  instead of <code>Option&lt;QualifiedThreadId&gt;</code>. This represents how the<br>
+  currently executing thread could be a host thread, not just a guest<br>
+  thread, which is required for borrow-tracking.</p>
+</li>
+<li>
+<p><code>HostTask</code> creation in <code>poll_and_block</code> and <code>first_poll</code>, the two main<br>
+  entrypoints of async host tasks when called by the guest, is now<br>
+  externalized from these functions. Instead these functions assume that<br>
+  the currently running thread is already a <code>HostTask</code> of some kind.</p>
+</li>
+<li>
+<p>In <code>poll_and_block</code> the host's result is no longer stored in the guest<br>
+  task but in the host task instead.</p>
+</li>
+</ul>
+<p>Overall this enables the <code>*.wast</code> test for <a href="https://github.com/bytecodealliance/wasmtime/issues/12510">https://github.com/bytecodealliance/wasmtime/issues/12510</a> to fix the original<br>
+issue. This then adds new tests to ensure that cleanup of various<br>
+constructs happens appropriately, such as cancelling a host task should<br>
+clean up its associated resources. Additionally synchronously calling an<br>
+async host task no longer leaks resources in a <code>Store</code> and should<br>
+properly clean up everything.</p>
+<p>There is still more work to do in this area (e.g. <a href="https://github.com/bytecodealliance/wasmtime/issues/12544">https://github.com/bytecodealliance/wasmtime/issues/12544</a>) but that's<br>
+going to be deferred to a future PR at this point.</p>
+<p>Closes <a href="https://github.com/bytecodealliance/wasmtime/issues/12510">https://github.com/bytecodealliance/wasmtime/issues/12510</a></p>
+<p>~~Depends on <a href="https://github.com/bytecodealliance/wasmtime/pull/12545">https://github.com/bytecodealliance/wasmtime/pull/12545</a>, <a href="https://github.com/bytecodealliance/wasmtime/pull/12546">https://github.com/bytecodealliance/wasmtime/pull/12546</a>, <a href="https://github.com/bytecodealliance/wasmtime/pull/12547">https://github.com/bytecodealliance/wasmtime/pull/12547</a>, <a href="https://github.com/bytecodealliance/wasmtime/pull/12548">https://github.com/bytecodealliance/wasmtime/pull/12548</a>, and <a href="https://github.com/bytecodealliance/wasmtime/pull/12549~~">https://github.com/bytecodealliance/wasmtime/pull/12549~~</a></p>
+</blockquote>
+
+
+
+<a name="572902880"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312550%20Refactor%20borrow%20state%20tracking%20for%20a.../near/572902880" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312550.20Refactor.20borrow.20state.20tracking.20for.20a.2E.2E.2E.html#572902880">(Feb 09 2026 at 22:47)</a>:</h4>
+<p>fitzgen submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12550#pullrequestreview-3775790805">PR review</a>:</p>
+<blockquote>
+<p>I'm not too familiar with the CM async stuff, but this LGTM in general. If you want more detailed feedback, flag another reviewer :)</p>
+</blockquote>
+
+
+
+<a name="572903334"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312550%20Refactor%20borrow%20state%20tracking%20for%20a.../near/572903334" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312550.20Refactor.20borrow.20state.20tracking.20for.20a.2E.2E.2E.html#572903334">(Feb 09 2026 at 22:51)</a>:</h4>
+<p><strong>alexcrichton</strong> requested <a href="https://github.com/dicej">dicej</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/12550">PR #12550</a>.</p>
+
+
+
+<a name="572910421"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312550%20Refactor%20borrow%20state%20tracking%20for%20a.../near/572910421" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312550.20Refactor.20borrow.20state.20tracking.20for.20a.2E.2E.2E.html#572910421">(Feb 09 2026 at 23:49)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/12550#discussion_r2785065192">PR review comment</a>:</p>
+<blockquote>
+<p>Consider renaming <code>expected_caller_instance</code> to <code>expected_caller</code> here since it's no longer an instance.</p>
+</blockquote>
+
+
+
+<a name="572910422"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312550%20Refactor%20borrow%20state%20tracking%20for%20a.../near/572910422" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312550.20Refactor.20borrow.20state.20tracking.20for.20a.2E.2E.2E.html#572910422">(Feb 09 2026 at 23:49)</a>:</h4>
+<p>dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/12550#discussion_r2785068592">PR review comment</a>:</p>
+<blockquote>
+<p>As above, consider renaming this to <code>expected_caller</code>.</p>
+</blockquote>
+
+
+
+<a name="572910423"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312550%20Refactor%20borrow%20state%20tracking%20for%20a.../near/572910423" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312550.20Refactor.20borrow.20state.20tracking.20for.20a.2E.2E.2E.html#572910423">(Feb 09 2026 at 23:49)</a>:</h4>
+<p>dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12550#pullrequestreview-3775975559">PR review</a>.</p>
+
+
+
+<a name="572930403"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312550%20Refactor%20borrow%20state%20tracking%20for%20a.../near/572930403" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312550.20Refactor.20borrow.20state.20tracking.20for.20a.2E.2E.2E.html#572930403">(Feb 10 2026 at 02:52)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12550">PR #12550</a>.</p>
+
+
+
+<a name="572930430"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312550%20Refactor%20borrow%20state%20tracking%20for%20a.../near/572930430" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312550.20Refactor.20borrow.20state.20tracking.20for.20a.2E.2E.2E.html#572930430">(Feb 10 2026 at 02:52)</a>:</h4>
+<p>alexcrichton has enabled auto merge for <a href="https://github.com/bytecodealliance/wasmtime/pull/12550">PR #12550</a>.</p>
+
+
+
+<a name="572933197"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312550%20Refactor%20borrow%20state%20tracking%20for%20a.../near/572933197" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312550.20Refactor.20borrow.20state.20tracking.20for.20a.2E.2E.2E.html#572933197">(Feb 10 2026 at 03:15)</a>:</h4>
+<p>alexcrichton added <a href="https://github.com/bytecodealliance/wasmtime/pull/12550">PR #12550 Refactor borrow state tracking for async tasks </a> to the merge queue.</p>
+
+
+
+<a name="572936168"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312550%20Refactor%20borrow%20state%20tracking%20for%20a.../near/572936168" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312550.20Refactor.20borrow.20state.20tracking.20for.20a.2E.2E.2E.html#572936168">(Feb 10 2026 at 03:41)</a>:</h4>
+<p>alexcrichton merged <a href="https://github.com/bytecodealliance/wasmtime/pull/12550">PR #12550</a>.</p>
+
+
+
+<a name="572936170"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312550%20Refactor%20borrow%20state%20tracking%20for%20a.../near/572936170" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312550.20Refactor.20borrow.20state.20tracking.20for.20a.2E.2E.2E.html#572936170">(Feb 10 2026 at 03:41)</a>:</h4>
+<p>alexcrichton removed <a href="https://github.com/bytecodealliance/wasmtime/pull/12550">PR #12550 Refactor borrow state tracking for async tasks </a> from the merge queue.</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>

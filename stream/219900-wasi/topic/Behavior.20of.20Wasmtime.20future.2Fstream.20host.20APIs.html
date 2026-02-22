@@ -1,0 +1,931 @@
+<html>
+<head><meta charset="utf-8"><title>Behavior of Wasmtime future/stream host APIs · wasi · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/index.html">wasi</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html">Behavior of Wasmtime future/stream host APIs</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="536821471"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536821471" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536821471">(Aug 29 2025 at 16:11)</a>:</h4>
+<p><span class="user-mention" data-user-id="509936">@Joel Dice</span> <span class="user-mention" data-user-id="484032">@Roman Volosatovs</span> <span class="user-mention" data-user-id="480579">@Lann Martin</span> continuing our conversation of <a href="https://github.com/bytecodealliance/wasmtime/pull/11515">https://github.com/bytecodealliance/wasmtime/pull/11515</a> over here.</p>
+<p>Sounds like y'all were thinking of leaning towards when a value is taken from <code>Source</code> that you're not allowed to return pending, but I wanted to push back on that. Sounds like Joel's also having second thoughts though so I'll let him copy them here</p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/wasmtime/pull/11515" style="background-image: url(&quot;https://uploads.zulipusercontent.net/48d69a71353dafd4607040facf3c235a1dc71fbf/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f363963336332393064346633343233616233613665636366316564366134346264343064346339303564386239653637333931356638653861383332303234332f62797465636f6465616c6c69616e63652f7761736d74696d652f70756c6c2f3131353135&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/wasmtime/pull/11515" title="Revamp component model stream/future host API (again) by dicej · Pull Request #11515 · bytecodealliance/wasmtime">Revamp component model stream/future host API (again) by dicej · Pull Request #11515 · bytecodealliance/wasmtime</a></div><div class="message_embed_description">This changes the host APIs for dealing with futures and streams from a &quot;rendezvous&quot;-style API to a callback-oriented one.
+Previously you would create e.g. a StreamReader/StreamWriter pair...</div></div></div>
+
+
+
+<a name="536823707"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536823707" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536823707">(Aug 29 2025 at 16:24)</a>:</h4>
+<p>Yeah, so I've sketched out yet another revision of the public API for managing the read and write ends of streams in Wasmtime <a href="https://gist.github.com/dicej/3d0fead64faa2432f5c673cd7098f2ab">here</a> based on feedback from Roman as he's updating <code>wasmtime-wasi</code>'s p3 support to use it.  Overall, we're pretty happy with it, but still wrestling a bit with what it means to send a <code>COMPLETED</code> event for a <code>stream.write</code>.</p>
+<p>There are two possible interpretations of such an event:</p>
+<ol>
+<li>The reader has consumed N items from the write buffer, meaning they're no longer the writer's responsibility.</li>
+<li>In addition to #1, the reader has forwarded those N items on to wherever they were headed, e.g. the network or a file or whatever.</li>
+</ol>
+<p>If you go with #1, that means that <code>StreamConsumer::poll_consume</code> should return <code>Poll::Ready(_)</code> immediately upon taking one or more items, thereby allowing the runtime to promptly deliver the <code>COMPLETED</code> event to the writer so it knows what happened.  Alternatively, if you go with #2, it's reasonable for <code>StreamConsumer::poll_consume</code> to return <code>Poll::Pending</code> after taking one more more items, since the <code>COMPLETED</code> event should not be delivered until the items have been forwarded on to their destination.  That opens the possibility for the writer to cancel the write after the items have been consumed but before forwarding has finished.  In that case the consumer could just let it complete without interrupting, and that's probably what it <em>should</em> do since there's no way to give any of the items back to the writer at that point.</p>
+<p>It gets tricky, though, if not all the items can be forwarded before the destination is closed.  At that point we have no way to say "I consumed N items, but was only able to forward a subset M &lt; N to the destination".  Or at best, that would need to be communicated out-of-band.</p>
+<div class="message_embed"><a class="message_embed_image" href="https://gist.github.com/dicej/3d0fead64faa2432f5c673cd7098f2ab" style="background-image: url(&quot;https://uploads.zulipusercontent.net/91f9baed8f4fc08c462d1a4de5a8c23942d45e97/68747470733a2f2f6769746875622e6769746875626173736574732e636f6d2f6173736574732f676973742d6f672d696d6167652d3534666437646330373133652e706e67&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://gist.github.com/dicej/3d0fead64faa2432f5c673cd7098f2ab" title="Streams API Draft">Streams API Draft</a></div><div class="message_embed_description">Streams API Draft. GitHub Gist: instantly share code, notes, and snippets.</div></div></div>
+
+
+
+<a name="536824129"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536824129" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536824129">(Aug 29 2025 at 16:26)</a>:</h4>
+<p>The good news is that we can "cheat" for <code>stream&lt;u8&gt;</code> (and perhaps other primitive types) since we can allow the consumer to "peek" at the writer's buffer without marking the bytes consumed until it knows they've been forwarded.  But for other payload types (e.g. resources), the consumer can't get access to the items without irreversibly consuming them.</p>
+
+
+
+<a name="536824634"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536824634" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536824634">(Aug 29 2025 at 16:29)</a>:</h4>
+<p>I feel like this is a bit entangled and I'd like to say instead that <code>Source</code> passed to <code>StreamConsumer</code> is exclusively in charge of keeping track what to return to wasm. I think though that acquiring an item to send and sending back a notification "it's done" should be orthogonal operations. So for example:</p>
+<ul>
+<li>Implementations are required, once they get an item from <code>Source</code>, that they're solely responsible for it. It's up to the implementation to do its best, even in the face of cancellation from the guest, to send that value along.</li>
+<li>Guests can be arbitrarily blocked during writes as long as the host wants after it's taken  an item out since the host gets to decide when to wake up the guest.</li>
+</ul>
+<p>The exact meaning of what happens during cancellation sort of depends on what happens after it. The host is responsible for sending along the values it took out still, so if the guest continues to do more writes then I'd expect the host to apply backpressure and not read anything further from a <code>Source</code> until the previous write completes. If the guest just closes the stream then the host can sort of do whatever it wants and just shut down everything</p>
+
+
+
+<a name="536824841"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536824841" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536824841">(Aug 29 2025 at 16:30)</a>:</h4>
+<p>Basically I don't think it's possible for us to provide a super strict and/or automatic and/or smooth experience on either side to provide ironclad guarantees about what happened where for every possible aspect. What we're left with is a strict boundary of "the value was sent or not" and that's the most we can say. Further operations on a stream like flush/close/etc can then be used to provide more guarantees about previously sent values</p>
+
+
+
+<a name="536824915"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536824915" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536824915">(Aug 29 2025 at 16:30)</a>:</h4>
+<p>In a sense a higher level protocol and/or more flushing/closing/etc primitives are going to be required to fully learn about what just happened with the sent values</p>
+
+
+
+<a name="536824984"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536824984" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536824984">(Aug 29 2025 at 16:31)</a>:</h4>
+<p>It's like as we've said before, just b/c you write to the kernel doesn't mean it's going to make it to the client on the other end of the world</p>
+
+
+
+<a name="536825031"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536825031" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536825031">(Aug 29 2025 at 16:31)</a>:</h4>
+<p>the guarantee the kernel provides is that if you write more data it's going to come after the prior data</p>
+
+
+
+<a name="536825413"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536825413" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536825413">(Aug 29 2025 at 16:33)</a>:</h4>
+<p>Yeah, I'm thinking the same thing.  So, concretely, you're in favor of letting <code>StreamConsumer::poll_consume</code> return <code>Poll::Pending</code> after having taken items from <code>source</code> to apply backpressure to the writer, but regardless of what happens after that (e.g. maybe they're all forwarded to the destination or maybe not), we'll end up sending <code>COMPLETED</code> with the count of items taken from <code>source</code>, correct?</p>
+
+
+
+<a name="536825453"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536825453" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536825453">(Aug 29 2025 at 16:34)</a>:</h4>
+<p>correct</p>
+
+
+
+<a name="536825504"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536825504" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536825504">(Aug 29 2025 at 16:34)</a>:</h4>
+<p>and documenting that using <code>Source</code> is tricky and subtle</p>
+
+
+
+<a name="536825507"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536825507" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536825507">(Aug 29 2025 at 16:34)</a>:</h4>
+<p>And if the writer needs to know how many actually made it to the destination, that will need to be communicated out-of-band, e.g. via another future.</p>
+
+
+
+<a name="536825534"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536825534" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536825534">(Aug 29 2025 at 16:34)</a>:</h4>
+<p>effectively yeah</p>
+
+
+
+<a name="536825569"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536825569" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536825569">(Aug 29 2025 at 16:34)</a>:</h4>
+<p>or we add some sort of flush operation to streams or something like that</p>
+
+
+
+<a name="536825592"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536825592" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536825592">(Aug 29 2025 at 16:35)</a>:</h4>
+<p>where the flush would wait for the item to be fully sent</p>
+
+
+
+<a name="536825624"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536825624" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536825624">(Aug 29 2025 at 16:35)</a>:</h4>
+<p>(but even that's ambiguous, it made it to the kernel, now what?)</p>
+
+
+
+<a name="536825678"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536825678" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536825678">(Aug 29 2025 at 16:35)</a>:</h4>
+<p>so in some sense I think truly knowing what made it where requires something higher level at the protocol/WIT layer that we can't be responsible for at the runtime layer</p>
+
+
+
+<a name="536825985"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536825985" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536825985">(Aug 29 2025 at 16:37)</a>:</h4>
+<p>Yeah, and that's especially true for guest-&gt;guest writes, in which case the host can't possibly know what happened after the reader took responsibility  for the items.</p>
+
+
+
+<a name="536826052"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536826052" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536826052">(Aug 29 2025 at 16:37)</a>:</h4>
+<p>but we're also reflecting what (future) guests can do where they can acknowledge the write and then later say 'ok I took N items'</p>
+
+
+
+<a name="536826070"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536826070" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536826070">(Aug 29 2025 at 16:38)</a>:</h4>
+<p>or... something like that</p>
+
+
+
+<a name="536826256"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536826256" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536826256">(Aug 29 2025 at 16:39)</a>:</h4>
+<p>Like, "remember those N items I took?  Well I just finished forwarding them on", or "I forwarded M of them, but then the upstream destination closed on me, sorry"</p>
+
+
+
+<a name="536826291"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536826291" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536826291">(Aug 29 2025 at 16:39)</a>:</h4>
+<p>right</p>
+
+
+
+<a name="536826820"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536826820" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536826820">(Aug 29 2025 at 16:42)</a>:</h4>
+<p>The other thing to consider is that, by letting <code>StreamConsumer::poll_consume</code> take items from <code>source</code> and return <code>Poll::Pending</code>, we're letting the host do something that a guest can't do: consume items but delay telling the writer they've been consumed.  It's kind of a non-virtualizable host superpower and arguably not "fair".</p>
+
+
+
+<a name="536826880"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536826880" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536826880">(Aug 29 2025 at 16:43)</a>:</h4>
+<p>oh that's what I meant about future wasm</p>
+
+
+
+<a name="536826905"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536826905" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536826905">(Aug 29 2025 at 16:43)</a>:</h4>
+<p>ah, I see now</p>
+
+
+
+<a name="536826932"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536826932" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536826932">(Aug 29 2025 at 16:43)</a>:</h4>
+<p>I forget the comment but Dan made it on some repo somewhere</p>
+
+
+
+<a name="536826980"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536826980" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536826980">(Aug 29 2025 at 16:43)</a>:</h4>
+<p><a href="https://github.com/WebAssembly/wasi-cli/issues/65#issuecomment-3169429925">https://github.com/WebAssembly/wasi-cli/issues/65#issuecomment-3169429925</a></p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/WebAssembly/wasi-cli/issues/65#issuecomment-3169429925" style="background-image: url(&quot;https://uploads.zulipusercontent.net/a83305d535bfeb094c34a59d65dbbb37da20c84b/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f633366306337623265356536303839356133313032353661393964373263363564303639336331633435626330623962656466326363643461343637306362632f576562417373656d626c792f776173692d636c692f6973737565732f3635&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/WebAssembly/wasi-cli/issues/65#issuecomment-3169429925" title="[0.3.0-draft]: Move away from streams as an API? · Issue #65 · WebAssembly/wasi-cli">[0.3.0-draft]: Move away from streams as an API? · Issue #65 · WebAssembly/wasi-cli</a></div><div class="message_embed_description">I'd like to propose a possible radical restructuring of stdin/stdout/stderr and how they're modeled for 0.3.0. Specifically something like this for 0.3.0: interface stdin { read: async func(amount:...</div></div></div>
+
+
+
+<a name="536827059"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536827059" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536827059">(Aug 29 2025 at 16:44)</a>:</h4>
+<p>I guess I'm making a distinction between three separate steps:</p>
+<ol>
+<li>reader consumes items</li>
+<li>reader tells writer it has consumed items</li>
+<li>reader tells writer what the ultimate fate of those items where (e.g. how many reached the destination)</li>
+</ol>
+
+
+
+<a name="536827124"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536827124" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536827124">(Aug 29 2025 at 16:44)</a>:</h4>
+<p>I think what you suggested above covers 1 and 3, but not 2, correct?</p>
+
+
+
+<a name="536827220"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536827220" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536827220">(Aug 29 2025 at 16:45)</a>:</h4>
+<p>i.e. a guest reader can't separate 1 and 2 into distinct steps with an arbitrary delay between them</p>
+
+
+
+<a name="536827350"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536827350" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536827350">(Aug 29 2025 at 16:46)</a>:</h4>
+<p>not quite, today you're right a guest receiving a write is required to bundle 1/2, and I'm saying let's assume in the future the guest can split 1/2 and I'm saying that the host should be able to split 1/2 today</p>
+
+
+
+<a name="536827375"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536827375" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536827375">(Aug 29 2025 at 16:46)</a>:</h4>
+<p>and (3) is left to higher-level protocols</p>
+
+
+
+<a name="536827411"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536827411" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536827411">(Aug 29 2025 at 16:46)</a>:</h4>
+<p>ok, got it</p>
+
+
+
+<a name="536827435"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536827435" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536827435">(Aug 29 2025 at 16:46)</a>:</h4>
+<p>If we consider TCP for example ultimately I don't know what to even do about (3)</p>
+
+
+
+<a name="536827447"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536827447" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536827447">(Aug 29 2025 at 16:46)</a>:</h4>
+<p>at most we can delay (2) to "ok the kernel syscall completed"</p>
+
+
+
+<a name="536827464"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536827464" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536827464">(Aug 29 2025 at 16:46)</a>:</h4>
+<p>but I don't even know how to implement something further than that</p>
+
+
+
+<a name="536827730"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536827730" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536827730">(Aug 29 2025 at 16:48)</a>:</h4>
+<p>Presumably, e.g. a database client library will wait for an ack from the remote peer before saying e.g. a transaction is complete.  So yeah, anything beyond handing bytes to the kernel is solidly an application-level concern, IMO.</p>
+
+
+
+<a name="536827837"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536827837" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536827837">(Aug 29 2025 at 16:49)</a>:</h4>
+<p>Usually TCP ACKs aren't even useful to applications; there are too many middle boxes out there to rely on it for much of anything.</p>
+
+
+
+<a name="536827912"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536827912" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536827912">(Aug 29 2025 at 16:49)</a>:</h4>
+<p>It's buffers all the way down.</p>
+
+
+
+<a name="536827929"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536827929" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536827929">(Aug 29 2025 at 16:50)</a>:</h4>
+<p>yeah, I guess I meant a DB-protocol-level ack</p>
+
+
+
+<a name="536828031"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536828031" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536828031">(Aug 29 2025 at 16:50)</a>:</h4>
+<p>yeah I was asynchronously replying to "what to do about TCP" <span aria-label="slight smile" class="emoji emoji-1f642" role="img" title="slight smile">:slight_smile:</span></p>
+
+
+
+<a name="536828145"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536828145" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536828145">(Aug 29 2025 at 16:51)</a>:</h4>
+<p>my point there though is that even for the most basic streams we can guarantee nothing about (3)</p>
+
+
+
+<a name="536828162"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536828162" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536828162">(Aug 29 2025 at 16:51)</a>:</h4>
+<p>("the ultimate fate of the items")</p>
+
+
+
+<a name="536828205"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536828205" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536828205">(Aug 29 2025 at 16:51)</a>:</h4>
+<p>so IMO we just can't attempt to do anything beyond providing the guarantee "this is someone else's problem now"</p>
+
+
+
+<a name="536828279"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536828279" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536828279">(Aug 29 2025 at 16:52)</a>:</h4>
+<p>and that's what I mean about something in a higher level protocol, e.g. you wait for a read on something else after you write to confirm your bytes were sent</p>
+
+
+
+<a name="536828317"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536828317" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536828317">(Aug 29 2025 at 16:52)</a>:</h4>
+<p>right, but we <em>can</em> know if the upstream destination explicitly closed on us and definitely did <em>not</em> accept a subset of the items</p>
+
+
+
+<a name="536828361"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536828361" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536828361">(Aug 29 2025 at 16:53)</a>:</h4>
+<p>Jumping late into the conversation!</p>
+<p>Personally, I would prefer for consumers to be able to return <code>Poll::Pending</code> <em>after</em> reading items.<br>
+Some implementations (like e.g. <code>wasi:filesystem</code> currently) might require to <em>move</em> values, e.g. to operate on them in a separate thread.<br>
+With the current design, <em>peeking</em> into byte buffers is allowed, so the consumer can then clone that buffer and eventually "mark" the bytes read once it receives a signal from the thread.</p>
+<p>It appears that this covers WASI needs, but I think it's important to have this use case work in general case. I also imagine that it would be the least surprising behavior, which would align well with other similar constructs in Rust. That said, if necessary, I think it also makes sense to <em>only</em> allow this for byte buffers for MVP and relaxing this requirement it in the future.</p>
+
+
+
+<a name="536828401"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536828401" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536828401">(Aug 29 2025 at 16:53)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="509936">Joel Dice</span> <a href="#narrow/channel/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs/near/536828317">said</a>:</p>
+<blockquote>
+<p>right, but we <em>can</em> know if the upstream destination explicitly closed on us and definitely did <em>not</em> accept a subset of the items</p>
+</blockquote>
+<p>for specific cases perhaps, but not in the general case?</p>
+
+
+
+<a name="536828507"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536828507" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536828507">(Aug 29 2025 at 16:53)</a>:</h4>
+<p>sure; either way we're agreed that this is an application-level concern</p>
+
+
+
+<a name="536828553"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536828553" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536828553">(Aug 29 2025 at 16:54)</a>:</h4>
+<p><span class="user-mention" data-user-id="484032">@Roman Volosatovs</span> I agree with you yeah, basically returning pending after "officially" reading an item should be allowed in wasmtime</p>
+
+
+
+<a name="536828604"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536828604" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536828604">(Aug 29 2025 at 16:54)</a>:</h4>
+<p>the consequence is that the implementation is quite a bit more complicated since now you're juggling something the guest thinks is done, but I think that's just a fact of life</p>
+
+
+
+<a name="536828656"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536828656" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536828656">(Aug 29 2025 at 16:55)</a>:</h4>
+<p>Yeah, <span class="user-mention" data-user-id="484032">@Roman Volosatovs</span> I think we're all on board with that; I'll update the gist</p>
+
+
+
+<a name="536828908"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536828908" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536828908">(Aug 29 2025 at 16:56)</a>:</h4>
+<p>Is this adequately addressed in the async explainer?</p>
+
+
+
+<a name="536829015"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536829015" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536829015">(Aug 29 2025 at 16:57)</a>:</h4>
+<p>sort of, but probably not what you're looking for</p>
+
+
+
+<a name="536829023"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536829023" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536829023">(Aug 29 2025 at 16:57)</a>:</h4>
+<p>For TCP we can actually be smarter and use various platform-specific things to query the kernel unsent buffer size to figure out how many bytes can we <em>actually</em> write without blocking. I've left a note about that in the implementation: <a href="https://github.com/bytecodealliance/wasmtime/blob/f7ff95747a6e2515c1a5b7a697794e5cc002e6f5/crates/wasi/src/p3/sockets/host/types/tcp.rs#L224-L266">https://github.com/bytecodealliance/wasmtime/blob/f7ff95747a6e2515c1a5b7a697794e5cc002e6f5/crates/wasi/src/p3/sockets/host/types/tcp.rs#L224-L266</a></p>
+<div class="message_embed"><a class="message_embed_image" href="https://github.com/bytecodealliance/wasmtime/blob/f7ff95747a6e2515c1a5b7a697794e5cc002e6f5/crates/wasi/src/p3/sockets/host/types/tcp.rs#L224-L266" style="background-image: url(&quot;https://uploads.zulipusercontent.net/65f86235aaee2f74ab1c91f9895d8e2ef8c925a7/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f636566326437643666616533356636613836353635646264303933346363376265663839386132303637656433346565353563373861636332353339393130372f62797465636f6465616c6c69616e63652f7761736d74696d65&quot;)"></a><div class="data-container"><div class="message_embed_title"><a href="https://github.com/bytecodealliance/wasmtime/blob/f7ff95747a6e2515c1a5b7a697794e5cc002e6f5/crates/wasi/src/p3/sockets/host/types/tcp.rs#L224-L266" title="wasmtime/crates/wasi/src/p3/sockets/host/types/tcp.rs at f7ff95747a6e2515c1a5b7a697794e5cc002e6f5 · bytecodealliance/wasmtime">wasmtime/crates/wasi/src/p3/sockets/host/types/tcp.rs at f7ff95747a6e2515c1a5b7a697794e5cc002e6f5 · bytecodealliance/wasmtime</a></div><div class="message_embed_description">A lightweight WebAssembly runtime that is fast, secure, and standards-compliant - bytecodealliance/wasmtime</div></div></div>
+
+
+
+<a name="536829047"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536829047" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536829047">(Aug 29 2025 at 16:57)</a>:</h4>
+<p>Right its sort of addressed by omission</p>
+
+
+
+<a name="536829112"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536829112" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536829112">(Aug 29 2025 at 16:58)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="480579">Lann Martin</span> <a href="#narrow/channel/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs/near/536828908">said</a>:</p>
+<blockquote>
+<p>Is this adequately addressed in the async explainer?</p>
+</blockquote>
+<p>the explainer says what happens between guests, and it's very clear what happens there, which is that it's a "rendezvous" and nothing else.</p>
+<p>In that sense it's quite clear about this. It does not dive into the implications of this, however.</p>
+
+
+
+<a name="536829150"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536829150" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536829150">(Aug 29 2025 at 16:58)</a>:</h4>
+<p>arguably that's not what the explainer should do though (but maybe some other place should? unsure)</p>
+
+
+
+<a name="536829229"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536829229" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536829229">(Aug 29 2025 at 16:58)</a>:</h4>
+<p>I guess probably the doc comments of what Joel is working on?</p>
+
+
+
+<a name="536829335"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536829335" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536829335">(Aug 29 2025 at 16:59)</a>:</h4>
+<p><span class="user-mention" data-user-id="484032">@Roman Volosatovs</span> if we wanted to spec something like a hard guaratnee for WASI or component model things we'd have to be able to guarantee that for all platforms and all WASI things</p>
+
+
+
+<a name="536829375"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536829375" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536829375">(Aug 29 2025 at 16:59)</a>:</h4>
+<p>so what you describe I think might make sense as a WASI-specific method but not a stream thing per-se</p>
+
+
+
+<a name="536829436"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536829436" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536829436">(Aug 29 2025 at 17:00)</a>:</h4>
+<p>And for docs it probably makes sense to thoroughly document in WASI what it means to write/read from streams</p>
+
+
+
+<a name="536829446"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536829446" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536829446">(Aug 29 2025 at 17:00)</a>:</h4>
+<blockquote>
+<p>the consequence is that the implementation is quite a bit more complicated since now you're juggling something the guest thinks is done, but I think that's just a fact of life</p>
+</blockquote>
+<p>are we talking about cancellation? in case of filesystem and stdio, I would expect for cancellation to only finish once the worker thread is done the I/O operation</p>
+
+
+
+<a name="536829459"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536829459" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536829459">(Aug 29 2025 at 17:00)</a>:</h4>
+<p>as opposed to just saying "here's a stream go ham"</p>
+
+
+
+<a name="536829544"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536829544" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536829544">(Aug 29 2025 at 17:00)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="484032">Roman Volosatovs</span> <a href="#narrow/channel/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs/near/536829446">said</a>:</p>
+<blockquote>
+<blockquote>
+<p>the consequence is that the implementation is quite a bit more complicated since now you're juggling something the guest thinks is done, but I think that's just a fact of life</p>
+</blockquote>
+<p>are we talking about cancellation? in case of filesystem and stdio, I would expect for cancellation to only finish once the worker thread is done the I/O operation</p>
+</blockquote>
+<p>I'm thinking non-byte-based streams mixed with cancellation. So you had to get an item from <code>Source</code>, but upon cancellation you're still responsible for that item</p>
+
+
+
+<a name="536829797"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536829797" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536829797">(Aug 29 2025 at 17:02)</a>:</h4>
+<p>right, but the host is allowed to block the guest until it's done </p>
+<p>So if we're thinking in terms of <code>futures::Sink</code></p>
+<p>it would look something like:</p>
+<ul>
+<li>read an item</li>
+<li>call <code>start_send</code></li>
+<li>call <code>poll_flush</code> and return <code>Poll::Ready</code> once it's ready</li>
+</ul>
+
+
+
+<a name="536829898"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536829898" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536829898">(Aug 29 2025 at 17:03)</a>:</h4>
+<p><code>poll_consume</code> does not return ready until the sink's "flush" is done - doesn't that address the problem?</p>
+
+
+
+<a name="536830009"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536830009" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536830009">(Aug 29 2025 at 17:03)</a>:</h4>
+<p>and presumably it would <em>also</em> wait for the flush to finish when cancelled, correct?</p>
+
+
+
+<a name="536830040"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536830040" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536830040">(Aug 29 2025 at 17:04)</a>:</h4>
+<p>yes, exactly</p>
+
+
+
+<a name="536830236"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536830236" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536830236">(Aug 29 2025 at 17:05)</a>:</h4>
+<p>ok, I think we're agreed that's the expected behavior for wasmtime-wasi (and other libraries/embeddings that implement <code>StreamConsumer</code>), but Alex might be pointing out that not every implementation is <em>required</em> to behave that way, and indeed guest-based virtualized impls cannot do that currently</p>
+
+
+
+<a name="536830295"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536830295" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536830295">(Aug 29 2025 at 17:05)</a>:</h4>
+<p>it comes down to a sort of "best-effort" guarantee</p>
+
+
+
+<a name="536830695"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536830695" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536830695">(Aug 29 2025 at 17:08)</a>:</h4>
+<p>That makes sense to me. In fact, we should probably just say that it's interface-specific</p>
+
+
+
+<a name="536830787"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536830787" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536830787">(Aug 29 2025 at 17:09)</a>:</h4>
+<p>Yeah, I can include a "best practices" section in the <code>StreamConsumer</code> docs to guide implementers</p>
+
+
+
+<a name="536830840"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536830840" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536830840">(Aug 29 2025 at 17:09)</a>:</h4>
+<p>Some interfaces might expose application-specific <em>flush</em> and might even expect for their writes to be buffered (e.g. for performance reasons)</p>
+
+
+
+<a name="536831202"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536831202" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536831202">(Aug 29 2025 at 17:12)</a>:</h4>
+<p>It seems like just about the only end-to-end guarantee is negative: if a stream write indicates that something <em>wasn't</em> consumed then it definitely wasn't sent</p>
+
+
+
+<a name="536831388"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536831388" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536831388">(Aug 29 2025 at 17:13)</a>:</h4>
+<p>Technically a misbehaving <code>StreamConsumer&lt;u8&gt;</code> could lie about that and never call <code>DirectSource::mark_read</code>, but that's just evil.</p>
+
+
+
+<a name="536831594"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536831594" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536831594">(Aug 29 2025 at 17:15)</a>:</h4>
+<p>Yeah "guarantee" not enforced by code, but something we can definitively say is a bug</p>
+
+
+
+<a name="536831879"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536831879" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536831879">(Aug 29 2025 at 17:17)</a>:</h4>
+<p>oh I also just forget that cancellation can block, but yes if we say that cancellation doesn't actually do anything then there's not really any complication</p>
+
+
+
+<a name="536831918"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536831918" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536831918">(Aug 29 2025 at 17:17)</a>:</h4>
+<p>my thinking is that we don't actually want those semantics though and we want cancellation to cancel</p>
+
+
+
+<a name="536832664"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536832664" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536832664">(Aug 29 2025 at 17:21)</a>:</h4>
+<p>I had a quick chat with <span class="user-mention" data-user-id="253998">@Luke Wagner</span> yesterday about this problem and he pointed out that the host is free to finish any work it has to do before reporting cancellation as "done".<br>
+I was under impression that cancellation would immediately abort as well.</p>
+
+
+
+<a name="536832755"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536832755" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536832755">(Aug 29 2025 at 17:22)</a>:</h4>
+<p>allowing the cancellation to "block" certainly makes host's life easier though</p>
+
+
+
+<a name="536833046"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536833046" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536833046">(Aug 29 2025 at 17:24)</a>:</h4>
+<p>e.g. if we have fired a file <code>append</code> off in a thread, we can just await it's completion.<br>
+Otherwise, it seems we would need to spawn a dedicated worker thread and use something like message passing to communicate cancellation intent</p>
+
+
+
+<a name="536834207"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536834207" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536834207">(Aug 29 2025 at 17:31)</a>:</h4>
+<p>actually, these kind of operations simply cannot be cancelled <span aria-label="thinking" class="emoji emoji-1f914" role="img" title="thinking">:thinking:</span> <br>
+so if <code>cancel</code> blocks, the guest will now when the write has been finished - when the <code>cancel</code> returns<br>
+if <code>cancel</code> does not block - the guest will either never know about it, or will block until all previous appends (potentially multiple) are done on the next append <em>attempt</em></p>
+
+
+
+<a name="536834214"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536834214" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536834214">(Aug 29 2025 at 17:31)</a>:</h4>
+<p>Here's the docs section I just added to <code>StreamConsumer</code> which addresses this:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="w">    </span><span class="sd">/// ## Backpressure</span>
+<span class="w">    </span><span class="sd">///</span>
+<span class="w">    </span><span class="sd">/// As mentioned above, an implementation might choose to return</span>
+<span class="w">    </span><span class="sd">/// `Poll::Pending` after taking items from `source`, which tells the caller</span>
+<span class="w">    </span><span class="sd">/// to delay sending a `COMPLETED` event to the writer.  This can be used as</span>
+<span class="w">    </span><span class="sd">/// a form of backpressure when the items are forwarded to an upstream sink</span>
+<span class="w">    </span><span class="sd">/// asynchronously.  Note, however, that it's not possible to "put back"</span>
+<span class="w">    </span><span class="sd">/// items into `source` once they've been taken out, so if the upstream sink</span>
+<span class="w">    </span><span class="sd">/// is unable to accept all the items, that cannot be communicated to the</span>
+<span class="w">    </span><span class="sd">/// writer at this level of abstraction.  Just as with application-specific,</span>
+<span class="w">    </span><span class="sd">/// recoverable errors, information about which items could be forwarded and</span>
+<span class="w">    </span><span class="sd">/// which could not must be communicated out-of-band, e.g. by writing to an</span>
+<span class="w">    </span><span class="sd">/// application-specific `future`.</span>
+<span class="w">    </span><span class="sd">///</span>
+<span class="w">    </span><span class="sd">/// Similarly, if the writer cancels the write after items have been taken</span>
+<span class="w">    </span><span class="sd">/// from `source` but before the items have all been forwarded to an</span>
+<span class="w">    </span><span class="sd">/// upstream sink, `poll_consume` will be called with `finish` set to true,</span>
+<span class="w">    </span><span class="sd">/// and the implementation may either:</span>
+<span class="w">    </span><span class="sd">///</span>
+<span class="w">    </span><span class="sd">/// - Interrupt the forwarding process gracefully.  This may be preferrable</span>
+<span class="w">    </span><span class="sd">/// if there is an out-of-band channel for communicating to the writer how</span>
+<span class="w">    </span><span class="sd">/// many items were forwarded before being interrupted.</span>
+<span class="w">    </span><span class="sd">///</span>
+<span class="w">    </span><span class="sd">/// - Allow the forwarding to complete without interrupting it.  This is</span>
+<span class="w">    </span><span class="sd">/// usually preferable if there's no out-of-band channel for reporting back</span>
+<span class="w">    </span><span class="sd">/// to the writer how many items were forwarded.</span>
+</code></pre></div>
+
+
+
+<a name="536834235"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536834235" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536834235">(Aug 29 2025 at 17:32)</a>:</h4>
+<p>It seems like "cancel" is a little misleading; its more like "stop asap".</p>
+
+
+
+<a name="536834584"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536834584" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536834584">(Aug 29 2025 at 17:34)</a>:</h4>
+<p>with pseudocode like this:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="n">tx</span><span class="p">,</span><span class="w"> </span><span class="n">rx</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">stream</span><span class="p">();</span>
+<span class="n">file</span><span class="p">.</span><span class="n">append</span><span class="p">(</span><span class="n">rx</span><span class="p">);</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">fut</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tx</span><span class="p">.</span><span class="n">write</span><span class="p">(</span><span class="s">"hello"</span><span class="p">);</span>
+<span class="n">cancel</span><span class="p">(</span><span class="n">fut</span><span class="p">);</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">fut</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tx</span><span class="p">.</span><span class="n">write</span><span class="p">(</span><span class="s">", world"</span><span class="p">);</span>
+<span class="n">cancel</span><span class="p">(</span><span class="n">fut</span><span class="p">);</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">fut</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tx</span><span class="p">.</span><span class="n">write</span><span class="p">(</span><span class="s">"!"</span><span class="p">);</span>
+<span class="n">cancel</span><span class="p">(</span><span class="n">fut</span><span class="p">);</span>
+</code></pre></div>
+<p>IMO the expectation is always that <code>hello, world!</code> will <em>eventually</em> be written to the file<br>
+personally, I'd expect each <code>cancel</code> to "flush"</p>
+
+
+
+<a name="536834933"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536834933" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536834933">(Aug 29 2025 at 17:37)</a>:</h4>
+<p>alternatively, we can say that once a stream write has been cancelled, the stream is "corrupted", <code>file.append</code> resolves to an error and the guest has to try again</p>
+
+
+
+<a name="536835046"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536835046" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536835046">(Aug 29 2025 at 17:38)</a>:</h4>
+<p>remember that for <code>stream&lt;u8&gt;</code> you have the option of not calling <code>DirectSource::mark_read</code> until the write is flushed, so you don't have to worry about the cancel-after-taking-from-source-but-before-flushed in that case</p>
+
+
+
+<a name="536835193"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536835193" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536835193">(Aug 29 2025 at 17:39)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="484032">Roman Volosatovs</span> <a href="#narrow/channel/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs/near/536832664">said</a>:</p>
+<blockquote>
+<p>I had a quick chat with <span class="user-mention silent" data-user-id="253998">Luke Wagner</span> yesterday about this problem and he pointed out that the host is free to finish any work it has to do before reporting cancellation as "done".<br>
+I was under impression that cancellation would immediately abort as well.</p>
+</blockquote>
+<p>To clarify my thinking on this, I understand the host is allowed to do this and it's going to be required for filesystem things that simply cannot be cancelled. That being said we should avoid this wherever possible as it largely defeats the point of cancellation in the first place.</p>
+<p>Rust, for example, will synchronously await cancellation of futures meaning that if we liberally use this on the host then it means that all Rust guests will block quite a lot due to this behavior</p>
+
+
+
+<a name="536835304"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536835304" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536835304">(Aug 29 2025 at 17:40)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="253994">Alex Crichton</span> <a href="#narrow/channel/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs/near/536835193">said</a>:</p>
+<blockquote>
+<p><span class="user-mention silent" data-user-id="484032">Roman Volosatovs</span> <a href="#narrow/channel/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs/near/536832664">said</a>:</p>
+<blockquote>
+<p>I had a quick chat with <span class="user-mention silent" data-user-id="253998">Luke Wagner</span> yesterday about this problem and he pointed out that the host is free to finish any work it has to do before reporting cancellation as "done".<br>
+I was under impression that cancellation would immediately abort as well.</p>
+</blockquote>
+<p>To clarify my thinking on this, I understand the host is allowed to do this and it's going to be required for filesystem things that simply cannot be cancelled. That being said we should avoid this wherever possible as it largely defeats the point of cancellation in the first place.</p>
+<p>Rust, for example, will synchronously await cancellation of futures meaning that if we liberally use this on the host then it means that all Rust guests will block quite a lot due to this behavior</p>
+</blockquote>
+<p>Totally agree with that, <em>most</em> implementations should not do that, but some simply have to</p>
+
+
+
+<a name="536835336"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536835336" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536835336">(Aug 29 2025 at 17:40)</a>:</h4>
+<p>For your "write hello world in 3 chunks" example, given Rust bindings and the predicted WASI implementation, yes cancellation means nothing and it'll just pretend that didn't happen</p>
+
+
+
+<a name="536835391"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536835391" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536835391">(Aug 29 2025 at 17:41)</a>:</h4>
+<p>we as a host, however, have the option of doing something fancier here</p>
+
+
+
+<a name="536835405"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536835405" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536835405">(Aug 29 2025 at 17:41)</a>:</h4>
+<p>for example we could immediately say a cancelled write is indeed cancelled</p>
+
+
+
+<a name="536835422"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536835422" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536835422">(Aug 29 2025 at 17:41)</a>:</h4>
+<p>then the next write is blocked until the previous write actually completes</p>
+
+
+
+<a name="536835504"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536835504" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536835504">(Aug 29 2025 at 17:41)</a>:</h4>
+<p>If I write a buffer of two things to a stream, then cancel, and get a result of progress = 1, is that semantically the same as not cancelling and getting a result of progress = 1?</p>
+
+
+
+<a name="536835506"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536835506" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536835506">(Aug 29 2025 at 17:41)</a>:</h4>
+<p>so the first cancellation call above would return immediately but eventually <code>hello</code> would get written. The other two calls wouldn't actually spawn anything b/c the previous write is still ongoing, so cancellation would successfully actually cancel (and report 0 bytes written immediately)</p>
+
+
+
+<a name="536835534"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536835534" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536835534">(Aug 29 2025 at 17:42)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="480579">Lann Martin</span> <a href="#narrow/channel/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs/near/536835504">said</a>:</p>
+<blockquote>
+<p>If I write a buffer of two things to a stream, then cancel, and get a result of progress = 1, is that semantically the same as not cancelling and getting a result of progress = 1?</p>
+</blockquote>
+<p>IMO, yes</p>
+
+
+
+<a name="536835659"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536835659" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536835659">(Aug 29 2025 at 17:43)</a>:</h4>
+<p><span class="user-mention" data-user-id="480579">@Lann Martin</span> you <em>may</em> get different codes (<code>COMPLETED</code> vs. <code>CANCELLED</code>), though; it's up to the guest how it wants to interpret them</p>
+
+
+
+<a name="536835781"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536835781" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536835781">(Aug 29 2025 at 17:43)</a>:</h4>
+<p>That is a different answer <span aria-label="sweat smile" class="emoji emoji-1f605" role="img" title="sweat smile">:sweat_smile:</span></p>
+
+
+
+<a name="536835803"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536835803" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536835803">(Aug 29 2025 at 17:43)</a>:</h4>
+<p>well, at an ABI level yes</p>
+
+
+
+<a name="536835813"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536835813" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536835813">(Aug 29 2025 at 17:43)</a>:</h4>
+<p>but semantically they mean the same thing</p>
+
+
+
+<a name="536835822"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536835822" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536835822">(Aug 29 2025 at 17:43)</a>:</h4>
+<p>from a "what was written" perspective</p>
+
+
+
+<a name="536835873"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536835873" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536835873">(Aug 29 2025 at 17:44)</a>:</h4>
+<p>yeah, they'll both have a payload of 1, in any case</p>
+
+
+
+<a name="536835933"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536835933" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536835933">(Aug 29 2025 at 17:44)</a>:</h4>
+<p>Is CANCELLED actually useful?</p>
+
+
+
+<a name="536835998"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536835998" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536835998">(Aug 29 2025 at 17:44)</a>:</h4>
+<p>I think it's <em>supposed</em> to mean "I could have done more, but you interrupted me, dammit"</p>
+
+
+
+<a name="536836039"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536836039" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536836039">(Aug 29 2025 at 17:45)</a>:</h4>
+<p>Sure but the writer knows what it did</p>
+
+
+
+<a name="536836074"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536836074" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536836074">(Aug 29 2025 at 17:45)</a>:</h4>
+<p>it resolves the race of "did this finish due to cancellation or due to the thing completing"</p>
+
+
+
+<a name="536836115"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536836115" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536836115">(Aug 29 2025 at 17:45)</a>:</h4>
+<p>which is not the most meaningful thing, sure, but why not transfer the extra bit?</p>
+
+
+
+<a name="536836155"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536836155" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536836155">(Aug 29 2025 at 17:45)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="480579">Lann Martin</span> <a href="#narrow/channel/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs/near/536836039">said</a>:</p>
+<blockquote>
+<p>Sure but the writer knows what it did</p>
+</blockquote>
+<p>But it doesn't know what the reader <em>would</em> have done otherwise</p>
+
+
+
+<a name="536836240"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536836240" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536836240">(Aug 29 2025 at 17:46)</a>:</h4>
+<p>It makes the semantics of cancellation more ambiguous</p>
+
+
+
+<a name="536836255"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536836255" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536836255">(Aug 29 2025 at 17:46)</a>:</h4>
+<p>but yeah, I agree that it's not very useful in practice</p>
+
+
+
+<a name="536836463"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536836463" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536836463">(Aug 29 2025 at 17:47)</a>:</h4>
+<p>for that I'd recommend an issue on the CM repo for possible 0.3.x adjustments</p>
+
+
+
+<a name="536836600"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536836600" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536836600">(Aug 29 2025 at 17:49)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="253994">Alex Crichton</span> <a href="#narrow/channel/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs/near/536836074">said</a>:</p>
+<blockquote>
+<p>it resolves the race of "did this finish due to cancellation or due to the thing completing"</p>
+</blockquote>
+<p>for this to work, runtime would need to do something like this, right?</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">poll_consume</span><span class="p">(</span><span class="n">finish</span><span class="p">:</span><span class="w"> </span><span class="nc">false</span><span class="p">)</span>
+<span class="n">consumer_cx</span><span class="p">.</span><span class="n">wake</span><span class="p">()</span>
+<span class="n">cancel</span><span class="p">()</span>
+<span class="n">poll_consume</span><span class="p">(</span><span class="n">finish</span><span class="p">:</span><span class="w"> </span><span class="nc">false</span><span class="p">)</span>
+<span class="k">if</span><span class="w"> </span><span class="n">pending</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">poll_consume</span><span class="p">(</span><span class="n">finish</span><span class="p">:</span><span class="w"> </span><span class="nc">true</span><span class="p">)</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>i.e. if guest called <code>cancel</code> after the consumer had called <code>wake</code>, but before <code>poll_consume</code> was called (since these things are concurrent), runtime might need to call <code>poll_consume</code> twice</p>
+
+
+
+<a name="536836792"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536836792" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536836792">(Aug 29 2025 at 17:50)</a>:</h4>
+<p>I'm not sure that cancellation affects that?</p>
+
+
+
+<a name="536836808"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536836808" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536836808">(Aug 29 2025 at 17:50)</a>:</h4>
+<p>but yes, that happens</p>
+
+
+
+<a name="536836844"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536836844" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536836844">(Aug 29 2025 at 17:51)</a>:</h4>
+<p>one event, the "thing completing", and another event "cancel", causing two polls seems normal to me?</p>
+
+
+
+<a name="536836877"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536836877" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536836877">(Aug 29 2025 at 17:51)</a>:</h4>
+<p>e.g. it's "two events generate two polls" and cancellation doesn't seem special here</p>
+
+
+
+<a name="536836910"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536836910" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536836910">(Aug 29 2025 at 17:51)</a>:</h4>
+<p>For the runtime to know whether return <code>CANCELLED</code> or <code>COMPLETED</code> it needs to know if <code>poll_consume</code> after <code>wake</code> would result in <code>Poll::Ready</code></p>
+
+
+
+<a name="536836967"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536836967" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Roman Volosatovs <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536836967">(Aug 29 2025 at 17:51)</a>:</h4>
+<p>if it gives <code>finish: true</code>, consumer is forced to return ASAP and the runtime cannot know which one it is anymore</p>
+
+
+
+<a name="536836975"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536836975" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536836975">(Aug 29 2025 at 17:52)</a>:</h4>
+<p>another difference between COMPLETED and CANCELLED: the former can only have a zero payload for a zero-length read/write, while the latter can have a zero payload any time.  Whether that justifies the existence of CANCELLED is debateable</p>
+
+
+
+<a name="536837093"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536837093" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536837093">(Aug 29 2025 at 17:52)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="484032">Roman Volosatovs</span> <a href="#narrow/channel/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs/near/536836967">said</a>:</p>
+<blockquote>
+<p>if it gives <code>finish: true</code>, consumer is forced to return ASAP and the runtime cannot know which one it is anymore</p>
+</blockquote>
+<p>yeah, good point</p>
+
+
+
+<a name="536837096"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536837096" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536837096">(Aug 29 2025 at 17:52)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="484032">Roman Volosatovs</span> <a href="#narrow/channel/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs/near/536836910">said</a>:</p>
+<blockquote>
+<p>For the runtime to know whether return <code>CANCELLED</code> or <code>COMPLETED</code> it needs to know if <code>poll_consume</code> after <code>wake</code> would result in <code>Poll::Ready</code></p>
+</blockquote>
+<p>I think this depends on <code>poll_consume</code>, if the first <code>poll_consume(finish: false)</code> after the <code>cancel()</code> above says "I'm ready" the host would say <code>COMPLETED</code> and that's not a spec violation</p>
+
+
+
+<a name="536837166"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536837166" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536837166">(Aug 29 2025 at 17:53)</a>:</h4>
+<p>We can always add a <code>Cancelled</code> variant to the <code>StreamState</code> enum if desired</p>
+
+
+
+<a name="536837188"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536837188" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536837188">(Aug 29 2025 at 17:53)</a>:</h4>
+<p>Yeah again, the writer knows it cancelled; I think it's even supposed to trap if it gets CANCELLED otherwise</p>
+
+
+
+<a name="536837257"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536837257" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536837257">(Aug 29 2025 at 17:54)</a>:</h4>
+<p>I guess I'm just trying to make sure I/we aren't missing anything semantically</p>
+
+
+
+<a name="536837426"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536837426" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536837426">(Aug 29 2025 at 17:55)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="509936">Joel Dice</span> <a href="#narrow/channel/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs/near/536837166">said</a>:</p>
+<blockquote>
+<p>We can always add a <code>Cancelled</code> variant to the <code>StreamState</code> enum if desired</p>
+</blockquote>
+<p>And rename <code>StreamState::Open</code> to <code>Completed</code>, and <code>Closed</code> to <code>Dropped</code> for consistency</p>
+
+
+
+<a name="536837483"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536837483" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536837483">(Aug 29 2025 at 17:55)</a>:</h4>
+<p>that seems reasonable to me</p>
+
+
+
+<a name="536838047"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/536838047" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#536838047">(Aug 29 2025 at 17:59)</a>:</h4>
+<p>ok, I'm sick of editing that gist, but I've made those changes locally in my Wasmtime clone</p>
+
+
+
+<a name="538795461"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Behavior%20of%20Wasmtime%20future/stream%20host%20APIs/near/538795461" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Nathan Petrangelo <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Behavior.20of.20Wasmtime.20future.2Fstream.20host.20APIs.html#538795461">(Sep 11 2025 at 08:11)</a>:</h4>
+<p>I like these changes, awesome work!</p>
+
+
+
+<hr><p>Last updated: Feb 22 2026 at 11:05 UTC</p>
+</html>
