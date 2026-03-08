@@ -1,0 +1,110 @@
+[
+    {
+        "content": "<p>alexcrichton opened <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12550\">PR #12550</a> from <code>alexcrichton:remove-call-contexts</code> to <code>bytecodealliance:main</code>:</p>\n<blockquote>\n<p>This commit is a somewhat deep refactoring of how the state of<br>\n<code>borrow&lt;T&gt;</code> is managed for both the host and the guest with respect to<br>\nasync tasks. This additionally refactors how some async task management<br>\nis done for host-called functions.</p>\n<p>The fundamental problem being tackled here is <a href=\"https://github.com/bytecodealliance/wasmtime/issues/12510\">https://github.com/bytecodealliance/wasmtime/issues/12510</a>. In that issue it<br>\nwas discovered that the way <code>CallContext</code>, the borrow tracking mechanism<br>\nin Wasmtime, is managed is incompatible with async tasks. Specifically<br>\nthe previous assumption of the scope being mutated for a borrow is<br>\nsomewhere on the call stack is no longer true. It's possible for an<br>\nasync task to be suspended, for example, and then a sibling task drops a<br>\nborrow which should update the scope of the suspended task. There were a<br>\nnumber of other small issues I noticed here and there which this PR<br>\nadditionally has tests for, all of which failed before this change and<br>\npass afterwards.</p>\n<p>The manner in which borrow state is manipulated is a pretty old part of<br>\nthe component model implementation dating back to the original<br>\nimplementation of resources. I decided to forgo any possible quick fix<br>\nand have attempted to more deeply refactor and integrate async tasks<br>\ninto all of this infrastructure. A list of the changes made here are:</p>\n<ul>\n<li>\n<p>The <code>CallContexts</code> structure, a stack of <code>CallContext</code>, was removed.<br>\n  Tasks now directly store a <code>CallContext</code> which is the source of truth<br>\n  for borrow tracking for that call, and it does not move from this<br>\n  location. The store <code>CallContexts</code> is now deleted in favor of updating<br>\n  the <code>Option&lt;ConcurrentState&gt;</code> in the store to be an <code>enum</code> of either<br>\n  concurrent state or a stack. In this manner the old stack-based<br>\n  structure is still used sometimes, but it's impossible to reach when<br>\n  concurrency is enabled.</p>\n</li>\n<li>\n<p>Entry to the host from guests now reliably pushes a <code>HostTask</code> into<br>\n  the store. Previously where a frame were always pushed into a<br>\n<code>CallContext</code> a <code>HostTask</code> is pushed into the store. This is still<br>\n  expected to be a bit too expensive for cheap host calls, but it<br>\n  doesn't meaningfully change the performance profile of before.</p>\n</li>\n<li>\n<p>The <code>resource_enter_call</code> and <code>resource_exit_call</code> libcalls have been<br>\n  removed. These are now folded into the <code>enter_sync_call</code> and<br>\n<code>exit_sync_call</code> libcalls. Emission of these hooks has been updated<br>\n  accordingly. The concept of entering a call more generally has been<br>\n  removed. This is more formally known in the async world as a task<br>\n  starting, so the task creation is now responsible for the demarcation<br>\n  of entering a call. Additionally this means that the concept of<br>\n  exiting a call has somewhat gone away. Instead this method was renamed<br>\n  to <code>validate_scope_exit</code> which double-checks that a borrow-scope can<br>\n  be exited but doesn't actually remove the task. Task removal is<br>\n  deferred to preexisting mechanisms.</p>\n</li>\n<li>\n<p>Management of a <code>GuestTask</code>'s previous <code>Option&lt;CallContext&gt;</code> field,<br>\n  for example taking/restoring and pushing/popping onto <code>CallContexts</code><br>\n  is now all gone. All related code is outright deleted as the<br>\n<code>GuestTask</code>'s now non-optional <code>CallContext</code> field is the source of truth.</p>\n</li>\n<li>\n<p>The <code>ConcurrentState</code> structure now stores a <code>CurrentThread</code> enum<br>\n  instead of <code>Option&lt;QualifiedThreadId&gt;</code>. This represents how the<br>\n  currently executing thread could be a host thread, not just a guest<br>\n  thread, which is required for borrow-tracking.</p>\n</li>\n<li>\n<p><code>HostTask</code> creation in <code>poll_and_block</code> and <code>first_poll</code>, the two main<br>\n  entrypoints of async host tasks when called by the guest, is now<br>\n  externalized from these functions. Instead these functions assume that<br>\n  the currently running thread is already a <code>HostTask</code> of some kind.</p>\n</li>\n<li>\n<p>In <code>poll_and_block</code> the host's result is no longer stored in the guest<br>\n  task but in the host task instead.</p>\n</li>\n</ul>\n<p>Overall this enables the <code>*.wast</code> test for <a href=\"https://github.com/bytecodealliance/wasmtime/issues/12510\">https://github.com/bytecodealliance/wasmtime/issues/12510</a> to fix the original<br>\nissue. This then adds new tests to ensure that cleanup of various<br>\nconstructs happens appropriately, such as cancelling a host task should<br>\nclean up its associated resources. Additionally synchronously calling an<br>\nasync host task no longer leaks resources in a <code>Store</code> and should<br>\nproperly clean up everything.</p>\n<p>There is still more work to do in this area (e.g. <a href=\"https://github.com/bytecodealliance/wasmtime/issues/12544\">https://github.com/bytecodealliance/wasmtime/issues/12544</a>) but that's<br>\ngoing to be deferred to a future PR at this point.</p>\n<p>Closes <a href=\"https://github.com/bytecodealliance/wasmtime/issues/12510\">https://github.com/bytecodealliance/wasmtime/issues/12510</a></p>\n<p>Depends on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12545\">https://github.com/bytecodealliance/wasmtime/pull/12545</a>, <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12546\">https://github.com/bytecodealliance/wasmtime/pull/12546</a>, <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12547\">https://github.com/bytecodealliance/wasmtime/pull/12547</a>, <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12548\">https://github.com/bytecodealliance/wasmtime/pull/12548</a>, and <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12549\">https://github.com/bytecodealliance/wasmtime/pull/12549</a></p>\n</blockquote>",
+        "id": 572872291,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1770666436
+    },
+    {
+        "content": "<p><strong>alexcrichton</strong> requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers\">wasmtime-core-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12550\">PR #12550</a>.</p>",
+        "id": 572872292,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1770666436
+    },
+    {
+        "content": "<p><strong>alexcrichton</strong> requested <a href=\"https://github.com/fitzgen\">fitzgen</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12550\">PR #12550</a>.</p>",
+        "id": 572872296,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1770666436
+    },
+    {
+        "content": "<p><strong>alexcrichton</strong> requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers\">wasmtime-compiler-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12550\">PR #12550</a>.</p>",
+        "id": 572872297,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1770666436
+    },
+    {
+        "content": "<p>alexcrichton updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12550\">PR #12550</a>.</p>",
+        "id": 572872377,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1770666457
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12550\">PR #12550</a>.</p>",
+        "id": 572885196,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1770670655
+    },
+    {
+        "content": "<p>alexcrichton updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12550\">PR #12550</a>.</p>",
+        "id": 572895906,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1770674557
+    },
+    {
+        "content": "<p>alexcrichton edited <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12550\">PR #12550</a>:</p>\n<blockquote>\n<p>This commit is a somewhat deep refactoring of how the state of<br>\n<code>borrow&lt;T&gt;</code> is managed for both the host and the guest with respect to<br>\nasync tasks. This additionally refactors how some async task management<br>\nis done for host-called functions.</p>\n<p>The fundamental problem being tackled here is <a href=\"https://github.com/bytecodealliance/wasmtime/issues/12510\">https://github.com/bytecodealliance/wasmtime/issues/12510</a>. In that issue it<br>\nwas discovered that the way <code>CallContext</code>, the borrow tracking mechanism<br>\nin Wasmtime, is managed is incompatible with async tasks. Specifically<br>\nthe previous assumption of the scope being mutated for a borrow is<br>\nsomewhere on the call stack is no longer true. It's possible for an<br>\nasync task to be suspended, for example, and then a sibling task drops a<br>\nborrow which should update the scope of the suspended task. There were a<br>\nnumber of other small issues I noticed here and there which this PR<br>\nadditionally has tests for, all of which failed before this change and<br>\npass afterwards.</p>\n<p>The manner in which borrow state is manipulated is a pretty old part of<br>\nthe component model implementation dating back to the original<br>\nimplementation of resources. I decided to forgo any possible quick fix<br>\nand have attempted to more deeply refactor and integrate async tasks<br>\ninto all of this infrastructure. A list of the changes made here are:</p>\n<ul>\n<li>\n<p>The <code>CallContexts</code> structure, a stack of <code>CallContext</code>, was removed.<br>\n  Tasks now directly store a <code>CallContext</code> which is the source of truth<br>\n  for borrow tracking for that call, and it does not move from this<br>\n  location. The store <code>CallContexts</code> is now deleted in favor of updating<br>\n  the <code>Option&lt;ConcurrentState&gt;</code> in the store to be an <code>enum</code> of either<br>\n  concurrent state or a stack. In this manner the old stack-based<br>\n  structure is still used sometimes, but it's impossible to reach when<br>\n  concurrency is enabled.</p>\n</li>\n<li>\n<p>Entry to the host from guests now reliably pushes a <code>HostTask</code> into<br>\n  the store. Previously where a frame were always pushed into a<br>\n<code>CallContext</code> a <code>HostTask</code> is pushed into the store. This is still<br>\n  expected to be a bit too expensive for cheap host calls, but it<br>\n  doesn't meaningfully change the performance profile of before.</p>\n</li>\n<li>\n<p>The <code>resource_enter_call</code> and <code>resource_exit_call</code> libcalls have been<br>\n  removed. These are now folded into the <code>enter_sync_call</code> and<br>\n<code>exit_sync_call</code> libcalls. Emission of these hooks has been updated<br>\n  accordingly. The concept of entering a call more generally has been<br>\n  removed. This is more formally known in the async world as a task<br>\n  starting, so the task creation is now responsible for the demarcation<br>\n  of entering a call. Additionally this means that the concept of<br>\n  exiting a call has somewhat gone away. Instead this method was renamed<br>\n  to <code>validate_scope_exit</code> which double-checks that a borrow-scope can<br>\n  be exited but doesn't actually remove the task. Task removal is<br>\n  deferred to preexisting mechanisms.</p>\n</li>\n<li>\n<p>Management of a <code>GuestTask</code>'s previous <code>Option&lt;CallContext&gt;</code> field,<br>\n  for example taking/restoring and pushing/popping onto <code>CallContexts</code><br>\n  is now all gone. All related code is outright deleted as the<br>\n<code>GuestTask</code>'s now non-optional <code>CallContext</code> field is the source of truth.</p>\n</li>\n<li>\n<p>The <code>ConcurrentState</code> structure now stores a <code>CurrentThread</code> enum<br>\n  instead of <code>Option&lt;QualifiedThreadId&gt;</code>. This represents how the<br>\n  currently executing thread could be a host thread, not just a guest<br>\n  thread, which is required for borrow-tracking.</p>\n</li>\n<li>\n<p><code>HostTask</code> creation in <code>poll_and_block</code> and <code>first_poll</code>, the two main<br>\n  entrypoints of async host tasks when called by the guest, is now<br>\n  externalized from these functions. Instead these functions assume that<br>\n  the currently running thread is already a <code>HostTask</code> of some kind.</p>\n</li>\n<li>\n<p>In <code>poll_and_block</code> the host's result is no longer stored in the guest<br>\n  task but in the host task instead.</p>\n</li>\n</ul>\n<p>Overall this enables the <code>*.wast</code> test for <a href=\"https://github.com/bytecodealliance/wasmtime/issues/12510\">https://github.com/bytecodealliance/wasmtime/issues/12510</a> to fix the original<br>\nissue. This then adds new tests to ensure that cleanup of various<br>\nconstructs happens appropriately, such as cancelling a host task should<br>\nclean up its associated resources. Additionally synchronously calling an<br>\nasync host task no longer leaks resources in a <code>Store</code> and should<br>\nproperly clean up everything.</p>\n<p>There is still more work to do in this area (e.g. <a href=\"https://github.com/bytecodealliance/wasmtime/issues/12544\">https://github.com/bytecodealliance/wasmtime/issues/12544</a>) but that's<br>\ngoing to be deferred to a future PR at this point.</p>\n<p>Closes <a href=\"https://github.com/bytecodealliance/wasmtime/issues/12510\">https://github.com/bytecodealliance/wasmtime/issues/12510</a></p>\n<p>~~Depends on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12545\">https://github.com/bytecodealliance/wasmtime/pull/12545</a>, <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12546\">https://github.com/bytecodealliance/wasmtime/pull/12546</a>, <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12547\">https://github.com/bytecodealliance/wasmtime/pull/12547</a>, <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12548\">https://github.com/bytecodealliance/wasmtime/pull/12548</a>, and <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12549~~\">https://github.com/bytecodealliance/wasmtime/pull/12549~~</a></p>\n</blockquote>",
+        "id": 572895952,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1770674569
+    },
+    {
+        "content": "<p>fitzgen submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12550#pullrequestreview-3775790805\">PR review</a>:</p>\n<blockquote>\n<p>I'm not too familiar with the CM async stuff, but this LGTM in general. If you want more detailed feedback, flag another reviewer :)</p>\n</blockquote>",
+        "id": 572902880,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1770677273
+    },
+    {
+        "content": "<p><strong>alexcrichton</strong> requested <a href=\"https://github.com/dicej\">dicej</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12550\">PR #12550</a>.</p>",
+        "id": 572903334,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1770677491
+    },
+    {
+        "content": "<p>dicej created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12550#discussion_r2785065192\">PR review comment</a>:</p>\n<blockquote>\n<p>Consider renaming <code>expected_caller_instance</code> to <code>expected_caller</code> here since it's no longer an instance.</p>\n</blockquote>",
+        "id": 572910421,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1770680962
+    },
+    {
+        "content": "<p>dicej created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12550#discussion_r2785068592\">PR review comment</a>:</p>\n<blockquote>\n<p>As above, consider renaming this to <code>expected_caller</code>.</p>\n</blockquote>",
+        "id": 572910422,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1770680962
+    },
+    {
+        "content": "<p>dicej submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12550#pullrequestreview-3775975559\">PR review</a>.</p>",
+        "id": 572910423,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1770680962
+    },
+    {
+        "content": "<p>alexcrichton updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12550\">PR #12550</a>.</p>",
+        "id": 572930403,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1770691933
+    },
+    {
+        "content": "<p>alexcrichton has enabled auto merge for <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12550\">PR #12550</a>.</p>",
+        "id": 572930430,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1770691943
+    },
+    {
+        "content": "<p>alexcrichton added <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12550\">PR #12550 Refactor borrow state tracking for async tasks </a> to the merge queue.</p>",
+        "id": 572933197,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1770693353
+    },
+    {
+        "content": "<p>alexcrichton merged <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12550\">PR #12550</a>.</p>",
+        "id": 572936168,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1770694915
+    },
+    {
+        "content": "<p>alexcrichton removed <a href=\"https://github.com/bytecodealliance/wasmtime/pull/12550\">PR #12550 Refactor borrow state tracking for async tasks </a> from the merge queue.</p>",
+        "id": 572936170,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1770694915
+    }
+]
