@@ -1,0 +1,102 @@
+<html>
+<head><meta charset="utf-8"><title>Running Wasmtime on Pico 2: Overcoming Memory issues · SIG-Embedded · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/438936-SIG-Embedded/index.html">SIG-Embedded</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/438936-SIG-Embedded/topic/Running.20Wasmtime.20on.20Pico.202.3A.20Overcoming.20Memory.20issues.html">Running Wasmtime on Pico 2: Overcoming Memory issues</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="579467377"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/438936-SIG-Embedded/topic/Running%20Wasmtime%20on%20Pico%202%3A%20Overcoming%20Memory%20issues/near/579467377" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lukas Barragan Torres <a href="https://bytecodealliance.github.io/zulip-archive/stream/438936-SIG-Embedded/topic/Running.20Wasmtime.20on.20Pico.202.3A.20Overcoming.20Memory.20issues.html#579467377">(Mar 14 2026 at 20:10)</a>:</h4>
+<p>Hi everyone!</p>
+<p>I'm currently working on running Wasmtime using the new Pulley bytecode interpreter on a Raspberry Pi Pico 2.<br>
+I've successfully built a <code>no_std</code> host that runs a component precompiled to <code>pulley32</code>. The guest uses a custom SPI WIT to read a BME280 sensor and display data on an OLED screen. (<a href="https://github.com/idlab-discover/masters-wasi-spi">https://github.com/idlab-discover/masters-wasi-spi</a>)</p>
+<p>While I've got a single component running successfully, I'm hitting a hard wall regarding linear memory management and the strict constraints of an MMU-less device. After digging into the memory behavior these are the memory roadblocks i came across:</p>
+<ul>
+<li>
+<p><strong>64KiB Page Size:</strong> Standard 64KiB pages are very big for the Pico 2's 512KiB RAM. I tried the 1-byte custom page proposal using <code>-C link-arg=--page-size=1</code>,  but it seemed the guest totally ignored this.</p>
+</li>
+<li>
+<p><strong>Forced <code>memory.grow</code>:</strong> Compiling to <code>wasm32-unknown-unknown</code> makes the default allocator treat all initial memory as the Wasm image. It immediately calls <code>memory.grow</code> to get heap space, forcing a minimum of 2 pages (128KiB) for any component handling dynamic data. (source: <a href="https://github.com/wasm-bindgen/wasm-bindgen/issues/1389#issuecomment-476224477">https://github.com/wasm-bindgen/wasm-bindgen/issues/1389#issuecomment-476224477</a>)</p>
+</li>
+<li>
+<p><strong>No-MMU Reallocation Overhead:</strong> without virtual memory, linear memory must be physically contiguous. Growing from 1 to 2 pages requires the host to allocate 2 <em>new</em> pages before copying the original, temporarily spiking the memory requirement to 3 pages.</p>
+</li>
+<li>
+<p><strong><code>wac</code> Multiplier:</strong> When gluing components with <code>wac</code>, they retain separate linear memories. This means the overheads mentioned above multiply for <em>every</em> internal sub-component.</p>
+</li>
+</ul>
+<p>This is my first project with wasmtime and embedded systems so I'd appreciate any insights, workarounds, or pointers to Wasmtime configuration flags I might have missed! Thanks! :D</p>
+
+
+
+<a name="579569358"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/438936-SIG-Embedded/topic/Running%20Wasmtime%20on%20Pico%202%3A%20Overcoming%20Memory%20issues/near/579569358" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Ralph <a href="https://bytecodealliance.github.io/zulip-archive/stream/438936-SIG-Embedded/topic/Running.20Wasmtime.20on.20Pico.202.3A.20Overcoming.20Memory.20issues.html#579569358">(Mar 15 2026 at 19:15)</a>:</h4>
+<p>this is a GREAT project, <span class="user-mention" data-user-id="1003778">@Lukas Barragan Torres</span>, and we're thrilled you're chewing on it. I'll leave these questions to the engineers here, but I note about the "wac multiplier": yes, that's a feature -- unless you do not want it.</p>
+
+
+
+<a name="579569456"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/438936-SIG-Embedded/topic/Running%20Wasmtime%20on%20Pico%202%3A%20Overcoming%20Memory%20issues/near/579569456" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Ralph <a href="https://bytecodealliance.github.io/zulip-archive/stream/438936-SIG-Embedded/topic/Running.20Wasmtime.20on.20Pico.202.3A.20Overcoming.20Memory.20issues.html#579569456">(Mar 15 2026 at 19:17)</a>:</h4>
+<p>for the seriously embedded use case, you'd only want a new sandbox to encapsulate code you do not want the entire component to access freely. If you're going to make the assumption that the component boundary -- that is, the parent component that wasmtime started -- is the boundary, then you would have the ability to compile all code together.</p>
+
+
+
+<a name="579569502"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/438936-SIG-Embedded/topic/Running%20Wasmtime%20on%20Pico%202%3A%20Overcoming%20Memory%20issues/near/579569502" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Ralph <a href="https://bytecodealliance.github.io/zulip-archive/stream/438936-SIG-Embedded/topic/Running.20Wasmtime.20on.20Pico.202.3A.20Overcoming.20Memory.20issues.html#579569502">(Mar 15 2026 at 19:18)</a>:</h4>
+<p>if there's a situation in which you MUST use different languages, for example, then the sandbox between those two things are going to be there, regardless whether they're components or modules.</p>
+
+
+
+<a name="579569558"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/438936-SIG-Embedded/topic/Running%20Wasmtime%20on%20Pico%202%3A%20Overcoming%20Memory%20issues/near/579569558" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Ralph <a href="https://bytecodealliance.github.io/zulip-archive/stream/438936-SIG-Embedded/topic/Running.20Wasmtime.20on.20Pico.202.3A.20Overcoming.20Memory.20issues.html#579569558">(Mar 15 2026 at 19:19)</a>:</h4>
+<p>so that one's a choice to make. If you trust your parent sandbox boundary as THE boundary, then just compile all the code together. The only issue is if for some reason you cannot.</p>
+
+
+
+<a name="579569602"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/438936-SIG-Embedded/topic/Running%20Wasmtime%20on%20Pico%202%3A%20Overcoming%20Memory%20issues/near/579569602" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Ralph <a href="https://bytecodealliance.github.io/zulip-archive/stream/438936-SIG-Embedded/topic/Running.20Wasmtime.20on.20Pico.202.3A.20Overcoming.20Memory.20issues.html#579569602">(Mar 15 2026 at 19:20)</a>:</h4>
+<p>I would <strong>imagine</strong> that typically in a pico sized scenario, you'd control the components executing, right? If you're not, then you'd need the security boundary in any case.....</p>
+
+
+
+<a name="579807235"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/438936-SIG-Embedded/topic/Running%20Wasmtime%20on%20Pico%202%3A%20Overcoming%20Memory%20issues/near/579807235" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Christof Petig <a href="https://bytecodealliance.github.io/zulip-archive/stream/438936-SIG-Embedded/topic/Running.20Wasmtime.20on.20Pico.202.3A.20Overcoming.20Memory.20issues.html#579807235">(Mar 16 2026 at 21:58)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="268586">Ralph</span> <a href="#narrow/channel/438936-SIG-Embedded/topic/Running.20Wasmtime.20on.20Pico.202.3A.20Overcoming.20Memory.20issues/near/579569502">said</a>:</p>
+<blockquote>
+<p>if there's a situation in which you MUST use different languages, for example, then the sandbox between those two things are going to be there, regardless whether they're components or modules.</p>
+</blockquote>
+<p>I have developed a way to mix languages inside the <em>same</em> sandbox using WIT between the boundaries. See <a href="https://github.com/cpetig/wit-bindgen">https://github.com/cpetig/wit-bindgen</a> and <a href="https://wasmcon24.sched.com/event/1qvIG/component-model-in-software-defined-vehicles-christof-petig-aptiv">https://wasmcon24.sched.com/event/1qvIG/component-model-in-software-defined-vehicles-christof-petig-aptiv</a> , I should really make it an official variant (mostly documentation is missing) and support more languages, but it works well and can be exchanged for the canonical ABI without changing the source code.</p>
+
+
+
+<a name="579812824"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/438936-SIG-Embedded/topic/Running%20Wasmtime%20on%20Pico%202%3A%20Overcoming%20Memory%20issues/near/579812824" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Ralph <a href="https://bytecodealliance.github.io/zulip-archive/stream/438936-SIG-Embedded/topic/Running.20Wasmtime.20on.20Pico.202.3A.20Overcoming.20Memory.20issues.html#579812824">(Mar 16 2026 at 22:41)</a>:</h4>
+<p>there you go: a solution that casts all code into one sandbox -- which implies all code is trusted within that sandbox. <span class="user-mention" data-user-id="590366">@Christof Petig</span> you really should make that official.</p>
+
+
+
+<a name="580400225"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/438936-SIG-Embedded/topic/Running%20Wasmtime%20on%20Pico%202%3A%20Overcoming%20Memory%20issues/near/580400225" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lukas Barragan Torres <a href="https://bytecodealliance.github.io/zulip-archive/stream/438936-SIG-Embedded/topic/Running.20Wasmtime.20on.20Pico.202.3A.20Overcoming.20Memory.20issues.html#580400225">(Mar 19 2026 at 11:18)</a>:</h4>
+<p>Thanks Ralph and Christof!</p>
+<p><span class="user-mention" data-user-id="268586">@Ralph</span>  I'm compiling everything together right now, which works okay for my current setup. However, it still feels a bit suboptimal compared to the broader Wasm philosophy, where you should be able to just plug and play with pre-compiled driver Wasm blobs using WIT.</p>
+<p><span class="user-mention" data-user-id="590366">@Christof Petig</span> Just to make sure I understand: does your fork essentially generate standard, statically linkable bindings from the WIT file instead of the usual Component Model Canonical ABI bindings? Meaning it lets us use WIT purely as an interface design tool, but under the hood, everything still compiles down into one single Wasm module with a shared memory?</p>
+<p>For now I'll stick to keeping it all compiled together until I can find a way to keep the memory overhead and individual component usage down on the Pulley/Wasmtime side. Thanks again for the pointers!</p>
+
+
+
+<a name="580885575"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/438936-SIG-Embedded/topic/Running%20Wasmtime%20on%20Pico%202%3A%20Overcoming%20Memory%20issues/near/580885575" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Christof Petig <a href="https://bytecodealliance.github.io/zulip-archive/stream/438936-SIG-Embedded/topic/Running.20Wasmtime.20on.20Pico.202.3A.20Overcoming.20Memory.20issues.html#580885575">(Mar 22 2026 at 04:45)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="1003778">Lukas Barragan Torres</span> <a href="#narrow/channel/438936-SIG-Embedded/topic/Running.20Wasmtime.20on.20Pico.202.3A.20Overcoming.20Memory.20issues/near/580400225">said</a>:</p>
+<blockquote>
+<p><span class="user-mention silent" data-user-id="590366">Christof Petig</span> Just to make sure I understand: does your fork essentially generate standard, statically linkable bindings from the WIT file instead of the usual Component Model Canonical ABI bindings? Meaning it lets us use WIT purely as an interface design tool, but under the hood, everything still compiles down into one single Wasm module with a shared memory?</p>
+</blockquote>
+<p>Yes, exactly. We use it to compile native applications with a single memory instance, thus no sandbox between components.</p>
+
+
+
+<hr><p>Last updated: Mar 23 2026 at 11:17 UTC</p>
+</html>

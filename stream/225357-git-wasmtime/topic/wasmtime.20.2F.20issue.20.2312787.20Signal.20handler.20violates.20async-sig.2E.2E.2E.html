@@ -1,0 +1,164 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #12787 Signal handler violates async-sig... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312787.20Signal.20handler.20violates.20async-sig.2E.2E.2E.html">wasmtime / issue #12787 Signal handler violates async-sig...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="579773840"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312787%20Signal%20handler%20violates%20async-sig.../near/579773840" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312787.20Signal.20handler.20violates.20async-sig.2E.2E.2E.html#579773840">(Mar 16 2026 at 18:24)</a>:</h4>
+<p>jbachorik opened <a href="https://github.com/bytecodealliance/wasmtime/issues/12787">issue #12787</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p>Wasmtime's SIGSEGV/SIGBUS trap handler (trap_handler in crates/wasmtime/src/runtime/vm/sys/unix/signals.rs) violates POSIX async-signal-safety requirements by:               </p>
+<ol>
+<li>Accessing thread-local storage via tls::with(), which can trigger __tls_get_addr</li>
+<li>__tls_get_addr calls malloc() on first TLS access for a thread </li>
+<li>malloc() is not async-signal-safe and can deadlock if the interrupted code was holding malloc's internal lock</li>
+</ol>
+<h2>Reproduction</h2>
+<p>This causes deadlocks when wasmtime is used alongside other software that:</p>
+<ul>
+<li>Installs its own SIGSEGV handlers (e.g., Java profilers using safefetch)</li>
+<li>Triggers SIGSEGV intentionally for safe memory probing</li>
+</ul>
+<p>The deadlock occurs when:</p>
+<p>1. Thread A is inside malloc() holding its internal lock<br>
+  2. SIGSEGV arrives (from safefetch or other intentional fault)<br>
+  3. Wasmtime's trap_handler runs<br>
+  4. tls::with() → __tls_get_addr → malloc()<br>
+  5. malloc() tries to acquire the lock already held → DEADLOCK</p>
+<h3>Stack trace from deadlock</h3>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="w">  </span><span class="p">#</span><span class="mi">7</span><span class="w">  </span><span class="n">__tls_get_addr</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="o">../</span><span class="n">sysdeps</span><span class="o">/</span><span class="n">x86_64</span><span class="o">/</span><span class="n">tls_get_addr</span><span class="p">.</span><span class="n">S</span><span class="p">:</span><span class="mi">55</span>
+<span class="w">  </span><span class="p">#</span><span class="mi">8</span><span class="w">  </span><span class="n">wasmtime_runtime</span><span class="p">::</span><span class="n">traphandlers</span><span class="p">::</span><span class="n">tls</span><span class="p">::</span><span class="n">raw</span><span class="p">::</span><span class="n">get</span><span class="w"> </span><span class="p">()</span>
+<span class="w">  </span><span class="p">#</span><span class="mi">9</span><span class="w">  </span><span class="n">wasmtime_runtime</span><span class="p">::</span><span class="n">traphandlers</span><span class="p">::</span><span class="n">unix</span><span class="p">::</span><span class="n">trap_handler</span><span class="w"> </span><span class="p">()</span>
+<span class="w">  </span><span class="p">#</span><span class="mi">10</span><span class="w"> </span><span class="o">&lt;</span><span class="n">signal</span><span class="w"> </span><span class="n">handler</span><span class="w"> </span><span class="n">called</span><span class="o">&gt;</span>
+<span class="w">  </span><span class="p">#</span><span class="mi">11</span><span class="w"> </span><span class="n">safefetch64_impl</span><span class="w"> </span><span class="p">()</span><span class="w">  </span><span class="c1">// intentional SIGSEGV for safe memory access</span>
+<span class="w">  </span><span class="o">..</span><span class="p">.</span>
+<span class="w">  </span><span class="p">#</span><span class="mi">27</span><span class="w"> </span><span class="n">sysmalloc</span><span class="w"> </span><span class="p">()</span>
+<span class="w">  </span><span class="p">#</span><span class="mi">28</span><span class="w"> </span><span class="n">_int_malloc</span><span class="w"> </span><span class="p">()</span>
+<span class="w">  </span><span class="p">#</span><span class="mi">29</span><span class="w"> </span><span class="n">__GI___libc_malloc</span><span class="w"> </span><span class="p">()</span><span class="w">  </span><span class="c1">// original malloc call that holds the lock</span>
+</code></pre></div>
+<p>The code comment acknowledges this                                                                                                                                            </p>
+<p>From <a href="http://signals.rs">signals.rs</a>:<br>
+"The main current requirement of the signal handler in terms of stack space is that malloc/realloc are called to create a Backtrace of wasm frames."</p>
+<h2>Suggested fix</h2>
+<p>1. Use tls_eager_initialize() on thread creation to ensure TLS is initialized before any signal can arrive<br>
+  2. Consider using a signal-safe TLS mechanism (e.g., dedicated pthread key with pre-allocated storage)<br>
+  3. Avoid any allocation in the signal handler fast path - defer backtrace creation</p>
+<h2>Environment</h2>
+<p>- wasmtime-jni 0.19.0<br>
+  - Linux x86_64<br>
+  - glibc</p>
+</blockquote>
+
+
+
+<a name="579789384"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312787%20Signal%20handler%20violates%20async-sig.../near/579789384" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312787.20Signal.20handler.20violates.20async-sig.2E.2E.2E.html#579789384">(Mar 16 2026 at 19:58)</a>:</h4>
+<p>bjorn3 <a href="https://github.com/bytecodealliance/wasmtime/issues/12787#issuecomment-4070251216">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12787">issue #12787</a>:</p>
+<blockquote>
+<p>FWIW the rust standard library already does tls accesses in its SIGSEGV handler. I believe the latest glibc release also no longer does lazy allocation of tls slots. Musl has never done lazy allocation.</p>
+<blockquote>
+<p>Use tls_eager_initialize() on thread creation to ensure TLS is initialized before any signal can arrive</p>
+</blockquote>
+<p>This is something you can do yourself.</p>
+<blockquote>
+<p>Consider using a signal-safe TLS mechanism (e.g., dedicated pthread key with pre-allocated storage)</p>
+</blockquote>
+<p>Pthread keys don't have pre-allocated storage AFAIK. If anything they are more likely to be lazily allocated I would think. Unlike <code>std::thread_local!()</code>, they are not visible to libc at startup time when the initial tls storage is allocated.</p>
+<blockquote>
+<p>Avoid any allocation in the signal handler fast path - defer backtrace creation</p>
+</blockquote>
+<p>How? After the longjmp out of the signal handler, the wasm stack frames are gone and thus can't be included in any backtrace we generate afterwards.</p>
+</blockquote>
+
+
+
+<a name="579814688"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312787%20Signal%20handler%20violates%20async-sig.../near/579814688" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312787.20Signal.20handler.20violates.20async-sig.2E.2E.2E.html#579814688">(Mar 16 2026 at 23:01)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/12787#issuecomment-4071194510">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12787">issue #12787</a>:</p>
+<blockquote>
+<p>I'd agree that I don't really know exactly what we can do about this. Apart from @jbachorik the bindings to wasmtime explicitly calling <code>Engine::tls_eager_initialize</code> I think that's sort of the best solution here.</p>
+<p>Our signal handler in general isn't async-signal safe, and that's a known property. This includes TLS but if it's a fault in Wasmtime we go so far as to lock data structures as well. This works out in Wasmtime because wasmtime-generated signals aren't happening asynchronously, but if an external system is generating asynchronous signals that causes problems.</p>
+<p>Being able to access TLS is a pretty fundamental part of our signal handler and I'm not sure how we'd paper over that or remove it. With native TLS not being async-signal safe, and pthread-realted functions also not being async-signal-safe, I'm not sure what we could do.</p>
+<p>That's what leads me to: @jbachorik is it possible to use <code>tls_eager_initialize</code>?</p>
+</blockquote>
+
+
+
+<a name="579938431"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312787%20Signal%20handler%20violates%20async-sig.../near/579938431" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312787.20Signal.20handler.20violates.20async-sig.2E.2E.2E.html#579938431">(Mar 17 2026 at 13:05)</a>:</h4>
+<p>jbachorik <a href="https://github.com/bytecodealliance/wasmtime/issues/12787#issuecomment-4074812757">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12787">issue #12787</a>:</p>
+<blockquote>
+<blockquote>
+<p>FWIW the rust standard library already does tls accesses in its SIGSEGV handler</p>
+</blockquote>
+<p>I don't think this is true, according to <a href="https://doc.rust-lang.org/src/std/sys/pal/unix/stack_overflow/thread_info.rs.html">https://doc.rust-lang.org/src/std/sys/pal/unix/stack_overflow/thread_info.rs.html</a></p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="sd">//! Unfortunately, because thread local storage isn't async-signal-safe, we</span>
+<span class="sd">//! cannot soundly use it in our stack overflow handler. While this works</span>
+<span class="sd">//! without problems on most platforms, it can lead to undefined behaviour</span>
+<span class="sd">//! on others (such as GNU/Linux). Luckily, the POSIX specification documents</span>
+<span class="sd">//! two thread-specific values that can be accessed in asynchronous signal</span>
+<span class="sd">//! handlers: the value of `pthread_self()` and the address of `errno`. As</span>
+<span class="sd">//! `pthread_t` is an opaque platform-specific type, we use the address of</span>
+<span class="sd">//! `errno` here. As it is thread-specific and does not change over the</span>
+<span class="sd">//! lifetime of a thread, we can use `&amp;errno` as a key for a `BTreeMap`</span>
+<span class="sd">//! that stores thread-specific data.</span>
+</code></pre></div>
+<p>In general, POSIX says that if an asynchronous signal handler calls outside the Section 2.4 “Signal Concepts” safe set, behavior is undefined. In real libcs, many “normal” functions rely on internal locks and mutable global state (stdio buffers, allocator metadata). If the signal interrupts code while those internals are locked or mid-update, a handler that calls back into them can deadlock (lock re-entry) or corrupt state, which can later surface as crashes.</p>
+<p>In asynchronously executed signal handlers, restrict code to async-signal-safe operations only. POSIX specifies undefined behavior if a handler calls POSIX functions outside the safe set (POSIX.1-2017 §2.4 “Signal Concepts”; see signal()), and sigaction(3p) notes POSIX does not define behavior when an unsafe handler interrupts unsafe library code. ISO C is stricter: in an asynchronous handler, calling most of the standard library is undefined behavior (C11 draft N1570 §7.14.1.1). In practice, violations can deadlock (re-entering libc while it holds internal locks) or cause corruption/crashes (re-entering while internal state is mid-update).</p>
+<hr>
+<blockquote>
+<p>This works out in Wasmtime because wasmtime-generated signals aren't happening asynchronously</p>
+</blockquote>
+<p>Ok, so you expect to be reacting only to signals your runtime generated in a controlled manner? In that case, the signal handler should immediately pass the signal up the handler chain when it detects the signal does not belong to it.</p>
+<p>Maybe you are already doing that; but there is one weird caveat with the compiler-based TLS values I noticed in our profiler code - sometimes the compiler decides to hoist the TLS initialization before the check and branch and you end up with the TLS initialized unconditionally even if you are not processing the signal. Would be probably worth checking.<br>
+</p>
+</blockquote>
+
+
+
+<a name="579943239"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312787%20Signal%20handler%20violates%20async-sig.../near/579943239" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312787.20Signal.20handler.20violates.20async-sig.2E.2E.2E.html#579943239">(Mar 17 2026 at 13:23)</a>:</h4>
+<p>bjorn3 <a href="https://github.com/bytecodealliance/wasmtime/issues/12787#issuecomment-4074930568">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12787">issue #12787</a>:</p>
+<blockquote>
+<blockquote>
+<p>I don't think this is true, according to <a href="https://doc.rust-lang.org/src/std/sys/pal/unix/stack_overflow/thread_info.rs.html">https://doc.rust-lang.org/src/std/sys/pal/unix/stack_overflow/thread_info.rs.html</a></p>
+</blockquote>
+<p>Looks like that was changed in <a href="https://github.com/rust-lang/rust/commit/84bb0f07e6c3e920db567ff95a5f8365cf042c75">https://github.com/rust-lang/rust/commit/84bb0f07e6c3e920db567ff95a5f8365cf042c75</a>.</p>
+<blockquote>
+<p>In that case, the signal handler should immediately pass the signal up the handler chain when it detects the signal does not belong to it.</p>
+</blockquote>
+<p>It does, bubble up the signal if it is not for us, unless <a href="https://docs.rs/wasmtime/latest/wasmtime/unix/trait.StoreExt.html#tymethod.set_signal_handler"><code>StoreExt::set_signal_handler</code></a> was used to override the signal handler for a specific store, in which case it unconditionally runs said signal handler. To know if a signal handler override is present for the store Wasmtime needs to lookup the current store in thread local storage: <a href="https://github.com/bytecodealliance/wasmtime/blob/a1a74d3a174e52ee71e33a076b8c55801a166dbe/crates/wasmtime/src/runtime/vm/sys/unix/signals.rs#L163-L165">https://github.com/bytecodealliance/wasmtime/blob/a1a74d3a174e52ee71e33a076b8c55801a166dbe/crates/wasmtime/src/runtime/vm/sys/unix/signals.rs#L163-L165</a>, <a href="https://github.com/bytecodealliance/wasmtime/blob/a1a74d3a174e52ee71e33a076b8c55801a166dbe/crates/wasmtime/src/runtime/vm/traphandlers.rs#L1027-L1036">https://github.com/bytecodealliance/wasmtime/blob/a1a74d3a174e52ee71e33a076b8c55801a166dbe/crates/wasmtime/src/runtime/vm/traphandlers.rs#L1027-L1036</a> This API was added in <a href="https://github.com/bytecodealliance/wasmtime/pull/620">https://github.com/bytecodealliance/wasmtime/pull/620</a>. I'm not sure if it is necessary anymore after <a href="https://github.com/bytecodealliance/wasmtime/pull/1577">https://github.com/bytecodealliance/wasmtime/pull/1577</a>.</p>
+</blockquote>
+
+
+
+<a name="580105769"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312787%20Signal%20handler%20violates%20async-sig.../near/580105769" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312787.20Signal.20handler.20violates.20async-sig.2E.2E.2E.html#580105769">(Mar 18 2026 at 05:41)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/12787#issuecomment-4079895849">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12787">issue #12787</a>:</p>
+<blockquote>
+<p>That's an... interesting solution for libstd, but not really in the cards for us. Libstd has a one-time setup of signal handling state whereas in Wasmtime we're constantly frobbing the TLS slots here, so I don't think we can take the perf hit of inserting a <code>BTreeMap</code> around that. </p>
+<p>Looking at other engines, it looks like <a href="https://github.com/v8/v8/blob/779a6047a79ec8018cfabb2122cc5e44c59aba0e/src/trap-handler/trap-handler-internal.h#L43">v8 hits a thread local</a> and <a href="https://searchfox.org/firefox-main/source/js/src/wasm/WasmSignalHandlers.cpp#506">SpiderMonkey does the same</a>. </p>
+<hr>
+<p><code>StoreExt::set_signal_handler</code> I don't think would help here. My assumption is that if a thread has executed wasm it's fine because it's initialized TLS. The problem is that Wasmtime's TLS access means that for threads that Wasmtime hasn't touched it'll initialize TLS when Wasmtime's signal handler doesn't need to run at all. If this is something we want to fix, I don't see how we'd solve this without jettisoning our use of TLS entirely.</p>
+</blockquote>
+
+
+
+<a name="580113660"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312787%20Signal%20handler%20violates%20async-sig.../near/580113660" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312787.20Signal.20handler.20violates.20async-sig.2E.2E.2E.html#580113660">(Mar 18 2026 at 06:51)</a>:</h4>
+<p>bjorn3 <a href="https://github.com/bytecodealliance/wasmtime/issues/12787#issuecomment-4080155654">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12787">issue #12787</a>:</p>
+<blockquote>
+<p>I mean if we get rid of <code>set_signal_handler</code> we can delay the tls access until after we have checked that the signal was caused by wasm code.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Mar 23 2026 at 11:17 UTC</p>
+</html>

@@ -1,0 +1,82 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #12662 TypeRegistry internal data struct... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312662.20TypeRegistry.20internal.20data.20struct.2E.2E.2E.html">wasmtime / issue #12662 TypeRegistry internal data struct...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="575655027"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312662%20TypeRegistry%20internal%20data%20struct.../near/575655027" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312662.20TypeRegistry.20internal.20data.20struct.2E.2E.2E.html#575655027">(Feb 24 2026 at 22:39)</a>:</h4>
+<p>fitzgen opened <a href="https://github.com/bytecodealliance/wasmtime/issues/12662">issue #12662</a>:</p>
+<blockquote>
+<p>A place to continue the discussion from <a href="https://github.com/bytecodealliance/wasmtime/pull/12621">https://github.com/bytecodealliance/wasmtime/pull/12621</a></p>
+</blockquote>
+
+
+
+<a name="575675435"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312662%20TypeRegistry%20internal%20data%20struct.../near/575675435" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312662.20TypeRegistry.20internal.20data.20struct.2E.2E.2E.html#575675435">(Feb 25 2026 at 01:33)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/12662#issuecomment-3956018383">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12662">issue #12662</a>:</p>
+<blockquote>
+<p>Carrying over form <a href="https://github.com/bytecodealliance/wasmtime/pull/12621#issuecomment-3947408535">here</a></p>
+<blockquote>
+<p>Our struct-of-arrays implementation today is an optimization over that baseline because it allows us to avoid the memory overhead of supertypes, trampolines, and GC layouts when GC stuff isn't used at all. That's already a win.</p>
+</blockquote>
+<p>To try to quantify this, our current struct-of-arrays is <a href="https://github.com/bytecodealliance/wasmtime/blob/2e3d0ecb5e6b761d2b6424031c69770c5105eddd/crates/wasmtime/src/runtime/type_registry.rs#L587-L645">here</a> where the arrays are:</p>
+<ul>
+<li><code>types</code> - a pointer-per-element (of <code>WasmSubType</code>) which all types will push to</li>
+<li><code>type_to_rec_group</code>, <code>type_to_supertypes</code>, <code>type_to_gc_layout</code> - not present for "vanilla" function types but GC types will insert into this.</li>
+<li><code>type_to_trampoline</code> - possible to show up for some function types using GC types and such</li>
+</ul>
+<p>The theoretical wins here is that <code>WasmSubType</code> is smaller because it doesn't need to contain rec groups, supertypes, gc layouts, and trampolines. <code>WasmSubType</code>, however, is pretty inefficient where its hierarchy is:</p>
+<ul>
+<li><code>WasmSubType = (bool, Option&lt;EngineOrModuleTypeIndex&gt;, WasmCompositeType)</code></li>
+<li><code>EngineOrModuleTypeIndex = (tag, u32)</code></li>
+<li><code>WasmCompositeType = (WasmCompositeInnerType, bool)</code></li>
+<li><code>WasmCompositeInnerType = WasmArrayType | WasmFuncType | WasmStructType | WasmContType | WasmExnType</code></li>
+<li>...</li>
+</ul>
+<p>Basically I'd say that <code>WasmSubType</code> is already quite far away from its optimal representation, and we're allocating that per-type in the <code>Engine</code>. Given that are we really gaining much by moving a few extra things out to secondary maps?</p>
+<p>For example one thing we could do is bundle all the <code>SecondaryMaps</code> into some sort of <code>TypeAuxiliary</code> thing which is stored in <code>WasmSubType</code> under an <code>Option&lt;Box&lt;...&gt;&gt;</code>. That's a single word of extra storage per type which compared to the current weight of <code>WasmSubType</code> I would suspect is relatively small. Even if we were to optimize the representation of <code>WasmSubType</code> an extra word probably wouldn't break the bank.</p>
+<p>So my current read on this -- are we benefitting from the secondary maps? My impression is that struct-of-arrays are really good for (a) allocating a ton of a type which has lots of internal padding or (b) algorithms that frequently access just a single field of many structs. For (a) I don't think we've optimized <code>WasmSubType</code> to actually get any gains, and for (b) I don't think we're using the struct-of-arrays approach for cache locality currently.</p>
+<p>I could very well be missing things though, @fitzgen you wouldn't happen to recall any measurements or specific situations you were thinking of struct-of-arrays for would you?</p>
+</blockquote>
+
+
+
+<a name="575675453"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312662%20TypeRegistry%20internal%20data%20struct.../near/575675453" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312662.20TypeRegistry.20internal.20data.20struct.2E.2E.2E.html#575675453">(Feb 25 2026 at 01:33)</a>:</h4>
+<p>alexcrichton edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/12662#issuecomment-3956018383">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12662">issue #12662</a>:</p>
+<blockquote>
+<p>Carrying over from <a href="https://github.com/bytecodealliance/wasmtime/pull/12621#issuecomment-3947408535">here</a></p>
+<blockquote>
+<p>Our struct-of-arrays implementation today is an optimization over that baseline because it allows us to avoid the memory overhead of supertypes, trampolines, and GC layouts when GC stuff isn't used at all. That's already a win.</p>
+</blockquote>
+<p>To try to quantify this, our current struct-of-arrays is <a href="https://github.com/bytecodealliance/wasmtime/blob/2e3d0ecb5e6b761d2b6424031c69770c5105eddd/crates/wasmtime/src/runtime/type_registry.rs#L587-L645">here</a> where the arrays are:</p>
+<ul>
+<li><code>types</code> - a pointer-per-element (of <code>WasmSubType</code>) which all types will push to</li>
+<li><code>type_to_rec_group</code>, <code>type_to_supertypes</code>, <code>type_to_gc_layout</code> - not present for "vanilla" function types but GC types will insert into this.</li>
+<li><code>type_to_trampoline</code> - possible to show up for some function types using GC types and such</li>
+</ul>
+<p>The theoretical wins here is that <code>WasmSubType</code> is smaller because it doesn't need to contain rec groups, supertypes, gc layouts, and trampolines. <code>WasmSubType</code>, however, is pretty inefficient where its hierarchy is:</p>
+<ul>
+<li><code>WasmSubType = (bool, Option&lt;EngineOrModuleTypeIndex&gt;, WasmCompositeType)</code></li>
+<li><code>EngineOrModuleTypeIndex = (tag, u32)</code></li>
+<li><code>WasmCompositeType = (WasmCompositeInnerType, bool)</code></li>
+<li><code>WasmCompositeInnerType = WasmArrayType | WasmFuncType | WasmStructType | WasmContType | WasmExnType</code></li>
+<li>...</li>
+</ul>
+<p>Basically I'd say that <code>WasmSubType</code> is already quite far away from its optimal representation, and we're allocating that per-type in the <code>Engine</code>. Given that are we really gaining much by moving a few extra things out to secondary maps?</p>
+<p>For example one thing we could do is bundle all the <code>SecondaryMaps</code> into some sort of <code>TypeAuxiliary</code> thing which is stored in <code>WasmSubType</code> under an <code>Option&lt;Box&lt;...&gt;&gt;</code>. That's a single word of extra storage per type which compared to the current weight of <code>WasmSubType</code> I would suspect is relatively small. Even if we were to optimize the representation of <code>WasmSubType</code> an extra word probably wouldn't break the bank.</p>
+<p>So my current read on this -- are we benefitting from the secondary maps? My impression is that struct-of-arrays are really good for (a) allocating a ton of a type which has lots of internal padding or (b) algorithms that frequently access just a single field of many structs. For (a) I don't think we've optimized <code>WasmSubType</code> to actually get any gains, and for (b) I don't think we're using the struct-of-arrays approach for cache locality currently.</p>
+<p>I could very well be missing things though, @fitzgen you wouldn't happen to recall any measurements or specific situations you were thinking of struct-of-arrays for would you?</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Mar 23 2026 at 11:17 UTC</p>
+</html>
