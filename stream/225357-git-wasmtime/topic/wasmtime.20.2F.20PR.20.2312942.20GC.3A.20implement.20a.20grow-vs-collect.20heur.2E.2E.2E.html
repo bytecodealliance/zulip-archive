@@ -1,0 +1,374 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #12942 GC: implement a grow-vs-collect heur... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html">wasmtime / PR #12942 GC: implement a grow-vs-collect heur...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="583336950"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583336950" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583336950">(Apr 02 2026 at 19:19)</a>:</h4>
+<p>cfallin requested <a href="https://github.com/fitzgen">fitzgen</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>.</p>
+
+
+
+<a name="583336954"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583336954" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583336954">(Apr 02 2026 at 19:19)</a>:</h4>
+<p>cfallin opened <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a> from <code>cfallin:gc-growth-heuristic</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>This implements the heuristic discussed in #12860: it replaces the existing behavior where Wasmtime's GC, when allocating, will continue growing the GC heap up to its size limit before initiating a collection. That behavior optimizes for allocation performance but at the cost of resident memory size -- it is at one extreme end of that tradeoff spectrum.</p>
+<p>There are a number of use-cases where there may be heavy allocation traffic but a relatively small live-heap size compared to the total volume of allocations. For example, lots of temporary "garbage" may be allocated by many workloads. Or, more pertinently to #12860, a C/C++ workload that uses the underlying GC heap only for exceptions, and uses those exceptions in a way that only one <code>exnref</code> is live at a time (no <code>exn</code> objects are stashed away and used later), will also generate a lot of "garbage" during normal execution. These kinds of workloads benefit significantly from more frequent collection to keep the resident-set size small. This also may benefit performance, even accounting for the cost of the collection itself, because it keeps the footprint of touched memory within higher cache-hierarchy levels.</p>
+<p>In order to accommodate that kind of workload while also presenting reasonable behavior to large-working-set-size benchmarks, it is desirable to implement an <em>adaptive</em> policy. To that end, this PR implements a scheme similar to our OwnedRooted allocation/collection algorithm (and specified explicitly [here] by fitzgen): we use the last live-heap size (post-collection) compared to current capacity to decide whether to grow or collect. When the current capacity is more than twice the last live-heap size, we collect first; if we still can't allocate, then we grow. Otherwise, we just grow.</p>
+<p>The idea is that (when combined with an exponential heap-growth rule) the continuous-allocation case will collect once at each power-of-two, then grow; this is "amortized constant time" overhead. A case with a stable working-set size but with some ups and downs will never hit a "threshold-thrashing" problem: the heap capacity will tend toward twice the live-heap size, in the steady state (see proof <a href="http://proof">here</a> for the analogous algorithm for <code>OwnedRooted</code>). Thus we have a nice, deterministic bound no matter what, with no bad (quadratic or worse) cases.</p>
+<p>This PR adds a test that creates a bunch of almost-immediately-dead garbage (allocates a GC struct that is only live for one iteration of a loop) and checks the heap size at each iteration. To allow this check, it also adds a method to <code>Store</code> to get the current GC heap capacity, which seems like a generally useful kind of observability as well.</p>
+<p>[here]: <a href="https://github.com/bytecodealliance/wasmtime/pull/12860#issuecomment-4158147842">https://github.com/bytecodealliance/wasmtime/pull/12860#issuecomment-4158147842</a><br>
+[proof]: <a href="https://github.com/bytecodealliance/wasmtime/blob/e5b127ccd71dbd7d447a32722b2c699abc46fe61/crates/wasmtime/src/runtime/gc/enabled/rooting.rs#L617-L678">https://github.com/bytecodealliance/wasmtime/blob/e5b127ccd71dbd7d447a32722b2c699abc46fe61/crates/wasmtime/src/runtime/gc/enabled/rooting.rs#L617-L678</a></p>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+</blockquote>
+
+
+
+<a name="583336955"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583336955" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583336955">(Apr 02 2026 at 19:19)</a>:</h4>
+<p>cfallin requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>.</p>
+
+
+
+<a name="583348259"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583348259" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583348259">(Apr 02 2026 at 20:12)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#discussion_r3030062570">PR review comment</a>:</p>
+<blockquote>
+<p>Especially since <code>layout.size()</code> is being used here on increments.</p>
+</blockquote>
+
+
+
+<a name="583348261"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583348261" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583348261">(Apr 02 2026 at 20:12)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#discussion_r3030070676">PR review comment</a>:</p>
+<blockquote>
+<p>Nitpick: this isn't quite the same as "live" since there may be unreachable objects we just haven't collected yet.</p>
+</blockquote>
+
+
+
+<a name="583348262"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583348262" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583348262">(Apr 02 2026 at 20:12)</a>:</h4>
+<p>fitzgen submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#pullrequestreview-4052894722">PR review</a>.</p>
+
+
+
+<a name="583348263"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583348263" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583348263">(Apr 02 2026 at 20:12)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#discussion_r3030114186">PR review comment</a>:</p>
+<blockquote>
+<p>This function's behavior seems weird to me now. In particular, it is strange that we would always grow if <code>bytes_needed</code> is provided, even when collection freed up more than enough space in the GC heap.</p>
+<p>I guess what I would expect is something like this:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="n">caller</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="n">Store</span><span class="p">::</span><span class="n">gc</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">post_gc_allocated_bytes</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">gc_heap_capacity</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">collect</span><span class="p">();</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="n">bytes_needed</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="n">gc_heap_capacity</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">post_gc_allocated_bytes</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">grow</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">grow</span><span class="p">();</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>And I'm not even 100% sold on always-collect-if-the-caller-is-<code>Store::gc</code> but if we do want to have that behavior, then we probably want to pull this apart into multiple functions (collect-or-grow vs collect-and-then-grow-if-necessary) and just have <code>Store::gc</code> call the latter.</p>
+</blockquote>
+
+
+
+<a name="583348264"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583348264" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583348264">(Apr 02 2026 at 20:12)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#discussion_r3030058896">PR review comment</a>:</p>
+<blockquote>
+<p>The free list can round sizes up to its min size and min alignment, so it is more accurate to do the following:</p>
+<p><div class="codehilite" data-code-language="suggestion"><pre><span></span><code>        let size = self.index(drc_ref).object_size();
+        let layout = FreeList::layout(size);
+        self.allocated_bytes -= layout.size();
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="583366724"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583366724" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583366724">(Apr 02 2026 at 21:54)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>.</p>
+
+
+
+<a name="583366725"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583366725" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583366725">(Apr 02 2026 at 21:54)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:ref-types</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>.</p>
+
+
+
+<a name="583366731"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583366731" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583366731">(Apr 02 2026 at 21:54)</a>:</h4>
+<p>github-actions[bot] <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#issuecomment-4180693903">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>:</p>
+<blockquote>
+<h4>Subscribe to Label Action</h4>
+<p>cc @fitzgen</p>
+<p>&lt;details&gt;<br>
+This issue or pull request has been labeled: "wasmtime:api", "wasmtime:ref-types"</p>
+<p>Thus the following users have been cc'd because of the following labels:</p>
+<ul>
+<li>fitzgen: wasmtime:ref-types</li>
+</ul>
+<p>To subscribe or unsubscribe from this label, edit the &lt;code&gt;.github/subscribe-to-label.json&lt;/code&gt; configuration file.</p>
+<p><a href="https://github.com/bytecodealliance/subscribe-to-label-action">Learn more.</a><br>
+&lt;/details&gt;</p>
+</blockquote>
+
+
+
+<a name="583529897"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583529897" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583529897">(Apr 03 2026 at 22:20)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>.</p>
+
+
+
+<a name="583529905"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583529905" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583529905">(Apr 03 2026 at 22:20)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>.</p>
+
+
+
+<a name="583529927"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583529927" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583529927">(Apr 03 2026 at 22:20)</a>:</h4>
+<p>cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#pullrequestreview-4057506984">PR review</a>.</p>
+
+
+
+<a name="583529931"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583529931" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583529931">(Apr 03 2026 at 22:20)</a>:</h4>
+<p>cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#pullrequestreview-4057507061">PR review</a>.</p>
+
+
+
+<a name="583529932"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583529932" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583529932">(Apr 03 2026 at 22:20)</a>:</h4>
+<p>cfallin created <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#discussion_r3034598742">PR review comment</a>:</p>
+<blockquote>
+<p>Clarified.</p>
+</blockquote>
+
+
+
+<a name="583529937"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583529937" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583529937">(Apr 03 2026 at 22:20)</a>:</h4>
+<p>cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#pullrequestreview-4057507167">PR review</a>.</p>
+
+
+
+<a name="583529946"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583529946" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583529946">(Apr 03 2026 at 22:20)</a>:</h4>
+<p>cfallin created <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#discussion_r3034598648">PR review comment</a>:</p>
+<blockquote>
+<p>So this one is a little confusing to me too wrt intent. Note that this function's only caller <em>is</em> <code>Store::gc</code>, so we can safely const-prop your OR-condition; then the intent is I guess "always collect, then grow if request is greater than likely available size". I've updated to this and renamed to <code>collect_and_maybe_grow_gc_heap</code> to hopefully make that clearer.</p>
+</blockquote>
+
+
+
+<a name="583530063"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583530063" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583530063">(Apr 03 2026 at 22:22)</a>:</h4>
+<p>cfallin created <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#discussion_r3034598876">PR review comment</a>:</p>
+<blockquote>
+<p>Done!</p>
+</blockquote>
+
+
+
+<a name="583530872"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583530872" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583530872">(Apr 03 2026 at 22:33)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>.</p>
+
+
+
+<a name="583530894"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583530894" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583530894">(Apr 03 2026 at 22:33)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#issuecomment-4185468124">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>:</p>
+<blockquote>
+<p>Updated; thanks!</p>
+</blockquote>
+
+
+
+<a name="583533798"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583533798" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583533798">(Apr 03 2026 at 23:16)</a>:</h4>
+<p>fitzgen submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#pullrequestreview-4057608535">PR review</a>:</p>
+<blockquote>
+<p>Thanks!</p>
+</blockquote>
+
+
+
+<a name="583533799"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583533799" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583533799">(Apr 03 2026 at 23:16)</a>:</h4>
+<p>fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#discussion_r3034702895">PR review comment</a>:</p>
+<blockquote>
+<p>Indentation looks like it got messed up here</p>
+</blockquote>
+
+
+
+<a name="583534386"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583534386" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583534386">(Apr 03 2026 at 23:25)</a>:</h4>
+<p>cfallin created <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#discussion_r3034727604">PR review comment</a>:</p>
+<blockquote>
+<p>Hmm, actually, there's something weird in the current test failure that removing the <code>if bytes_needed &gt; ...</code> conditional resolves -- will investigate more next week...</p>
+</blockquote>
+
+
+
+<a name="583534388"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/583534388" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#583534388">(Apr 03 2026 at 23:25)</a>:</h4>
+<p>cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#pullrequestreview-4057630076">PR review</a>.</p>
+
+
+
+<a name="584324848"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/584324848" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#584324848">(Apr 08 2026 at 22:26)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#issuecomment-4210094960">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>:</p>
+<blockquote>
+<p>@fitzgen I looked into the test failure here and it seems to be kind of a fundamental mismatch between the <code>null</code> collector's inline path and <code>Store::gc</code>'s contract (<a href="https://github.com/bytecodealliance/wasmtime/blob/51959f238e5c65f535047a8bf4615b8b28a14429/crates/wasmtime/src/runtime/store/gc.rs#L10-L14">here</a>) that allocation may not succeed even after GC.</p>
+<p>The DRC collector's allocation path goes through <code>retry_after_gc_async</code> (via the <code>gc_alloc_raw</code> libcall), which implements the new two-level retry behavior in this PR, which (given the algorithm) is guaranteed to grow if more space is needed. However, the null collector's inline path (<code>NullCompiler::emit_inline_alloc</code>) only calls the <code>grow_gc_heap</code> libcall (which calls <code>Store::gc</code> with <code>bytes_needed</code>) and then retries allocation once. That's not sufficient to cause a growth to occur with the new algorithm, as long as <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#discussion_r3030114186">your requested heuristic</a>) is present.</p>
+<p>I think the actual bug here appears to be the mismatch in contracts between the inline alloc path and <code>Store::gc</code>'s contract, but it also seems like we shouldn't be duplicating the growth heuristic or retry logic multiple times. I kind of prefer restoring the old <code>Store::gc</code> behavior to keep the null allocator working but could either (i) refactor the null allocator to have a double-retry inline or (ii) remove the inline allocation path altogether, and make the same libcall as the DRC collector, if you prefer.</p>
+</blockquote>
+
+
+
+<a name="584327012"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/584327012" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#584327012">(Apr 08 2026 at 22:47)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#issuecomment-4210188217">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>:</p>
+<blockquote>
+<blockquote>
+<p>However, the null collector's inline path (<code>NullCompiler::emit_inline_alloc</code>) only calls the <code>grow_gc_heap</code> libcall (which calls <code>Store::gc</code> with <code>bytes_needed</code>) and then retries allocation once. That's not sufficient to cause a growth to occur with the new algorithm, as long as <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#discussion_r3030114186">your requested heuristic</a>) is present</p>
+</blockquote>
+<p>I think the <code>grow_gc_heap</code> libcall should just grow the GC heap directly, not try to do it indirectly through <code>store.gc(Some(bytes_needed))</code> or <code>store.grow_or_collect_gc_heap</code>. We should just make <code>StoreOpaque::grow_gc_heap</code> in <code>crates/wasmtime/src/runtime/store/gc.rs</code> be <code>pub(crate)</code> and call it from the <code>grow_gc_heap</code> libcall.</p>
+<p>How does that sound?</p>
+</blockquote>
+
+
+
+<a name="584330849"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/584330849" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#584330849">(Apr 08 2026 at 23:33)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>.</p>
+
+
+
+<a name="584330973"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/584330973" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#584330973">(Apr 08 2026 at 23:34)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>.</p>
+
+
+
+<a name="584330990"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/584330990" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#584330990">(Apr 08 2026 at 23:34)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#issuecomment-4210411041">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>:</p>
+<blockquote>
+<p>Ah, right, that's way simpler -- done!</p>
+</blockquote>
+
+
+
+<a name="584331060"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/584331060" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#584331060">(Apr 08 2026 at 23:35)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>.</p>
+
+
+
+<a name="584331152"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/584331152" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#584331152">(Apr 08 2026 at 23:36)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>.</p>
+
+
+
+<a name="584331198"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/584331198" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#584331198">(Apr 08 2026 at 23:37)</a>:</h4>
+<p>cfallin has enabled auto merge for <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>.</p>
+
+
+
+<a name="584331938"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/584331938" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#584331938">(Apr 08 2026 at 23:47)</a>:</h4>
+<p>fitzgen submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#pullrequestreview-4078988660">PR review</a>:</p>
+<blockquote>
+<p>Thanks!</p>
+</blockquote>
+
+
+
+<a name="584348813"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/584348813" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#584348813">(Apr 09 2026 at 02:13)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>.</p>
+
+
+
+<a name="584349062"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/584349062" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#584349062">(Apr 09 2026 at 02:16)</a>:</h4>
+<p>cfallin has disabled auto merge for <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>.</p>
+
+
+
+<a name="584349073"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/584349073" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#584349073">(Apr 09 2026 at 02:16)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/12942#issuecomment-4211011772">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>:</p>
+<blockquote>
+<p>There's a weird failure with the GC oom test that wasn't there before -- will try to bottom this out later when I have some more time.</p>
+</blockquote>
+
+
+
+<a name="584721889"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/584721889" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#584721889">(Apr 10 2026 at 17:14)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>.</p>
+
+
+
+<a name="584721964"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/584721964" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#584721964">(Apr 10 2026 at 17:15)</a>:</h4>
+<p>cfallin has enabled auto merge for <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>.</p>
+
+
+
+<a name="584724288"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/584724288" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#584724288">(Apr 10 2026 at 17:28)</a>:</h4>
+<p>cfallin added <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942 GC: implement a grow-vs-collect heuristic.</a> to the merge queue</p>
+
+
+
+<a name="584729414"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/584729414" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#584729414">(Apr 10 2026 at 17:51)</a>:</h4>
+<p>cfallin removed <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942 GC: implement a grow-vs-collect heuristic.</a> from the merge queue</p>
+
+
+
+<a name="584729430"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2312942%20GC%3A%20implement%20a%20grow-vs-collect%20heur.../near/584729430" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2312942.20GC.3A.20implement.20a.20grow-vs-collect.20heur.2E.2E.2E.html#584729430">(Apr 10 2026 at 17:52)</a>:</h4>
+<p>cfallin merged <a href="https://github.com/bytecodealliance/wasmtime/pull/12942">PR #12942</a>.</p>
+
+
+
+<hr><p>Last updated: May 20 2026 at 11:01 UTC</p>
+</html>

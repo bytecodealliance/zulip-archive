@@ -1,0 +1,272 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13270 Cranelift: MachBuffer assertion w... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313270.20Cranelift.3A.20MachBuffer.20assertion.20w.2E.2E.2E.html">wasmtime / issue #13270 Cranelift: MachBuffer assertion w...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="592850303"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313270%20Cranelift%3A%20MachBuffer%20assertion%20w.../near/592850303" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313270.20Cranelift.3A.20MachBuffer.20assertion.20w.2E.2E.2E.html#592850303">(May 04 2026 at 22:05)</a>:</h4>
+<p>darioush opened <a href="https://github.com/bytecodealliance/wasmtime/issues/13270">issue #13270</a>:</p>
+<blockquote>
+<p>Hello! I found that a certain form of wasm with many chained <code>i32.trunc_f64_s</code>/ <code>f64.convert_i32_s</code> ops can trigger a panic during compilation on aarc64, but compiles fine on x86_64.</p>
+<p>I can confirm the issue reproduces, and it is somewhat sad that I could not find a smaller reproduction. The specifics of the code involved here seems quite detailed and beyond my expertise. As such, I will include the LLM's analysis in case it is helpful:</p>
+<h3><code>.clif</code> Test Case</h3>
+<p>One <code>fcvt_to_sint.i32 f64</code> (which emits a <code>Ldr19</code> constant-pool fixup on aarch64) followed by ~29,200 chained <code>sdiv</code> ops (which pile up deferred traps until the constant pool is forced past the 1 MB <code>Ldr19</code> range):</p>
+<div class="codehilite" data-code-language="clif"><pre><span></span><code>function u0:0(f64, i32) -&gt; i32 fast {
+block0(v0: f64, v1: i32):
+    v2 = fcvt_to_sint.i32 v0      ;; emits Ldr19 fixup at prologue offset ~20
+    v3 = sdiv v2, v1               ;; }
+    v4 = sdiv v3, v1               ;; } ~29,200 sdivs pile up deferred traps
+    ;; ... 29,196 more sdivs ...   ;; }
+    v29202 = sdiv v29201, v1
+    return v29202
+}
+</code></pre></div>
+<p>Generator (<code>gen_clif.py N</code>, default N=29200 panics reliably; threshold ~29,130):</p>
+<div class="codehilite" data-code-language="Python"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="n">N</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="k">else</span> <span class="mi">29200</span>
+<span class="nb">print</span><span class="p">(</span><span class="s1">'function u0:0(f64, i32) -&gt; i32 fast {'</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s1">'block0(v0: f64, v1: i32):'</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s1">'    v2 = fcvt_to_sint.i32 v0'</span><span class="p">)</span>
+<span class="n">prev</span> <span class="o">=</span> <span class="s1">'v2'</span>
+<span class="n">ssa</span> <span class="o">=</span> <span class="mi">3</span>
+<span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">N</span><span class="p">):</span>
+    <span class="n">iv</span> <span class="o">=</span> <span class="n">ssa</span><span class="p">;</span> <span class="n">ssa</span> <span class="o">+=</span> <span class="mi">1</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s1">'    v</span><span class="si">{</span><span class="n">iv</span><span class="si">}</span><span class="s1"> = sdiv </span><span class="si">{</span><span class="n">prev</span><span class="si">}</span><span class="s1">, v1'</span><span class="p">)</span>
+    <span class="n">prev</span> <span class="o">=</span> <span class="sa">f</span><span class="s1">'v</span><span class="si">{</span><span class="n">iv</span><span class="si">}</span><span class="s1">'</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s1">'    return </span><span class="si">{</span><span class="n">prev</span><span class="si">}</span><span class="s1">'</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s1">'}'</span><span class="p">)</span>
+</code></pre></div>
+<h3>Steps to Reproduce</h3>
+<p><a href="https://github.com/user-attachments/files/27377962/gen_clif.py">gen_clif.py</a></p>
+<p><a href="https://github.com/user-attachments/files/27377965/gen.py">gen.py</a></p>
+<ul>
+<li>Generate the wasm with gen.py:</li>
+</ul>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="w"> </span><span class="n">python3</span><span class="w"> </span><span class="n">gen</span><span class="p">.</span><span class="n">py</span><span class="w"> </span><span class="mi">16000</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="n">repro</span><span class="p">.</span><span class="n">wat</span>
+<span class="n">wasm</span><span class="o">-</span><span class="n">tools</span><span class="w"> </span><span class="n">parse</span><span class="w"> </span><span class="n">repro</span><span class="p">.</span><span class="n">wat</span><span class="w"> </span><span class="o">-</span><span class="n">o</span><span class="w"> </span><span class="n">repro</span><span class="p">.</span><span class="n">wasm</span>
+<span class="n">wasmtime</span><span class="w"> </span><span class="n">compile</span><span class="w"> </span><span class="n">repro</span><span class="p">.</span><span class="n">wasm</span>
+</code></pre></div>
+<ul>
+<li>
+<p>or the clif with <code>gen_clif.py N</code>.</p>
+</li>
+<li>
+<p>Compile it against the aarch64 cranelift backend using <code>clif-util compile</code> or the minimal harness below:<br>
+  ```rust<br>
+  // Cargo.toml: cranelift-codegen = { version = "0.131", features = ["all-arch"] }<br>
+  //             cranelift-reader  = "0.131"<br>
+  use cranelift_codegen::{isa, settings, Context};<br>
+  use cranelift_codegen:<span aria-label="settings" class="emoji emoji-2699" role="img" title="settings">:settings:</span>:Configurable;<br>
+  use cranelift_reader::parse_functions;</p>
+<p>fn main() {<br>
+    let src = std::fs::read_to_string(std::env::args().nth(1).unwrap()).unwrap();<br>
+    let mut flag_builder = settings::builder();<br>
+    flag_builder.set("opt_level", "speed").unwrap();<br>
+    let isa = isa::lookup_by_name("aarch64-unknown-unknown").unwrap()<br>
+        .finish(settings::Flags::new(flag_builder)).unwrap();<br>
+    for f in parse_functions(&amp;src).unwrap() {<br>
+        Context::for_function(f).compile(&amp;*isa, &amp;mut Default::default()).unwrap();<br>
+    }<br>
+}<br>
+```</p>
+<p><code>sh
+cargo run --release -- repro.clif
+</code></p>
+</li>
+</ul>
+<h3>Expected Results</h3>
+<p>Compiles successfully. (Verified: x86_64 with <code>wasmtime compile repro.wasm</code> exits 0 in 0.135s on a c2-standard-16 GCE instance with wasmtime 44.0.1.)</p>
+<h3>Actual Results</h3>
+<p>Release-mode panic on aarch64:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">thread</span><span class="w"> </span><span class="o">'</span><span class="na">main</span><span class="o">'</span><span class="w"> </span><span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">cranelift</span><span class="o">-</span><span class="n">codegen</span><span class="o">-</span><span class="mf">0.131.1</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">machinst</span><span class="o">/</span><span class="n">buffer</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">1496</span><span class="p">:</span><span class="mi">17</span><span class="p">:</span>
+<span class="nc">assertion</span><span class="w"> </span><span class="n">failed</span><span class="p">:</span><span class="w"> </span><span class="p">(</span><span class="n">label_offset</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">offset</span><span class="p">)</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="n">kind</span><span class="p">.</span><span class="n">max_pos_range</span><span class="p">()</span>
+</code></pre></div>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">machinst</span><span class="p">::</span><span class="n">buffer</span><span class="p">::</span><span class="n">MachBuffer</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;</span><span class="p">::</span><span class="n">handle_fixup</span>
+<span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">machinst</span><span class="p">::</span><span class="n">buffer</span><span class="p">::</span><span class="n">MachBuffer</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;</span><span class="p">::</span><span class="n">emit_island_maybe_forced</span>
+<span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">machinst</span><span class="p">::</span><span class="n">vcode</span><span class="p">::</span><span class="n">VCode</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;</span><span class="p">::</span><span class="n">emit</span>
+<span class="o">&lt;</span><span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">isa</span><span class="p">::</span><span class="n">aarch64</span><span class="p">::</span><span class="n">AArch64Backend</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">TargetIsa</span><span class="o">&gt;</span><span class="p">::</span><span class="n">compile_function</span>
+</code></pre></div>
+<h3>Versions and Environment</h3>
+<p>Cranelift version: 0.131.0 and 0.131.1</p>
+<table>
+<thead>
+<tr>
+<th>wasmtime</th>
+<th>cranelift</th>
+<th>panic line</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>36.0.7</td>
+<td>0.123.7</td>
+<td><code>buffer.rs:1395</code></td>
+</tr>
+<tr>
+<td>44.0.0</td>
+<td>0.131.0</td>
+<td><code>buffer.rs:1496</code></td>
+</tr>
+<tr>
+<td>44.0.1</td>
+<td>0.131.1</td>
+<td><code>buffer.rs:1496</code></td>
+</tr>
+</tbody>
+</table>
+<p>Operating system: macOS (Apple Silicon M-series).</p>
+<p>Architecture: aarch64 panics; x86_64 unaffected.</p>
+<p><strong>Note on specificity.</strong> Only <code>fcvt_to_sint.i32 f64</code> triggers; <code>fcvt_to_uint</code>, <code>fcvt_to_sint.i64</code>, and <code>sdiv</code> alone do not (the first two emit no <code>Ldr19</code> on this backend, the last has no constant-pool load).<br>
+</p>
+</blockquote>
+
+
+
+<a name="592850305"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313270%20Cranelift%3A%20MachBuffer%20assertion%20w.../near/592850305" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313270.20Cranelift.3A.20MachBuffer.20assertion.20w.2E.2E.2E.html#592850305">(May 04 2026 at 22:05)</a>:</h4>
+<p><a href="https://github.com/darioush">darioush</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13270">Issue #13270</a>.</p>
+
+
+
+<a name="592850306"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313270%20Cranelift%3A%20MachBuffer%20assertion%20w.../near/592850306" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313270.20Cranelift.3A.20MachBuffer.20assertion.20w.2E.2E.2E.html#592850306">(May 04 2026 at 22:05)</a>:</h4>
+<p><a href="https://github.com/darioush">darioush</a> added the cranelift label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13270">Issue #13270</a>.</p>
+
+
+
+<a name="592850503"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313270%20Cranelift%3A%20MachBuffer%20assertion%20w.../near/592850503" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313270.20Cranelift.3A.20MachBuffer.20assertion.20w.2E.2E.2E.html#592850503">(May 04 2026 at 22:06)</a>:</h4>
+<p>cfallin closed <a href="https://github.com/bytecodealliance/wasmtime/issues/13270">issue #13270</a>:</p>
+<blockquote>
+<p>Hello! I found that a certain form of wasm with many chained <code>i32.trunc_f64_s</code>/ <code>f64.convert_i32_s</code> ops can trigger a panic during compilation on aarc64, but compiles fine on x86_64.</p>
+<p>I can confirm the issue reproduces, and it is somewhat sad that I could not find a smaller reproduction. The specifics of the code involved here seems quite detailed and beyond my expertise. As such, I will include the LLM's analysis in case it is helpful:</p>
+<h3><code>.clif</code> Test Case</h3>
+<p>One <code>fcvt_to_sint.i32 f64</code> (which emits a <code>Ldr19</code> constant-pool fixup on aarch64) followed by ~29,200 chained <code>sdiv</code> ops (which pile up deferred traps until the constant pool is forced past the 1 MB <code>Ldr19</code> range):</p>
+<div class="codehilite" data-code-language="clif"><pre><span></span><code>function u0:0(f64, i32) -&gt; i32 fast {
+block0(v0: f64, v1: i32):
+    v2 = fcvt_to_sint.i32 v0      ;; emits Ldr19 fixup at prologue offset ~20
+    v3 = sdiv v2, v1               ;; }
+    v4 = sdiv v3, v1               ;; } ~29,200 sdivs pile up deferred traps
+    ;; ... 29,196 more sdivs ...   ;; }
+    v29202 = sdiv v29201, v1
+    return v29202
+}
+</code></pre></div>
+<p>Generator (<code>gen_clif.py N</code>, default N=29200 panics reliably; threshold ~29,130):</p>
+<div class="codehilite" data-code-language="Python"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="n">N</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="k">else</span> <span class="mi">29200</span>
+<span class="nb">print</span><span class="p">(</span><span class="s1">'function u0:0(f64, i32) -&gt; i32 fast {'</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s1">'block0(v0: f64, v1: i32):'</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s1">'    v2 = fcvt_to_sint.i32 v0'</span><span class="p">)</span>
+<span class="n">prev</span> <span class="o">=</span> <span class="s1">'v2'</span>
+<span class="n">ssa</span> <span class="o">=</span> <span class="mi">3</span>
+<span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">N</span><span class="p">):</span>
+    <span class="n">iv</span> <span class="o">=</span> <span class="n">ssa</span><span class="p">;</span> <span class="n">ssa</span> <span class="o">+=</span> <span class="mi">1</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s1">'    v</span><span class="si">{</span><span class="n">iv</span><span class="si">}</span><span class="s1"> = sdiv </span><span class="si">{</span><span class="n">prev</span><span class="si">}</span><span class="s1">, v1'</span><span class="p">)</span>
+    <span class="n">prev</span> <span class="o">=</span> <span class="sa">f</span><span class="s1">'v</span><span class="si">{</span><span class="n">iv</span><span class="si">}</span><span class="s1">'</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s1">'    return </span><span class="si">{</span><span class="n">prev</span><span class="si">}</span><span class="s1">'</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s1">'}'</span><span class="p">)</span>
+</code></pre></div>
+<h3>Steps to Reproduce</h3>
+<p><a href="https://github.com/user-attachments/files/27377962/gen_clif.py">gen_clif.py</a></p>
+<p><a href="https://github.com/user-attachments/files/27377965/gen.py">gen.py</a></p>
+<ul>
+<li>Generate the wasm with gen.py:</li>
+</ul>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="w"> </span><span class="n">python3</span><span class="w"> </span><span class="n">gen</span><span class="p">.</span><span class="n">py</span><span class="w"> </span><span class="mi">16000</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="n">repro</span><span class="p">.</span><span class="n">wat</span>
+<span class="n">wasm</span><span class="o">-</span><span class="n">tools</span><span class="w"> </span><span class="n">parse</span><span class="w"> </span><span class="n">repro</span><span class="p">.</span><span class="n">wat</span><span class="w"> </span><span class="o">-</span><span class="n">o</span><span class="w"> </span><span class="n">repro</span><span class="p">.</span><span class="n">wasm</span>
+<span class="n">wasmtime</span><span class="w"> </span><span class="n">compile</span><span class="w"> </span><span class="n">repro</span><span class="p">.</span><span class="n">wasm</span>
+</code></pre></div>
+<ul>
+<li>
+<p>or the clif with <code>gen_clif.py N</code>.</p>
+</li>
+<li>
+<p>Compile it against the aarch64 cranelift backend using <code>clif-util compile</code> or the minimal harness below:<br>
+  ```rust<br>
+  // Cargo.toml: cranelift-codegen = { version = "0.131", features = ["all-arch"] }<br>
+  //             cranelift-reader  = "0.131"<br>
+  use cranelift_codegen::{isa, settings, Context};<br>
+  use cranelift_codegen:<span aria-label="settings" class="emoji emoji-2699" role="img" title="settings">:settings:</span>:Configurable;<br>
+  use cranelift_reader::parse_functions;</p>
+<p>fn main() {<br>
+    let src = std::fs::read_to_string(std::env::args().nth(1).unwrap()).unwrap();<br>
+    let mut flag_builder = settings::builder();<br>
+    flag_builder.set("opt_level", "speed").unwrap();<br>
+    let isa = isa::lookup_by_name("aarch64-unknown-unknown").unwrap()<br>
+        .finish(settings::Flags::new(flag_builder)).unwrap();<br>
+    for f in parse_functions(&amp;src).unwrap() {<br>
+        Context::for_function(f).compile(&amp;*isa, &amp;mut Default::default()).unwrap();<br>
+    }<br>
+}<br>
+```</p>
+<p><code>sh
+cargo run --release -- repro.clif
+</code></p>
+</li>
+</ul>
+<h3>Expected Results</h3>
+<p>Compiles successfully. (Verified: x86_64 with <code>wasmtime compile repro.wasm</code> exits 0 in 0.135s on a c2-standard-16 GCE instance with wasmtime 44.0.1.)</p>
+<h3>Actual Results</h3>
+<p>Release-mode panic on aarch64:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">thread</span><span class="w"> </span><span class="o">'</span><span class="na">main</span><span class="o">'</span><span class="w"> </span><span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">cranelift</span><span class="o">-</span><span class="n">codegen</span><span class="o">-</span><span class="mf">0.131.1</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">machinst</span><span class="o">/</span><span class="n">buffer</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">1496</span><span class="p">:</span><span class="mi">17</span><span class="p">:</span>
+<span class="nc">assertion</span><span class="w"> </span><span class="n">failed</span><span class="p">:</span><span class="w"> </span><span class="p">(</span><span class="n">label_offset</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">offset</span><span class="p">)</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="n">kind</span><span class="p">.</span><span class="n">max_pos_range</span><span class="p">()</span>
+</code></pre></div>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">machinst</span><span class="p">::</span><span class="n">buffer</span><span class="p">::</span><span class="n">MachBuffer</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;</span><span class="p">::</span><span class="n">handle_fixup</span>
+<span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">machinst</span><span class="p">::</span><span class="n">buffer</span><span class="p">::</span><span class="n">MachBuffer</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;</span><span class="p">::</span><span class="n">emit_island_maybe_forced</span>
+<span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">machinst</span><span class="p">::</span><span class="n">vcode</span><span class="p">::</span><span class="n">VCode</span><span class="o">&lt;</span><span class="n">I</span><span class="o">&gt;</span><span class="p">::</span><span class="n">emit</span>
+<span class="o">&lt;</span><span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">isa</span><span class="p">::</span><span class="n">aarch64</span><span class="p">::</span><span class="n">AArch64Backend</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">TargetIsa</span><span class="o">&gt;</span><span class="p">::</span><span class="n">compile_function</span>
+</code></pre></div>
+<h3>Versions and Environment</h3>
+<p>Cranelift version: 0.131.0 and 0.131.1</p>
+<table>
+<thead>
+<tr>
+<th>wasmtime</th>
+<th>cranelift</th>
+<th>panic line</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>36.0.7</td>
+<td>0.123.7</td>
+<td><code>buffer.rs:1395</code></td>
+</tr>
+<tr>
+<td>44.0.0</td>
+<td>0.131.0</td>
+<td><code>buffer.rs:1496</code></td>
+</tr>
+<tr>
+<td>44.0.1</td>
+<td>0.131.1</td>
+<td><code>buffer.rs:1496</code></td>
+</tr>
+</tbody>
+</table>
+<p>Operating system: macOS (Apple Silicon M-series).</p>
+<p>Architecture: aarch64 panics; x86_64 unaffected.</p>
+<p><strong>Note on specificity.</strong> Only <code>fcvt_to_sint.i32 f64</code> triggers; <code>fcvt_to_uint</code>, <code>fcvt_to_sint.i64</code>, and <code>sdiv</code> alone do not (the first two emit no <code>Ldr19</code> on this backend, the last has no constant-pool load).<br>
+</p>
+</blockquote>
+
+
+
+<a name="592850505"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313270%20Cranelift%3A%20MachBuffer%20assertion%20w.../near/592850505" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313270.20Cranelift.3A.20MachBuffer.20assertion.20w.2E.2E.2E.html#592850505">(May 04 2026 at 22:06)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/13270#issuecomment-4374842207">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13270">issue #13270</a>:</p>
+<blockquote>
+<p>Hi -- this is a duplicate of #12968; we know about the issue and have a tentative plan to fix it (I just need to find the time). Thanks! I'll go ahead and close-as-duplicate.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: May 20 2026 at 11:01 UTC</p>
+</html>

@@ -1,0 +1,617 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13024 Cross-thread subtask.{drop,cancel... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313024.20Cross-thread.20subtask.2E.7Bdrop.2Ccancel.2E.2E.2E.html">wasmtime / issue #13024 Cross-thread subtask.{drop,cancel...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="584535840"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313024%20Cross-thread%20subtask.%7Bdrop%2Ccancel.../near/584535840" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313024.20Cross-thread.20subtask.2E.7Bdrop.2Ccancel.2E.2E.2E.html#584535840">(Apr 09 2026 at 20:33)</a>:</h4>
+<p>alexcrichton edited <a href="https://github.com/bytecodealliance/wasmtime/issues/13024">issue #13024</a>:</p>
+<blockquote>
+<p>This test, which is generated and needs to be cleaned up:</p>
+<div class="codehilite" data-code-language="wasm"><pre><span></span><code>;;! component_model_async = true
+;;! component_model_threading = true
+;;! reference_types = true
+;;! multi_memory = true
+
+;; Vulnerability: debug_assert_eq in subtask_cancel compiled out in release builds.
+;;
+;; concurrent.rs line 3604:
+;;   debug_assert_eq!(expected_caller, concurrent_state.current_guest_thread()?);
+;;
+;; This check verifies that the thread calling subtask.cancel is the same thread
+;; that created the subtask. In debug builds, this fires a panic (crashing the
+;; host). In release builds, the debug_assert is compiled out, so ANY thread
+;; within the same component instance can cancel any other thread's running subtask.
+;;
+;; Security impact:
+;; - Debug builds: Host process crash (DoS) — exit code 101
+;; - Release builds: Cross-thread authorization bypass — a malicious thread
+;;   can cancel running subtasks belonging to other threads
+
+(component
+  ;; Callee: async export that yields to stay alive
+  (component $callee
+    (core module $m
+      (func $do_work (export "do-work") (result i32)
+        ;; Return YIELD to stay alive (not finished yet)
+        (i32.const 1 (; YIELD ;))
+      )
+
+      (func $callback (export "callback") (param i32 i32 i32) (result i32)
+        ;; Keep yielding — never return. This keeps the subtask in "running" state.
+        (i32.const 1 (; YIELD ;))
+      )
+    )
+
+    (core instance $m (instantiate $m))
+
+    (func (export "do-work") async (canon lift
+      (core func $m "do-work")
+      async (callback (func $m "callback"))
+    ))
+  )
+
+  ;; Caller: spawns an explicit thread that cancels the main thread's subtask
+  (component $caller
+    (import "do-work" (func $do-work async))
+
+    (core module $libc
+      (memory (export "memory") 1)
+      (table (export "__indirect_function_table") 1 funcref)
+    )
+    (core instance $libc (instantiate $libc))
+    (alias core export $libc "memory" (core memory $memory))
+    (alias core export $libc "__indirect_function_table" (core table $table))
+
+    (core module $m
+      (import "" "do-work" (func $do_work (result i32)))
+      (import "" "task.return" (func $task_return))
+      (import "" "subtask.cancel" (func $subtask_cancel (param i32) (result i32)))
+      (import "" "subtask.drop" (func $subtask_drop (param i32)))
+      (import "" "thread.new-indirect" (func $thread_new (param i32 i32) (result i32)))
+      (import "" "thread.unsuspend" (func $thread_unsuspend (param i32)))
+      (import "" "thread.yield" (func $thread_yield (result i32)))
+      (import "" "thread.index" (func $thread_index (result i32)))
+      (import "" "memory" (memory 1))
+      (import "libc" "__indirect_function_table" (table $table 1 funcref))
+
+      (global $main_idx (mut i32) (i32.const 0))
+
+      ;; Explicit thread entry: receives subtask handle as context, cancels it.
+      ;; This violates the invariant that only the creating thread should cancel
+      ;; a subtask. In debug builds, the debug_assert_eq fires and crashes.
+      (func $thread_entry (param $subtask_handle i32)
+        ;; Cancel the subtask that belongs to the MAIN thread.
+        ;; In debug builds: debug_assert_eq(expected_caller=main_thread,
+        ;;   current_guest_thread=this_thread) fires → panic → host crash.
+        ;; In release builds: silently succeeds (authorization bypass).
+        (drop (call $subtask_cancel (local.get $subtask_handle)))
+
+        ;; Reschedule the main thread so it can exit
+        (call $thread_unsuspend (global.get $main_idx))
+      )
+      (export "thread_entry" (func $thread_entry))
+
+      ;; Initialize function table with thread entry function
+      (elem (table $table) (i32.const 0) func $thread_entry)
+
+      ;; Main function
+      (func $run (export "run") (result i32)
+        (local $subtask i32)
+        (local $new_thread i32)
+
+        ;; Save main thread index for the spawned thread to unsuspend us
+        (global.set $main_idx (call $thread_index))
+
+        ;; Call async import → get (BLOCKED | (subtask_handle &lt;&lt; 4))
+        (local.set $subtask (i32.shr_u (call $do_work) (i32.const 4)))
+
+        ;; Spawn an explicit thread that will CANCEL the subtask from a
+        ;; DIFFERENT thread context. Pass the subtask handle as context.
+        (local.set $new_thread
+          (call $thread_new (i32.const 0) (local.get $subtask)))
+
+        ;; Unsuspend the new thread and yield to let it run
+        (call $thread_unsuspend (local.get $new_thread))
+        (drop (call $thread_yield))
+
+        ;; After being unsuspended by the explicit thread, drop the
+        ;; (now-cancelled) subtask and return.
+        (call $subtask_drop (local.get $subtask))
+        (call $task_return)
+        (i32.const 0 (; EXIT ;))
+      )
+
+      ;; Callback for the async export (should not be reached)
+      (func $callback (export "callback") (param i32 i32 i32) (result i32)
+        unreachable
+      )
+    )
+
+    (core type $start_func_ty (func (param i32)))
+    (canon lower (func $do-work) async (memory $memory) (core func $do_work'))
+    (core func $task.return (canon task.return))
+    (core func $subtask.cancel (canon subtask.cancel))
+    (core func $subtask.drop (canon subtask.drop))
+    (core func $thread.new-indirect (canon thread.new-indirect $start_func_ty (table $table)))
+    (core func $thread.unsuspend (canon thread.unsuspend))
+    (core func $thread.yield (canon thread.yield))
+    (core func $thread.index (canon thread.index))
+    (core instance $m (instantiate $m (with "" (instance
+      (export "do-work" (func $do_work'))
+      (export "task.return" (func $task.return))
+      (export "subtask.cancel" (func $subtask.cancel))
+      (export "subtask.drop" (func $subtask.drop))
+      (export "thread.new-indirect" (func $thread.new-indirect))
+      (export "thread.unsuspend" (func $thread.unsuspend))
+      (export "thread.yield" (func $thread.yield))
+      (export "thread.index" (func $thread.index))
+      (export "memory" (memory $memory))
+    )) (with "libc" (instance
+      (export "__indirect_function_table" (table $table))
+    ))))
+
+    (func (export "run") async (canon lift
+      (core func $m "run")
+      async (callback (func $m "callback"))
+    ))
+  )
+
+  (instance $callee (instantiate $callee))
+  (instance $caller (instantiate $caller
+    (with "do-work" (func $callee "do-work"))
+  ))
+
+  (func (export "run") (alias export $caller "run"))
+)
+
+;; In debug builds: this crashes the host (exit code 101) due to
+;; debug_assert_eq!(expected_caller, current_guest_thread()) firing in
+;; subtask_cancel at concurrent.rs line 3604.
+;;
+;; In release builds: this succeeds (the cross-thread cancel is silently allowed),
+;; demonstrating the authorization bypass.
+(assert_trap (invoke "run") "")
+</code></pre></div>
+<p>currently fails</p>
+<p><div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">cargo</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">W</span><span class="w"> </span><span class="n">component</span><span class="o">-</span><span class="n">model</span><span class="o">-</span><span class="k">async</span><span class="p">,</span><span class="n">component</span><span class="o">-</span><span class="n">model</span><span class="o">-</span><span class="n">threading</span><span class="w"> </span><span class="n">vuln3_cross_thread_subtask_cancel</span><span class="p">.</span><span class="n">wast</span>
+<span class="w">    </span><span class="n">Finished</span><span class="w"> </span><span class="err">`</span><span class="n">dev</span><span class="err">`</span><span class="w"> </span><span class="n">profile</span><span class="w"> </span><span class="p">[</span><span class="n">unoptimized</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">debuginfo</span><span class="p">]</span><span class="w"> </span><span class="n">target</span><span class="p">(</span><span class="n">s</span><span class="p">)</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="mf">0.14</span><span class="n">s</span>
+<span class="w">     </span><span class="n">Running</span><span class="w"> </span><span class="err">`</span><span class="o">/</span><span class="n">home</span><span class="o">/</span><span class="n">alex</span><span class="o">/</span><span class="n">code</span><span class="o">/</span><span class="n">wasmtime2</span><span class="o">/</span><span class="n">target</span><span class="o">/</span><span class="n">debug</span><span class="o">/</span><span class="n">wasmtime</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">W</span><span class="w"> </span><span class="n">component</span><span class="o">-</span><span class="n">model</span><span class="o">-</span><span class="k">async</span><span class="p">,</span><span class="n">component</span><span class="o">-</span><span class="n">model</span><span class="o">-</span><span class="n">threading</span><span class="w"> </span><span class="n">vuln3_cross_thread_subtask_cancel</span><span class="p">.</span><span class="n">wast</span><span class="err">`</span>
+
+<span class="n">thread</span><span class="w"> </span><span class="o">'</span><span class="na">main</span><span class="o">'</span><span class="w"> </span><span class="p">(</span><span class="mi">405121</span><span class="p">)</span><span class="w"> </span><span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">crates</span><span class="o">/</span><span class="n">wasmtime</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">runtime</span><span class="o">/</span><span class="n">component</span><span class="o">/</span><span class="n">concurrent</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">3604</span><span class="p">:</span><span class="mi">9</span><span class="p">:</span>
+<span class="nc">assertion</span><span class="w"> </span><span class="err">`</span><span class="n">left</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">right</span><span class="err">`</span><span class="w"> </span><span class="n">failed</span>
+<span class="w">  </span><span class="n">left</span><span class="p">:</span><span class="w"> </span><span class="nc">QualifiedThreadId</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">)</span>
+<span class="w"> </span><span class="n">right</span><span class="p">:</span><span class="w"> </span><span class="nc">QualifiedThreadId</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">7</span><span class="p">)</span>
+<span class="n">note</span><span class="p">:</span><span class="w"> </span><span class="nc">run</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="err">`</span><span class="n">RUST_BACKTRACE</span><span class="o">=</span><span class="mi">1</span><span class="err">`</span><span class="w"> </span><span class="n">environment</span><span class="w"> </span><span class="n">variable</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">display</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="n">backtrace</span>
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="584535877"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313024%20Cross-thread%20subtask.%7Bdrop%2Ccancel.../near/584535877" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313024.20Cross-thread.20subtask.2E.7Bdrop.2Ccancel.2E.2E.2E.html#584535877">(Apr 09 2026 at 20:33)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/13024#issuecomment-4217310279">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13024">issue #13024</a>:</p>
+<blockquote>
+<p>Another test, for <code>subtask.drop</code>, is:</p>
+<p><div class="codehilite" data-code-language="wasm"><pre><span></span><code>;;! component_model_async = true
+;;! component_model_threading = true
+;;! reference_types = true
+;;! multi_memory = true
+
+;; Vulnerability: debug_assert_eq in subtask_drop compiled out in release builds.
+;;
+;; concurrent.rs line 3170:
+;;   debug_assert_eq!(expected_caller, concurrent_state.current_guest_thread()?);
+;;
+;; This check verifies that the thread calling subtask.drop is the same thread
+;; that created the subtask. In debug builds, this fires a panic (crashing the
+;; host). In release builds, the debug_assert is compiled out, so ANY thread
+;; within the same component instance can drop any other thread's subtask.
+;;
+;; The same pattern exists in subtask.cancel at line 3604.
+;;
+;; Security impact:
+;; - Debug builds: Host process crash (DoS) — exit code 101
+;; - Release builds: Cross-thread authorization bypass — a malicious thread
+;;   can drop/cancel subtasks belonging to other threads, invalidating their
+;;   handles and causing subsequent operations to fail with "handle not found"
+
+(component
+  ;; Callee: simple async export that yields then returns
+  (component $callee
+    (core module $m
+      (import "" "task.return" (func $task_return))
+
+      (func $do_work (export "do-work") (result i32)
+        ;; Yield once to force the caller to get a BLOCKED subtask handle
+        (i32.const 1 (; YIELD ;))
+      )
+
+      (func $callback (export "callback") (param i32 i32 i32) (result i32)
+        ;; On callback (after yield), return the result and exit
+        (call $task_return)
+        (i32.const 0 (; EXIT ;))
+      )
+    )
+
+    (core func $task.return (canon task.return))
+    (core instance $m (instantiate $m (with "" (instance
+      (export "task.return" (func $task.return))
+    ))))
+
+    (func (export "do-work") async (canon lift
+      (core func $m "do-work")
+      async (callback (func $m "callback"))
+    ))
+  )
+
+  ;; Caller: spawns an explicit thread that drops the main thread's subtask
+  (component $caller
+    (import "do-work" (func $do-work async))
+
+    (core module $libc
+      (memory (export "memory") 1)
+      (table (export "__indirect_function_table") 1 funcref)
+    )
+    (core instance $libc (instantiate $libc))
+    (alias core export $libc "memory" (core memory $memory))
+    (alias core export $libc "__indirect_function_table" (core table $table))
+
+    (core module $m
+      (import "" "do-work" (func $do_work (result i32)))
+      (import "" "task.return" (func $task_return))
+      (import "" "subtask.drop" (func $subtask_drop (param i32)))
+      (import "" "waitable.join" (func $join (param i32 i32)))
+      (import "" "waitable-set.new" (func $set_new (result i32)))
+      (import "" "waitable-set.wait" (func $set_wait (param i32 i32) (result i32)))
+      (import "" "thread.new-indirect" (func $thread_new (param i32 i32) (result i32)))
+      (import "" "thread.unsuspend" (func $thread_unsuspend (param i32)))
+      (import "" "thread.yield" (func $thread_yield (result i32)))
+      (import "" "thread.index" (func $thread_index (result i32)))
+      (import "" "memory" (memory 1))
+      (import "libc" "__indirect_function_table" (table $table 1 funcref))
+
+      (global $main_idx (mut i32) (i32.const 0))
+
+      ;; Explicit thread entry: receives subtask handle as context, drops it.
+      ;; This violates the invariant that only the creating thread should drop
+      ;; a subtask. In debug builds, the debug_assert_eq fires and crashes.
+      (func $thread_entry (param $subtask_handle i32)
+        ;; Drop the subtask that belongs to the MAIN thread.
+        ;; In debug builds: debug_assert_eq(expected_caller=main_thread,
+        ;;   current_guest_thread=this_thread) fires → panic → host crash.
+        ;; In release builds: silently succeeds (authorization bypass).
+        (call $subtask_drop (local.get $subtask_handle))
+
+        ;; Reschedule the main thread so it can exit after we're done
+        (call $thread_unsuspend (global.get $main_idx))
+      )
+      (export "thread_entry" (func $thread_entry))
+
+      ;; Initialize function table with thread entry function
+      (elem (table $table) (i32.const 0) func $thread_entry)
+
+      ;; Main function
+      (func $run (export "run") (result i32)
+        (local $subtask i32)
+        (local $set i32)
+        (local $new_thread i32)
+
+        ;; Save main thread index for the spawned thread to unsuspend us
+        (global.set $main_idx (call $thread_index))
+
+        ;; Call async import → get (BLOCKED | (subtask_handle &lt;&lt; 4))
+        (local.set $subtask (i32.shr_u (call $do_work) (i32.const 4)))
+
+        ;; Create a waitable set and join the subtask to it
+        (local.set $set (call $set_new))
+        (call $join (local.get $subtask) (local.get $set))
+
+        ;; Wait for the Returned event (blocks on fiber, resumes when callee returns)
+        (drop (call $set_wait (local.get $set) (i32.const 0)))
+
+        ;; Now the subtask has returned. Spawn an explicit thread that will
+        ;; DROP the subtask from a DIFFERENT thread context.
+        ;; Pass the subtask handle as the context parameter.
+        (local.set $new_thread
+          (call $thread_new (i32.const 0) (local.get $subtask)))
+
+        ;; Unsuspend the new thread and yield to let it run
+        (call $thread_unsuspend (local.get $new_thread))
+        (drop (call $thread_yield))
+
+        ;; Return and exit
+        (call $task_return)
+        (i32.const 0 (; EXIT ;))
+      )
+
+      ;; Callback for the async export (should not be reached)
+      (func $callback (export "callback") (param i32 i32 i32) (result i32)
+        unreachable
+      )
+    )
+
+    (core type $start_func_ty (func (param i32)))
+    (canon lower (func $do-work) async (memory $memory) (core func $do_work'))
+    (core func $task.return (canon task.return))
+    (core func $subtask.drop (canon subtask.drop))
+    (core func $waitable.join (canon waitable.join))
+    (core func $waitable-set.new (canon waitable-set.new))
+    (core func $waitable-set.wait (canon waitable-set.wait (memory $memory)))
+    (core func $thread.new-indirect (canon thread.new-indirect $start_func_ty (table $table)))
+    (core func $thread.unsuspend (canon thread.unsuspend))
+    (core func $thread.yield (canon thread.yield))
+    (core func $thread.index (canon thread.index))
+    (core instance $m (instantiate $m (with "" (instance
+      (export "do-work" (func $do_work'))
+      (export "task.return" (func $task.return))
+      (export "subtask.drop" (func $subtask.drop))
+      (export "waitable.join" (func $waitable.join))
+      (export "waitable-set.new" (func $waitable-set.new))
+      (export "waitable-set.wait" (func $waitable-set.wait))
+      (export "thread.new-indirect" (func $thread.new-indirect))
+      (export "thread.unsuspend" (func $thread.unsuspend))
+      (export "thread.yield" (func $thread.yield))
+      (export "thread.index" (func $thread.index))
+      (export "memory" (memory $memory))
+    )) (with "libc" (instance
+      (export "__indirect_function_table" (table $table))
+    ))))
+
+    (func (export "run") async (canon lift
+      (core func $m "run")
+      async (callback (func $m "callback"))
+    ))
+  )
+
+  (instance $callee (instantiate $callee))
+  (instance $caller (instantiate $caller
+    (with "do-work" (func $callee "do-work"))
+  ))
+
+  (func (export "run") (alias export $caller "run"))
+)
+
+;; In debug builds: this crashes the host (exit code 101) due to
+;; debug_assert_eq!(expected_caller, current_guest_thread()) firing.
+;;
+;; In release builds: this succeeds (the cross-thread drop is silently allowed),
+;; demonstrating the authorization bypass.
+;;
+;; Using assert_trap to catch the debug-mode crash:
+(assert_trap (invoke "run") "")
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="584625689"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313024%20Cross-thread%20subtask.%7Bdrop%2Ccancel.../near/584625689" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313024.20Cross-thread.20subtask.2E.7Bdrop.2Ccancel.2E.2E.2E.html#584625689">(Apr 10 2026 at 09:04)</a>:</h4>
+<p>TartanLlama <a href="https://github.com/bytecodealliance/wasmtime/issues/13024#issuecomment-4222407988">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13024">issue #13024</a>:</p>
+<blockquote>
+<p>Seems to me there are two issues here:</p>
+<ul>
+<li>The thread index check should be a task index check</li>
+<li>Even with the task index check, it's feasible that a different task in the same instance could just pull a handle index out of thin air and try to cancel it, in which case this should return an <code>Err</code> rather than asserting</li>
+</ul>
+<p>Does that sound right to you @alexcrichton @dicej ?</p>
+</blockquote>
+
+
+
+<a name="584743588"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313024%20Cross-thread%20subtask.%7Bdrop%2Ccancel.../near/584743588" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313024.20Cross-thread.20subtask.2E.7Bdrop.2Ccancel.2E.2E.2E.html#584743588">(Apr 10 2026 at 19:19)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/13024#issuecomment-4226184036">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13024">issue #13024</a>:</p>
+<blockquote>
+<p>Hm thinking about this... I see now this isn't actually related to threading all that much despite the tests using that as a vehicle to model this. In that sense sorry @TartanLlama I should have dug in more before pinging!</p>
+<p>Otherwise though I agree that this should in theory be a task check instead of a thread check, but I'd differ I think in my conclusions after that. I think that these assertions are a holdover of a previous design (e.g. what was removed in <a href="https://github.com/bytecodealliance/wasmtime/pull/12570">https://github.com/bytecodealliance/wasmtime/pull/12570</a>) where parents were expected, but nowadays I don't think there's any reasonable expected caller in these situations. Effectively any task within the instance is allowed to cancel/drop any other subtask just fine.</p>
+<p>I'll work on a PR for this</p>
+</blockquote>
+
+
+
+<a name="584749894"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313024%20Cross-thread%20subtask.%7Bdrop%2Ccancel.../near/584749894" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313024.20Cross-thread.20subtask.2E.7Bdrop.2Ccancel.2E.2E.2E.html#584749894">(Apr 10 2026 at 20:02)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/13024#issuecomment-4226436478">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13024">issue #13024</a>:</p>
+<blockquote>
+<p>Fixed in <a href="https://github.com/bytecodealliance/wasmtime/pull/13041">https://github.com/bytecodealliance/wasmtime/pull/13041</a></p>
+</blockquote>
+
+
+
+<a name="584755932"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313024%20Cross-thread%20subtask.%7Bdrop%2Ccancel.../near/584755932" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313024.20Cross-thread.20subtask.2E.7Bdrop.2Ccancel.2E.2E.2E.html#584755932">(Apr 10 2026 at 20:49)</a>:</h4>
+<p>alexcrichton closed <a href="https://github.com/bytecodealliance/wasmtime/issues/13024">issue #13024</a>:</p>
+<blockquote>
+<p>This test, which is generated and needs to be cleaned up:</p>
+<div class="codehilite" data-code-language="wasm"><pre><span></span><code>;;! component_model_async = true
+;;! component_model_threading = true
+;;! reference_types = true
+;;! multi_memory = true
+
+;; Vulnerability: debug_assert_eq in subtask_cancel compiled out in release builds.
+;;
+;; concurrent.rs line 3604:
+;;   debug_assert_eq!(expected_caller, concurrent_state.current_guest_thread()?);
+;;
+;; This check verifies that the thread calling subtask.cancel is the same thread
+;; that created the subtask. In debug builds, this fires a panic (crashing the
+;; host). In release builds, the debug_assert is compiled out, so ANY thread
+;; within the same component instance can cancel any other thread's running subtask.
+;;
+;; Security impact:
+;; - Debug builds: Host process crash (DoS) — exit code 101
+;; - Release builds: Cross-thread authorization bypass — a malicious thread
+;;   can cancel running subtasks belonging to other threads
+
+(component
+  ;; Callee: async export that yields to stay alive
+  (component $callee
+    (core module $m
+      (func $do_work (export "do-work") (result i32)
+        ;; Return YIELD to stay alive (not finished yet)
+        (i32.const 1 (; YIELD ;))
+      )
+
+      (func $callback (export "callback") (param i32 i32 i32) (result i32)
+        ;; Keep yielding — never return. This keeps the subtask in "running" state.
+        (i32.const 1 (; YIELD ;))
+      )
+    )
+
+    (core instance $m (instantiate $m))
+
+    (func (export "do-work") async (canon lift
+      (core func $m "do-work")
+      async (callback (func $m "callback"))
+    ))
+  )
+
+  ;; Caller: spawns an explicit thread that cancels the main thread's subtask
+  (component $caller
+    (import "do-work" (func $do-work async))
+
+    (core module $libc
+      (memory (export "memory") 1)
+      (table (export "__indirect_function_table") 1 funcref)
+    )
+    (core instance $libc (instantiate $libc))
+    (alias core export $libc "memory" (core memory $memory))
+    (alias core export $libc "__indirect_function_table" (core table $table))
+
+    (core module $m
+      (import "" "do-work" (func $do_work (result i32)))
+      (import "" "task.return" (func $task_return))
+      (import "" "subtask.cancel" (func $subtask_cancel (param i32) (result i32)))
+      (import "" "subtask.drop" (func $subtask_drop (param i32)))
+      (import "" "thread.new-indirect" (func $thread_new (param i32 i32) (result i32)))
+      (import "" "thread.unsuspend" (func $thread_unsuspend (param i32)))
+      (import "" "thread.yield" (func $thread_yield (result i32)))
+      (import "" "thread.index" (func $thread_index (result i32)))
+      (import "" "memory" (memory 1))
+      (import "libc" "__indirect_function_table" (table $table 1 funcref))
+
+      (global $main_idx (mut i32) (i32.const 0))
+
+      ;; Explicit thread entry: receives subtask handle as context, cancels it.
+      ;; This violates the invariant that only the creating thread should cancel
+      ;; a subtask. In debug builds, the debug_assert_eq fires and crashes.
+      (func $thread_entry (param $subtask_handle i32)
+        ;; Cancel the subtask that belongs to the MAIN thread.
+        ;; In debug builds: debug_assert_eq(expected_caller=main_thread,
+        ;;   current_guest_thread=this_thread) fires → panic → host crash.
+        ;; In release builds: silently succeeds (authorization bypass).
+        (drop (call $subtask_cancel (local.get $subtask_handle)))
+
+        ;; Reschedule the main thread so it can exit
+        (call $thread_unsuspend (global.get $main_idx))
+      )
+      (export "thread_entry" (func $thread_entry))
+
+      ;; Initialize function table with thread entry function
+      (elem (table $table) (i32.const 0) func $thread_entry)
+
+      ;; Main function
+      (func $run (export "run") (result i32)
+        (local $subtask i32)
+        (local $new_thread i32)
+
+        ;; Save main thread index for the spawned thread to unsuspend us
+        (global.set $main_idx (call $thread_index))
+
+        ;; Call async import → get (BLOCKED | (subtask_handle &lt;&lt; 4))
+        (local.set $subtask (i32.shr_u (call $do_work) (i32.const 4)))
+
+        ;; Spawn an explicit thread that will CANCEL the subtask from a
+        ;; DIFFERENT thread context. Pass the subtask handle as context.
+        (local.set $new_thread
+          (call $thread_new (i32.const 0) (local.get $subtask)))
+
+        ;; Unsuspend the new thread and yield to let it run
+        (call $thread_unsuspend (local.get $new_thread))
+        (drop (call $thread_yield))
+
+        ;; After being unsuspended by the explicit thread, drop the
+        ;; (now-cancelled) subtask and return.
+        (call $subtask_drop (local.get $subtask))
+        (call $task_return)
+        (i32.const 0 (; EXIT ;))
+      )
+
+      ;; Callback for the async export (should not be reached)
+      (func $callback (export "callback") (param i32 i32 i32) (result i32)
+        unreachable
+      )
+    )
+
+    (core type $start_func_ty (func (param i32)))
+    (canon lower (func $do-work) async (memory $memory) (core func $do_work'))
+    (core func $task.return (canon task.return))
+    (core func $subtask.cancel (canon subtask.cancel))
+    (core func $subtask.drop (canon subtask.drop))
+    (core func $thread.new-indirect (canon thread.new-indirect $start_func_ty (table $table)))
+    (core func $thread.unsuspend (canon thread.unsuspend))
+    (core func $thread.yield (canon thread.yield))
+    (core func $thread.index (canon thread.index))
+    (core instance $m (instantiate $m (with "" (instance
+      (export "do-work" (func $do_work'))
+      (export "task.return" (func $task.return))
+      (export "subtask.cancel" (func $subtask.cancel))
+      (export "subtask.drop" (func $subtask.drop))
+      (export "thread.new-indirect" (func $thread.new-indirect))
+      (export "thread.unsuspend" (func $thread.unsuspend))
+      (export "thread.yield" (func $thread.yield))
+      (export "thread.index" (func $thread.index))
+      (export "memory" (memory $memory))
+    )) (with "libc" (instance
+      (export "__indirect_function_table" (table $table))
+    ))))
+
+    (func (export "run") async (canon lift
+      (core func $m "run")
+      async (callback (func $m "callback"))
+    ))
+  )
+
+  (instance $callee (instantiate $callee))
+  (instance $caller (instantiate $caller
+    (with "do-work" (func $callee "do-work"))
+  ))
+
+  (func (export "run") (alias export $caller "run"))
+)
+
+;; In debug builds: this crashes the host (exit code 101) due to
+;; debug_assert_eq!(expected_caller, current_guest_thread()) firing in
+;; subtask_cancel at concurrent.rs line 3604.
+;;
+;; In release builds: this succeeds (the cross-thread cancel is silently allowed),
+;; demonstrating the authorization bypass.
+(assert_trap (invoke "run") "")
+</code></pre></div>
+<p>currently fails</p>
+<p><div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">cargo</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">W</span><span class="w"> </span><span class="n">component</span><span class="o">-</span><span class="n">model</span><span class="o">-</span><span class="k">async</span><span class="p">,</span><span class="n">component</span><span class="o">-</span><span class="n">model</span><span class="o">-</span><span class="n">threading</span><span class="w"> </span><span class="n">vuln3_cross_thread_subtask_cancel</span><span class="p">.</span><span class="n">wast</span>
+<span class="w">    </span><span class="n">Finished</span><span class="w"> </span><span class="err">`</span><span class="n">dev</span><span class="err">`</span><span class="w"> </span><span class="n">profile</span><span class="w"> </span><span class="p">[</span><span class="n">unoptimized</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">debuginfo</span><span class="p">]</span><span class="w"> </span><span class="n">target</span><span class="p">(</span><span class="n">s</span><span class="p">)</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="mf">0.14</span><span class="n">s</span>
+<span class="w">     </span><span class="n">Running</span><span class="w"> </span><span class="err">`</span><span class="o">/</span><span class="n">home</span><span class="o">/</span><span class="n">alex</span><span class="o">/</span><span class="n">code</span><span class="o">/</span><span class="n">wasmtime2</span><span class="o">/</span><span class="n">target</span><span class="o">/</span><span class="n">debug</span><span class="o">/</span><span class="n">wasmtime</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">W</span><span class="w"> </span><span class="n">component</span><span class="o">-</span><span class="n">model</span><span class="o">-</span><span class="k">async</span><span class="p">,</span><span class="n">component</span><span class="o">-</span><span class="n">model</span><span class="o">-</span><span class="n">threading</span><span class="w"> </span><span class="n">vuln3_cross_thread_subtask_cancel</span><span class="p">.</span><span class="n">wast</span><span class="err">`</span>
+
+<span class="n">thread</span><span class="w"> </span><span class="o">'</span><span class="na">main</span><span class="o">'</span><span class="w"> </span><span class="p">(</span><span class="mi">405121</span><span class="p">)</span><span class="w"> </span><span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">crates</span><span class="o">/</span><span class="n">wasmtime</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">runtime</span><span class="o">/</span><span class="n">component</span><span class="o">/</span><span class="n">concurrent</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">3604</span><span class="p">:</span><span class="mi">9</span><span class="p">:</span>
+<span class="nc">assertion</span><span class="w"> </span><span class="err">`</span><span class="n">left</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">right</span><span class="err">`</span><span class="w"> </span><span class="n">failed</span>
+<span class="w">  </span><span class="n">left</span><span class="p">:</span><span class="w"> </span><span class="nc">QualifiedThreadId</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">)</span>
+<span class="w"> </span><span class="n">right</span><span class="p">:</span><span class="w"> </span><span class="nc">QualifiedThreadId</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">7</span><span class="p">)</span>
+<span class="n">note</span><span class="p">:</span><span class="w"> </span><span class="nc">run</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="err">`</span><span class="n">RUST_BACKTRACE</span><span class="o">=</span><span class="mi">1</span><span class="err">`</span><span class="w"> </span><span class="n">environment</span><span class="w"> </span><span class="n">variable</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">display</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="n">backtrace</span>
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: May 20 2026 at 11:01 UTC</p>
+</html>

@@ -1,0 +1,272 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #13225 Fix souper harvest · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313225.20Fix.20souper.20harvest.html">wasmtime / PR #13225 Fix souper harvest</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="591669235"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313225%20Fix%20souper%20harvest/near/591669235" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313225.20Fix.20souper.20harvest.html#591669235">(Apr 29 2026 at 01:38)</a>:</h4>
+<p>bongjunj opened <a href="https://github.com/bytecodealliance/wasmtime/pull/13225">PR #13225</a> from <code>bongjunj:souper</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+<p>Currently, <code>clif-util souper-harvest</code> has limitations where:</p>
+<ol>
+<li>It does not translate <code>bnot</code> instruction to Souper IR, and</li>
+<li>It does not correctly infer types of instructions that use an <code>icmp</code> instruction.</li>
+</ol>
+<p>The fix for the first one is straightforward. I added a translation from <code>bnot x</code> (in CLIF) to <code>xor x, -1</code> (in Souper IR).</p>
+<p>The second problem arises when an instruction uses a value produced by an <code>icmp</code> instruction.<br>
+In Cranelift, <code>icmp</code> produces an <code>i8</code> value; therefore, its users usually also are of <code>i8</code> type too.<br>
+However, in Souper/LLVM, <code>icmp</code> produces an <code>i1</code> value; therefore, its users, without casting, users must be of <code>i1</code> type.<br>
+The current problem of the harvest is that, when determining the type of an Souper value, it directly copies the type of that of CLIF side. For example,</p>
+<div class="codehilite" data-code-language="clif"><pre><span></span><code>function %test_bor_slt_eq(i32, i32) -&gt; i8 fast {
+block0(v0: i32, v1: i32):
+    v2 = icmp slt v0, v1
+    v3 = icmp eq v0, v1
+    v4 = bor v2, v3
+    return v4
+}
+</code></pre></div>
+<p>is translated to</p>
+<div class="codehilite" data-code-language="souper"><pre><span></span><code>...
+%0:i32 = var
+%1:i32 = var
+%2:i1 = slt %0, %1
+%3:i1 = eq %0, %1
+%4:i8 = or %2, %3
+infer %4
+</code></pre></div>
+<p>which causes type mismatch, preventing Souper from running properly. (Notice that <code>or</code> is  <code>i8</code>!)</p>
+<p>I fixed this by carrying Souper-side type information with new <code>SouperValue</code> struct, while such a type information is produced in <code>souper_type_of</code> function. Initial type informations are only produced for constants (<code>iconst</code>), variables, and type-casts.</p>
+<p>However, I didn't yet implement type unification. A proper implementation would require a larger refactor to make operand types mutable and propagate inferred types back to other values. The current change is intentionally narrower to keep this simple.</p>
+<h3>Test Results</h3>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">cargo</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="o">--</span><span class="w"> </span><span class="n">souper</span><span class="o">-</span><span class="n">harvest</span><span class="w"> </span><span class="o">--</span><span class="n">target</span><span class="w"> </span><span class="n">x86_64</span><span class="w"> </span><span class="n">cranelift</span><span class="o">/</span><span class="n">filetests</span><span class="o">/</span><span class="n">filetests</span><span class="o">/</span><span class="n">egraph</span><span class="o">/</span><span class="n">bitops</span><span class="p">.</span><span class="n">clif</span><span class="w"> </span><span class="o">-</span><span class="n">o</span><span class="w"> </span><span class="o">/</span><span class="n">tmp</span><span class="o">/</span><span class="n">souper</span><span class="o">/</span>
+<span class="p">.</span><span class="o">/</span><span class="n">run</span><span class="o">-</span><span class="n">souper</span><span class="p">.</span><span class="n">sh</span><span class="w"> </span><span class="n">souper</span><span class="o">-</span><span class="n">check</span><span class="w"> </span><span class="o">/</span><span class="n">tmp</span><span class="o">/</span><span class="n">souper</span><span class="o">/</span>
+</code></pre></div>
+<ul>
+<li><strong>Before</strong>: Produced 57 left-hand sides. 17 souper-check inference successes. 34 timed out.<ul>
+<li>Fails on the example case above.</li>
+</ul>
+</li>
+<li><strong>After</strong>: Processing 72 left-hand sides. 21 souper-check inference succeesses. 50 timed out.</li>
+</ul>
+</blockquote>
+
+
+
+<a name="591669237"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313225%20Fix%20souper%20harvest/near/591669237" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313225.20Fix.20souper.20harvest.html#591669237">(Apr 29 2026 at 01:38)</a>:</h4>
+<p>bongjunj requested <a href="https://github.com/alexcrichton">alexcrichton</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13225">PR #13225</a>.</p>
+
+
+
+<a name="591669238"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313225%20Fix%20souper%20harvest/near/591669238" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313225.20Fix.20souper.20harvest.html#591669238">(Apr 29 2026 at 01:38)</a>:</h4>
+<p>bongjunj requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13225">PR #13225</a>.</p>
+
+
+
+<a name="591697079"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313225%20Fix%20souper%20harvest/near/591697079" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313225.20Fix.20souper.20harvest.html#591697079">(Apr 29 2026 at 06:34)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13225">PR #13225</a>.</p>
+
+
+
+<a name="591783156"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313225%20Fix%20souper%20harvest/near/591783156" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313225.20Fix.20souper.20harvest.html#591783156">(Apr 29 2026 at 12:39)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> fitzgen submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13225#pullrequestreview-4196947993">PR review</a>:</p>
+<blockquote>
+<p>Thanks @bongjunj! One question below.</p>
+</blockquote>
+
+
+
+<a name="591783157"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313225%20Fix%20souper%20harvest/near/591783157" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313225.20Fix.20souper.20harvest.html#591783157">(Apr 29 2026 at 12:39)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> fitzgen created <a href="https://github.com/bytecodealliance/wasmtime/pull/13225#discussion_r3160988230">PR review comment</a>:</p>
+<blockquote>
+<p>Would it be good enough to eagerly translate CLIF <code>icmp</code> instructions into two Souper instructions: a compare followed by a zero extend? Eg something like this:</p>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="c1">;; CLIF</span>
+<span class="err">v</span><span class="mi">3</span> <span class="err">=</span> <span class="err">icmp</span> <span class="err">eq</span> <span class="err">v</span><span class="mi">1</span><span class="err">,</span> <span class="err">v</span><span class="mi">2</span>
+<span class="err">v</span><span class="mi">4</span> <span class="err">=</span> <span class="err">bor</span> <span class="err">v</span><span class="mi">3</span><span class="err">,</span> <span class="err">v</span><span class="mi">3</span>
+
+<span class="c1">;; Souper</span>
+<span class="err">%</span><span class="mi">3</span><span class="err">:i</span><span class="mi">1</span> <span class="err">=</span> <span class="err">eq</span> <span class="err">%</span><span class="mi">1</span><span class="err">,</span> <span class="err">%</span><span class="mi">2</span>
+<span class="err">%</span><span class="mi">4</span><span class="err">:i</span><span class="mi">8</span> <span class="err">=</span> <span class="err">zext</span> <span class="err">%</span><span class="mi">3</span>
+<span class="err">%</span><span class="mi">5</span><span class="err">:i</span><span class="mi">8</span> <span class="err">=</span> <span class="err">or</span> <span class="err">%</span><span class="mi">4</span><span class="err">,</span> <span class="err">%</span><span class="mi">4</span>
+</code></pre></div>
+<p>I think this would be a bit simpler and lets us avoid the <code>SouperValue</code> machinery, while also fixing the same set of type mismatch bugs? But I'm not 100% sure on that, so I'm interested in your feedback and whether you considered this approach.</p>
+</blockquote>
+
+
+
+<a name="591790131"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313225%20Fix%20souper%20harvest/near/591790131" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313225.20Fix.20souper.20harvest.html#591790131">(Apr 29 2026 at 13:05)</a>:</h4>
+<p>alexcrichton unassigned alexcrichton from <a href="https://github.com/bytecodealliance/wasmtime/pull/13225">PR #13225 Fix souper harvest</a>.</p>
+
+
+
+<a name="591790134"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313225%20Fix%20souper%20harvest/near/591790134" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313225.20Fix.20souper.20harvest.html#591790134">(Apr 29 2026 at 13:05)</a>:</h4>
+<p>alexcrichton requested <a href="https://github.com/fitzgen">fitzgen</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13225">PR #13225</a>.</p>
+
+
+
+<a name="591937631"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313225%20Fix%20souper%20harvest/near/591937631" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313225.20Fix.20souper.20harvest.html#591937631">(Apr 30 2026 at 02:08)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> bongjunj submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13225#pullrequestreview-4201991203">PR review</a>.</p>
+
+
+
+<a name="591937632"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313225%20Fix%20souper%20harvest/near/591937632" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313225.20Fix.20souper.20harvest.html#591937632">(Apr 30 2026 at 02:08)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> bongjunj created <a href="https://github.com/bytecodealliance/wasmtime/pull/13225#discussion_r3165259181">PR review comment</a>:</p>
+<blockquote>
+<p>Oh, haven't considered this approach, and I agree this would make this PR much simpler...<br>
+In addition, having the bitwidth semantics aligned (<code>or i8</code> vs <code>or i1</code>) is a huge plus!</p>
+<p>Imagine that <code>or</code> is being used by other instructions, then the <code>i1</code> type of the <code>or</code> would affect the user instructions. And this effect would be descended further on and on. Restoring the type of the comparison immediately with <code>zext</code> will rule out this scenario.</p>
+<p>I will come back once I complete implementing your approach. Thanks for the insight!</p>
+</blockquote>
+
+
+
+<a name="592213382"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313225%20Fix%20souper%20harvest/near/592213382" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313225.20Fix.20souper.20harvest.html#592213382">(May 01 2026 at 05:30)</a>:</h4>
+<p>bongjunj updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13225">PR #13225</a>.</p>
+
+
+
+<a name="592218021"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313225%20Fix%20souper%20harvest/near/592218021" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313225.20Fix.20souper.20harvest.html#592218021">(May 01 2026 at 06:04)</a>:</h4>
+<p>bongjunj <a href="https://github.com/bytecodealliance/wasmtime/pull/13225#issuecomment-4358080707">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13225">PR #13225</a>:</p>
+<blockquote>
+<p>Change the implementation.</p>
+<ul>
+<li>Now it zero-extends the icmp result immediately, instead of keeping <code>i1</code> results down the instruction sequence.</li>
+<li>Fixed a bug where <code>ule</code> was mistranslated to <code>sle</code>.</li>
+</ul>
+<p>One thing to keep in mind:<br>
+<code>souper</code> now inserts <code>freeze</code> instruction at the end. However, the insertion is proven not necessary: <a href="https://alive2.llvm.org/ce/z/2B5qiB">https://alive2.llvm.org/ce/z/2B5qiB</a></p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">souper</span><span class="o">-</span><span class="n">check</span><span class="w"> </span><span class="o">--</span><span class="n">infer</span><span class="o">-</span><span class="n">rhs</span><span class="w"> </span><span class="o">-</span><span class="n">souper</span><span class="o">-</span><span class="n">enumerative</span><span class="o">-</span><span class="n">synthesis</span><span class="o">-</span><span class="n">max</span><span class="o">-</span><span class="n">instructions</span><span class="o">=</span><span class="mi">3</span>
+<span class="o">%</span><span class="mi">0</span><span class="p">:</span><span class="kt">i32</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">var</span>
+<span class="o">%</span><span class="mi">1</span><span class="p">:</span><span class="kt">i32</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">var</span>
+<span class="o">%</span><span class="mi">2</span><span class="p">:</span><span class="nc">i1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ult</span><span class="w"> </span><span class="o">%</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="mi">1</span>
+<span class="o">%</span><span class="mi">4</span><span class="p">:</span><span class="nc">i1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">eq</span><span class="w"> </span><span class="o">%</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="mi">1</span>
+<span class="o">%</span><span class="mi">5</span><span class="p">:</span><span class="nc">i1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">or</span><span class="w"> </span><span class="o">%</span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="mi">4</span>
+<span class="n">infer</span><span class="w"> </span><span class="o">%</span><span class="mi">5</span>
+<span class="p">;</span><span class="w"> </span><span class="n">RHS</span><span class="w"> </span><span class="n">inferred</span><span class="w"> </span><span class="n">successfully</span>
+<span class="o">%</span><span class="mi">5</span><span class="p">:</span><span class="nc">i1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ule</span><span class="w"> </span><span class="o">%</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="mi">1</span>
+<span class="n">result</span><span class="w"> </span><span class="o">%</span><span class="mi">5</span>
+</code></pre></div>
+<p><div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">souper</span><span class="o">-</span><span class="n">check</span><span class="w"> </span><span class="o">--</span><span class="n">infer</span><span class="o">-</span><span class="n">rhs</span><span class="w"> </span><span class="o">-</span><span class="n">souper</span><span class="o">-</span><span class="n">enumerative</span><span class="o">-</span><span class="n">synthesis</span><span class="o">-</span><span class="n">max</span><span class="o">-</span><span class="n">instructions</span><span class="o">=</span><span class="mi">3</span>
+<span class="o">%</span><span class="mi">0</span><span class="p">:</span><span class="kt">i32</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">var</span>
+<span class="o">%</span><span class="mi">1</span><span class="p">:</span><span class="kt">i32</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">var</span>
+<span class="o">%</span><span class="mi">2</span><span class="p">:</span><span class="nc">i1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ult</span><span class="w"> </span><span class="o">%</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="mi">1</span>
+<span class="o">%</span><span class="mi">3</span><span class="p">:</span><span class="kt">i8</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">zext</span><span class="w"> </span><span class="o">%</span><span class="mi">2</span>
+<span class="o">%</span><span class="mi">4</span><span class="p">:</span><span class="nc">i1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">eq</span><span class="w"> </span><span class="o">%</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="mi">1</span>
+<span class="o">%</span><span class="mi">5</span><span class="p">:</span><span class="kt">i8</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">zext</span><span class="w"> </span><span class="o">%</span><span class="mi">4</span>
+<span class="o">%</span><span class="mi">6</span><span class="p">:</span><span class="kt">i8</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">or</span><span class="w"> </span><span class="o">%</span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="mi">5</span>
+<span class="n">infer</span><span class="w"> </span><span class="o">%</span><span class="mi">6</span>
+<span class="p">;</span><span class="w"> </span><span class="n">RHS</span><span class="w"> </span><span class="n">inferred</span><span class="w"> </span><span class="n">successfully</span>
+<span class="o">%</span><span class="mi">7</span><span class="p">:</span><span class="nc">i1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ule</span><span class="w"> </span><span class="o">%</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="mi">1</span>
+<span class="o">%</span><span class="mi">8</span><span class="p">:</span><span class="kt">i8</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">zext</span><span class="w"> </span><span class="o">%</span><span class="mi">7</span>
+<span class="o">%</span><span class="mi">9</span><span class="p">:</span><span class="kt">i8</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">freeze</span><span class="w"> </span><span class="o">%</span><span class="mi">8</span>
+<span class="n">result</span><span class="w"> </span><span class="o">%</span><span class="mi">9</span>
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="592218035"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313225%20Fix%20souper%20harvest/near/592218035" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313225.20Fix.20souper.20harvest.html#592218035">(May 01 2026 at 06:04)</a>:</h4>
+<p>bongjunj edited a <a href="https://github.com/bytecodealliance/wasmtime/pull/13225#issuecomment-4358080707">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13225">PR #13225</a>:</p>
+<blockquote>
+<p>@fitzgen  Change the implementation.</p>
+<ul>
+<li>Now it zero-extends the icmp result immediately, instead of keeping <code>i1</code> results down the instruction sequence.</li>
+<li>Fixed a bug where <code>ule</code> was mistranslated to <code>sle</code>.</li>
+</ul>
+<p>One thing to keep in mind:<br>
+<code>souper</code> now inserts <code>freeze</code> instruction at the end. However, the insertion is proven not necessary: <a href="https://alive2.llvm.org/ce/z/2B5qiB">https://alive2.llvm.org/ce/z/2B5qiB</a></p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">souper</span><span class="o">-</span><span class="n">check</span><span class="w"> </span><span class="o">--</span><span class="n">infer</span><span class="o">-</span><span class="n">rhs</span><span class="w"> </span><span class="o">-</span><span class="n">souper</span><span class="o">-</span><span class="n">enumerative</span><span class="o">-</span><span class="n">synthesis</span><span class="o">-</span><span class="n">max</span><span class="o">-</span><span class="n">instructions</span><span class="o">=</span><span class="mi">3</span>
+<span class="o">%</span><span class="mi">0</span><span class="p">:</span><span class="kt">i32</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">var</span>
+<span class="o">%</span><span class="mi">1</span><span class="p">:</span><span class="kt">i32</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">var</span>
+<span class="o">%</span><span class="mi">2</span><span class="p">:</span><span class="nc">i1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ult</span><span class="w"> </span><span class="o">%</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="mi">1</span>
+<span class="o">%</span><span class="mi">4</span><span class="p">:</span><span class="nc">i1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">eq</span><span class="w"> </span><span class="o">%</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="mi">1</span>
+<span class="o">%</span><span class="mi">5</span><span class="p">:</span><span class="nc">i1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">or</span><span class="w"> </span><span class="o">%</span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="mi">4</span>
+<span class="n">infer</span><span class="w"> </span><span class="o">%</span><span class="mi">5</span>
+<span class="p">;</span><span class="w"> </span><span class="n">RHS</span><span class="w"> </span><span class="n">inferred</span><span class="w"> </span><span class="n">successfully</span>
+<span class="o">%</span><span class="mi">5</span><span class="p">:</span><span class="nc">i1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ule</span><span class="w"> </span><span class="o">%</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="mi">1</span>
+<span class="n">result</span><span class="w"> </span><span class="o">%</span><span class="mi">5</span>
+</code></pre></div>
+<p><div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">souper</span><span class="o">-</span><span class="n">check</span><span class="w"> </span><span class="o">--</span><span class="n">infer</span><span class="o">-</span><span class="n">rhs</span><span class="w"> </span><span class="o">-</span><span class="n">souper</span><span class="o">-</span><span class="n">enumerative</span><span class="o">-</span><span class="n">synthesis</span><span class="o">-</span><span class="n">max</span><span class="o">-</span><span class="n">instructions</span><span class="o">=</span><span class="mi">3</span>
+<span class="o">%</span><span class="mi">0</span><span class="p">:</span><span class="kt">i32</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">var</span>
+<span class="o">%</span><span class="mi">1</span><span class="p">:</span><span class="kt">i32</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">var</span>
+<span class="o">%</span><span class="mi">2</span><span class="p">:</span><span class="nc">i1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ult</span><span class="w"> </span><span class="o">%</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="mi">1</span>
+<span class="o">%</span><span class="mi">3</span><span class="p">:</span><span class="kt">i8</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">zext</span><span class="w"> </span><span class="o">%</span><span class="mi">2</span>
+<span class="o">%</span><span class="mi">4</span><span class="p">:</span><span class="nc">i1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">eq</span><span class="w"> </span><span class="o">%</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="mi">1</span>
+<span class="o">%</span><span class="mi">5</span><span class="p">:</span><span class="kt">i8</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">zext</span><span class="w"> </span><span class="o">%</span><span class="mi">4</span>
+<span class="o">%</span><span class="mi">6</span><span class="p">:</span><span class="kt">i8</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">or</span><span class="w"> </span><span class="o">%</span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="mi">5</span>
+<span class="n">infer</span><span class="w"> </span><span class="o">%</span><span class="mi">6</span>
+<span class="p">;</span><span class="w"> </span><span class="n">RHS</span><span class="w"> </span><span class="n">inferred</span><span class="w"> </span><span class="n">successfully</span>
+<span class="o">%</span><span class="mi">7</span><span class="p">:</span><span class="nc">i1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ule</span><span class="w"> </span><span class="o">%</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="mi">1</span>
+<span class="o">%</span><span class="mi">8</span><span class="p">:</span><span class="kt">i8</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">zext</span><span class="w"> </span><span class="o">%</span><span class="mi">7</span>
+<span class="o">%</span><span class="mi">9</span><span class="p">:</span><span class="kt">i8</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">freeze</span><span class="w"> </span><span class="o">%</span><span class="mi">8</span>
+<span class="n">result</span><span class="w"> </span><span class="o">%</span><span class="mi">9</span>
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="592337949"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313225%20Fix%20souper%20harvest/near/592337949" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313225.20Fix.20souper.20harvest.html#592337949">(May 01 2026 at 18:27)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> fitzgen submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13225#pullrequestreview-4212698402">PR review</a>:</p>
+<blockquote>
+<p>Awesome, thanks!</p>
+</blockquote>
+
+
+
+<a name="592337971"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313225%20Fix%20souper%20harvest/near/592337971" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313225.20Fix.20souper.20harvest.html#592337971">(May 01 2026 at 18:27)</a>:</h4>
+<p>fitzgen added <a href="https://github.com/bytecodealliance/wasmtime/pull/13225">PR #13225 Fix souper harvest</a> to the merge queue.</p>
+
+
+
+<a name="592341900"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313225%20Fix%20souper%20harvest/near/592341900" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313225.20Fix.20souper.20harvest.html#592341900">(May 01 2026 at 18:53)</a>:</h4>
+<p><span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span> fitzgen merged <a href="https://github.com/bytecodealliance/wasmtime/pull/13225">PR #13225</a>.</p>
+
+
+
+<a name="592341901"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313225%20Fix%20souper%20harvest/near/592341901" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313225.20Fix.20souper.20harvest.html#592341901">(May 01 2026 at 18:53)</a>:</h4>
+<p>fitzgen removed <a href="https://github.com/bytecodealliance/wasmtime/pull/13225">PR #13225 Fix souper harvest</a> from the merge queue.</p>
+
+
+
+<hr><p>Last updated: May 20 2026 at 11:01 UTC</p>
+</html>

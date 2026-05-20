@@ -1,0 +1,107 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13122 cranelift-assembler-x64: generate... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313122.20cranelift-assembler-x64.3A.20generate.2E.2E.2E.html">wasmtime / issue #13122 cranelift-assembler-x64: generate...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="585800138"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313122%20cranelift-assembler-x64%3A%20generate.../near/585800138" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313122.20cranelift-assembler-x64.3A.20generate.2E.2E.2E.html#585800138">(Apr 16 2026 at 03:26)</a>:</h4>
+<p>travisdowns opened <a href="https://github.com/bytecodealliance/wasmtime/issues/13122">issue #13122</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p><code>cranelift/assembler-x64/build.rs</code> writes absolute <code>OUT_DIR</code> paths into <code>generated-files.rs</code> with no sanitization:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">for</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="o">&amp;</span><span class="n">built_files</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="fm">writeln!</span><span class="p">(</span><span class="n">vec_of_built_files</span><span class="p">,</span><span class="w"> </span><span class="s">"  {:?}.into(),"</span><span class="p">,</span><span class="w"> </span><span class="n">file</span><span class="p">.</span><span class="n">display</span><span class="p">()).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>This produces:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="fm">vec!</span><span class="p">[</span>
+<span class="w">  </span><span class="s">"/home/alice/wasmtime/target/debug/build/cranelift-assembler-x64-abc123/out/assembler.rs"</span><span class="p">.</span><span class="n">into</span><span class="p">(),</span>
+<span class="p">]</span>
+</code></pre></div>
+<p>On released versions (v32.0.0 and earlier), <code>generated-files.rs</code> was <code>include!</code>'d in <code>lib.rs</code> via a <code>pub fn generated_files()</code>, which meant the absolute path got compiled into <strong>every binary linking the library</strong> — including downstream projects that only use cranelift as a dependency. On <code>main</code>, the <code>no_std</code> refactor (63330f11f5) moved the <code>include!</code> out of <code>lib.rs</code> into <code>main.rs</code> only, so the library is no longer affected. But <code>generated-files.rs</code> and the utility binary still contain the absolute path.</p>
+<p>Related: #13121 — the <code>cranelift-codegen</code> side of this was already fixed by 0694bba38 ("Strip prefixes in file names").</p>
+<h2>The tension</h2>
+<p>There's a tension here between two goals:</p>
+<ul>
+<li><strong>Deterministic library output</strong>: the library should not embed build-specific absolute paths</li>
+<li><strong>Useful utility binary</strong>: <code>main.rs</code> prints paths to generated code, which is most useful as absolute paths</li>
+</ul>
+<p>On <code>main</code>, the first goal is already satisfied (the <code>include!</code> was moved out of <code>lib.rs</code>). For the second, <code>main.rs</code> could reconstruct the absolute path at runtime using <code>env!("OUT_DIR")</code> while keeping the source text deterministic.</p>
+<p>One possible approach: have <code>build.rs</code> write only the filename relative to <code>OUT_DIR</code> into <code>generated-files.rs</code>, and have <code>main.rs</code> join it with <code>env!("OUT_DIR")</code> at compile time:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="c1">// build.rs: write relative filename</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">relative</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">file</span><span class="p">.</span><span class="n">strip_prefix</span><span class="p">(</span><span class="n">out_dir</span><span class="p">).</span><span class="n">expect</span><span class="p">(</span><span class="s">"generated file should be under OUT_DIR"</span><span class="p">);</span>
+<span class="fm">writeln!</span><span class="p">(</span><span class="n">vec_of_built_files</span><span class="p">,</span><span class="w"> </span><span class="s">"  std::path::Path::new(env!(</span><span class="se">\"</span><span class="s">OUT_DIR</span><span class="se">\"</span><span class="s">)).join({:?}).into(),"</span><span class="p">,</span><span class="w"> </span><span class="n">relative</span><span class="p">.</span><span class="n">display</span><span class="p">()).</span><span class="n">unwrap</span><span class="p">();</span>
+</code></pre></div>
+<p>This keeps <code>generated-files.rs</code> deterministic while the compiled binary still prints the correct absolute path (since <code>env!("OUT_DIR")</code> is resolved at compile time by rustc, not baked into the source text).</p>
+<p>But I'm not sure how important the determinism of the utility binary itself is to the project — happy to hear what approach you'd prefer.</p>
+<h2>Reproducer</h2>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code><span class="nb">cd</span><span class="w"> </span>wasmtime
+<span class="nv">CARGO_TARGET_DIR</span><span class="o">=</span>/tmp/build1<span class="w"> </span>cargo<span class="w"> </span>build<span class="w"> </span>-p<span class="w"> </span>cranelift-assembler-x64
+cat<span class="w"> </span>/tmp/build1/debug/build/cranelift-assembler-x64-*/out/generated-files.rs
+<span class="c1"># → absolute path to /tmp/build1/...</span>
+</code></pre></div>
+<h2>Environment</h2>
+<ul>
+<li>Discovered building wasmtime v32.0.0 via Bazel (rules_rust) with sandboxed execution</li>
+<li>On v32.0.0, this caused non-determinism in the <strong>library</strong> (and all downstream binaries)</li>
+<li>On <code>main</code>, library is no longer affected but <code>generated-files.rs</code> and the utility binary still are</li>
+</ul>
+</blockquote>
+
+
+
+<a name="585801657"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313122%20cranelift-assembler-x64%3A%20generate.../near/585801657" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313122.20cranelift-assembler-x64.3A.20generate.2E.2E.2E.html#585801657">(Apr 16 2026 at 03:46)</a>:</h4>
+<p>travisdowns closed <a href="https://github.com/bytecodealliance/wasmtime/issues/13122">issue #13122</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p><code>cranelift/assembler-x64/build.rs</code> writes absolute <code>OUT_DIR</code> paths into <code>generated-files.rs</code> with no sanitization:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">for</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="o">&amp;</span><span class="n">built_files</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="fm">writeln!</span><span class="p">(</span><span class="n">vec_of_built_files</span><span class="p">,</span><span class="w"> </span><span class="s">"  {:?}.into(),"</span><span class="p">,</span><span class="w"> </span><span class="n">file</span><span class="p">.</span><span class="n">display</span><span class="p">()).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>This produces:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="fm">vec!</span><span class="p">[</span>
+<span class="w">  </span><span class="s">"/home/alice/wasmtime/target/debug/build/cranelift-assembler-x64-abc123/out/assembler.rs"</span><span class="p">.</span><span class="n">into</span><span class="p">(),</span>
+<span class="p">]</span>
+</code></pre></div>
+<p>On released versions (v32.0.0 and earlier), <code>generated-files.rs</code> was <code>include!</code>'d in <code>lib.rs</code> via a <code>pub fn generated_files()</code>, which meant the absolute path got compiled into <strong>every binary linking the library</strong> — including downstream projects that only use cranelift as a dependency. On <code>main</code>, the <code>no_std</code> refactor (63330f11f5) moved the <code>include!</code> out of <code>lib.rs</code> into <code>main.rs</code> only, so the library is no longer affected. But <code>generated-files.rs</code> and the utility binary still contain the absolute path.</p>
+<p>Related: #13121 — the <code>cranelift-codegen</code> side of this was already fixed by 0694bba38 ("Strip prefixes in file names").</p>
+<h2>The tension</h2>
+<p>There's a tension here between two goals:</p>
+<ul>
+<li><strong>Deterministic library output</strong>: the library should not embed build-specific absolute paths</li>
+<li><strong>Useful utility binary</strong>: <code>main.rs</code> prints paths to generated code, which is most useful as absolute paths</li>
+</ul>
+<p>On <code>main</code>, the first goal is already satisfied (the <code>include!</code> was moved out of <code>lib.rs</code>). For the second, <code>main.rs</code> could reconstruct the absolute path at runtime using <code>env!("OUT_DIR")</code> while keeping the source text deterministic.</p>
+<p>One possible approach: have <code>build.rs</code> write only the filename relative to <code>OUT_DIR</code> into <code>generated-files.rs</code>, and have <code>main.rs</code> join it with <code>env!("OUT_DIR")</code> at compile time:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="c1">// build.rs: write relative filename</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">relative</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">file</span><span class="p">.</span><span class="n">strip_prefix</span><span class="p">(</span><span class="n">out_dir</span><span class="p">).</span><span class="n">expect</span><span class="p">(</span><span class="s">"generated file should be under OUT_DIR"</span><span class="p">);</span>
+<span class="fm">writeln!</span><span class="p">(</span><span class="n">vec_of_built_files</span><span class="p">,</span><span class="w"> </span><span class="s">"  std::path::Path::new(env!(</span><span class="se">\"</span><span class="s">OUT_DIR</span><span class="se">\"</span><span class="s">)).join({:?}).into(),"</span><span class="p">,</span><span class="w"> </span><span class="n">relative</span><span class="p">.</span><span class="n">display</span><span class="p">()).</span><span class="n">unwrap</span><span class="p">();</span>
+</code></pre></div>
+<p>This keeps <code>generated-files.rs</code> deterministic while the compiled binary still prints the correct absolute path (since <code>env!("OUT_DIR")</code> is resolved at compile time by rustc, not baked into the source text).</p>
+<p>But I'm not sure how important the determinism of the utility binary itself is to the project — happy to hear what approach you'd prefer.</p>
+<h2>Reproducer</h2>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code><span class="nb">cd</span><span class="w"> </span>wasmtime
+<span class="nv">CARGO_TARGET_DIR</span><span class="o">=</span>/tmp/build1<span class="w"> </span>cargo<span class="w"> </span>build<span class="w"> </span>-p<span class="w"> </span>cranelift-assembler-x64
+cat<span class="w"> </span>/tmp/build1/debug/build/cranelift-assembler-x64-*/out/generated-files.rs
+<span class="c1"># → absolute path to /tmp/build1/...</span>
+</code></pre></div>
+<h2>Environment</h2>
+<ul>
+<li>Discovered building wasmtime v32.0.0 via Bazel (rules_rust) with sandboxed execution</li>
+<li>On v32.0.0, this caused non-determinism in the <strong>library</strong> (and all downstream binaries)</li>
+<li>On <code>main</code>, library is no longer affected but <code>generated-files.rs</code> and the utility binary still are</li>
+</ul>
+</blockquote>
+
+
+
+<hr><p>Last updated: May 20 2026 at 11:01 UTC</p>
+</html>

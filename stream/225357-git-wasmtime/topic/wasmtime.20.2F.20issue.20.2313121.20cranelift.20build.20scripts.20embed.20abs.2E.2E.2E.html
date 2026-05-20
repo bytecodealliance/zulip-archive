@@ -1,0 +1,323 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13121 cranelift build scripts embed abs... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313121.20cranelift.20build.20scripts.20embed.20abs.2E.2E.2E.html">wasmtime / issue #13121 cranelift build scripts embed abs...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="585795666"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313121%20cranelift%20build%20scripts%20embed%20abs.../near/585795666" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313121.20cranelift.20build.20scripts.20embed.20abs.2E.2E.2E.html#585795666">(Apr 16 2026 at 02:26)</a>:</h4>
+<p>travisdowns opened <a href="https://github.com/bytecodealliance/wasmtime/issues/13121">issue #13121</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p>The <code>build.rs</code> scripts for <code>cranelift-codegen</code> and <code>cranelift-assembler-x64</code> embed absolute filesystem paths into generated Rust source files. These paths change across different build environments (different machines, different <code>--target-dir</code> values, sandboxed build systems like Bazel or Nix), producing non-reproducible build artifacts.</p>
+<p>Both issues are present on <code>main</code> as of d5f1b973e48b.</p>
+<h2>Affected crates</h2>
+<h3>1. <code>cranelift-assembler-x64</code></h3>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/assembler-x64/build.rs"><code>cranelift/assembler-x64/build.rs</code></a> writes absolute <code>OUT_DIR</code> paths directly into <code>generated-files.rs</code> with no attempt to relativize:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">for</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="o">&amp;</span><span class="n">built_files</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="fm">writeln!</span><span class="p">(</span><span class="n">vec_of_built_files</span><span class="p">,</span><span class="w"> </span><span class="s">"  {:?}.into(),"</span><span class="p">,</span><span class="w"> </span><span class="n">file</span><span class="p">.</span><span class="n">display</span><span class="p">()).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="p">}</span>
+</code></pre></div>
+<p><code>built_files</code> contains absolute paths derived from <code>OUT_DIR</code>, so <code>generated-files.rs</code> ends up with:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="fm">vec!</span><span class="p">[</span>
+<span class="w">  </span><span class="s">"/home/alice/wasmtime/target/debug/build/cranelift-assembler-x64-abc123/out/assembler.rs"</span><span class="p">.</span><span class="n">into</span><span class="p">(),</span>
+<span class="p">]</span>
+</code></pre></div>
+<p>This path changes with the build directory, user home directory, or sandbox instance.</p>
+<h3>2. <code>cranelift-codegen</code></h3>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/codegen/build.rs"><code>make_isle_source_path_relative()</code></a> in <code>cranelift/codegen/build.rs</code> tries to strip <code>cur_dir</code> (the crate's source directory) from file paths:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">fn</span><span class="w"> </span><span class="nf">make_isle_source_path_relative</span><span class="p">(</span>
+<span class="w">    </span><span class="n">cur_dir</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">std</span><span class="p">::</span><span class="n">path</span><span class="p">::</span><span class="n">Path</span><span class="p">,</span>
+<span class="w">    </span><span class="n">filename</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">std</span><span class="p">::</span><span class="n">path</span><span class="p">::</span><span class="n">Path</span><span class="p">,</span>
+<span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">std</span><span class="p">::</span><span class="n">path</span><span class="p">::</span><span class="n">PathBuf</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(</span><span class="n">suffix</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">filename</span><span class="p">.</span><span class="n">strip_prefix</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cur_dir</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">suffix</span><span class="p">.</span><span class="n">to_path_buf</span><span class="p">()</span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">filename</span><span class="p">.</span><span class="n">to_path_buf</span><span class="p">()</span><span class="w">  </span><span class="c1">// ← falls back to absolute path</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>This function is called with <code>isle_dir</code> (= <code>OUT_DIR</code>) as the filename. Since <code>OUT_DIR</code> is under the <code>target/</code> directory and not under the crate source directory, <code>strip_prefix</code> fails, and the absolute path falls through unchanged. These absolute paths then get embedded into ISLE-generated source files (<code>isle_x64.rs</code>, etc.) as:</p>
+<ul>
+<li>Error string literals: <code>"no rule matched for term ... at /home/alice/wasmtime/target/debug/build/cranelift-codegen-XXX/out/assembler.isle line 18"</code></li>
+<li>Source location comments: <code>// Rule at /home/alice/.../assembler.isle line 19</code></li>
+</ul>
+<p>The paths for source inputs (under <code>crate_dir</code>) ARE correctly relativized because <code>crate_dir</code> is the current working directory. Only paths under <code>OUT_DIR</code> leak through.</p>
+<h2>Impact</h2>
+<ul>
+<li><strong>Standard Cargo builds:</strong> building on different machines, or with different <code>--target-dir</code>, produces different generated source and different final binaries</li>
+<li><strong>Sandboxed builds (Bazel, Nix, etc.):</strong> each build action runs in a unique sandbox directory, so every build produces a different binary even on the same machine with the same inputs</li>
+</ul>
+<h2>Reproducer</h2>
+<p>Tested on v32.0.0 (cranelift 0.119.0) and confirmed still present on <code>main</code>.</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code><span class="nb">cd</span><span class="w"> </span>wasmtime
+
+<span class="c1"># Build with two different target directories</span>
+<span class="nv">CARGO_TARGET_DIR</span><span class="o">=</span>/tmp/build1<span class="w"> </span>cargo<span class="w"> </span>build<span class="w"> </span>-p<span class="w"> </span>cranelift-codegen<span class="w"> </span>--features<span class="w"> </span>x86<span class="w"> </span>-p<span class="w"> </span>cranelift-assembler-x64
+<span class="nv">CARGO_TARGET_DIR</span><span class="o">=</span>/tmp/build2<span class="w"> </span>cargo<span class="w"> </span>build<span class="w"> </span>-p<span class="w"> </span>cranelift-codegen<span class="w"> </span>--features<span class="w"> </span>x86<span class="w"> </span>-p<span class="w"> </span>cranelift-assembler-x64
+
+<span class="c1"># cranelift-assembler-x64: absolute paths in generated-files.rs</span>
+cat<span class="w"> </span>/tmp/build1/debug/build/cranelift-assembler-x64-*/out/generated-files.rs
+<span class="c1"># vec![</span>
+<span class="c1">#   "/tmp/build1/debug/build/cranelift-assembler-x64-8eadefadaa0bb4cd/out/assembler.rs".into(),</span>
+<span class="c1"># ]</span>
+
+<span class="c1"># cranelift-codegen: absolute paths in ISLE-generated source</span>
+<span class="c1"># (despite make_isle_source_path_relative trying to strip them)</span>
+grep<span class="w"> </span>-c<span class="w"> </span><span class="s2">"/tmp/build1"</span><span class="w"> </span>/tmp/build1/debug/build/cranelift-codegen-*/out/isle_x64.rs
+<span class="c1"># → 297 matches — all from OUT_DIR paths where strip_prefix failed</span>
+</code></pre></div>
+<h2>Environment</h2>
+<ul>
+<li>Discovered building wasmtime 32.0.0 via Bazel (rules_rust) with sandboxed execution</li>
+<li>Confirmed present on <code>main</code> (d5f1b973e48b)</li>
+<li>Also reproducible with standard Cargo using different <code>--target-dir</code> values</li>
+</ul>
+</blockquote>
+
+
+
+<a name="585795802"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313121%20cranelift%20build%20scripts%20embed%20abs.../near/585795802" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313121.20cranelift.20build.20scripts.20embed.20abs.2E.2E.2E.html#585795802">(Apr 16 2026 at 02:27)</a>:</h4>
+<p>travisdowns edited <a href="https://github.com/bytecodealliance/wasmtime/issues/13121">issue #13121</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p>The <code>build.rs</code> scripts for <code>cranelift-codegen</code> and <code>cranelift-assembler-x64</code> embed absolute filesystem paths into generated Rust source files. These paths change across different build environments (different machines, different <code>--target-dir</code> values, sandboxed build systems like Bazel or Nix), producing non-reproducible build artifacts.</p>
+<p>Both issues are present on <code>main</code> as of d5f1b973e48b.</p>
+<h2>Affected crates</h2>
+<h3>1. <code>cranelift-assembler-x64</code></h3>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/assembler-x64/build.rs"><code>cranelift/assembler-x64/build.rs</code></a> writes absolute <code>OUT_DIR</code> paths directly into <code>generated-files.rs</code> with no attempt to relativize:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">for</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="o">&amp;</span><span class="n">built_files</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="fm">writeln!</span><span class="p">(</span><span class="n">vec_of_built_files</span><span class="p">,</span><span class="w"> </span><span class="s">"  {:?}.into(),"</span><span class="p">,</span><span class="w"> </span><span class="n">file</span><span class="p">.</span><span class="n">display</span><span class="p">()).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>\`built_files\` contains absolute paths derived from \`OUT_DIR\`, so \`generated-files.rs\` ends up with:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="fm">vec!</span><span class="p">[</span>
+<span class="w">  </span><span class="s">"/home/alice/wasmtime/target/debug/build/cranelift-assembler-x64-abc123/out/assembler.rs"</span><span class="p">.</span><span class="n">into</span><span class="p">(),</span>
+<span class="p">]</span>
+</code></pre></div>
+<p>This path changes with the build directory, user home directory, or sandbox instance.</p>
+<h3>2. <code>cranelift-codegen</code></h3>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/codegen/build.rs"><code>make_isle_source_path_relative()</code></a> in <code>cranelift/codegen/build.rs</code> tries to strip <code>cur_dir</code> (the crate's source directory) from file paths:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">fn</span><span class="w"> </span><span class="nf">make_isle_source_path_relative</span><span class="p">(</span>
+<span class="w">    </span><span class="n">cur_dir</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">std</span><span class="p">::</span><span class="n">path</span><span class="p">::</span><span class="n">Path</span><span class="p">,</span>
+<span class="w">    </span><span class="n">filename</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">std</span><span class="p">::</span><span class="n">path</span><span class="p">::</span><span class="n">Path</span><span class="p">,</span>
+<span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">std</span><span class="p">::</span><span class="n">path</span><span class="p">::</span><span class="n">PathBuf</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(</span><span class="n">suffix</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">filename</span><span class="p">.</span><span class="n">strip_prefix</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cur_dir</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">suffix</span><span class="p">.</span><span class="n">to_path_buf</span><span class="p">()</span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">filename</span><span class="p">.</span><span class="n">to_path_buf</span><span class="p">()</span><span class="w">  </span><span class="c1">// ← falls back to absolute path</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>This function is called with <code>isle_dir</code> (= <code>OUT_DIR</code>) as the filename. When <code>OUT_DIR</code> is a descendant of <code>cur_dir</code>, <code>strip_prefix</code> succeeds and paths are correctly relativized — this is the common case in standard Cargo builds where <code>target/</code> is under the workspace root and the crate source is also under the workspace root. However, when <code>OUT_DIR</code> is NOT under <code>cur_dir</code>, <code>strip_prefix</code> fails and the absolute path falls through unchanged. This happens in:</p>
+<ul>
+<li><strong>Sandboxed builds</strong> (Bazel, Nix, etc.) where <code>OUT_DIR</code> and <code>CWD</code> are under different subtrees of the sandbox</li>
+<li><strong>Cargo builds with <code>--target-dir</code></strong> pointing outside the workspace (e.g. <code>CARGO_TARGET_DIR=/tmp/build</code>)</li>
+<li><strong>Any build</strong> where the output directory tree doesn't share a prefix with the source directory</li>
+</ul>
+<p>These absolute paths get embedded into ISLE-generated source files (<code>isle_x64.rs</code>, etc.) as:</p>
+<ul>
+<li>Error string literals: <code>"no rule matched for term ... at /home/alice/wasmtime/target/debug/build/cranelift-codegen-XXX/out/assembler.isle line 18"</code></li>
+<li>Source location comments: <code>// Rule at /home/alice/.../assembler.isle line 19</code></li>
+</ul>
+<p>The paths for source inputs (under <code>crate_dir</code>) ARE correctly relativized because <code>crate_dir</code> is the current working directory. Only paths under <code>OUT_DIR</code> leak through when it's outside the CWD tree.</p>
+<h2>Impact</h2>
+<ul>
+<li><strong>Standard Cargo builds:</strong> building on different machines, or with <code>--target-dir</code> outside the workspace, produces different generated source and different final binaries</li>
+<li><strong>Sandboxed builds (Bazel, Nix, etc.):</strong> each build action runs in a unique sandbox directory, so every build produces a different binary even on the same machine with the same inputs</li>
+</ul>
+<h2>Reproducer</h2>
+<p>Tested on v32.0.0 (cranelift 0.119.0) and confirmed still present on <code>main</code>.</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code><span class="nb">cd</span><span class="w"> </span>wasmtime
+
+<span class="c1"># Build with two different target directories (outside the workspace)</span>
+<span class="nv">CARGO_TARGET_DIR</span><span class="o">=</span>/tmp/build1<span class="w"> </span>cargo<span class="w"> </span>build<span class="w"> </span>-p<span class="w"> </span>cranelift-codegen<span class="w"> </span>--features<span class="w"> </span>x86<span class="w"> </span>-p<span class="w"> </span>cranelift-assembler-x64
+<span class="nv">CARGO_TARGET_DIR</span><span class="o">=</span>/tmp/build2<span class="w"> </span>cargo<span class="w"> </span>build<span class="w"> </span>-p<span class="w"> </span>cranelift-codegen<span class="w"> </span>--features<span class="w"> </span>x86<span class="w"> </span>-p<span class="w"> </span>cranelift-assembler-x64
+
+<span class="c1"># cranelift-assembler-x64: absolute paths in generated-files.rs</span>
+cat<span class="w"> </span>/tmp/build1/debug/build/cranelift-assembler-x64-*/out/generated-files.rs
+<span class="c1"># vec![</span>
+<span class="c1">#   "/tmp/build1/debug/build/cranelift-assembler-x64-8eadefadaa0bb4cd/out/assembler.rs".into(),</span>
+<span class="c1"># ]</span>
+
+<span class="c1"># cranelift-codegen: absolute paths in ISLE-generated source</span>
+<span class="c1"># (make_isle_source_path_relative's strip_prefix fails because</span>
+<span class="c1"># /tmp/build1/... is not under the CWD)</span>
+grep<span class="w"> </span>-c<span class="w"> </span><span class="s2">"/tmp/build1"</span><span class="w"> </span>/tmp/build1/debug/build/cranelift-codegen-*/out/isle_x64.rs
+<span class="c1"># → 297 matches — all from OUT_DIR paths where strip_prefix failed</span>
+</code></pre></div>
+<h2>Environment</h2>
+<ul>
+<li>Discovered building wasmtime 32.0.0 via Bazel (rules_rust) with sandboxed execution</li>
+<li>Confirmed present on <code>main</code> (d5f1b973e48b)</li>
+<li>Also reproducible with standard Cargo using different <code>--target-dir</code> values</li>
+</ul>
+</blockquote>
+
+
+
+<a name="585796091"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313121%20cranelift%20build%20scripts%20embed%20abs.../near/585796091" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313121.20cranelift.20build.20scripts.20embed.20abs.2E.2E.2E.html#585796091">(Apr 16 2026 at 02:31)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/13121#issuecomment-4257021540">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13121">issue #13121</a>:</p>
+<blockquote>
+<p>@travisdowns thanks for the report -- we're happy to take PRs to fix reproducible build issues!</p>
+</blockquote>
+
+
+
+<a name="585796240"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313121%20cranelift%20build%20scripts%20embed%20abs.../near/585796240" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313121.20cranelift.20build.20scripts.20embed.20abs.2E.2E.2E.html#585796240">(Apr 16 2026 at 02:33)</a>:</h4>
+<p>travisdowns <a href="https://github.com/bytecodealliance/wasmtime/issues/13121#issuecomment-4257028892">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13121">issue #13121</a>:</p>
+<blockquote>
+<blockquote>
+<p><a href="https://github.com/travisdowns">@travisdowns</a> thanks for the report -- we're happy to take PRs to fix reproducible build issues!</p>
+</blockquote>
+<p>I was in the middle of that, but just noticed on main there have been changes already in this which might fix it ... that escaped my attention. Will update shortly.</p>
+</blockquote>
+
+
+
+<a name="585796999"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313121%20cranelift%20build%20scripts%20embed%20abs.../near/585796999" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313121.20cranelift.20build.20scripts.20embed.20abs.2E.2E.2E.html#585796999">(Apr 16 2026 at 02:42)</a>:</h4>
+<p>travisdowns edited <a href="https://github.com/bytecodealliance/wasmtime/issues/13121">issue #13121</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p>The <code>build.rs</code> scripts for <code>cranelift-codegen</code> and <code>cranelift-assembler-x64</code> embed absolute filesystem paths into generated Rust source files. These paths change across different build environments (different machines, different <code>--target-dir</code> values, sandboxed build systems like Bazel or Nix), producing non-reproducible build artifacts.</p>
+<h2>Status</h2>
+<p><strong><code>cranelift-codegen</code>: Fixed on <code>main</code></strong> by 0694bba38 ("Strip prefixes in file names"), which replaces <code>OUT_DIR</code> paths with <code>&lt;OUT_DIR&gt;</code> in the ISLE-generated source. Sorry for the noise on this one — I was testing against v32.0.0 and missed that this was already fixed. I'll pick this up when the next release ships.</p>
+<p><strong><code>cranelift-assembler-x64</code>: Still unfixed on <code>main</code>.</strong> See details below.</p>
+<h2><code>cranelift-assembler-x64</code></h2>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/assembler-x64/build.rs"><code>cranelift/assembler-x64/build.rs</code></a> writes absolute <code>OUT_DIR</code> paths directly into <code>generated-files.rs</code> with no attempt to relativize:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">for</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="o">&amp;</span><span class="n">built_files</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="fm">writeln!</span><span class="p">(</span><span class="n">vec_of_built_files</span><span class="p">,</span><span class="w"> </span><span class="s">"  {:?}.into(),"</span><span class="p">,</span><span class="w"> </span><span class="n">file</span><span class="p">.</span><span class="n">display</span><span class="p">()).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>\`built_files\` contains absolute paths derived from \`OUT_DIR\`, so \`generated-files.rs\` ends up with:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="fm">vec!</span><span class="p">[</span>
+<span class="w">  </span><span class="s">"/home/alice/wasmtime/target/debug/build/cranelift-assembler-x64-abc123/out/assembler.rs"</span><span class="p">.</span><span class="n">into</span><span class="p">(),</span>
+<span class="p">]</span>
+</code></pre></div>
+<p>Verified still present on <code>main</code> (d5f1b973e48b).</p>
+<h2>Impact</h2>
+<ul>
+<li><strong>Standard Cargo builds:</strong> building on different machines, or with <code>--target-dir</code> outside the workspace, produces different generated source and different final binaries</li>
+<li><strong>Sandboxed builds (Bazel, Nix, etc.):</strong> each build action runs in a unique sandbox directory, so every build produces a different binary even on the same machine with the same inputs</li>
+</ul>
+<h2>Reproducer</h2>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code><span class="nb">cd</span><span class="w"> </span>wasmtime
+
+<span class="nv">CARGO_TARGET_DIR</span><span class="o">=</span>/tmp/build1<span class="w"> </span>cargo<span class="w"> </span>build<span class="w"> </span>-p<span class="w"> </span>cranelift-assembler-x64
+<span class="nv">CARGO_TARGET_DIR</span><span class="o">=</span>/tmp/build2<span class="w"> </span>cargo<span class="w"> </span>build<span class="w"> </span>-p<span class="w"> </span>cranelift-assembler-x64
+
+<span class="c1"># Different absolute paths in generated-files.rs:</span>
+cat<span class="w"> </span>/tmp/build1/debug/build/cranelift-assembler-x64-*/out/generated-files.rs
+<span class="c1"># vec![</span>
+<span class="c1">#   "/tmp/build1/debug/build/cranelift-assembler-x64-8eadefadaa0bb4cd/out/assembler.rs".into(),</span>
+<span class="c1"># ]</span>
+
+cat<span class="w"> </span>/tmp/build2/debug/build/cranelift-assembler-x64-*/out/generated-files.rs
+<span class="c1"># vec![</span>
+<span class="c1">#   "/tmp/build2/debug/build/cranelift-assembler-x64-8eadefadaa0bb4cd/out/assembler.rs".into(),</span>
+<span class="c1"># ]</span>
+</code></pre></div>
+<h2>Environment</h2>
+<ul>
+<li>Discovered building wasmtime 32.0.0 via Bazel (rules_rust) with sandboxed execution</li>
+<li>Also reproducible with standard Cargo using different <code>--target-dir</code> values</li>
+</ul>
+</blockquote>
+
+
+
+<a name="585797037"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313121%20cranelift%20build%20scripts%20embed%20abs.../near/585797037" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313121.20cranelift.20build.20scripts.20embed.20abs.2E.2E.2E.html#585797037">(Apr 16 2026 at 02:42)</a>:</h4>
+<p>travisdowns <a href="https://github.com/bytecodealliance/wasmtime/issues/13121#issuecomment-4257065922">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13121">issue #13121</a>:</p>
+<blockquote>
+<p>Updated the issue: <code>cranelift-codegen</code> was already fixed on <code>main</code> by 0694bba38 ("Strip prefixes in file names"). Only <code>cranelift-assembler-x64</code> remains affected. Working on a PR for that now.</p>
+</blockquote>
+
+
+
+<a name="585797749"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313121%20cranelift%20build%20scripts%20embed%20abs.../near/585797749" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313121.20cranelift.20build.20scripts.20embed.20abs.2E.2E.2E.html#585797749">(Apr 16 2026 at 02:52)</a>:</h4>
+<p>travisdowns <a href="https://github.com/bytecodealliance/wasmtime/issues/13121#issuecomment-4257097641">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13121">issue #13121</a>:</p>
+<blockquote>
+<p>On closer look, <code>generated-files.rs</code> is only consumed by the <code>cranelift-assembler-x64</code> utility binary (<code>main.rs</code>), not the library. For a utility that prints paths to generated code, absolute paths are the right behavior — relative or placeholder paths would make the output less useful.</p>
+<p>It's possible to make the <code>generated-files.rs</code> source itself deterministic (e.g. by using <code>env!("OUT_DIR")</code> to defer path resolution to compile time), but the binary would still contain the absolute path after <code>env!()</code> expansion, so the non-determinism just moves from the source file to the compiled output. Not much of a win.</p>
+<p>I think this issue can be closed — the <code>cranelift-codegen</code> side was already fixed by 0694bba38, and the <code>cranelift-assembler-x64</code> side doesn't need fixing.</p>
+</blockquote>
+
+
+
+<a name="585797752"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313121%20cranelift%20build%20scripts%20embed%20abs.../near/585797752" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313121.20cranelift.20build.20scripts.20embed.20abs.2E.2E.2E.html#585797752">(Apr 16 2026 at 02:52)</a>:</h4>
+<p>travisdowns closed <a href="https://github.com/bytecodealliance/wasmtime/issues/13121">issue #13121</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p>The <code>build.rs</code> scripts for <code>cranelift-codegen</code> and <code>cranelift-assembler-x64</code> embed absolute filesystem paths into generated Rust source files. These paths change across different build environments (different machines, different <code>--target-dir</code> values, sandboxed build systems like Bazel or Nix), producing non-reproducible build artifacts.</p>
+<h2>Status</h2>
+<p><strong><code>cranelift-codegen</code>: Fixed on <code>main</code></strong> by 0694bba38 ("Strip prefixes in file names"), which replaces <code>OUT_DIR</code> paths with <code>&lt;OUT_DIR&gt;</code> in the ISLE-generated source. Sorry for the noise on this one — I was testing against v32.0.0 and missed that this was already fixed. I'll pick this up when the next release ships.</p>
+<p><strong><code>cranelift-assembler-x64</code>: Still unfixed on <code>main</code>.</strong> See details below.</p>
+<h2><code>cranelift-assembler-x64</code></h2>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/assembler-x64/build.rs"><code>cranelift/assembler-x64/build.rs</code></a> writes absolute <code>OUT_DIR</code> paths directly into <code>generated-files.rs</code> with no attempt to relativize:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">for</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="o">&amp;</span><span class="n">built_files</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="fm">writeln!</span><span class="p">(</span><span class="n">vec_of_built_files</span><span class="p">,</span><span class="w"> </span><span class="s">"  {:?}.into(),"</span><span class="p">,</span><span class="w"> </span><span class="n">file</span><span class="p">.</span><span class="n">display</span><span class="p">()).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>\`built_files\` contains absolute paths derived from \`OUT_DIR\`, so \`generated-files.rs\` ends up with:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="fm">vec!</span><span class="p">[</span>
+<span class="w">  </span><span class="s">"/home/alice/wasmtime/target/debug/build/cranelift-assembler-x64-abc123/out/assembler.rs"</span><span class="p">.</span><span class="n">into</span><span class="p">(),</span>
+<span class="p">]</span>
+</code></pre></div>
+<p>Verified still present on <code>main</code> (d5f1b973e48b).</p>
+<h2>Impact</h2>
+<ul>
+<li><strong>Standard Cargo builds:</strong> building on different machines, or with <code>--target-dir</code> outside the workspace, produces different generated source and different final binaries</li>
+<li><strong>Sandboxed builds (Bazel, Nix, etc.):</strong> each build action runs in a unique sandbox directory, so every build produces a different binary even on the same machine with the same inputs</li>
+</ul>
+<h2>Reproducer</h2>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code><span class="nb">cd</span><span class="w"> </span>wasmtime
+
+<span class="nv">CARGO_TARGET_DIR</span><span class="o">=</span>/tmp/build1<span class="w"> </span>cargo<span class="w"> </span>build<span class="w"> </span>-p<span class="w"> </span>cranelift-assembler-x64
+<span class="nv">CARGO_TARGET_DIR</span><span class="o">=</span>/tmp/build2<span class="w"> </span>cargo<span class="w"> </span>build<span class="w"> </span>-p<span class="w"> </span>cranelift-assembler-x64
+
+<span class="c1"># Different absolute paths in generated-files.rs:</span>
+cat<span class="w"> </span>/tmp/build1/debug/build/cranelift-assembler-x64-*/out/generated-files.rs
+<span class="c1"># vec![</span>
+<span class="c1">#   "/tmp/build1/debug/build/cranelift-assembler-x64-8eadefadaa0bb4cd/out/assembler.rs".into(),</span>
+<span class="c1"># ]</span>
+
+cat<span class="w"> </span>/tmp/build2/debug/build/cranelift-assembler-x64-*/out/generated-files.rs
+<span class="c1"># vec![</span>
+<span class="c1">#   "/tmp/build2/debug/build/cranelift-assembler-x64-8eadefadaa0bb4cd/out/assembler.rs".into(),</span>
+<span class="c1"># ]</span>
+</code></pre></div>
+<h2>Environment</h2>
+<ul>
+<li>Discovered building wasmtime 32.0.0 via Bazel (rules_rust) with sandboxed execution</li>
+<li>Also reproducible with standard Cargo using different <code>--target-dir</code> values</li>
+</ul>
+</blockquote>
+
+
+
+<a name="585797827"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313121%20cranelift%20build%20scripts%20embed%20abs.../near/585797827" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313121.20cranelift.20build.20scripts.20embed.20abs.2E.2E.2E.html#585797827">(Apr 16 2026 at 02:53)</a>:</h4>
+<p>travisdowns edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/13121#issuecomment-4257097641">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13121">issue #13121</a>:</p>
+<blockquote>
+<p>On closer look, <code>generated-files.rs</code> is only consumed by the <code>cranelift-assembler-x64</code> utility binary (<code>main.rs</code>), not the library. For a utility that prints paths to generated code, absolute paths are the right behavior — relative or placeholder paths would make the output less useful.</p>
+<p>It's possible to make the <code>generated-files.rs</code> source itself deterministic (e.g. by using <code>env!("OUT_DIR")</code> to defer path resolution to compile time), but the binary would still contain the absolute path after <code>env!()</code> expansion, so the non-determinism just moves from the source file to the compiled output. Not much of a win.</p>
+<p>I think this issue can be closed — the <code>cranelift-codegen</code> side was already fixed by 0694bba38, and the <code>cranelift-assembler-x64</code> side doesn't need fixing.</p>
+<p>Sorry for the noise!</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: May 20 2026 at 11:01 UTC</p>
+</html>

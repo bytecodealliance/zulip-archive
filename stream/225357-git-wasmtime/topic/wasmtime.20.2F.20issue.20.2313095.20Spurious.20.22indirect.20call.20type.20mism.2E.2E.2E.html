@@ -1,0 +1,481 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13095 Spurious &quot;indirect call type mism... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313095.20Spurious.20.22indirect.20call.20type.20mism.2E.2E.2E.html">wasmtime / issue #13095 Spurious &quot;indirect call type mism...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="585487866"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313095%20Spurious%20%22indirect%20call%20type%20mism.../near/585487866" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313095.20Spurious.20.22indirect.20call.20type.20mism.2E.2E.2E.html#585487866">(Apr 14 2026 at 17:41)</a>:</h4>
+<p>shumbo opened <a href="https://github.com/bytecodealliance/wasmtime/issues/13095">issue #13095</a>:</p>
+<blockquote>
+<h3>Summary</h3>
+<p>Under <code>-Wgc</code>, wasmtime spuriously traps with <code>indirect call type mismatch</code> on a valid <code>call_indirect</code>. The cause is that for <em>imported</em> functions, wasmtime stores the <strong>declared import type</strong> (a supertype) into <code>VMFuncRef.type_index</code> instead of the function's <strong>actual</strong> type (the subtype). At a <code>call_indirect</code> site annotated with the actual subtype, the JIT then checks <code>supertype &lt;: subtype</code> and traps.</p>
+<p>The bug requires the GC proposal (it only manifests when function types have non-trivial subtyping) and is strictly fail-closed — no invalid call can be accepted — so it's a spec-conformance issue, not a security vulnerability. V8 and the Wasm reference interpreter both accept the program.</p>
+<h3>Test Case</h3>
+<p>A minimal <code>.wast</code> PoC is attached as <code>test_type_index_bug.wast</code>:</p>
+<div class="codehilite" data-code-language="wasm"><pre><span></span><code>(module $A
+  (type $super (sub (func (param i32) (result i32))))
+  (type $sub (sub $super (func (param i32) (result i32))))
+  (func (export "f") (type $sub) (param i32) (result i32) (local.get 0))
+)
+(register "A" $A)
+
+(module $B
+  (type $super (sub (func (param i32) (result i32))))
+  (type $sub (sub $super (func (param i32) (result i32))))
+
+  ;; Valid covariant import: $sub &lt;: $super
+  (import "A" "f" (func $f (type $super)))
+
+  (table 10 funcref)
+  (elem declare func $f)
+
+  (func (export "test_super") (result i32)
+    (table.set (i32.const 0) (ref.func $f))
+    (i32.const 99) (i32.const 0)
+    (call_indirect (type $super)))
+
+  (func (export "test_sub") (result i32)
+    (table.set (i32.const 0) (ref.func $f))
+    (i32.const 99) (i32.const 0)
+    (call_indirect (type $sub)))
+)
+
+(assert_return (invoke "test_super") (i32.const 99))
+(assert_return (invoke "test_sub")   (i32.const 99))
+</code></pre></div>
+<p>The pattern: module A defines and exports a function with actual type <code>$sub</code>; module B imports it declared as the supertype <code>$super</code> (valid via function-type subtyping in the GC proposal), places it in a <code>funcref</code> table, and calls it indirectly under both annotations.</p>
+<h3>Steps to Reproduce</h3>
+<ol>
+<li>Build wasmtime with GC enabled: <code>cargo build --release -p wasmtime-cli --features gc</code>.</li>
+<li>Run the test: <code>./target/release/wasmtime wast -Wgc test_type_index_bug.wast</code>.</li>
+</ol>
+<h3>Expected Results</h3>
+<p>Both <code>assert_return</code> directives pass and return <code>99</code>. This matches:</p>
+<ul>
+<li><strong>V8 13.6</strong> (Node.js 24.3.0): both calls return <code>99</code>.</li>
+<li><strong>Wasm reference interpreter</strong> (<code>spec</code> repo, 3.0.0): the script exits 0 with both <code>assert_return</code> directives passing.</li>
+</ul>
+<h3>Actual Results</h3>
+<p>The first assertion passes; the second traps:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">Error</span><span class="p">:</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="n">script</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="o">'</span><span class="na">test_type_index_bug</span><span class="p">.</span><span class="n">wast</span><span class="o">'</span>
+
+<span class="n">Caused</span><span class="w"> </span><span class="n">by</span><span class="p">:</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">:</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">directive</span><span class="w"> </span><span class="n">on</span><span class="w"> </span><span class="n">test_type_index_bug</span><span class="p">.</span><span class="n">wast</span><span class="p">:</span><span class="mi">34</span>
+<span class="w">    </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="nc">error</span><span class="w"> </span><span class="k">while</span><span class="w"> </span><span class="n">executing</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">wasm</span><span class="w"> </span><span class="n">backtrace</span><span class="p">:</span>
+<span class="w">           </span><span class="mi">0</span><span class="p">:</span><span class="w">  </span><span class="mh">0x75</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">B</span><span class="o">!&lt;</span><span class="n">wasm</span><span class="w"> </span><span class="n">function</span><span class="w"> </span><span class="mi">2</span><span class="o">&gt;</span>
+<span class="w">    </span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="nc">wasm</span><span class="w"> </span><span class="n">trap</span><span class="p">:</span><span class="w"> </span><span class="nc">indirect</span><span class="w"> </span><span class="n">call</span><span class="w"> </span><span class="k">type</span><span class="w"> </span><span class="nc">mismatch</span>
+</code></pre></div>
+<h3>Versions and Environment</h3>
+<ul>
+<li><strong>Wasmtime version</strong>: <code>main</code> (v45.0.0); root-cause analysis below is against current <code>main</code>.</li>
+<li><strong>Operating system</strong>: Linux (reproduced on arch linux, kernel 6.10.8).</li>
+<li><strong>Architecture</strong>: aarch64 (also reproduces on x86_64 by code inspection — the affected code is architecture-independent pure-Rust runtime code).</li>
+</ul>
+<h3>Extra Info</h3>
+<p><code>Instance::get_func_ref</code> (<code>crates/wasmtime/src/runtime/vm/instance.rs:884-933</code>) populates a <code>VMFuncRef</code> with the type stored in <code>Module::functions[index].signature</code>. For a <em>locally defined</em> function this is the actual type. For an <em>imported</em> function it is the <strong>declared import type</strong>, which may be a proper supertype of the actual type. The wrong type is then stamped into <code>VMFuncRef.type_index</code> and used by the JIT-emitted <code>call_indirect</code> / <code>call_ref</code> subtype check. The check becomes <code>declared_import_type &lt;: call_site_annotation</code>, which spuriously fails when the annotation is the real (sub) type.</p>
+<p>The bug is strictly one-directional (it makes the check too <em>strict</em>, never too <em>permissive</em>), so sandbox integrity is not affected — per wasmtime's security policy this is a correctness / spec-conformance issue, not a security vulnerability.</p>
+<table>
+<thead>
+<tr>
+<th><code>call_indirect</code> annotation</th>
+<th>Correct check</th>
+<th>Buggy check</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>(type $super)</code></td>
+<td><code>$sub &lt;: $super</code> = yes</td>
+<td><code>$super &lt;: $super</code> = yes</td>
+<td>OK (accidental)</td>
+</tr>
+<tr>
+<td><code>(type $sub)</code></td>
+<td><code>$sub &lt;: $sub</code> = yes</td>
+<td><code>$super &lt;: $sub</code> = no</td>
+<td><strong>wrong trap</strong></td>
+</tr>
+</tbody>
+</table>
+<p>V8 and the reference interpreter accept the program:</p>
+<table>
+<thead>
+<tr>
+<th>Runtime</th>
+<th><code>test_super</code></th>
+<th><code>test_sub</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>V8 13.6 (Node.js 24.3.0)</td>
+<td>99</td>
+<td>99</td>
+</tr>
+<tr>
+<td>Wasm reference interpreter 3.0.0</td>
+<td>99</td>
+<td>99</td>
+</tr>
+<tr>
+<td>Wasmtime <code>main</code> (v45.0)</td>
+<td>99</td>
+<td><strong>traps</strong> (indirect call type mismatch)</td>
+</tr>
+</tbody>
+</table>
+<p>The reference interpreter output, for the record:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">wasm</span><span class="w"> </span><span class="o">-</span><span class="n">t</span><span class="w"> </span><span class="n">test_type_index_bug</span><span class="p">.</span><span class="n">wast</span>
+<span class="o">--</span><span class="w"> </span><span class="n">Asserting</span><span class="w"> </span><span class="k">return</span><span class="o">..</span><span class="p">.</span>
+<span class="o">--</span><span class="w"> </span><span class="n">Invoking</span><span class="w"> </span><span class="n">function</span><span class="w"> </span><span class="s">"test_super"</span><span class="o">..</span><span class="p">.</span>
+<span class="o">--</span><span class="w"> </span><span class="n">Asserting</span><span class="w"> </span><span class="k">return</span><span class="o">..</span><span class="p">.</span>
+<span class="o">--</span><span class="w"> </span><span class="n">Invoking</span><span class="w"> </span><span class="n">function</span><span class="w"> </span><span class="s">"test_sub"</span><span class="o">..</span><span class="p">.</span>
+<span class="p">(</span><span class="n">exit</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span>
+</code></pre></div>
+<p>The spec says</p>
+<ul>
+<li><a href="https://www.w3.org/TR/wasm-core-2/#exec-call-indirect"><code>call_indirect</code></a> checks the call-site annotation against the type of the function <strong>as recorded in the store</strong>, looked up via the table entry's function address — not against anything in the caller module.</li>
+<li>A <a href="https://www.w3.org/TR/wasm-core-2/#function-instances">function instance</a> has a single <code>type</code> field, set when the function is <a href="https://www.w3.org/TR/wasm-core-2/#alloc-func">allocated</a> from its defining module.</li>
+<li>Imports reuse the exporter's function address; <a href="https://www.w3.org/TR/wasm-core-2/#match-externtype">extern-type matching</a> uses subtyping only for the compatibility check at instantiation time and never rewraps the stored type.</li>
+</ul>
+<p>Applied to the PoC: A's allocation stamps the function instance's type as <code>$sub</code>. B's <code>$super</code> import does not change it. <code>call_indirect (type $sub)</code> must therefore check <code>$sub &lt;: $sub</code> and succeed. Wasmtime's trap substitutes B's declared import type for the function instance's actual stored type.</p>
+<h4>Root cause and suggested fix</h4>
+<p><code>Module::functions[i].signature</code> is the importing module's <em>view</em> of function <code>i</code>. For imports, that view only records the declaration type, not the type resolved at instantiation. <code>get_func_ref</code> trusts this view unconditionally.</p>
+<p>Possible fixes:</p>
+<ul>
+<li>Pointer-chase from <code>VMFunctionImport.vmctx</code> back to the exporter's <code>VMFuncRef</code> in <code>get_func_ref</code>. No struct-layout changes, but fragile under re-export chains and adds work to every <code>get_func_ref</code> call.</li>
+<li>Add a <code>type_index: VMSharedTypeIndex</code> field to <code>VMFunctionImport</code>, populated at instantiation time. <code>construct_func_ref</code> then reads the correct type directly; re-export chains are handled by construction. Costs 4 bytes in <code>VMFunctionImport</code> and a VMContext offset recalculation.</li>
+<li>Branch in <code>get_func_ref</code> on defined-vs-imported and retrieve the type via (A) or (B) for imports.<br>
+</li>
+</ul>
+</blockquote>
+
+
+
+<a name="585487869"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313095%20Spurious%20%22indirect%20call%20type%20mism.../near/585487869" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313095.20Spurious.20.22indirect.20call.20type.20mism.2E.2E.2E.html#585487869">(Apr 14 2026 at 17:41)</a>:</h4>
+<p><a href="https://github.com/shumbo">shumbo</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13095">Issue #13095</a>.</p>
+
+
+
+<a name="585487941"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313095%20Spurious%20%22indirect%20call%20type%20mism.../near/585487941" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313095.20Spurious.20.22indirect.20call.20type.20mism.2E.2E.2E.html#585487941">(Apr 14 2026 at 17:41)</a>:</h4>
+<p>shumbo edited <a href="https://github.com/bytecodealliance/wasmtime/issues/13095">issue #13095</a>:</p>
+<blockquote>
+<h3>Summary</h3>
+<p>Under <code>-Wgc</code>, wasmtime spuriously traps with <code>indirect call type mismatch</code> on a valid <code>call_indirect</code>. The cause is that for <em>imported</em> functions, wasmtime stores the <strong>declared import type</strong> (a supertype) into <code>VMFuncRef.type_index</code> instead of the function's <strong>actual</strong> type (the subtype). At a <code>call_indirect</code> site annotated with the actual subtype, the JIT then checks <code>supertype &lt;: subtype</code> and traps.</p>
+<p>The bug requires the GC proposal (it only manifests when function types have non-trivial subtyping) and is strictly fail-closed — no invalid call can be accepted — so it's a spec-conformance issue, not a security vulnerability. V8 and the Wasm reference interpreter both accept the program.</p>
+<h3>Test Case</h3>
+<p>A minimal <code>.wast</code> PoC is attached as <code>test_type_index_bug.wast</code>:</p>
+<div class="codehilite" data-code-language="wasm"><pre><span></span><code>(module $A
+  (type $super (sub (func (param i32) (result i32))))
+  (type $sub (sub $super (func (param i32) (result i32))))
+  (func (export "f") (type $sub) (param i32) (result i32) (local.get 0))
+)
+(register "A" $A)
+
+(module $B
+  (type $super (sub (func (param i32) (result i32))))
+  (type $sub (sub $super (func (param i32) (result i32))))
+
+  ;; Valid covariant import: $sub &lt;: $super
+  (import "A" "f" (func $f (type $super)))
+
+  (table 10 funcref)
+  (elem declare func $f)
+
+  (func (export "test_super") (result i32)
+    (table.set (i32.const 0) (ref.func $f))
+    (i32.const 99) (i32.const 0)
+    (call_indirect (type $super)))
+
+  (func (export "test_sub") (result i32)
+    (table.set (i32.const 0) (ref.func $f))
+    (i32.const 99) (i32.const 0)
+    (call_indirect (type $sub)))
+)
+
+(assert_return (invoke "test_super") (i32.const 99))
+(assert_return (invoke "test_sub")   (i32.const 99))
+</code></pre></div>
+<p>The pattern: module A defines and exports a function with actual type <code>$sub</code>; module B imports it declared as the supertype <code>$super</code> (valid via function-type subtyping in the GC proposal), places it in a <code>funcref</code> table, and calls it indirectly under both annotations.</p>
+<h3>Steps to Reproduce</h3>
+<ol>
+<li>Build wasmtime with GC enabled: <code>cargo build --release -p wasmtime-cli --features gc</code>.</li>
+<li>Run the test: <code>./target/release/wasmtime wast -Wgc test_type_index_bug.wast</code>.</li>
+</ol>
+<h3>Expected Results</h3>
+<p>Both <code>assert_return</code> directives pass and return <code>99</code>. This matches:</p>
+<ul>
+<li><strong>V8 13.6</strong> (Node.js 24.3.0): both calls return <code>99</code>.</li>
+<li><strong>Wasm reference interpreter</strong> (<code>spec</code> repo, 3.0.0): the script exits 0 with both <code>assert_return</code> directives passing.</li>
+</ul>
+<h3>Actual Results</h3>
+<p>The first assertion passes; the second traps:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">Error</span><span class="p">:</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="n">script</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="o">'</span><span class="na">test_type_index_bug</span><span class="p">.</span><span class="n">wast</span><span class="o">'</span>
+
+<span class="n">Caused</span><span class="w"> </span><span class="n">by</span><span class="p">:</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">:</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">directive</span><span class="w"> </span><span class="n">on</span><span class="w"> </span><span class="n">test_type_index_bug</span><span class="p">.</span><span class="n">wast</span><span class="p">:</span><span class="mi">34</span>
+<span class="w">    </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="nc">error</span><span class="w"> </span><span class="k">while</span><span class="w"> </span><span class="n">executing</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">wasm</span><span class="w"> </span><span class="n">backtrace</span><span class="p">:</span>
+<span class="w">           </span><span class="mi">0</span><span class="p">:</span><span class="w">  </span><span class="mh">0x75</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">B</span><span class="o">!&lt;</span><span class="n">wasm</span><span class="w"> </span><span class="n">function</span><span class="w"> </span><span class="mi">2</span><span class="o">&gt;</span>
+<span class="w">    </span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="nc">wasm</span><span class="w"> </span><span class="n">trap</span><span class="p">:</span><span class="w"> </span><span class="nc">indirect</span><span class="w"> </span><span class="n">call</span><span class="w"> </span><span class="k">type</span><span class="w"> </span><span class="nc">mismatch</span>
+</code></pre></div>
+<h3>Versions and Environment</h3>
+<ul>
+<li><strong>Wasmtime version</strong>: <code>main</code> (v45.0.0); root-cause analysis below is against current <code>main</code>.</li>
+<li><strong>Operating system</strong>: Linux (reproduced on arch linux, kernel 6.10.8).</li>
+<li><strong>Architecture</strong>: aarch64 (also reproduces on x86_64 by code inspection — the affected code is architecture-independent pure-Rust runtime code).</li>
+</ul>
+<h3>Extra Info</h3>
+<p><code>Instance::get_func_ref</code> (<code>crates/wasmtime/src/runtime/vm/instance.rs:884-933</code>) populates a <code>VMFuncRef</code> with the type stored in <code>Module::functions[index].signature</code>. For a <em>locally defined</em> function this is the actual type. For an <em>imported</em> function it is the <strong>declared import type</strong>, which may be a proper supertype of the actual type. The wrong type is then stamped into <code>VMFuncRef.type_index</code> and used by the JIT-emitted <code>call_indirect</code> / <code>call_ref</code> subtype check. The check becomes <code>declared_import_type &lt;: call_site_annotation</code>, which spuriously fails when the annotation is the real (sub) type.</p>
+<p>The bug is strictly one-directional (it makes the check too <em>strict</em>, never too <em>permissive</em>), so sandbox integrity is not affected — per wasmtime's security policy this is a correctness / spec-conformance issue, not a security vulnerability.</p>
+<table>
+<thead>
+<tr>
+<th><code>call_indirect</code> annotation</th>
+<th>Correct check</th>
+<th>Buggy check</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>(type $super)</code></td>
+<td><code>$sub &lt;: $super</code> = yes</td>
+<td><code>$super &lt;: $super</code> = yes</td>
+<td>OK (accidental)</td>
+</tr>
+<tr>
+<td><code>(type $sub)</code></td>
+<td><code>$sub &lt;: $sub</code> = yes</td>
+<td><code>$super &lt;: $sub</code> = no</td>
+<td><strong>wrong trap</strong></td>
+</tr>
+</tbody>
+</table>
+<p>V8 and the reference interpreter accept the program:</p>
+<table>
+<thead>
+<tr>
+<th>Runtime</th>
+<th><code>test_super</code></th>
+<th><code>test_sub</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>V8 13.6 (Node.js 24.3.0)</td>
+<td>99</td>
+<td>99</td>
+</tr>
+<tr>
+<td>Wasm reference interpreter 3.0.0</td>
+<td>99</td>
+<td>99</td>
+</tr>
+<tr>
+<td>Wasmtime <code>main</code> (v45.0)</td>
+<td>99</td>
+<td><strong>traps</strong> (indirect call type mismatch)</td>
+</tr>
+</tbody>
+</table>
+<p>The reference interpreter output, for the record:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">wasm</span><span class="w"> </span><span class="o">-</span><span class="n">t</span><span class="w"> </span><span class="n">test_type_index_bug</span><span class="p">.</span><span class="n">wast</span>
+<span class="o">--</span><span class="w"> </span><span class="n">Asserting</span><span class="w"> </span><span class="k">return</span><span class="o">..</span><span class="p">.</span>
+<span class="o">--</span><span class="w"> </span><span class="n">Invoking</span><span class="w"> </span><span class="n">function</span><span class="w"> </span><span class="s">"test_super"</span><span class="o">..</span><span class="p">.</span>
+<span class="o">--</span><span class="w"> </span><span class="n">Asserting</span><span class="w"> </span><span class="k">return</span><span class="o">..</span><span class="p">.</span>
+<span class="o">--</span><span class="w"> </span><span class="n">Invoking</span><span class="w"> </span><span class="n">function</span><span class="w"> </span><span class="s">"test_sub"</span><span class="o">..</span><span class="p">.</span>
+<span class="p">(</span><span class="n">exit</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span>
+</code></pre></div>
+<p>The spec says</p>
+<ul>
+<li><a href="https://www.w3.org/TR/wasm-core-2/#exec-call-indirect"><code>call_indirect</code></a> checks the call-site annotation against the type of the function <strong>as recorded in the store</strong>, looked up via the table entry's function address — not against anything in the caller module.</li>
+<li>A <a href="https://www.w3.org/TR/wasm-core-2/#function-instances">function instance</a> has a single <code>type</code> field, set when the function is <a href="https://www.w3.org/TR/wasm-core-2/#alloc-func">allocated</a> from its defining module.</li>
+<li>Imports reuse the exporter's function address; <a href="https://www.w3.org/TR/wasm-core-2/#match-externtype">extern-type matching</a> uses subtyping only for the compatibility check at instantiation time and never rewraps the stored type.</li>
+</ul>
+<p>Applied to the PoC: A's allocation stamps the function instance's type as <code>$sub</code>. B's <code>$super</code> import does not change it. <code>call_indirect (type $sub)</code> must therefore check <code>$sub &lt;: $sub</code> and succeed. Wasmtime's trap substitutes B's declared import type for the function instance's actual stored type.</p>
+<h4>Root cause and suggested fix</h4>
+<p><code>Module::functions[i].signature</code> is the importing module's <em>view</em> of function <code>i</code>. For imports, that view only records the declaration type, not the type resolved at instantiation. <code>get_func_ref</code> trusts this view unconditionally.</p>
+<p>Possible fixes:</p>
+<ul>
+<li>Pointer-chase from <code>VMFunctionImport.vmctx</code> back to the exporter's <code>VMFuncRef</code> in <code>get_func_ref</code>. No struct-layout changes, but fragile under re-export chains and adds work to every <code>get_func_ref</code> call.</li>
+<li>Add a <code>type_index: VMSharedTypeIndex</code> field to <code>VMFunctionImport</code>, populated at instantiation time. <code>construct_func_ref</code> then reads the correct type directly; re-export chains are handled by construction. Costs 4 bytes in <code>VMFunctionImport</code> and a VMContext offset recalculation.</li>
+<li>Branch in <code>get_func_ref</code> on defined-vs-imported and retrieve the type<br>
+</li>
+</ul>
+</blockquote>
+
+
+
+<a name="585502103"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313095%20Spurious%20%22indirect%20call%20type%20mism.../near/585502103" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313095.20Spurious.20.22indirect.20call.20type.20mism.2E.2E.2E.html#585502103">(Apr 14 2026 at 18:57)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasm-proposal:gc label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13095">Issue #13095</a>.</p>
+
+
+
+<a name="585505018"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313095%20Spurious%20%22indirect%20call%20type%20mism.../near/585505018" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313095.20Spurious.20.22indirect.20call.20type.20mism.2E.2E.2E.html#585505018">(Apr 14 2026 at 19:12)</a>:</h4>
+<p>fitzgen assigned fitzgen to <a href="https://github.com/bytecodealliance/wasmtime/issues/13095">issue #13095</a>.</p>
+
+
+
+<a name="588681256"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313095%20Spurious%20%22indirect%20call%20type%20mism.../near/588681256" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313095.20Spurious.20.22indirect.20call.20type.20mism.2E.2E.2E.html#588681256">(Apr 21 2026 at 17:21)</a>:</h4>
+<p>fitzgen closed <a href="https://github.com/bytecodealliance/wasmtime/issues/13095">issue #13095</a>:</p>
+<blockquote>
+<h3>Summary</h3>
+<p>Under <code>-Wgc</code>, wasmtime spuriously traps with <code>indirect call type mismatch</code> on a valid <code>call_indirect</code>. The cause is that for <em>imported</em> functions, wasmtime stores the <strong>declared import type</strong> (a supertype) into <code>VMFuncRef.type_index</code> instead of the function's <strong>actual</strong> type (the subtype). At a <code>call_indirect</code> site annotated with the actual subtype, the JIT then checks <code>supertype &lt;: subtype</code> and traps.</p>
+<p>The bug requires the GC proposal (it only manifests when function types have non-trivial subtyping) and is strictly fail-closed — no invalid call can be accepted — so it's a spec-conformance issue, not a security vulnerability. V8 and the Wasm reference interpreter both accept the program.</p>
+<h3>Test Case</h3>
+<p>A minimal <code>.wast</code> PoC is attached as <code>test_type_index_bug.wast</code>:</p>
+<div class="codehilite" data-code-language="wasm"><pre><span></span><code>(module $A
+  (type $super (sub (func (param i32) (result i32))))
+  (type $sub (sub $super (func (param i32) (result i32))))
+  (func (export "f") (type $sub) (param i32) (result i32) (local.get 0))
+)
+(register "A" $A)
+
+(module $B
+  (type $super (sub (func (param i32) (result i32))))
+  (type $sub (sub $super (func (param i32) (result i32))))
+
+  ;; Valid covariant import: $sub &lt;: $super
+  (import "A" "f" (func $f (type $super)))
+
+  (table 10 funcref)
+  (elem declare func $f)
+
+  (func (export "test_super") (result i32)
+    (table.set (i32.const 0) (ref.func $f))
+    (i32.const 99) (i32.const 0)
+    (call_indirect (type $super)))
+
+  (func (export "test_sub") (result i32)
+    (table.set (i32.const 0) (ref.func $f))
+    (i32.const 99) (i32.const 0)
+    (call_indirect (type $sub)))
+)
+
+(assert_return (invoke "test_super") (i32.const 99))
+(assert_return (invoke "test_sub")   (i32.const 99))
+</code></pre></div>
+<p>The pattern: module A defines and exports a function with actual type <code>$sub</code>; module B imports it declared as the supertype <code>$super</code> (valid via function-type subtyping in the GC proposal), places it in a <code>funcref</code> table, and calls it indirectly under both annotations.</p>
+<h3>Steps to Reproduce</h3>
+<ol>
+<li>Build wasmtime with GC enabled: <code>cargo build --release -p wasmtime-cli --features gc</code>.</li>
+<li>Run the test: <code>./target/release/wasmtime wast -Wgc test_type_index_bug.wast</code>.</li>
+</ol>
+<h3>Expected Results</h3>
+<p>Both <code>assert_return</code> directives pass and return <code>99</code>. This matches:</p>
+<ul>
+<li><strong>V8 13.6</strong> (Node.js 24.3.0): both calls return <code>99</code>.</li>
+<li><strong>Wasm reference interpreter</strong> (<code>spec</code> repo, 3.0.0): the script exits 0 with both <code>assert_return</code> directives passing.</li>
+</ul>
+<h3>Actual Results</h3>
+<p>The first assertion passes; the second traps:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">Error</span><span class="p">:</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="n">script</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="o">'</span><span class="na">test_type_index_bug</span><span class="p">.</span><span class="n">wast</span><span class="o">'</span>
+
+<span class="n">Caused</span><span class="w"> </span><span class="n">by</span><span class="p">:</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">:</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">directive</span><span class="w"> </span><span class="n">on</span><span class="w"> </span><span class="n">test_type_index_bug</span><span class="p">.</span><span class="n">wast</span><span class="p">:</span><span class="mi">34</span>
+<span class="w">    </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="nc">error</span><span class="w"> </span><span class="k">while</span><span class="w"> </span><span class="n">executing</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">wasm</span><span class="w"> </span><span class="n">backtrace</span><span class="p">:</span>
+<span class="w">           </span><span class="mi">0</span><span class="p">:</span><span class="w">  </span><span class="mh">0x75</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">B</span><span class="o">!&lt;</span><span class="n">wasm</span><span class="w"> </span><span class="n">function</span><span class="w"> </span><span class="mi">2</span><span class="o">&gt;</span>
+<span class="w">    </span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="nc">wasm</span><span class="w"> </span><span class="n">trap</span><span class="p">:</span><span class="w"> </span><span class="nc">indirect</span><span class="w"> </span><span class="n">call</span><span class="w"> </span><span class="k">type</span><span class="w"> </span><span class="nc">mismatch</span>
+</code></pre></div>
+<h3>Versions and Environment</h3>
+<ul>
+<li><strong>Wasmtime version</strong>: <code>main</code> (v45.0.0); root-cause analysis below is against current <code>main</code>.</li>
+<li><strong>Operating system</strong>: Linux (reproduced on arch linux, kernel 6.10.8).</li>
+<li><strong>Architecture</strong>: aarch64 (also reproduces on x86_64 by code inspection — the affected code is architecture-independent pure-Rust runtime code).</li>
+</ul>
+<h3>Extra Info</h3>
+<p><code>Instance::get_func_ref</code> (<code>crates/wasmtime/src/runtime/vm/instance.rs:884-933</code>) populates a <code>VMFuncRef</code> with the type stored in <code>Module::functions[index].signature</code>. For a <em>locally defined</em> function this is the actual type. For an <em>imported</em> function it is the <strong>declared import type</strong>, which may be a proper supertype of the actual type. The wrong type is then stamped into <code>VMFuncRef.type_index</code> and used by the JIT-emitted <code>call_indirect</code> / <code>call_ref</code> subtype check. The check becomes <code>declared_import_type &lt;: call_site_annotation</code>, which spuriously fails when the annotation is the real (sub) type.</p>
+<p>The bug is strictly one-directional (it makes the check too <em>strict</em>, never too <em>permissive</em>), so sandbox integrity is not affected — per wasmtime's security policy this is a correctness / spec-conformance issue, not a security vulnerability.</p>
+<table>
+<thead>
+<tr>
+<th><code>call_indirect</code> annotation</th>
+<th>Correct check</th>
+<th>Buggy check</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>(type $super)</code></td>
+<td><code>$sub &lt;: $super</code> = yes</td>
+<td><code>$super &lt;: $super</code> = yes</td>
+<td>OK (accidental)</td>
+</tr>
+<tr>
+<td><code>(type $sub)</code></td>
+<td><code>$sub &lt;: $sub</code> = yes</td>
+<td><code>$super &lt;: $sub</code> = no</td>
+<td><strong>wrong trap</strong></td>
+</tr>
+</tbody>
+</table>
+<p>V8 and the reference interpreter accept the program:</p>
+<table>
+<thead>
+<tr>
+<th>Runtime</th>
+<th><code>test_super</code></th>
+<th><code>test_sub</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>V8 13.6 (Node.js 24.3.0)</td>
+<td>99</td>
+<td>99</td>
+</tr>
+<tr>
+<td>Wasm reference interpreter 3.0.0</td>
+<td>99</td>
+<td>99</td>
+</tr>
+<tr>
+<td>Wasmtime <code>main</code> (v45.0)</td>
+<td>99</td>
+<td><strong>traps</strong> (indirect call type mismatch)</td>
+</tr>
+</tbody>
+</table>
+<p>The reference interpreter output, for the record:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">wasm</span><span class="w"> </span><span class="o">-</span><span class="n">t</span><span class="w"> </span><span class="n">test_type_index_bug</span><span class="p">.</span><span class="n">wast</span>
+<span class="o">--</span><span class="w"> </span><span class="n">Asserting</span><span class="w"> </span><span class="k">return</span><span class="o">..</span><span class="p">.</span>
+<span class="o">--</span><span class="w"> </span><span class="n">Invoking</span><span class="w"> </span><span class="n">function</span><span class="w"> </span><span class="s">"test_super"</span><span class="o">..</span><span class="p">.</span>
+<span class="o">--</span><span class="w"> </span><span class="n">Asserting</span><span class="w"> </span><span class="k">return</span><span class="o">..</span><span class="p">.</span>
+<span class="o">--</span><span class="w"> </span><span class="n">Invoking</span><span class="w"> </span><span class="n">function</span><span class="w"> </span><span class="s">"test_sub"</span><span class="o">..</span><span class="p">.</span>
+<span class="p">(</span><span class="n">exit</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span>
+</code></pre></div>
+<p>The spec says</p>
+<ul>
+<li><a href="https://www.w3.org/TR/wasm-core-2/#exec-call-indirect"><code>call_indirect</code></a> checks the call-site annotation against the type of the function <strong>as recorded in the store</strong>, looked up via the table entry's function address — not against anything in the caller module.</li>
+<li>A <a href="https://www.w3.org/TR/wasm-core-2/#function-instances">function instance</a> has a single <code>type</code> field, set when the function is <a href="https://www.w3.org/TR/wasm-core-2/#alloc-func">allocated</a> from its defining module.</li>
+<li>Imports reuse the exporter's function address; <a href="https://www.w3.org/TR/wasm-core-2/#match-externtype">extern-type matching</a> uses subtyping only for the compatibility check at instantiation time and never rewraps the stored type.</li>
+</ul>
+<p>Applied to the PoC: A's allocation stamps the function instance's type as <code>$sub</code>. B's <code>$super</code> import does not change it. <code>call_indirect (type $sub)</code> must therefore check <code>$sub &lt;: $sub</code> and succeed. Wasmtime's trap substitutes B's declared import type for the function instance's actual stored type.</p>
+<h4>Root cause and suggested fix</h4>
+<p><code>Module::functions[i].signature</code> is the importing module's <em>view</em> of function <code>i</code>. For imports, that view only records the declaration type, not the type resolved at instantiation. <code>get_func_ref</code> trusts this view unconditionally.</p>
+<p>Possible fixes:</p>
+<ul>
+<li>Pointer-chase from <code>VMFunctionImport.vmctx</code> back to the exporter's <code>VMFuncRef</code> in <code>get_func_ref</code>. No struct-layout changes, but fragile under re-export chains and adds work to every <code>get_func_ref</code> call.</li>
+<li>Add a <code>type_index: VMSharedTypeIndex</code> field to <code>VMFunctionImport</code>, populated at instantiation time. <code>construct_func_ref</code> then reads the correct type directly; re-export chains are handled by construction. Costs 4 bytes in <code>VMFunctionImport</code> and a VMContext offset recalculation.</li>
+<li>Branch in <code>get_func_ref</code> on defined-vs-imported and retrieve the type<br>
+</li>
+</ul>
+</blockquote>
+
+
+
+<hr><p>Last updated: May 20 2026 at 11:01 UTC</p>
+</html>

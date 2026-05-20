@@ -1,0 +1,347 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #13343 cranelift: fold `ctz`/`clz` directly... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html">wasmtime / PR #13343 cranelift: fold `ctz`/`clz` directly...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="594686872"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594686872" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594686872">(May 12 2026 at 21:38)</a>:</h4>
+<p>ggreif opened <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343</a> from <code>ggreif:gabor/brif-cond-simplify</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<h2>Motivation</h2>
+<p>PR #13332 landed mid-end rules that fold <code>(eq/ne (ctz/clz X) 0)</code> icmp shapes into direct bit tests on <code>X</code>. Those rules hinge on an <code>icmp</code> interposed between the bit-counter and its consumer — i.e. the wasm 3-op pattern <code>i32.ctz; i32.eqz; br_if</code>.</p>
+<p>Frontends that emit the 2-op form <code>i32.ctz; br_if</code> (with no <code>i32.eqz</code> between them — e.g. Motoko's <code>moc</code>, after its <code>and 1; eqz; br_if</code> → <code>ctz; br_if</code> byte-size peephole) feed <code>(brif (ctz X))</code> into cranelift, with no icmp for the existing rules to match. #13334 (x64) and #13336 (aarch64) added backend lowering rules to cover that gap. As @cfallin pointed out <a href="https://github.com/bytecodealliance/wasmtime/pull/13336#issuecomment-4432447379">in #13336</a>, the backend is the wrong place — both for SWE reasons (rule duplication per ISA) and because we want these simplifications to compose with other mid-end opts.</p>
+<h2>Approach</h2>
+<p>This PR extends <code>simplify_skeleton</code> to rewrite the <em>condition operand</em> of an existing <code>brif</code> in place. The CFG is preserved by construction: the opcode and successor blocks stay; only argument 0 changes.</p>
+<p>Concretely:</p>
+<ol>
+<li><strong>New <code>SkeletonInstSimplification::ReplaceBranchCond(Value)</code></strong> variant in <code>prelude_opt.isle</code> — a narrow rewrite that carries just the new cond value.</li>
+<li><strong>Driver patch</strong> in <code>cranelift/codegen/src/egraph/mod.rs</code>: allow <code>Opcode::Brif</code> through the previously-blanket <code>is_branch()</code> skip; apply <code>ReplaceBranchCond</code> by writing through <code>inst_args_mut</code>. Other branches (jump, br_table, return, trap) still skip — their rewrites would change CFG.</li>
+<li><strong><code>replace_branch_cond</code> constructor</strong> in <code>prelude_opt.isle</code>.</li>
+<li>
+<p><strong>Two ISLE rules</strong> in <code>opts/icmp.isle</code>:</p>
+<p><code>isle
+ (rule (simplify_skeleton (brif (ctz x_ty X) _ _))
+       (replace_branch_cond
+         (eq $I8 (band x_ty X (iconst_u x_ty 1)) (iconst_u x_ty 0))))
+ (rule (simplify_skeleton (brif (clz x_ty X) _ _))
+       (replace_branch_cond (sge $I8 X (iconst_u x_ty 0))))
+ </code></p>
+</li>
+</ol>
+<h2>Effect</h2>
+<p>On the 2-op <code>brif (ctz X)</code> / <code>brif (clz X)</code> patterns:</p>
+<table>
+<thead>
+<tr>
+<th>platform</th>
+<th>input</th>
+<th>mid-end-alone lowering</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>x86_64</td>
+<td><code>brif (ctz X)</code></td>
+<td><code>testl $1, %edi; je</code> ✓ (matches #13334's x64 backend rules)</td>
+</tr>
+<tr>
+<td>x86_64</td>
+<td><code>brif (clz X)</code></td>
+<td><code>testl %edi, %edi; jge</code> ✓ (matches #13336's intent)</td>
+</tr>
+<tr>
+<td>aarch64</td>
+<td><code>brif (ctz X)</code></td>
+<td><code>tbz w0, #0</code> — <strong>single-instruction</strong> test-and-branch, <em>tighter</em> than #13336's <code>tst+cmp+b.cc</code></td>
+</tr>
+</tbody>
+</table>
+<h2>Test</h2>
+<p>New filetest <code>cranelift/filetests/filetests/egraph/brif-cnt-cond.clif</code> covers ctz/clz over i32/i64 in the 2-op <code>brif</code>-direct form. All 70 cranelift egraph filetests pass.</p>
+<h2>Supersedes</h2>
+<ul>
+<li>Closes #13336 — this PR yields strictly better aarch64 code (<code>tbz</code> vs <code>tst+cmp+b.cc</code>).</li>
+<li>Supersedes #13334 — will close once review discussion migrates here.</li>
+</ul>
+<h2>Future work</h2>
+<p>The <code>ReplaceBranchCond</code> variant only handles <code>brif</code>. Other side-effectful single-arg branches (<code>trapnz</code>, <code>trapz</code>) would be natural follow-ups for the same kind of cond simplification. A broader extension that allows <code>Replace</code> of a <code>brif</code> with another <code>brif</code> (validating same-successor invariant) is also possible but unnecessary for the cases this PR targets.</p>
+</blockquote>
+
+
+
+<a name="594686877"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594686877" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594686877">(May 12 2026 at 21:38)</a>:</h4>
+<p>ggreif requested <a href="https://github.com/cfallin">cfallin</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343</a>.</p>
+
+
+
+<a name="594686878"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594686878" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594686878">(May 12 2026 at 21:38)</a>:</h4>
+<p>ggreif requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343</a>.</p>
+
+
+
+<a name="594688970"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594688970" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594688970">(May 12 2026 at 21:51)</a>:</h4>
+<p>ggreif <a href="https://github.com/bytecodealliance/wasmtime/pull/13343#issuecomment-4435120706">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343</a>:</p>
+<blockquote>
+<p>Cross-backend confirmation that this mid-end change is a strict win on every target wasmtime supports — no per-backend rules needed:</p>
+<table>
+<thead>
+<tr>
+<th>backend</th>
+<th><code>brif (ctz v0)</code></th>
+<th><code>brif (clz v0)</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>x86_64</strong></td>
+<td><code>testl $1, %edi; je</code></td>
+<td><code>testl %edi, %edi; jge</code></td>
+</tr>
+<tr>
+<td><strong>aarch64</strong></td>
+<td><code>tbz w0, #0</code> (single op)</td>
+<td><code>cmp w0, #0; b.ge</code></td>
+</tr>
+<tr>
+<td><strong>riscv64</strong></td>
+<td><code>andi a0, a0, 1; sext.w a0, a0; beqz a0, …</code></td>
+<td><code>sext.w a0, a0; bgez a0, …</code></td>
+</tr>
+<tr>
+<td><strong>s390x</strong></td>
+<td><code>nilf %r2, 1; clfi %r2, 0; jge</code></td>
+<td><code>chi %r2, 0; jghe</code></td>
+</tr>
+</tbody>
+</table>
+<p>Notes:</p>
+<ul>
+<li><strong>aarch64 ctz</strong> gets a single-instruction <code>tbz</code> (test-bit-and-branch) — tighter than #13336's <code>tst+cmp+b.cc</code> form.</li>
+<li><strong>s390x</strong> (and the other two) fall in via the existing per-backend <code>icmp+brif</code> fusion path — the mid-end rewrite hands them a shape they already lower optimally, so no new backend rules anywhere.</li>
+<li>The <code>sext.w</code> overhead on riscv64 is a separate i32→i64 register-width peephole gap, independent of this PR; the bit-counter is still elided.</li>
+</ul>
+<p>So the cost-vs-benefit picture for landing this PR vs the two backend PRs (#13334 / #13336): one ~50-line mid-end change covers 4 ISAs simultaneously, with the aarch64 case getting <em>strictly better</em> code than dedicated backend rules would produce.</p>
+</blockquote>
+
+
+
+<a name="594689343"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594689343" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594689343">(May 12 2026 at 21:54)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13343#pullrequestreview-4276508554">PR review</a>:</p>
+<blockquote>
+<p>Looks fine -- thanks!</p>
+</blockquote>
+
+
+
+<a name="594689461"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594689461" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594689461">(May 12 2026 at 21:55)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/13343#issuecomment-4435138729">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343</a>:</p>
+<blockquote>
+<p>@ggreif it looks like you'll need to re-bless a test; and also run <code>cargo fmt</code> to ensure all source is properly formatted. Happy to merge once that's done. Thanks!</p>
+</blockquote>
+
+
+
+<a name="594690149"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594690149" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594690149">(May 12 2026 at 22:00)</a>:</h4>
+<p>ggreif updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343</a>.</p>
+
+
+
+<a name="594690303"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594690303" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594690303">(May 12 2026 at 22:01)</a>:</h4>
+<p>ggreif updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343</a>.</p>
+
+
+
+<a name="594691626"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594691626" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594691626">(May 12 2026 at 22:12)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/13343#issuecomment-4435236738">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343</a>:</p>
+<blockquote>
+<p>(I saw your push to fix the formatting; the test-blessing failure is <a href="https://github.com/bytecodealliance/wasmtime/actions/runs/25764803651/job/75674875711?pr=13343">here</a> and should be fixable with <code>WASMTIME_TEST_BLESS=1 cargo test --test disas</code>)</p>
+</blockquote>
+
+
+
+<a name="594691815"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594691815" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594691815">(May 12 2026 at 22:14)</a>:</h4>
+<p>ggreif requested <a href="https://github.com/pchickey">pchickey</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343</a>.</p>
+
+
+
+<a name="594691817"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594691817" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594691817">(May 12 2026 at 22:14)</a>:</h4>
+<p>ggreif updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343</a>.</p>
+
+
+
+<a name="594691818"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594691818" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594691818">(May 12 2026 at 22:14)</a>:</h4>
+<p>ggreif requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343</a>.</p>
+
+
+
+<a name="594692039"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594692039" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594692039">(May 12 2026 at 22:15)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/13343#issuecomment-4435252396">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343</a>:</p>
+<blockquote>
+<p>Ah, and now there's a merge conflict -- sorry for the merging troubles, @ggreif! If you could fix that, I'll be happy to merge.</p>
+</blockquote>
+
+
+
+<a name="594692738"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594692738" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594692738">(May 12 2026 at 22:20)</a>:</h4>
+<p>ggreif updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343</a>.</p>
+
+
+
+<a name="594692803"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594692803" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594692803">(May 12 2026 at 22:21)</a>:</h4>
+<p>cfallin has enabled auto merge for <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343</a>.</p>
+
+
+
+<a name="594693059"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594693059" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594693059">(May 12 2026 at 22:23)</a>:</h4>
+<p>ggreif edited <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343</a>:</p>
+<blockquote>
+<h2>Motivation</h2>
+<p>PR #13332 landed mid-end rules that fold <code>(eq/ne (ctz/clz X) 0)</code> icmp shapes into direct bit tests on <code>X</code>. Those rules hinge on an <code>icmp</code> interposed between the bit-counter and its consumer — i.e. the wasm 3-op pattern <code>i32.ctz; i32.eqz; br_if</code>.</p>
+<p>Frontends that emit the 2-op form <code>i32.ctz; br_if</code> (with no <code>i32.eqz</code> between them — e.g. Motoko's <code>moc</code>, after its <code>and 1; eqz; br_if</code> → <code>ctz; br_if</code> byte-size peephole) feed <code>(brif (ctz X))</code> into cranelift, with no icmp for the existing rules to match. #13334 (x64) and #13336 (aarch64) added backend lowering rules to cover that gap. As @cfallin pointed out <a href="https://github.com/bytecodealliance/wasmtime/pull/13336#issuecomment-4432447379">in #13336</a>, the backend is the wrong place — both for SWE reasons (rule duplication per ISA) and because we want these simplifications to compose with other mid-end opts.</p>
+<h2>Approach</h2>
+<p>This PR extends <code>simplify_skeleton</code> to rewrite the <em>condition operand</em> of an existing <code>brif</code> in place. The CFG is preserved by construction: the opcode and successor blocks stay; only argument 0 changes.</p>
+<p>Concretely:</p>
+<ol>
+<li><strong>New <code>SkeletonInstSimplification::ReplaceBranchCond(Value)</code></strong> variant in <code>prelude_opt.isle</code> — a narrow rewrite that carries just the new cond value.</li>
+<li><strong>Driver patch</strong> in <code>cranelift/codegen/src/egraph/mod.rs</code>: handle the new variant — in the cost-loop, accept it eagerly (no cost ranking against opcode-preserving rewrites); in the apply site, swap argument 0 in place via <code>inst_args_mut</code>. Composes with #13267's existing branch-simplification machinery; no guard relaxation needed.</li>
+<li><strong><code>replace_branch_cond</code> constructor</strong> in <code>prelude_opt.isle</code>.</li>
+<li>
+<p><strong>Two ISLE rules</strong> in <code>opts/icmp.isle</code>:</p>
+<p><code>isle
+ (rule (simplify_skeleton (brif (ctz x_ty X) _ _))
+       (replace_branch_cond
+         (eq $I8 (band x_ty X (iconst_u x_ty 1)) (iconst_u x_ty 0))))
+ (rule (simplify_skeleton (brif (clz x_ty X) _ _))
+       (replace_branch_cond (sge $I8 X (iconst_u x_ty 0))))
+ </code></p>
+</li>
+</ol>
+<h2>Effect</h2>
+<p>On the 2-op <code>brif (ctz X)</code> / <code>brif (clz X)</code> patterns:</p>
+<table>
+<thead>
+<tr>
+<th>platform</th>
+<th>input</th>
+<th>mid-end-alone lowering</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>x86_64</td>
+<td><code>brif (ctz X)</code></td>
+<td><code>testl $1, %edi; je</code> ✓ (matches #13334's x64 backend rules)</td>
+</tr>
+<tr>
+<td>x86_64</td>
+<td><code>brif (clz X)</code></td>
+<td><code>testl %edi, %edi; jge</code> ✓ (matches #13336's intent)</td>
+</tr>
+<tr>
+<td>aarch64</td>
+<td><code>brif (ctz X)</code></td>
+<td><code>tbz w0, #0</code> — <strong>single-instruction</strong> test-and-branch, <em>tighter</em> than #13336's <code>tst+cmp+b.cc</code></td>
+</tr>
+</tbody>
+</table>
+<h2>Test</h2>
+<p>New filetest <code>cranelift/filetests/filetests/egraph/brif-cnt-cond.clif</code> covers ctz/clz over i32/i64 in the 2-op <code>brif</code>-direct form. All cranelift egraph filetests pass; <code>tests/disas/ctz-clz-bool-condition.wat</code> re-blessed (the bare-form cases now collapse to the optimal 2-instruction shape).</p>
+<h2>Supersedes</h2>
+<ul>
+<li>Closes #13336 — this PR yields strictly better aarch64 code (<code>tbz</code> vs <code>tst+cmp+b.cc</code>).</li>
+<li>Supersedes #13334 — closed once review discussion migrated here.</li>
+</ul>
+<h2>Future work</h2>
+<p>The <code>ReplaceBranchCond</code> variant covers the in-place cond swap; #13267 covers full <code>brif</code>-to-<code>jump</code> rewrites for constant conditions. A natural follow-up is extending the same cond-only rewrite shape to <code>trapnz</code> / <code>trapz</code> so e.g. <code>(trapnz (ctz x) code)</code> collapses to the bit-test form.</p>
+</blockquote>
+
+
+
+<a name="594694914"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594694914" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594694914">(May 12 2026 at 22:35)</a>:</h4>
+<p>cfallin added <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343 cranelift: fold <code>ctz</code>/<code>clz</code> directly into <code>brif</code> cond via <code>simplify_skeleton</code></a> to the merge queue</p>
+
+
+
+<a name="594696104"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594696104" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594696104">(May 12 2026 at 22:43)</a>:</h4>
+<p>ggreif <a href="https://github.com/bytecodealliance/wasmtime/pull/13343#issuecomment-4435440764">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343</a>:</p>
+<blockquote>
+<p>Sidebar / future work for riscv64: per the cross-backend table above, the mid-end rewrite leaves a <code>sext.w</code> in the riscv64 lowering:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">brif</span><span class="w"> </span><span class="p">(</span><span class="n">ctz</span><span class="w"> </span><span class="n">v0</span><span class="p">):</span><span class="w">  </span><span class="nc">andi</span><span class="w"> </span><span class="n">a0</span><span class="p">,</span><span class="w"> </span><span class="n">a0</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span><span class="w"> </span><span class="n">sext</span><span class="p">.</span><span class="n">w</span><span class="w"> </span><span class="n">a0</span><span class="p">,</span><span class="w"> </span><span class="n">a0</span><span class="p">;</span><span class="w"> </span><span class="n">beqz</span><span class="w"> </span><span class="n">a0</span><span class="p">,</span><span class="w"> </span><span class="o">..</span><span class="p">.</span>
+<span class="n">brif</span><span class="w"> </span><span class="p">(</span><span class="n">clz</span><span class="w"> </span><span class="n">v0</span><span class="p">):</span><span class="w">  </span><span class="nc">sext</span><span class="p">.</span><span class="n">w</span><span class="w"> </span><span class="n">a0</span><span class="p">,</span><span class="w"> </span><span class="n">a0</span><span class="p">;</span><span class="w"> </span><span class="n">bgez</span><span class="w"> </span><span class="n">a0</span><span class="p">,</span><span class="w"> </span><span class="o">..</span><span class="p">.</span>
+</code></pre></div>
+<p>For the <strong>ctz</strong> form the <code>sext.w</code> is unconditionally redundant: <code>andi</code> with a non-negative immediate (here <code>1</code>) zeroes the upper 32 bits, so the subsequent <code>beqz</code> (which tests the full 64-bit register against <code>x0</code>) reads the same value with or without the sext — the LSB-zero-ness is preserved either way. So <code>andi a0, a0, 1; beqz a0, ...</code> is the optimal 2-op form.</p>
+<p>For the <strong>clz</strong> form <code>bgez</code> does depend on the 64-bit sign bit; the <code>sext.w</code> is only redundant when <code>X</code> is already known-canonical i32 in its register slot (e.g. via a known-extending producer like <code>lw</code>/<code>sext.w</code>/icmp result). Narrower peephole there.</p>
+<p>@alexcrichton — flagging since you're touching riscv64 currently; the patterns above are stable shapes the mid-end now emits unconditionally for any <code>brif (ctz x)</code> / <code>brif (clz x)</code> consumer.</p>
+</blockquote>
+
+
+
+<a name="594698101"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594698101" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594698101">(May 12 2026 at 23:01)</a>:</h4>
+<p><span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span> cfallin merged <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343</a>.</p>
+
+
+
+<a name="594698104"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/594698104" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#594698104">(May 12 2026 at 23:01)</a>:</h4>
+<p>cfallin removed <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343 cranelift: fold <code>ctz</code>/<code>clz</code> directly into <code>brif</code> cond via <code>simplify_skeleton</code></a> from the merge queue</p>
+
+
+
+<a name="595033657"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313343%20cranelift%3A%20fold%20%60ctz%60/%60clz%60%20directly.../near/595033657" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313343.20cranelift.3A.20fold.20.60ctz.60.2F.60clz.60.20directly.2E.2E.2E.html#595033657">(May 14 2026 at 08:25)</a>:</h4>
+<p>ggreif <a href="https://github.com/bytecodealliance/wasmtime/pull/13343#issuecomment-4448997815">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13343">PR #13343</a>:</p>
+<blockquote>
+<p>Follow-up: verified locally on <code>alexcrichton/wasmtime#riscv64-opts</code> (PR #13350, commit <code>fd259583a</code>). It closes the <strong>ctz</strong> side of the sidebar above:</p>
+<table>
+<thead>
+<tr>
+<th>backend</th>
+<th><code>brif (ctz X)</code></th>
+<th><code>brif (clz X)</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>riscv64 (before #13350)</td>
+<td><code>andi a0, a0, 1; sext.w a0, a0; beqz a0, …</code></td>
+<td><code>sext.w a0, a0; bgez a0, …</code></td>
+</tr>
+<tr>
+<td>riscv64 (with #13350)</td>
+<td><code>andi a0, a0, 1; bnez a0, …</code> <span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span></td>
+<td><code>sext.w a0, a0; bgez a0, …</code> (unchanged)</td>
+</tr>
+</tbody>
+</table>
+<p>So riscv64 ctz now lands on the optimal 2-op shape across all bit-widths (i32 and i64 both elide the <code>sext.w</code> post-<code>andi 1</code>). The clz i32 case is unaffected — that's the narrower producer-tracking peephole (known-canonical i32 in its slot) which #13350 explicitly does not target.</p>
+<p>Closing this loop — thanks @alexcrichton.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: May 20 2026 at 11:01 UTC</p>
+</html>

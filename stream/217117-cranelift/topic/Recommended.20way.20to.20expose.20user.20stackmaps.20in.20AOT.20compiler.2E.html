@@ -1,0 +1,56 @@
+<html>
+<head><meta charset="utf-8"><title>Recommended way to expose user stackmaps in AOT compiler. · cranelift · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/index.html">cranelift</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/Recommended.20way.20to.20expose.20user.20stackmaps.20in.20AOT.20compiler.2E.html">Recommended way to expose user stackmaps in AOT compiler.</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="595555212"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/Recommended%20way%20to%20expose%20user%20stackmaps%20in%20AOT%20compiler./near/595555212" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Floppy <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/Recommended.20way.20to.20expose.20user.20stackmaps.20in.20AOT.20compiler.2E.html#595555212">(May 17 2026 at 01:28)</a>:</h4>
+<p>I'm testing out hooking up <a href="https://github.com/mmtk/mmtk-core">mmtk</a> to a Cranelift generated program in a minimal example, mainly to learn how it works and figure out how I'm later gonna do it in my <a href="https://github.com/luminalang/lumina">actual compiler</a>. </p>
+<p>My current understanding is that you retreive the full stackmap information at compile-time from <a href="https://docs.rs/cranelift-codegen/latest/cranelift_codegen/struct.MachBufferFinalized.html#method.user_stack_maps">MachBufferFinalized::user_stack_maps</a> and then decide yourself how to re-format that data into your own data structures to be made available at runtime for then invoking the garbage collector with. However; Storing this information directly as-given (<code>&amp;[(CodeOffset, Span, Vec&lt;PointerSize, SpOffset&gt;)]</code>) doesn't seem viable as finding the correct associated offsets from an <code>InstBuilder::get_stack_pointer</code> would require some sort of linear scan at runtime. Is there some "intended" way to use this information? </p>
+<p>Here's some half-baked ideas I'm considering. </p>
+<ul>
+<li>
+<p>Put the <code>user_stack_maps</code> data in a global variable. At any location in code where my compiler injects a call to invoke the <code>GC</code>, hardcode an index/slice into the element of the global variable that corresponds to the current function. Make sure this is done in the translation unit that contains the call to <code>GC</code> and not in the stdlib that contains the <code>GC</code> API. </p>
+</li>
+<li>
+<p>Since the offsets are ordered, perform a binary search at runtime and hope the overhead isn't big enough. </p>
+</li>
+<li>
+<p>Figure out at compile-time which part of the <code>user_stack_maps</code> is associated with the current function and hardcode the associated stackmap information into the <code>GC</code> callsite directly instead of loading information from a global variable. (this might be tricky as it requires changing functions after already having finalized the <code>MachBuffer</code>?)</p>
+</li>
+</ul>
+<p>Would love some pointers on this, or some clarification on what end-result was invisioned when designing the stackmaps API. </p>
+<p>I am planning on trying to add this to the <a href="https://github.com/simvux/cranelift-examples">cranelift-examples repository</a>.</p>
+
+
+
+<a name="595876995"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/Recommended%20way%20to%20expose%20user%20stackmaps%20in%20AOT%20compiler./near/595876995" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> fitzgen (he/him) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/Recommended.20way.20to.20expose.20user.20stackmaps.20in.20AOT.20compiler.2E.html#595876995">(May 18 2026 at 16:45)</a>:</h4>
+<p><span class="user-mention" data-user-id="725811">@Floppy</span>  you can look at what Wasmtime does for inspiration:</p>
+<ul>
+<li>Construction from Cranelift stack maps: <a href="https://github.com/bytecodealliance/wasmtime/blob/main/crates/environ/src/compile/stack_maps.rs">https://github.com/bytecodealliance/wasmtime/blob/main/crates/environ/src/compile/stack_maps.rs</a></li>
+<li>Usage APIs: <a href="https://github.com/bytecodealliance/wasmtime/blob/main/crates/environ/src/stack_map.rs">https://github.com/bytecodealliance/wasmtime/blob/main/crates/environ/src/stack_map.rs</a></li>
+<li>Actual usage of those APIs:<ul>
+<li><a href="https://github.com/bytecodealliance/wasmtime/blob/b61fd984e758153756cb471c9cc9a940b71064c2/crates/wasmtime/src/runtime/code.rs#L488-L492">https://github.com/bytecodealliance/wasmtime/blob/b61fd984e758153756cb471c9cc9a940b71064c2/crates/wasmtime/src/runtime/code.rs#L488-L492</a></li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/blob/b61fd984e758153756cb471c9cc9a940b71064c2/crates/wasmtime/src/runtime/store/gc.rs#L609-L636">https://github.com/bytecodealliance/wasmtime/blob/b61fd984e758153756cb471c9cc9a940b71064c2/crates/wasmtime/src/runtime/store/gc.rs#L609-L636</a></li>
+</ul>
+</li>
+</ul>
+<p>Basically, it creates a custom object section with the stack map data in an easily index-able format that doesn't really require parsing at runtime and just does a binary search</p>
+
+
+
+<a name="596041894"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/Recommended%20way%20to%20expose%20user%20stackmaps%20in%20AOT%20compiler./near/596041894" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Floppy <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/Recommended.20way.20to.20expose.20user.20stackmaps.20in.20AOT.20compiler.2E.html#596041894">(May 19 2026 at 02:43)</a>:</h4>
+<p>hm alright, i'll take a look thanks</p>
+
+
+
+<hr><p>Last updated: May 20 2026 at 11:01 UTC</p>
+</html>

@@ -1,0 +1,353 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13403 DRC: per-GC sweep cost grows unbo... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313403.20DRC.3A.20per-GC.20sweep.20cost.20grows.20unbo.2E.2E.2E.html">wasmtime / issue #13403 DRC: per-GC sweep cost grows unbo...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="595770955"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313403%20DRC%3A%20per-GC%20sweep%20cost%20grows%20unbo.../near/595770955" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313403.20DRC.3A.20per-GC.20sweep.20cost.20grows.20unbo.2E.2E.2E.html#595770955">(May 18 2026 at 09:56)</a>:</h4>
+<p>harryzz opened <a href="https://github.com/bytecodealliance/wasmtime/issues/13403">issue #13403</a>:</p>
+<blockquote>
+<hr>
+<h2>Summary</h2>
+<p>On a long-running Kotlin/Wasm + WasmGC guest (~9 MB/s steady allocation<br>
+rate driven by <code>suspendCoroutine</code>), per-<code>Store::gc</code> cost grows<br>
+super-linearly over time. After enough sustained use, a single sweep<br>
+exceeds 5 s of host-thread time, triggering Android's input-dispatch<br>
+ANR. We patched wasmtime to log the over-approximation list size <code>N</code>,<br>
+free-block count <code>F</code>, and sweep duration at every gc; **the trajectory<br>
+is reproducible and the scaling is clear**: sweep duration roughly<br>
+doubles every few minutes of typical UI interaction, driven primarily<br>
+by <code>N</code>'s linear growth.</p>
+<p>The root cause is <strong>architectural</strong>: nothing in wasmtime auto-triggers<br>
+gc, so <code>N</code> (over-approximated-stack-roots list) grows monotonically<br>
+between sweeps, while sweep itself is O(<code>N</code>) with poor cache locality.<br>
+Embedders that allocate at a steady rate and let <code>N</code> grow eventually<br>
+hit unworkable pause times.</p>
+<p>This is <strong>distinct from #9701 / PR #10401</strong>. That fix was about<br>
+transitive ref-decrementing (correctness). We're running on top of it,<br>
+on 44.0.1. The remaining issue is pure scaling cost in the <em>sweep</em>.</p>
+<h2>Environment</h2>
+<ul>
+<li><strong>wasmtime 44.0.1</strong>, features = <code>["component-model"]</code>, sync host calls</li>
+<li>Target: <code>aarch64-linux-android</code>, AOT (<code>--wasm gc --wasm function-references --wasm exceptions</code>)</li>
+<li>Host: single-threaded <code>Store</code> on the render thread (winit android-native-activity)</li>
+<li>Guest: Kotlin/Wasm 2.4.0-RC compiled to a wasm-component</li>
+<li>Device: Pixel 2 XL / Android 15 / API 35</li>
+</ul>
+<h2>Reproducer</h2>
+<p>Minimal: <a href="https://codeberg.org/harryzz/wart-leak-repro">https://codeberg.org/harryzz/wart-leak-repro</a></p>
+<p>A bare <code>suspendCoroutine</code> loop driven by per-frame host calls — no<br>
+Compose, no UI. Reproduces the underlying allocation pattern at ~9 MB/s<br>
+WasmGC-heap growth, OOM in ~6:37 on a Pixel 2 XL with no manual<br>
+<code>Store::gc</code> triggers.</p>
+<p>The full Compose-UI guest (which we actually run) drives a much larger<br>
+<em>retained live set</em> per gc (Composition tree, Snapshot records,<br>
+LaunchedEffect jobs, Recomposer invalidation list). The<br>
+super-linear-growth symptom is visible there but not in the minimal<br>
+repro, because the linear-scan cost is dominated by fragmentation,<br>
+which Compose's diverse object sizes produce far better than a tight<br>
+loop.</p>
+<h2>Root cause — sweep is O(<code>N</code>) and <code>N</code> grows unbounded between gcs</h2>
+<p><code>crates/wasmtime/src/runtime/vm/gc/enabled/drc.rs</code>, lines 124-128:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="sd">/// The head of the over-approximated-stack-roots list.</span>
+<span class="sd">///</span>
+<span class="sd">/// Note that this is exposed directly to compiled Wasm code through the</span>
+<span class="sd">/// vmctx, so must not move.</span>
+<span class="n">over_approximated_stack_roots</span><span class="p">:</span><span class="w"> </span><span class="nb">Box</span><span class="o">&lt;</span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">VMGcRef</span><span class="o">&gt;&gt;</span><span class="p">,</span>
+</code></pre></div>
+<p>The over-approximation set is a singly-linked list threaded through<br>
+the <code>next_over_approximated_stack_root</code> field in each object's<br>
+<code>VMDrcHeader</code> (line 645). <code>sweep</code> (lines 524-618) walks the entire<br>
+list every gc:</p>
+<ul>
+<li>
+<p>Unmarked entries → spliced out, dec_ref'd via<br>
+<code>dec_ref_and_maybe_dealloc</code>, possibly deallocated through<br>
+<code>FreeList::dealloc</code> (O(log F)).</p>
+</li>
+<li>
+<p>Marked entries → <strong>stay in the list</strong> across gcs (lines 578-588).</p>
+</li>
+</ul>
+<p>So <code>|list|</code> at sweep time = (refs currently on the precise wasm stack)</p>
+<ul>
+<li>(refs newly borrowed since last sweep). For a steady-state<br>
+high-allocation guest with no explicit <code>Store::gc</code> calls, this<br>
+monotonically grows. Each entry's <code>VMDrcHeader</code> is ~40 B, scattered<br>
+across the GC heap → walking is memory-bandwidth-bound (cache miss<br>
+per entry on a 95 MB working set at <code>N</code> = 2.4M).</li>
+</ul>
+<p><strong>Cost per gc:</strong> O(<code>N</code>) linked-list walk, plus N × O(log F) for the<br>
+deallocation phase, plus PR #10401's transitive dec-ref. Both <code>N</code> and<br>
+<code>F</code> grow over time → super-linear total cost.</p>
+<p>There is no automatic scheduling — wasmtime's <code>grow_or_collect_gc_heap</code><br>
+fallback path (the only auto-trigger) only fires on memory.grow<br>
+failure. An embedder that returns <code>Ok(true)</code> from<br>
+<code>ResourceLimiter::memory_growing</code> never sees a gc unless it calls<br>
+<code>Store::gc</code> itself. Embedders that <em>do</em> return false on threshold<br>
+also get the cascade-on-recomposition behavior described below.</p>
+<h2>Secondary — <code>FreeList::first_fit</code> is O(F), but not the dominant cost</h2>
+<p><code>crates/wasmtime/src/runtime/vm/gc/enabled/free_list.rs</code>, lines 180-195:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">fn</span><span class="w"> </span><span class="nf">first_fit</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">alloc_size</span><span class="p">:</span><span class="w"> </span><span class="kt">u32</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="p">(</span><span class="kt">u32</span><span class="p">,</span><span class="w"> </span><span class="kt">u32</span><span class="p">)</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="o">&amp;</span><span class="n">block_index</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">block_len</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">self</span>
+<span class="w">        </span><span class="p">.</span><span class="n">free_block_index_to_len</span>
+<span class="w">        </span><span class="p">.</span><span class="n">iter</span><span class="p">()</span><span class="w">                                  </span><span class="c1">// ← walks BTreeMap in key order</span>
+<span class="w">        </span><span class="p">.</span><span class="n">find</span><span class="p">(</span><span class="o">|</span><span class="p">(</span><span class="n">_idx</span><span class="p">,</span><span class="w"> </span><span class="n">len</span><span class="p">)</span><span class="o">|</span><span class="w"> </span><span class="o">**</span><span class="n">len</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="n">alloc_size</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="o">..</span><span class="p">.</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The free-block map is keyed by <strong>block index</strong> (address), not by size.<br>
+<code>iter().find(...)</code> walks entries in address order returning the<br>
+lowest-address block that fits. <strong>O(F) per allocation.</strong></p>
+<p>We initially thought this was the dominant cost. <strong>It isn't</strong> — see the<br>
+"What we tried" section. In our workload, frame-level allocation cost<br>
+is dwarfed by Compose's render/layout/draw work; switching to a size-<br>
+indexed O(log F) lookup didn't move the steady-state frame mean. The<br>
+sweep itself is the load-bearing cost, and replacing <code>first_fit</code><br>
+without also addressing the sweep makes things <em>worse</em> (see below).</p>
+<h2>Direct measurements from a patched wasmtime build</h2>
+<p>I patched 44.0.1 to log <code>N</code> (over-approximation list size), <code>F</code><br>
+(free-block count), sweep duration, and freed bytes at every sweep.<br>
+Three consecutive sweeps during a 45-min soak with active<br>
+scrolling/tapping in a Material3 LazyColumn:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="mi">11</span><span class="p">:</span><span class="mi">33</span><span class="p">:</span><span class="mi">56</span><span class="w">  </span><span class="n">sweep</span><span class="w"> </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="nc">dur</span><span class="o">=</span><span class="mi">478</span><span class="w"> </span><span class="n">ms</span><span class="p">,</span><span class="w">   </span><span class="n">N</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span><span class="mi">223</span><span class="p">,</span><span class="mi">135</span><span class="p">,</span><span class="w"> </span><span class="n">F</span><span class="p">:</span><span class="mi">1</span><span class="err">→</span><span class="mi">37</span><span class="p">,</span><span class="mi">269</span>
+<span class="mi">11</span><span class="p">:</span><span class="mi">41</span><span class="p">:</span><span class="mi">52</span><span class="w">  </span><span class="n">sweep</span><span class="w"> </span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="nc">dur</span><span class="o">=</span><span class="mi">1248</span><span class="w"> </span><span class="n">ms</span><span class="p">,</span><span class="w">  </span><span class="n">N</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span><span class="mi">333</span><span class="p">,</span><span class="mi">452</span><span class="p">,</span><span class="w"> </span><span class="n">F</span><span class="p">:</span><span class="mi">9</span><span class="p">,</span><span class="mi">966</span><span class="err">→</span><span class="mi">67</span><span class="p">,</span><span class="mi">394</span>
+<span class="mi">12</span><span class="p">:</span><span class="mi">18</span><span class="p">:</span><span class="mi">20</span><span class="w">  </span><span class="n">sweep</span><span class="w"> </span><span class="mi">3</span><span class="p">:</span><span class="w"> </span><span class="nc">dur</span><span class="o">=</span><span class="mi">3000</span><span class="w"> </span><span class="n">ms</span><span class="p">,</span><span class="w">  </span><span class="n">N</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span><span class="mi">585</span><span class="p">,</span><span class="mi">421</span><span class="p">,</span><span class="w"> </span><span class="n">F</span><span class="p">:</span><span class="mi">29</span><span class="p">,</span><span class="mi">538</span><span class="err">→</span><span class="mi">67</span><span class="p">,</span><span class="mi">394</span>
+</code></pre></div>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Sweep 1</th>
+<th>Sweep 2 (+8 min)</th>
+<th>Sweep 3 (+37 min)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>N</code></td>
+<td>1.22M</td>
+<td>2.33M</td>
+<td><strong>4.59M</strong></td>
+</tr>
+<tr>
+<td><code>F_after</code></td>
+<td>37,269</td>
+<td>67,394</td>
+<td>67,394</td>
+</tr>
+<tr>
+<td>Sweep duration</td>
+<td><strong>478 ms</strong></td>
+<td><strong>1,248 ms</strong></td>
+<td><strong>3,000 ms</strong></td>
+</tr>
+<tr>
+<td>Per-entry sweep cost</td>
+<td>0.39 μs</td>
+<td>0.53 μs</td>
+<td><strong>0.65 μs</strong></td>
+</tr>
+<tr>
+<td>Bytes reclaimed</td>
+<td>56 MB</td>
+<td>116 MB</td>
+<td>249 MB</td>
+</tr>
+</tbody>
+</table>
+<p>All three <code>kept</code> counts were 0 — sweeps fired from a host-side<br>
+<code>Store::gc(None)</code> invoked between frames, so the precise-stack-roots<br>
+set was empty at sweep time.</p>
+<p>Notable observations:</p>
+<ol>
+<li>
+<p><strong><code>F</code> jumps to 37K on the very first sweep.</strong> Sweep 1 deallocates<br>
+   1.2M scattered objects; the BTreeMap merge-with-neighbors logic in<br>
+<code>FreeList::dealloc</code> only coalesces <em>immediately address-adjacent</em><br>
+   blocks. With live retained objects sandwiching dead ones, ~37K of<br>
+   the freed blocks survive as discrete entries. From that point on,<br>
+   every guest allocation pays an O(37K) <code>first_fit</code> walk.</p>
+</li>
+<li>
+<p><strong><code>F</code> partially reverses between sweeps</strong> (37K → 10K before sweep<br>
+   2; 67K → 30K before sweep 3) — the allocator does merge some<br>
+   blocks as it satisfies new allocations. But each new sweep then<br>
+   re-bloats <code>F</code>. Net direction is monotonically up over the soak.</p>
+</li>
+<li>
+<p><strong>Per-entry sweep cost is rising monotonically</strong> (0.39 → 0.53 →<br>
+   0.65 μs/entry, +67% over 45 min). At N=4.6M the over-approximation<br>
+   linked list's 40-byte headers occupy ~180 MB of GC heap scattered<br>
+   across distant addresses. Walking them is bandwidth-bound; the<br>
+   working set has clearly blown L1/L2 and is likely thrashing L3 too.</p>
+</li>
+<li>
+<p><strong>Sweep duration grows faster than N</strong> — N grows ~2× per<br>
+   inter-sweep interval, but duration grew ~3× from sweep 2 to 3 even<br>
+   though that gap was 4× longer than sweep 1 to 2. The two effects<br>
+   (more entries to walk, each entry costs more) compound.</p>
+</li>
+</ol>
+<p>Extrapolating the trend: at the observed growth rate, sweep durations<br>
+push past 5 s within an hour or two. A single sweep at that scale, or<br>
+a small cascade of them inside one <code>render_frame</code>, exceeds Android's<br>
+5 s input-dispatch ANR threshold. We've observed this in practice in<br>
+multiple soaks (one ANR at ~48 min on the unpatched build, another at<br>
+~10 min on a heavier-interaction soak with the instrumentation<br>
+adding small per-sweep overhead). Typical ANR cascade pattern in<br>
+logcat:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">last</span><span class="w"> </span><span class="n">frame</span><span class="w"> </span><span class="n">log</span>
+<span class="o">+</span><span class="mf">0.0</span><span class="w"> </span><span class="n">s</span><span class="w">   </span><span class="n">wart</span><span class="o">-</span><span class="n">profile</span><span class="p">:</span><span class="w"> </span><span class="nc">frame</span><span class="w"> </span><span class="n">N</span><span class="w"> </span><span class="n">t</span><span class="o">+</span><span class="n">X</span><span class="w"> </span><span class="n">ms</span><span class="w">  </span><span class="n">win</span><span class="p">[</span><span class="n">N</span><span class="o">=</span><span class="mi">60</span><span class="w"> </span><span class="o">..</span><span class="p">.</span><span class="w"> </span><span class="p">]</span>
+<span class="o">+</span><span class="mf">0.0</span><span class="w"> </span><span class="n">s</span><span class="w">   </span><span class="n">InputDispatcher</span><span class="p">:</span><span class="w"> </span><span class="s">"spent 2005 ms processing MotionEvent"</span>
+<span class="o">+</span><span class="mf">1.0</span><span class="w"> </span><span class="n">s</span><span class="w">   </span><span class="n">InputDispatcher</span><span class="p">:</span><span class="w"> </span><span class="s">"spent 2350 ms processing MotionEvent"</span>
+<span class="o">+</span><span class="mf">4.0</span><span class="w"> </span><span class="n">s</span><span class="w">   </span><span class="n">InputDispatcher</span><span class="p">:</span><span class="w"> </span><span class="s">"spent 2247 ms processing MotionEvent"</span>
+<span class="o">+</span><span class="mf">5.0</span><span class="w"> </span><span class="n">s</span><span class="w">   </span><span class="n">ANR</span><span class="w"> </span><span class="err">—</span><span class="w"> </span><span class="s">"Waited 5000 ms for MotionEvent"</span>
+</code></pre></div>
+<p>Mean steady-state frame time stays flat at ~16 ms outside of<br>
+sweep/cascade windows — the problem isn't the normal allocation path,<br>
+it's the sweep + the post-sweep allocation cost driven by elevated F.</p>
+<h2>What we tried that did NOT work</h2>
+<p>We patched <code>FreeList</code> to add a parallel size-indexed<br>
+<code>BTreeSet&lt;(len, index)&gt;</code>, replacing the O(F) linear scan in <code>first_fit</code><br>
+with an O(log F) <code>range((alloc_size, 0)..).next()</code> lookup. All 12<br>
+existing <code>FreeList</code> unit tests pass. On device, this **made things<br>
+worse**:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Unpatched</th>
+<th>With FreeList fix</th>
+<th>Δ</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sweep 1 duration</td>
+<td>472 ms</td>
+<td>823 ms</td>
+<td><strong>+74%</strong></td>
+</tr>
+<tr>
+<td>Sweep 2 duration</td>
+<td>1,222 ms</td>
+<td>2,010 ms</td>
+<td><strong>+64%</strong></td>
+</tr>
+<tr>
+<td>Sweep 3 duration</td>
+<td>(ANR'd before)</td>
+<td><strong>4,314 ms</strong></td>
+<td>new</td>
+</tr>
+<tr>
+<td>Per-frame mean (steady)</td>
+<td>~16 ms</td>
+<td>~16 ms</td>
+<td>no change</td>
+</tr>
+<tr>
+<td>Guest alloc rate</td>
+<td>15K refs/sec</td>
+<td><strong>19K refs/sec</strong></td>
+<td><strong>+27%</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Two reasons it failed:</p>
+<ol>
+<li>
+<p><strong><code>first_fit</code> was not the bottleneck.</strong> Frame-mean cost is dominated<br>
+   by Compose's render/layout/draw work; the alloc-path microseconds<br>
+   we shaved off didn't manifest in any observable metric.</p>
+</li>
+<li>
+<p><strong>Faster allocs made the leak worse.</strong> With cheaper allocs, the<br>
+   Kotlin/Wasm guest churned through <code>suspendCoroutine</code> cycles faster,<br>
+   so <code>N</code> accumulated faster between sweeps. Each subsequent sweep had<br>
+<em>more</em> to walk and <em>more</em> to deallocate. The per-dealloc overhead<br>
+   from maintaining a second data structure (one extra BTreeSet op per<br>
+<code>add_block</code> / <code>remove_block</code> / <code>update_block_len</code>) then compounded<br>
+   over <code>N</code>+ deallocations per sweep.</p>
+</li>
+</ol>
+<p>The lesson: any allocator-side optimization must be paired with a<br>
+sweep-side fix, otherwise it accelerates the pathology. Posting this<br>
+finding in case it's useful — happy to share the patch diff if you want<br>
+to evaluate it for other workloads where alloc cost <em>is</em> the<br>
+bottleneck.</p>
+<h2>What would help</h2>
+<p>In order of e<br>
+[message truncated]</p>
+</blockquote>
+
+
+
+<a name="595770960"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313403%20DRC%3A%20per-GC%20sweep%20cost%20grows%20unbo.../near/595770960" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313403.20DRC.3A.20per-GC.20sweep.20cost.20grows.20unbo.2E.2E.2E.html#595770960">(May 18 2026 at 09:56)</a>:</h4>
+<p><a href="https://github.com/harryzz">harryzz</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13403">Issue #13403</a>.</p>
+
+
+
+<a name="595900605"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313403%20DRC%3A%20per-GC%20sweep%20cost%20grows%20unbo.../near/595900605" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313403.20DRC.3A.20per-GC.20sweep.20cost.20grows.20unbo.2E.2E.2E.html#595900605">(May 18 2026 at 18:27)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/13403#issuecomment-4480682145">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13403">issue #13403</a>:</p>
+<blockquote>
+<p>Hello, I appreciate the bug report and will strive to investigate it soon, but can you please avoid dumping AI-generated walls of text going forward? By not reviewing the LLM output and summarizing it / including just the necessary information yourself first before reporting, you are thrusting that work and effort upon Wasmtime's maintainers, which breaks the open-source social contract. <a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">Read the Bytecode Alliance AI tool usage policy for more details.</a> Thanks!</p>
+</blockquote>
+
+
+
+<a name="595901527"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313403%20DRC%3A%20per-GC%20sweep%20cost%20grows%20unbo.../near/595901527" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313403.20DRC.3A.20per-GC.20sweep.20cost.20grows.20unbo.2E.2E.2E.html#595901527">(May 18 2026 at 18:29)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the wasm-proposal:gc label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13403">Issue #13403</a>.</p>
+
+
+
+<a name="596298939"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313403%20DRC%3A%20per-GC%20sweep%20cost%20grows%20unbo.../near/596298939" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313403.20DRC.3A.20per-GC.20sweep.20cost.20grows.20unbo.2E.2E.2E.html#596298939">(May 19 2026 at 22:22)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/13403#issuecomment-4492558632">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13403">issue #13403</a>:</p>
+<blockquote>
+<p>@harryzz can you provide the exact Wasmtime invocation you used with <code>wart-leak-repro.wasm</code> to reproduce the increasing sweep times? I ran the following and it never allocated enough to trigger a GC:</p>
+<p><div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">wasmtime</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="o">-</span><span class="n">Wgc</span><span class="p">,</span><span class="n">function</span><span class="o">-</span><span class="n">references</span><span class="p">,</span><span class="n">exceptions</span><span class="w"> </span><span class="o">-</span><span class="n">Ccollector</span><span class="o">=</span><span class="n">drc</span><span class="w"> </span><span class="o">-</span><span class="n">Wunknown</span><span class="o">-</span><span class="n">imports</span><span class="o">-</span><span class="n">default</span><span class="o">=</span><span class="n">y</span><span class="w"> </span><span class="n">wart</span><span class="o">-</span><span class="n">leak</span><span class="o">-</span><span class="n">repro</span><span class="p">.</span><span class="n">wasm</span>
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="596358334"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313403%20DRC%3A%20per-GC%20sweep%20cost%20grows%20unbo.../near/596358334" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313403.20DRC.3A.20per-GC.20sweep.20cost.20grows.20unbo.2E.2E.2E.html#596358334">(May 20 2026 at 06:37)</a>:</h4>
+<p>harryzz <a href="https://github.com/bytecodealliance/wasmtime/issues/13403#issuecomment-4495325643">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13403">issue #13403</a>:</p>
+<blockquote>
+<p>@fitzgen first sorry for AI generated post. To the question: standalone can't run, need host function.<br>
+I have attached new self driven wasm file. Also repo with kotlin code updated if you need for reference.</p>
+<p>regards,<br>
+Zahari</p>
+<p>P.S. there short answer from AI if you need :)</p>
+<p>&lt;!-- Failed to upload "wart-leak.repro.tgz" --&gt;</p>
+<p>&lt;!-- Failed to upload "wart-leak.repro.tgz" --&gt;</p>
+<p>▎ Sorry, that's on me — the .wasm I attached doesn't reproduce standalone. It was a WASI component whose suspend loop was driven by an external render-frame export, so a plain wasmtime run calls main() once,<br>
+  ▎ which parks at the first suspendCoroutine and returns — nothing accumulates.<br>
+  ▎<br>
+  ▎ I've replaced it with a self-driving build (attached: wart-leak-repro.wasm) — main() now runs the suspend/resume cycle itself in an unbounded loop, no host imports, no component model. Your exact invocation<br>
+  ▎  reproduces it:<br>
+  ▎<br>
+  ▎ wasmtime run -Wgc,function-references,exceptions -Ccollector=drc wart-leak-repro.wasm<br>
+  ▎<br>
+  ▎ RSS climbs ~100 MB/s as garbage accumulates with no sweep, plateaus at the 4 GB wasm32 ceiling within ~50 s, then enters the steady-state sweep cycle (the tick # counter keeps advancing past the plateau).<br>
+  ▎ With 01-instrumentation.patch applied you get the per-sweep (N, F, dur) trajectory. The ~70-line source is Main.kt — pure suspendCoroutine, zero dependencies.</p>
+<p><a href="https://github.com/user-attachments/files/28045017/wart-leak-repro.tar.gz">wart-leak-repro.tar.gz</a></p>
+</blockquote>
+
+
+
+<hr><p>Last updated: May 20 2026 at 11:01 UTC</p>
+</html>
