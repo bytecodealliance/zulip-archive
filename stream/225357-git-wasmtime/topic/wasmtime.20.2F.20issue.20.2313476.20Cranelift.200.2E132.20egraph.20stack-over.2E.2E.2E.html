@@ -1,0 +1,226 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13476 Cranelift 0.132 egraph stack-over... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313476.20Cranelift.200.2E132.20egraph.20stack-over.2E.2E.2E.html">wasmtime / issue #13476 Cranelift 0.132 egraph stack-over...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="597459593"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313476%20Cranelift%200.132%20egraph%20stack-over.../near/597459593" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313476.20Cranelift.200.2E132.20egraph.20stack-over.2E.2E.2E.html#597459593">(May 25 2026 at 03:29)</a>:</h4>
+<p>hassard0 opened <a href="https://github.com/bytecodealliance/wasmtime/issues/13476">issue #13476</a>:</p>
+<blockquote>
+<h1>egraph stack-overflow on simple generic slice function</h1>
+<p><strong>Filed against</strong>: <code>bytecodealliance/wasmtime</code> (cranelift-codegen<br>
+0.132)</p>
+<p><strong>Mighty version</strong>: v0.9.0 (commit <code>06b6efe</code>).</p>
+<h2>Summary</h2>
+<p><code>cranelift-codegen 0.132</code>'s egraph optimization pass infinite-<br>
+recurses on a single 88-byte Mighty input that lowers to perfectly<br>
+ordinary CLIF — a generic-over-<code>T</code>, <code>&amp;[T]</code> → <code>Option&lt;&amp;T&gt;</code> helper.<br>
+The recursion blows the C stack inside libFuzzer's instrumented<br>
+binary in well under a second. The recursion lives entirely inside<br>
+<code>cranelift_codegen::opts::generated_code::constructor_simplify</code><br>
+(the ISLE-generated egraph entry point); nothing in the calling<br>
+backend (<code>mty-codegen-cranelift</code> → <code>cranelift_module</code> →<br>
+<code>Module::define_function</code>) is on the cycle.</p>
+<p>Workaround: set <code>opt_level = "none"</code> in<br>
+<code>cranelift_codegen::settings::Flags</code> — disables the egraph pass at<br>
+the cost of optimization quality.</p>
+<h2>Reproducer</h2>
+<h3>Mighty source</h3>
+<p>The full input is 88 bytes:</p>
+<div class="codehilite" data-code-language="mty"><pre><span></span><code>fn first[T](xs: &amp;[T]) -&gt; Option[&amp;T] {
+  if xs.len == 0 { None } else { Some(&amp;xs[0]) }
+}
+</code></pre></div>
+<p>The bug is triggered by the front-end accepting this program and<br>
+the IR lowerer emitting CLIF for the generic. We have not been<br>
+able to reproduce by hand-written CLIF — the issue depends on the<br>
+specific operand sequence the IR lowerer emits for a generic-over-<br>
+<code>T</code> slice indexing + Option-wrapping pattern.</p>
+<h3>Cranelift configuration</h3>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">b</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">settings</span><span class="p">::</span><span class="n">builder</span><span class="p">();</span>
+<span class="n">b</span><span class="p">.</span><span class="n">set</span><span class="p">(</span><span class="s">"opt_level"</span><span class="p">,</span><span class="w"> </span><span class="s">"speed"</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="n">b</span><span class="p">.</span><span class="n">set</span><span class="p">(</span><span class="s">"is_pic"</span><span class="p">,</span><span class="w"> </span><span class="s">"false"</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">flags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">settings</span><span class="p">::</span><span class="n">Flags</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+</code></pre></div>
+<p>(default <code>mty-codegen-cranelift</code> flags; see<br>
+<code>crates/mty-codegen-cranelift/src/lower.rs::default_flags</code>.)</p>
+<h3>Driver invocation</h3>
+<p>We trigger the crash via:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">mty_codegen_cranelift</span><span class="p">::</span><span class="n">object</span><span class="p">::</span><span class="n">compile_object</span><span class="p">(</span><span class="o">&amp;</span><span class="n">prog</span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="n">expect</span><span class="p">(</span><span class="s">"compile-object"</span><span class="p">);</span><span class="w">   </span><span class="c1">// → SIGSEGV stack-overflow inside Cranelift</span>
+</code></pre></div>
+<p><code>prog</code> is the result of <code>parse → lower → typeck → ir-lower</code> of the<br>
+Mighty source above. We have not yet been able to extract a<br>
+self-contained CLIF reproducer because the IR lowerer is the only<br>
+producer of this CLIF shape — we'll attach a CLIF dump if you'd<br>
+like one (it requires us to add a debug-print pass).</p>
+<h2>Stack trace (libFuzzer / ASAN, Windows MSVC)</h2>
+<p>Truncated to the recursive frames:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">opts</span><span class="p">::</span><span class="n">generated_code</span><span class="p">::</span><span class="n">constructor_simplify</span>
+<span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">opts</span><span class="p">::</span><span class="n">generated_code</span><span class="p">::</span><span class="n">optimize_pure_enode</span>
+<span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">opts</span><span class="p">::</span><span class="n">generated_code</span><span class="p">::</span><span class="n">make_inst_ctor</span>
+<span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">opts</span><span class="p">::</span><span class="n">generated_code</span><span class="p">::</span><span class="n">constructor_icmp</span>
+<span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">opts</span><span class="p">::</span><span class="n">generated_code</span><span class="p">::</span><span class="n">constructor_simplify</span><span class="w">   </span><span class="err">←</span><span class="w"> </span><span class="n">cycle</span>
+<span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">opts</span><span class="p">::</span><span class="n">generated_code</span><span class="p">::</span><span class="n">optimize_pure_enode</span>
+<span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">opts</span><span class="p">::</span><span class="n">generated_code</span><span class="p">::</span><span class="n">make_inst_ctor</span>
+<span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">opts</span><span class="p">::</span><span class="n">generated_code</span><span class="p">::</span><span class="n">constructor_icmp</span>
+<span class="n">cranelift_codegen</span><span class="p">::</span><span class="n">opts</span><span class="p">::</span><span class="n">generated_code</span><span class="p">::</span><span class="n">constructor_simplify</span><span class="w">   </span><span class="err">←</span><span class="w"> </span><span class="n">cycle</span>
+<span class="o">..</span><span class="p">.</span>
+<span class="p">[</span><span class="o">~</span><span class="mi">5000</span><span class="w"> </span><span class="n">frames</span><span class="w"> </span><span class="n">before</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">OS</span><span class="w"> </span><span class="n">kills</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">thread</span><span class="p">]</span>
+</code></pre></div>
+<p>ASAN tags the crash as <code>stack-overflow</code> (not a heap OOB).<br>
+Reproduces identically on:</p>
+<ul>
+<li>Windows 11 + nightly Rust <code>1.98.0-nightly (23a3312d9 2026-05-23)</code><ul>
+<li>cargo-fuzz 0.13.1 + libFuzzer.</li>
+</ul>
+</li>
+<li>(Not yet verified on Linux — the libFuzzer binary build path on<br>
+  Windows MSVC is the one that's instrumented; happy to repro on<br>
+  Linux if requested.)</li>
+</ul>
+<h2>Suspected root cause</h2>
+<p>The recursion bounces between <code>constructor_simplify</code> and<br>
+<code>constructor_icmp</code> via <code>optimize_pure_enode</code> →<br>
+<code>make_inst_ctor</code>. That suggests an ISLE rewrite rule pair that<br>
+rewrites <code>icmp</code> ↔ something-that-resimplifies-to-<code>icmp</code> without<br>
+adding any new e-node, so the optimizer's saturation check doesn't<br>
+fire. The CLIF that triggers it is plausibly an icmp chain emitted<br>
+for the <code>if xs.len == 0</code> test plus the bounds check inside <code>xs[0]</code><br>
+— specifically, a redundant comparison the optimizer keeps trying<br>
+to rewrite.</p>
+<p>(Speculation — we have not bisected the ISLE rules. Happy to bisect<br>
+on request if you give us the right knob to enable rule-by-rule<br>
+emission.)</p>
+<h2>Environment</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cranelift-codegen</code></td>
+<td><code>0.132.0</code> (workspace pin in</td>
+</tr>
+<tr>
+<td><code>Cargo.toml</code>)</td>
+<td></td>
+</tr>
+<tr>
+<td>Rust toolchain</td>
+<td><code>1.98.0-nightly (23a3312d9 2026-05-23)</code></td>
+</tr>
+<tr>
+<td>Host triple</td>
+<td><code>x86_64-pc-windows-msvc</code></td>
+</tr>
+<tr>
+<td>Optimizer level</td>
+<td><code>speed</code> (the default; <code>"none"</code> is a workaround)</td>
+</tr>
+<tr>
+<td>Reproducer</td>
+<td><code>crates/mty-codegen-cranelift/fuzz/artifacts/codegen_fuzz/crash-eb52420944e0ab2856e40ae22f6d6587e218a5da</code></td>
+</tr>
+</tbody>
+</table>
+<h2>Workaround we shipped</h2>
+<p><code>crates/mty-codegen-cranelift/src/lower.rs::default_flags</code> documents<br>
+the <code>opt_level = "none"</code> escape hatch. The Mighty CLI exposes it<br>
+via a future <code>--no-opt</code> flag (v0.10 follow-up); meanwhile, programs<br>
+matching the generic-slice shape can be compiled by editing<br>
+<code>default_flags</code> to set <code>opt_level = "none"</code>.</p>
+<p>We have NOT applied the workaround by default — the perf cost is<br>
+real, and the bug only affects one synthetic shape we have<br>
+identified so far. The escape hatch lives in code comments for<br>
+operators who hit a repro in the wild.</p>
+<h2>What we'd like upstream to look at</h2>
+<ol>
+<li>
+<p><strong>The cycle</strong> — <code>constructor_simplify</code> ↔ <code>constructor_icmp</code> via<br>
+<code>optimize_pure_enode</code> / <code>make_inst_ctor</code>. Adding a depth limit<br>
+   (or a more thorough saturation check) would close the crash<br>
+   surface even before the underlying rule pair is identified.</p>
+</li>
+<li>
+<p><strong>The triggering CLIF shape</strong> — we can produce a CLIF dump if<br>
+   the original Mighty input isn't useful. The pattern is generic-<br>
+   over-T + <code>&amp;[T]</code> indexing + Option wrapping; we suspect any<br>
+   front-end that emits a similar icmp chain would hit it.</p>
+</li>
+<li>
+<p><strong>Whether 0.133+ has fixed it</strong> — we'd like to pin a newer<br>
+   cranelift once a fix lands.</p>
+</li>
+</ol>
+<h2>Cross-references</h2>
+<ul>
+<li>
+<p>Bug-bash notes: <code>FUZZ_V0_9_NOTES.md</code> (Bug 3) in the Mighty repo<br>
+  (<code>hassard0/Mighty</code>, commit <code>06b6efe</code>).</p>
+</li>
+<li>
+<p>Cleanup follow-up: <code>CLEANUP_V0_10_NOTES.md</code>.</p>
+</li>
+</ul>
+<p>Thanks for cranelift! Happy to provide additional repros, a CLIF<br>
+dump, or test against a candidate fix on request.<br>
+</p>
+</blockquote>
+
+
+
+<a name="597460020"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313476%20Cranelift%200.132%20egraph%20stack-over.../near/597460020" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313476.20Cranelift.200.2E132.20egraph.20stack-over.2E.2E.2E.html#597460020">(May 25 2026 at 03:34)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/13476#issuecomment-4531265720">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13476">issue #13476</a>:</p>
+<blockquote>
+<p>Hi @hassard0 -- please see our <a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">AI tool policy</a>. This is clearly an AI-generated report, without a human-editing pass -- "what we'd like upstream to look at" (hi, you're speaking to upstream, no need for third-person!) and a lot of unnecessary detail. (Please see in particular the section in our policy about "extractive contributions", and our expectation that humans review the output of AI tools before blindly copy+pasting.) We'd appreciate a simple CLIF reproducer and a human-written description -- thanks!</p>
+</blockquote>
+
+
+
+<a name="597460354"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313476%20Cranelift%200.132%20egraph%20stack-over.../near/597460354" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313476.20Cranelift.200.2E132.20egraph.20stack-over.2E.2E.2E.html#597460354">(May 25 2026 at 03:40)</a>:</h4>
+<p>hassard0 <a href="https://github.com/bytecodealliance/wasmtime/issues/13476#issuecomment-4531287285">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13476">issue #13476</a>:</p>
+<blockquote>
+<p>@cfallin sorry about that. Claude on auto-pilot ignored its harness. If there is merit to the post great else disregard. If I validate it independently I'll reopen an issue. </p>
+</blockquote>
+
+
+
+<a name="597460489"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313476%20Cranelift%200.132%20egraph%20stack-over.../near/597460489" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313476.20Cranelift.200.2E132.20egraph.20stack-over.2E.2E.2E.html#597460489">(May 25 2026 at 03:42)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/13476#issuecomment-4531298598">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13476">issue #13476</a>:</p>
+<blockquote>
+<p>If there is legitimately a stack overflow in Cranelift with some CLIF input, we'd like to know about it -- ask that disobedient-but-good-at-heart agent for a reproducer (in vanilla Cranelift i.e. <code>clif-util</code> as long as we're being picky) and I'm happy to take a look, thanks!</p>
+</blockquote>
+
+
+
+<a name="597463080"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313476%20Cranelift%200.132%20egraph%20stack-over.../near/597463080" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313476.20Cranelift.200.2E132.20egraph.20stack-over.2E.2E.2E.html#597463080">(May 25 2026 at 04:17)</a>:</h4>
+<p>hassard0 <a href="https://github.com/bytecodealliance/wasmtime/issues/13476#issuecomment-4531437934">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13476">issue #13476</a>:</p>
+<blockquote>
+<p><a href="https://github.com/user-attachments/files/28205700/cranelift-egraph-repro-2026-05-25.zip">cranelift-egraph-repro-2026-05-25.zip</a></p>
+<p>Please see reproducer.  </p>
+<p>I will investigate this myself in my morning but the last note reveals it may just be the confluence of design decisions I made.  This was the output from my agent.  -  sorry again for the slop issue.  </p>
+<p>One honest caveat in the README: when I extracted the CLIF and ran the standalone harness, it compiled cleanly — the<br>
+  crash needed the libFuzzer+ASAN context to surface (likely because ASAN-instrumented frames blow the OS stack much<br>
+  sooner than release frames; the egraph recursion may still be runaway but stays under the OS stack limit without<br>
+  ASAN). The README flags this transparently with three hypotheses so the upstream team isn't surprised, and recommends<br>
+  they try RUSTFLAGS="-Zsanitizer=address" or ulimit -s 1024.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Jul 02 2026 at 22:22 UTC</p>
+</html>

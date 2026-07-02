@@ -1,0 +1,185 @@
+<html>
+<head><meta charset="utf-8"><title>Turning on GC changes codegen for `call_indirect` · wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/index.html">wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Turning.20on.20GC.20changes.20codegen.20for.20.60call_indirect.60.html">Turning on GC changes codegen for `call_indirect`</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="600331983"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Turning%20on%20GC%20changes%20codegen%20for%20%60call_indirect%60/near/600331983" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Turning.20on.20GC.20changes.20codegen.20for.20.60call_indirect.60.html#600331983">(Jun 04 2026 at 19:50)</a>:</h4>
+<p><span class="user-mention" data-user-id="253990">@fitzgen (he/him)</span> I was poking at somethings and noticed that there's a few instances in wasm translation where <code>features.gc()</code> affects what CLIF is generated. Notably <a href="https://github.com/bytecodealliance/wasmtime/blob/5ed24363bebb64ddc41cdc9c90bf8607ef988f5f/crates/cranelift/src/func_environ.rs#L2211">checking type signatures in call-indirect</a> (and another <a href="https://github.com/bytecodealliance/wasmtime/blob/5ed24363bebb64ddc41cdc9c90bf8607ef988f5f/crates/cranelift/src/func_environ.rs#L2305">here</a>) changes whether or not GC is enabled.</p>
+<p>I think this is probably something we're going to want to fix prior to enable-by-default (or before we ship on-by-default) because otherwise this looks like it's de-optimizing the <code>call_indirect</code> path with gc enabled. I think this is probably an easy fix (specialize <code>funcref</code> tables specifically) by my read, but wanted to flag this with you</p>
+
+
+
+<a name="600526472"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Turning%20on%20GC%20changes%20codegen%20for%20%60call_indirect%60/near/600526472" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> fitzgen (he/him) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Turning.20on.20GC.20changes.20codegen.20for.20.60call_indirect.60.html#600526472">(Jun 04 2026 at 23:17)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="253994">Alex Crichton</span> <a href="#narrow/channel/217126-wasmtime/topic/Turning.20on.20GC.20changes.20codegen.20for.20.60call_indirect.60/near/600331983">said</a>:</p>
+<blockquote>
+<p>because otherwise this looks like it's de-optimizing the <code>call_indirect</code> path with gc enabled.</p>
+</blockquote>
+<p>The fast path for call-indirect with GC is the same as call-indirect without GC, and the slow path with GC will always result in a trap without GC, so I don't think this is actually de-optimizing anything (other than a very slight bit of code size bloat, which is acceptable in this case IMO)</p>
+
+
+
+<a name="600527773"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Turning%20on%20GC%20changes%20codegen%20for%20%60call_indirect%60/near/600527773" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Turning.20on.20GC.20changes.20codegen.20for.20.60call_indirect.60.html#600527773">(Jun 04 2026 at 23:30)</a>:</h4>
+<p>The <a href="https://godbolt.org/z/Efz5c68cW">codegen definitely changes though</a>, and notably with <code>-Wgc</code> I see:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="w"> </span><span class="n">cmp</span><span class="w"> </span><span class="n">esi</span><span class="p">,</span><span class="w"> </span><span class="n">edx</span>
+<span class="w"> </span><span class="n">sete</span><span class="w"> </span><span class="n">al</span>
+<span class="w"> </span><span class="n">movzx</span><span class="w"> </span><span class="n">eax</span><span class="p">,</span><span class="w"> </span><span class="n">al</span>
+<span class="o">..</span><span class="p">.</span>
+<span class="w"> </span><span class="n">test</span><span class="w"> </span><span class="n">eax</span><span class="p">,</span><span class="w"> </span><span class="n">eax</span>
+<span class="w"> </span><span class="n">je</span><span class="w"> </span><span class="mh">0xa2</span><span class="w"> </span><span class="o">&lt;</span><span class="n">wasm</span><span class="p">[</span><span class="mi">0</span><span class="p">]::</span><span class="n">function</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">+</span><span class="mh">0xa2</span><span class="o">&gt;</span>
+</code></pre></div>
+
+
+
+<a name="600528529"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Turning%20on%20GC%20changes%20codegen%20for%20%60call_indirect%60/near/600528529" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Turning.20on.20GC.20changes.20codegen.20for.20.60call_indirect.60.html#600528529">(Jun 04 2026 at 23:38)</a>:</h4>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="w"> </span><span class="n">cmp</span><span class="w"> </span><span class="n">esi</span><span class="p">,</span><span class="w"> </span><span class="n">edx</span>
+<span class="w"> </span><span class="n">sete</span><span class="w"> </span><span class="n">al</span>
+<span class="w"> </span><span class="n">movzx</span><span class="w"> </span><span class="n">eax</span><span class="p">,</span><span class="w"> </span><span class="n">al</span>
+<span class="w"> </span><span class="n">cmp</span><span class="w"> </span><span class="n">esi</span><span class="p">,</span><span class="w"> </span><span class="n">edx</span>
+<span class="w"> </span><span class="n">je</span><span class="w"> </span><span class="mh">0x64</span><span class="w"> </span><span class="o">&lt;</span><span class="n">wasm</span><span class="p">[</span><span class="mi">0</span><span class="p">]::</span><span class="n">function</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">+</span><span class="mh">0x64</span><span class="o">&gt;</span>
+</code></pre></div>
+<p><em>cries in peephole optimization and path-sensitive constant propagation pain</em></p>
+<p>(<code>eax</code> will always be constant 1 when taken, constant 0 when not -- and after N years of effort our flags-related codegen is still decidedly Not Great. tangential to topic but we definitely still have low-hanging fruit here)</p>
+
+
+
+<a name="600528767"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Turning%20on%20GC%20changes%20codegen%20for%20%60call_indirect%60/near/600528767" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Turning.20on.20GC.20changes.20codegen.20for.20.60call_indirect.60.html#600528767">(Jun 04 2026 at 23:41)</a>:</h4>
+<p>I can never get sightglass to do what I want...</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">execution</span>
+<span class="w">  </span><span class="p">.</span><span class="o">/</span><span class="n">benchmarks</span><span class="o">/</span><span class="n">spidermonkey</span><span class="o">/</span><span class="n">spidermonkey</span><span class="o">-</span><span class="n">markdown</span><span class="p">.</span><span class="n">wasm</span>
+<span class="w">    </span><span class="n">cycles</span>
+<span class="w">      </span><span class="p">[</span><span class="mi">115443777</span><span class="w"> </span><span class="mf">126864658.04</span><span class="w"> </span><span class="mi">195022945</span><span class="p">]</span><span class="w"> </span><span class="o">../</span><span class="n">wasmtime</span><span class="o">/</span><span class="n">target</span><span class="o">/</span><span class="n">release</span><span class="o">/</span><span class="n">libwasmtime_bench_api</span><span class="p">.</span><span class="n">so</span>
+<span class="w">      </span><span class="p">[</span><span class="mi">122040249</span><span class="w"> </span><span class="mf">130580372.04</span><span class="w"> </span><span class="mi">194436680</span><span class="p">]</span><span class="w"> </span><span class="o">../</span><span class="n">wasmtime</span><span class="o">/</span><span class="n">target</span><span class="o">/</span><span class="n">release</span><span class="o">/</span><span class="n">libwasmtime_bench_api</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="p">(</span><span class="o">-</span><span class="n">Wgc</span><span class="p">)</span>
+</code></pre></div>
+<p>is the best I can get out of sightglass</p>
+
+
+
+<a name="600529051"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Turning%20on%20GC%20changes%20codegen%20for%20%60call_indirect%60/near/600529051" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Turning.20on.20GC.20changes.20codegen.20for.20.60call_indirect.60.html#600529051">(Jun 04 2026 at 23:45)</a>:</h4>
+<p>so ~3% slowdown</p>
+
+
+
+<a name="600680504"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Turning%20on%20GC%20changes%20codegen%20for%20%60call_indirect%60/near/600680504" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> fitzgen (he/him) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Turning.20on.20GC.20changes.20codegen.20for.20.60call_indirect.60.html#600680504">(Jun 05 2026 at 13:24)</a>:</h4>
+<p>hrm okay I can investigate</p>
+
+
+
+<a name="600680774"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Turning%20on%20GC%20changes%20codegen%20for%20%60call_indirect%60/near/600680774" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> fitzgen (he/him) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Turning.20on.20GC.20changes.20codegen.20for.20.60call_indirect.60.html#600680774">(Jun 05 2026 at 13:25)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="253994">Alex Crichton</span> <a href="#narrow/channel/217126-wasmtime/topic/Turning.20on.20GC.20changes.20codegen.20for.20.60call_indirect.60/near/600528767">said</a>:</p>
+<blockquote>
+<p>I can never get sightglass to do what I want...</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">execution</span>
+<span class="w">  </span><span class="p">.</span><span class="o">/</span><span class="n">benchmarks</span><span class="o">/</span><span class="n">spidermonkey</span><span class="o">/</span><span class="n">spidermonkey</span><span class="o">-</span><span class="n">markdown</span><span class="p">.</span><span class="n">wasm</span>
+<span class="w">    </span><span class="n">cycles</span>
+<span class="w">      </span><span class="p">[</span><span class="mi">115443777</span><span class="w"> </span><span class="mf">126864658.04</span><span class="w"> </span><span class="mi">195022945</span><span class="p">]</span><span class="w"> </span><span class="o">../</span><span class="n">wasmtime</span><span class="o">/</span><span class="n">target</span><span class="o">/</span><span class="n">release</span><span class="o">/</span><span class="n">libwasmtime_bench_api</span><span class="p">.</span><span class="n">so</span>
+<span class="w">      </span><span class="p">[</span><span class="mi">122040249</span><span class="w"> </span><span class="mf">130580372.04</span><span class="w"> </span><span class="mi">194436680</span><span class="p">]</span><span class="w"> </span><span class="o">../</span><span class="n">wasmtime</span><span class="o">/</span><span class="n">target</span><span class="o">/</span><span class="n">release</span><span class="o">/</span><span class="n">libwasmtime_bench_api</span><span class="p">.</span><span class="n">so</span><span class="w"> </span><span class="p">(</span><span class="o">-</span><span class="n">Wgc</span><span class="p">)</span>
+</code></pre></div>
+<p>is the best I can get out of sightglass</p>
+</blockquote>
+<p>fwiw, sightglass will currently only do its effect-size test when there are exactly two different <em>engines</em>, we haven't implemented the logic to do that when there is one engine but two different sets of engine flags, but should be pretty straightforward to do</p>
+
+
+
+<a name="600750870"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Turning%20on%20GC%20changes%20codegen%20for%20%60call_indirect%60/near/600750870" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Paul Osborne <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Turning.20on.20GC.20changes.20codegen.20for.20.60call_indirect.60.html#600750870">(Jun 05 2026 at 19:13)</a>:</h4>
+<p>One option available now: you can run multiple benchmark runs with different flags and then get the analysis results using the <code>report</code> command; this will generate a report including effect size analysis relative to the baseline (first input specified unless you override).</p>
+<p>With the "raw" results recorded, which with my latest round of updates does capture flags, you can then use <code>report</code> for an html report and can also use the <code>summarize</code> and <code>effect-size</code> commands on the results.</p>
+
+
+
+<a name="600751154"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Turning%20on%20GC%20changes%20codegen%20for%20%60call_indirect%60/near/600751154" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Paul Osborne <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Turning.20on.20GC.20changes.20codegen.20for.20.60call_indirect.60.html#600751154">(Jun 05 2026 at 19:15)</a>:</h4>
+<p>This is mac-specific as written (but easy to adapt) to show one way of wiring this up for an experiment.</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code><span class="ch">#!/usr/bin/env bash</span>
+
+<span class="nb">set</span><span class="w"> </span>-x
+
+<span class="nv">OUTDIR</span><span class="o">=</span><span class="si">${</span><span class="nv">OUTDIR</span><span class="k">:-</span><span class="s2">"bench-</span><span class="k">$(</span>date<span class="w"> </span>+%Y%m%d-%H%M%S<span class="k">)</span><span class="s2">"</span><span class="si">}</span>
+<span class="nv">REVISION</span><span class="o">=</span><span class="si">${</span><span class="nv">REVISION</span><span class="k">:-</span><span class="s2">"v45.0.1"</span><span class="si">}</span>
+mkdir<span class="w"> </span>-p<span class="w"> </span><span class="s2">"</span><span class="nv">$OUTDIR</span><span class="s2">"</span>
+
+sightglass<span class="o">()</span><span class="w"> </span><span class="o">{</span>
+<span class="w">    </span>cargo<span class="w"> </span>run<span class="w"> </span>--release<span class="w"> </span>--<span class="w"> </span><span class="s2">"</span><span class="nv">$@</span><span class="s2">"</span>
+<span class="o">}</span>
+
+build_engine<span class="o">()</span><span class="w"> </span><span class="o">{</span>
+<span class="w">    </span><span class="nv">engine_dir</span><span class="o">=</span><span class="s2">"</span><span class="nv">$PWD</span><span class="s2">/engines/wasmtime/</span><span class="nv">$REVISION</span><span class="s2">"</span>
+
+<span class="w">    </span><span class="c1"># early exit if the directory exists; assume built</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="o">[</span><span class="w"> </span>-f<span class="w"> </span><span class="s2">"</span><span class="nv">$engine_dir</span><span class="s2">/libengine.dylib"</span><span class="w"> </span><span class="o">]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="m">0</span>
+<span class="w">    </span><span class="k">fi</span>
+
+<span class="w">    </span>mkdir<span class="w"> </span>-p<span class="w"> </span><span class="s2">"</span><span class="nv">$engine_dir</span><span class="s2">"</span>
+<span class="w">    </span><span class="o">(</span>
+<span class="w">        </span><span class="nb">cd</span><span class="w"> </span>engines/wasmtime<span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nb">exit</span>
+<span class="w">        </span>rustc<span class="w"> </span>build.rs
+<span class="w">        </span><span class="nv">REVISION</span><span class="o">=</span><span class="s2">"</span><span class="nv">$REVISION</span><span class="s2">"</span><span class="w"> </span>./build<span class="w"> </span><span class="s2">"</span><span class="nv">$engine_dir</span><span class="s2">"</span>
+<span class="w">    </span><span class="o">)</span>
+<span class="o">}</span>
+
+benchmark<span class="o">()</span><span class="w"> </span><span class="o">{</span>
+<span class="w">    </span><span class="nv">flags</span><span class="o">=</span><span class="s2">"</span><span class="nv">$1</span><span class="s2">"</span>
+<span class="w">    </span><span class="nv">variant</span><span class="o">=</span><span class="s2">"</span><span class="nv">$2</span><span class="s2">"</span>
+
+<span class="w">    </span>build_engine
+<span class="w">    </span>sightglass<span class="w"> </span>benchmark<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--raw<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>-e<span class="w"> </span><span class="s2">"engines/wasmtime/</span><span class="nv">$REVISION</span><span class="s2">/libengine.dylib"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--engine-flags<span class="o">=</span><span class="s2">"</span><span class="nv">$flags</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>-o<span class="w"> </span><span class="s2">"</span><span class="nv">$OUTDIR</span><span class="s2">/</span><span class="nv">$variant</span><span class="s2">.json"</span>
+<span class="o">}</span>
+
+benchmark<span class="w"> </span><span class="s2">""</span><span class="w"> </span><span class="s2">"baseline"</span>
+benchmark<span class="w"> </span><span class="s2">"-Wgc"</span><span class="w"> </span><span class="s2">"gc"</span>
+
+<span class="o">(</span>
+<span class="w">    </span><span class="nb">cd</span><span class="w"> </span><span class="s2">"</span><span class="nv">$OUTDIR</span><span class="s2">"</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nb">exit</span>
+<span class="w">    </span>sightglass<span class="w"> </span>report<span class="w"> </span>-o<span class="w"> </span>report.html<span class="w"> </span>./*.json
+<span class="w">    </span>sightglass<span class="w"> </span>summarize<span class="w"> </span>-f<span class="w"> </span>./*.json
+<span class="o">)</span>
+</code></pre></div>
+
+
+
+<a name="600757734"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Turning%20on%20GC%20changes%20codegen%20for%20%60call_indirect%60/near/600757734" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Turning.20on.20GC.20changes.20codegen.20for.20.60call_indirect.60.html#600757734">(Jun 05 2026 at 19:59)</a>:</h4>
+<p>Oh that's what I ended up doing yeah but the <code>summarize</code> at the end didn't print out %-changes</p>
+
+
+
+<a name="600757770"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Turning%20on%20GC%20changes%20codegen%20for%20%60call_indirect%60/near/600757770" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Turning.20on.20GC.20changes.20codegen.20for.20.60call_indirect.60.html#600757770">(Jun 05 2026 at 19:59)</a>:</h4>
+<p>it also took me embarassingly long to figure out that I needed to use <code>--raw</code> to emit json</p>
+
+
+
+<a name="600764089"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Turning%20on%20GC%20changes%20codegen%20for%20%60call_indirect%60/near/600764089" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Paul Osborne <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Turning.20on.20GC.20changes.20codegen.20for.20.60call_indirect.60.html#600764089">(Jun 05 2026 at 20:46)</a>:</h4>
+<p>Yeah, I think we should change that.  I think if an output file is specified or format, that should just infer you want structured output rather than the summary.</p>
+
+
+
+<a name="600764808"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Turning%20on%20GC%20changes%20codegen%20for%20%60call_indirect%60/near/600764808" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Paul Osborne <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Turning.20on.20GC.20changes.20codegen.20for.20.60call_indirect.60.html#600764808">(Jun 05 2026 at 20:52)</a>:</h4>
+<p>I think there's a collect/analyze flow that is probably going to be used enough that there's probably some command (maybe <code>collect</code> or <code>record</code>) that takes as input some sort of experiment description.</p>
+<p>That's hand-wavy and coming up with an "experiment description" format that's powerful enough and concise is the hard part.</p>
+
+
+
+<hr><p>Last updated: Jul 02 2026 at 22:22 UTC</p>
+</html>

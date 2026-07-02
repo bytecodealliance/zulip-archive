@@ -1,0 +1,373 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #13404 refactor `wasmtime_wasi_http::handler` · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html">wasmtime / PR #13404 refactor `wasmtime_wasi_http::handler`</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="595897399"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/595897399" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#595897399">(May 18 2026 at 18:13)</a>:</h4>
+<p>dicej requested <a href="https://github.com/alexcrichton">alexcrichton</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13404">PR #13404</a>.</p>
+
+
+
+<a name="595897402"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/595897402" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#595897402">(May 18 2026 at 18:13)</a>:</h4>
+<p>dicej requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-wasi-reviewers">wasmtime-wasi-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13404">PR #13404</a>.</p>
+
+
+
+<a name="595897404"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/595897404" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#595897404">(May 18 2026 at 18:13)</a>:</h4>
+<p>dicej opened <a href="https://github.com/bytecodealliance/wasmtime/pull/13404">PR #13404</a> from <code>dicej:wasmtime-wasi-http-handler-refactor</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>The goal here is to make this module more flexible and easier to reuse.</p>
+<p>The heart of the changes is an overhaul of the <code>HandlerState</code> trait. Previously, it mostly consisted of functions returning <code>Duration</code> or <code>usize</code> representing various timeouts and reuse limits.  The drawback to that API is that it prevented the embedder from dynamically adjusting timeouts and limits based on service load and resource usage.  The new API uses pollable traits to provide such dynamism, allowing the embedder to e.g. expire and reclaim idle instances early if a pooling allocator limit has been reached.</p>
+<p>Other high-level changes:</p>
+<ul>
+<li>
+<p><code>ProxyHandler::spawn</code> has been replaced with <code>ProxyHandler::handle</code>, which takes a <code>http::Request</code> and returns a <code>Result&lt;http::Response, wasmtime::Error&gt;</code>, saving the embedder from needing to manage task spawning, type conversions, channels, etc.</p>
+</li>
+<li>
+<p><code>ProxyHandler::handle</code> may return a <code>wasmtime::Error</code> which may be downcast to an <code>InstantiationError</code>, which itself may contain a <code>PoolConcurrencyLimitError</code> representing a pooling allocator limit being reached.  In this case, the embedder may wish to expire and reclaim instances more aggressively and arrange to retry the <code>handle</code> call(s) as instances are reclaimed.</p>
+</li>
+<li>
+<p>Implementing <code>HandlerState</code> now requires providing an <code>InstanceExpiration</code> implementation as well.  An instance of this type will be created for each worker and polled as part of the worker future to determine when the worker and its associated instance should be expired.</p>
+</li>
+<li>
+<p><code>HandlerState::drop</code> is called when the worker exits (normally or with a failure), giving the embedder the chance to interrogate the store used by that worker (for e.g. telemetry) prior to dropping it.</p>
+</li>
+<li>
+<p>I've added a new <code>p2::types::WasiHttpCtxView::new_response_outparam_from_callback</code> function as a more flexible alternative to the existing <code>new_response_outparam</code> for cases where you don't have a <code>tokio::sync::oneshot::Sender</code> handy.</p>
+</li>
+</ul>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+</blockquote>
+
+
+
+<a name="595897406"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/595897406" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#595897406">(May 18 2026 at 18:13)</a>:</h4>
+<p>dicej requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13404">PR #13404</a>.</p>
+
+
+
+<a name="595897407"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/595897407" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#595897407">(May 18 2026 at 18:13)</a>:</h4>
+<p>dicej requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-default-reviewers">wasmtime-default-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13404">PR #13404</a>.</p>
+
+
+
+<a name="595899662"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/595899662" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#595899662">(May 18 2026 at 18:24)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13404">PR #13404</a>.</p>
+
+
+
+<a name="595930583"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/595930583" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#595930583">(May 18 2026 at 20:32)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13404">PR #13404</a>.</p>
+
+
+
+<a name="595947858"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/595947858" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#595947858">(May 18 2026 at 22:27)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> pchickey submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#pullrequestreview-4314412081">PR review</a>.</p>
+
+
+
+<a name="595947859"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/595947859" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#595947859">(May 18 2026 at 22:27)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> pchickey created <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#discussion_r3262561874">PR review comment</a>:</p>
+<blockquote>
+<p>There needs to be some way to determine which of the running instances (though, ideally, also the request where possible, though that now requires guest support...) a print line came from - is this just not done yet in the current design?</p>
+</blockquote>
+
+
+
+<a name="595954235"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/595954235" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#595954235">(May 18 2026 at 23:24)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13404">PR #13404</a>.</p>
+
+
+
+<a name="596019778"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/596019778" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#596019778">(May 18 2026 at 23:47)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#pullrequestreview-4314718327">PR review</a>.</p>
+
+
+
+<a name="596019779"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/596019779" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#596019779">(May 18 2026 at 23:47)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#discussion_r3262826113">PR review comment</a>:</p>
+<blockquote>
+<p>Given the possibility of concurrent execution in WASIp3, this can't be done in general; i.e. we can't unambiguously determine which request generated which stdio activity.</p>
+<p>Previously, I had written "best effort" code to plumb the request ID through in the case where instance reuse is disabled.  I removed it in this PR because it seemed like more trouble than it was worth given that the vision going forward is to reuse instances by default.  I can restore it, though, if desired.</p>
+</blockquote>
+
+
+
+<a name="596019844"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/596019844" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#596019844">(May 18 2026 at 23:48)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> dicej edited <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#discussion_r3262826113">PR review comment</a>.</p>
+
+
+
+<a name="596019938"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/596019938" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#596019938">(May 18 2026 at 23:49)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#pullrequestreview-4314722567">PR review</a>.</p>
+
+
+
+<a name="596019939"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/596019939" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#596019939">(May 18 2026 at 23:49)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#discussion_r3262830077">PR review comment</a>:</p>
+<blockquote>
+<p>If we only need to distinguish instance IDs and not request IDs, then yes, we can do that without ambiguity.</p>
+</blockquote>
+
+
+
+<a name="596240207"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/596240207" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#596240207">(May 19 2026 at 17:30)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> pchickey submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#pullrequestreview-4321436883">PR review</a>.</p>
+
+
+
+<a name="596240208"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/596240208" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#596240208">(May 19 2026 at 17:30)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> pchickey created <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#discussion_r3268292329">PR review comment</a>:</p>
+<blockquote>
+<p>If I understand correctly, this host code is going to still execute p2 guests where instances are not reused, so we should retain the way to tag those instances in the print, otherwise it degrades the experience for existing users of p2.</p>
+<p>I agree we need to do plumbing elsewhere to get a nice user experience in all cases with p3, but with backpressure on instance reuse there is still the possibility of many instances in p3 as well, so we will still need a way to disambiguate even if each instance keeps their own internal counter of request. (And it shows theres probably a need for some mechanism to get a unique id for a wasi-http <code>request</code> without depending on it being injected into a header, but thats a totally different problem for now...)</p>
+</blockquote>
+
+
+
+<a name="596240304"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/596240304" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#596240304">(May 19 2026 at 17:31)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> pchickey edited <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#discussion_r3268292329">PR review comment</a>.</p>
+
+
+
+<a name="596253907"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/596253907" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#596253907">(May 19 2026 at 18:32)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#pullrequestreview-4321975545">PR review</a>.</p>
+
+
+
+<a name="596253910"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/596253910" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#596253910">(May 19 2026 at 18:32)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#discussion_r3268678102">PR review comment</a>:</p>
+<blockquote>
+<p>OK, so if I (re-)add the ability to tag stdio output on a per-instance basis (without trying to do it on a per-request basis), will that be sufficient, at least for the time being?</p>
+</blockquote>
+
+
+
+<a name="596268395"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/596268395" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#596268395">(May 19 2026 at 19:39)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13404">PR #13404</a>.</p>
+
+
+
+<a name="596268508"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/596268508" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#596268508">(May 19 2026 at 19:39)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#pullrequestreview-4322530602">PR review</a>.</p>
+
+
+
+<a name="596268511"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/596268511" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#596268511">(May 19 2026 at 19:39)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#discussion_r3269114294">PR review comment</a>:</p>
+<blockquote>
+<p>I just pushed an update; let me know what you think.</p>
+</blockquote>
+
+
+
+<a name="596504005"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/596504005" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#596504005">(May 20 2026 at 16:24)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> pchickey submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#pullrequestreview-4330327689">PR review</a>.</p>
+
+
+
+<a name="596504008"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/596504008" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#596504008">(May 20 2026 at 16:24)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> pchickey created <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#discussion_r3275513825">PR review comment</a>:</p>
+<blockquote>
+<p>Thanks! Thats a good spot for this to be presently, and I will pursue the spec changes that I think are required to fix the rest separately.</p>
+</blockquote>
+
+
+
+<a name="596576254"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/596576254" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#596576254">(May 20 2026 at 22:15)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> tschneidereit submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#pullrequestreview-4332621282">PR review</a>.</p>
+
+
+
+<a name="596576255"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/596576255" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#596576255">(May 20 2026 at 22:15)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> tschneidereit created <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#discussion_r3277503815">PR review comment</a>:</p>
+<blockquote>
+<p>I don't think we can really do meaningfully better than this: there is no way to reliably tie a line printed to <code>stdout</code>/<code>err</code> back to a connection within an instance if multiple are in flight concurrently, since tasks from any of them might be processed freely and with arbitrary scheduling, or even without a Component Model task being visible at all. E.g. if for two incoming requests timer-based actions are used, they might be coalesced into a single external async task representing the closest deadline.</p>
+</blockquote>
+
+
+
+<a name="597295961"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/597295961" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#597295961">(May 23 2026 at 11:53)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#discussion_r3292704193">PR review comment</a>:</p>
+<blockquote>
+<p>I think I already asked this, so forgive me that I've forgotten the answer, but how disruptive do you think it would be to change <code>ErrorCode</code> here to <code>wasmtime::Error</code>?</p>
+</blockquote>
+
+
+
+<a name="597295962"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/597295962" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#597295962">(May 23 2026 at 11:53)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#pullrequestreview-4350562448">PR review</a>:</p>
+<blockquote>
+<p>Given that this doesn't regress existing behavior i personally think this is reasonable to land and mostly figure out the logging/etc in the CM issue (thanks Pat for opening!).</p>
+<p>Otherwise Joel and I worked through this ahead of time as well and everything looks reasonable here to me, too. Thanks @dicej!</p>
+</blockquote>
+
+
+
+<a name="597295963"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/597295963" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#597295963">(May 23 2026 at 11:53)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#discussion_r3292701479">PR review comment</a>:</p>
+<blockquote>
+<p>This looks like it's missing <code>#[cfg]</code> on this branch, and given that CI is passing it probably means we don't actually check that you can build <code>wasmtime-wasi-http</code> without either feature... Mind putting the <code>#[cfg]</code> here and perhaps filing an issue about testing the conditional compile in CI in a future PR?</p>
+</blockquote>
+
+
+
+<a name="597953153"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/597953153" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#597953153">(May 26 2026 at 22:10)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#pullrequestreview-4367862240">PR review</a>.</p>
+
+
+
+<a name="597953155"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/597953155" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#597953155">(May 26 2026 at 22:10)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#discussion_r3307154575">PR review comment</a>:</p>
+<blockquote>
+<p>I'll look into it.</p>
+</blockquote>
+
+
+
+<a name="597955120"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/597955120" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#597955120">(May 26 2026 at 22:29)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13404">PR #13404</a>.</p>
+
+
+
+<a name="597956014"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/597956014" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#597956014">(May 26 2026 at 22:38)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#pullrequestreview-4367994665">PR review</a>.</p>
+
+
+
+<a name="597956016"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/597956016" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#597956016">(May 26 2026 at 22:38)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#discussion_r3307268039">PR review comment</a>:</p>
+<blockquote>
+<p><a href="https://github.com/bytecodealliance/wasmtime/pull/13488">https://github.com/bytecodealliance/wasmtime/pull/13488</a></p>
+</blockquote>
+
+
+
+<a name="597957149"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/597957149" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#597957149">(May 26 2026 at 22:50)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13404">PR #13404</a>.</p>
+
+
+
+<a name="597957194"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/597957194" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#597957194">(May 26 2026 at 22:50)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#pullrequestreview-4368055770">PR review</a>.</p>
+
+
+
+<a name="597957202"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/597957202" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#597957202">(May 26 2026 at 22:50)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/13404#discussion_r3307314568">PR review comment</a>:</p>
+<blockquote>
+<p>Done.</p>
+</blockquote>
+
+
+
+<a name="597958010"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/597958010" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#597958010">(May 26 2026 at 22:58)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13404">PR #13404</a>.</p>
+
+
+
+<a name="597964464"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/597964464" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#597964464">(May 27 2026 at 00:05)</a>:</h4>
+<p>dicej added <a href="https://github.com/bytecodealliance/wasmtime/pull/13404">PR #13404 refactor <code>wasmtime_wasi_http::handler</code></a> to the merge queue</p>
+
+
+
+<a name="597976310"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/597976310" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#597976310">(May 27 2026 at 01:26)</a>:</h4>
+<p>github-merge-queue[bot] removed <a href="https://github.com/bytecodealliance/wasmtime/pull/13404">PR #13404 refactor <code>wasmtime_wasi_http::handler</code></a> from the merge queue</p>
+
+
+
+<a name="598090615"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/598090615" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#598090615">(May 27 2026 at 13:37)</a>:</h4>
+<p>dicej updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13404">PR #13404</a>.</p>
+
+
+
+<a name="598090775"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/598090775" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#598090775">(May 27 2026 at 13:38)</a>:</h4>
+<p>dicej has enabled auto merge for <a href="https://github.com/bytecodealliance/wasmtime/pull/13404">PR #13404</a>.</p>
+
+
+
+<a name="598093215"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/598093215" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#598093215">(May 27 2026 at 13:47)</a>:</h4>
+<p>dicej added <a href="https://github.com/bytecodealliance/wasmtime/pull/13404">PR #13404 refactor <code>wasmtime_wasi_http::handler</code></a> to the merge queue</p>
+
+
+
+<a name="598099668"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/598099668" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#598099668">(May 27 2026 at 14:12)</a>:</h4>
+<p><span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span> dicej merged <a href="https://github.com/bytecodealliance/wasmtime/pull/13404">PR #13404</a>.</p>
+
+
+
+<a name="598099675"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313404%20refactor%20%60wasmtime_wasi_http%3A%3Ahandler%60/near/598099675" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313404.20refactor.20.60wasmtime_wasi_http.3A.3Ahandler.60.html#598099675">(May 27 2026 at 14:12)</a>:</h4>
+<p>dicej removed <a href="https://github.com/bytecodealliance/wasmtime/pull/13404">PR #13404 refactor <code>wasmtime_wasi_http::handler</code></a> from the merge queue</p>
+
+
+
+<hr><p>Last updated: Jul 02 2026 at 22:22 UTC</p>
+</html>

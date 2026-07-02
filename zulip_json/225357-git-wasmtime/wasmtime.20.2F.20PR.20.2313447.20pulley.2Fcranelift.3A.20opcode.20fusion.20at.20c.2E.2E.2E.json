@@ -1,0 +1,128 @@
+[
+    {
+        "content": "<p>matthargett opened <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a> from <code>rebeckerspecialties:pulley-fusion-dispatch-tail-upstream</code> to <code>bytecodealliance:main</code>:</p>\n<blockquote>\n<h2>TL;DR</h2>\n<p>Stacks on #13445 (per-table mutability tracking). Adds a fused dispatch op family at the <code>call_indirect</code> lazy-init brif site (similar in shape to WAMR's preprocessed-bytecode register IR) plus a <code>call_indirect{1,2,3,4}</code> family mirroring direct-call <code>call{1,2,3,4}</code>. Consistent <strong>4–8 % wallclock wins</strong> on polymorphic vtable workloads across iPhone 12  E-core, Apple Watch SE2 , and M4 E-core. iPhone XS e-core is mixed and the reason, is visible in hand-rolled aarch64 assembly microbenchmarks: branch-prediction pressure is the cross-microarch variable.</p>\n<p>Closes ~10 % of the Pulley/WAMR wallclock gap on the iPhone 12 vtable suite (vtable_poly4 1.73× → 1.58×) and pushes WAMR within <strong>1.16×</strong> on <code>xmrsplayer</code> on Apple Watch SE2 — the closest cross-device result in our matrix.</p>\n<h2>Dependency</h2>\n<p>Depends on #13445 landing first. Both PRs are stacked from the same fork branch; this PR's diff against <code>main</code> includes #13445's 11 commits at the bottom + 13 fusion commits on top. The fusion is gated on <code>is_eagerly_initialized_funcref_table</code> (the predicate added in #13445), so it only fires when the table-mutability proof holds.</p>\n<h2>Stack</h2>\n<p>13 commits on top of #13445:</p>\n<ul>\n<li><strong>Phases 1–3</strong>: collapse <code>band + brif + 2 xloads</code> at the call_indirect lazy-init tail (5 Pulley dispatches → 2 per call_indirect site).</li>\n<li><strong>Phase 4</strong>: <code>call_indirect{1,2,3,4}</code> opcodes mirror direct-call <code>call{1,2,3,4}</code>. <code>Inst::IndirectCall</code> bundles first 4 integer ABI args into the call opcode instead of synthesising <code>xmov</code>s via regalloc <code>reg_fixed_use</code>.</li>\n<li><strong>Correctness</strong>: handlers trap on null (a slow-path-aliasing review concern: <code>sink_pure_inst</code> of the continuation-block loads broke the lazy-init slow path's rejoin; trapping fails closed under the predicate).</li>\n</ul>\n<h2>Wallclock medians, N=10, phase-4 vs <code>table-mutability-tracking</code> baseline</h2>\n<p><code>BENCH_TARGET_MS=2000</code>; <code>.utility</code> QoS on iOS / <code>taskpolicy -b</code> on M4.</p>\n<table>\n<thead>\n<tr>\n<th>workload</th>\n<th style=\"text-align: right;\">iPhone 12 (A14)</th>\n<th style=\"text-align: right;\">iPhone XS (A12)</th>\n<th style=\"text-align: right;\">Watch SE2 (S8)</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>call_indirect</td>\n<td style=\"text-align: right;\">−2.48 %</td>\n<td style=\"text-align: right;\">+0.18 %</td>\n<td style=\"text-align: right;\">−0.50 %</td>\n</tr>\n<tr>\n<td>vtable_bi</td>\n<td style=\"text-align: right;\"><strong>−7.45 %</strong></td>\n<td style=\"text-align: right;\">+4.84 %</td>\n<td style=\"text-align: right;\"><strong>−4.26 %</strong></td>\n</tr>\n<tr>\n<td>vtable_poly4</td>\n<td style=\"text-align: right;\"><strong>−8.61 %</strong></td>\n<td style=\"text-align: right;\">−2.96 %</td>\n<td style=\"text-align: right;\"><strong>−4.76 %</strong></td>\n</tr>\n<tr>\n<td>vtable_poly6</td>\n<td style=\"text-align: right;\"><strong>−5.32 %</strong></td>\n<td style=\"text-align: right;\">+5.41 %</td>\n<td style=\"text-align: right;\"><strong>−4.64 %</strong></td>\n</tr>\n<tr>\n<td>xmrsplayer</td>\n<td style=\"text-align: right;\">+0.26 %</td>\n<td style=\"text-align: right;\">−6.04 %</td>\n<td style=\"text-align: right;\">+0.25 %</td>\n</tr>\n<tr>\n<td>graphql (AS)</td>\n<td style=\"text-align: right;\">−0.13 %</td>\n<td style=\"text-align: right;\">−3.63 %</td>\n<td style=\"text-align: right;\">−0.74 %</td>\n</tr>\n<tr>\n<td>graphql (Porffor)</td>\n<td style=\"text-align: right;\">+2.13 %</td>\n<td style=\"text-align: right;\">+0.21 %</td>\n<td style=\"text-align: right;\">+0.58 %</td>\n</tr>\n</tbody>\n</table>\n<h2>PMU buckets (single 12 s xctrace <code>CPU Counters</code> per workload)</h2>\n<ul>\n<li><strong>A14 Icestorm vtable suite</strong>: 20–38 % Processing, 4–18 % Discarded.</li>\n<li><strong>A14 Icestorm graphql + call_indirect</strong>: 9–13 % Processing, <strong>17–41 % Discarded</strong> interpreter-loop mispredict pressure but its kinda squirrely and I couldn't pin it down..</li>\n<li><strong>M4 Sawtooth, every workload</strong>: <strong>33–47 % Processing</strong> — back-end load-use latency on the dispatch tail dominates Sawtooth's wider issue width. The wide spread here is probably due to running the measurement and dev stack on the device itself.</li>\n</ul>\n<p>Common bottleneck across A14 + M4 is Processing (back-end-bound). I can't measure these advacned CPU counters on iPhone XS (A12) or Apple Watch, I can only get wall clock time and power draw.</p>\n<h2>Verification</h2>\n<ul>\n<li>2237 / 2237 cranelift filetests</li>\n<li>13 / 13 <code>craneliftpulley_call_*</code> integration tests</li>\n<li>21 min <code>cargo fuzz run differential --no-default-features</code> with <code>ALLOWED_ENGINES=pulley,wasmtime</code> — 0 crashes / 0 divergences</li>\n</ul>\n<h2>Extra credit</h2>\n<p>Cross-device measurement harness I built for this bake-off across WASM runtimes: <a href=\"https://github.com/rebeckerspecialties/wasm-benchmark/pull/1\">https://github.com/rebeckerspecialties/wasm-benchmark/pull/1</a></p>\n<p>I submitted two PRs to WAMR to support exceptions and loose SIMD, so that it can run more of the benchmarks and generally have functional partity without losing its performance edge.</p>\n</blockquote>",
+        "id": 596903142,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779423205
+    },
+    {
+        "content": "<p>matthargett requested <a href=\"https://github.com/cfallin\">cfallin</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>.</p>",
+        "id": 596903143,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779423206
+    },
+    {
+        "content": "<p>matthargett requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers\">wasmtime-core-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>.</p>",
+        "id": 596903144,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779423206
+    },
+    {
+        "content": "<p>matthargett requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers\">wasmtime-compiler-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>.</p>",
+        "id": 596903145,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779423206
+    },
+    {
+        "content": "<p>matthargett requested <a href=\"https://github.com/fitzgen\">fitzgen</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>.</p>",
+        "id": 596903148,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779423207
+    },
+    {
+        "content": "<p>matthargett requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-default-reviewers\">wasmtime-default-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>.</p>",
+        "id": 596903149,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779423207
+    },
+    {
+        "content": "<p>matthargett <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447#issuecomment-4514975776\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>:</p>\n<blockquote>\n<h2>CI status</h2>\n<p>13/14 jobs are green. Remaining failure is <code>Nightly tests</code> → <code>wasmtime-fuzzing/oom</code>, but it doesn't look related to this PR:</p>\n<ul>\n<li>All individual <code>oom::*</code> tests print <code>ok</code> (including <code>table_grow</code>, the last to log).</li>\n<li>Process then aborts with <code>memory allocation of 8 bytes failed</code> + SIGABRT during teardown.</li>\n<li>Same pattern on every run since rebase onto current <code>main</code>.</li>\n</ul>\n<p>Our changes that touch instance/allocation are guarded on <code>is_eagerly_initialized_funcref_table</code> — only fires for module instantiation with funcref tables under the predicate. The failing tests create <code>Table::new</code> directly with <code>enable_compiler(false)</code>, no module instantiation; the new code path is never reached.</p>\n<p>Same <code>Nightly tests</code> job passes on recent <code>main</code> runs (<code>26267350231</code>, <code>26204292060</code>, <code>26140078343</code>) and was skipped on the parent PR #13445 (no test-nightly trigger). The 8-byte OOM at teardown after all tests passed reads as runner-side memory pressure rather than a real regression. Happy to dig further if maintainers can confirm whether this is a known infra issue, or if you want me to bisect locally — my pinned nightly toolchain doesn't accept the <code>arc_try_new</code> cfg gate so I can't reproduce the exact CI build flags here.</p>\n</blockquote>",
+        "id": 596905215,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779424251
+    },
+    {
+        "content": "<p>matthargett updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>.</p>",
+        "id": 596930161,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779434920
+    },
+    {
+        "content": "<p>matthargett edited a <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447#issuecomment-4514975776\">comment</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>:</p>\n<blockquote>\n<h2>CI status</h2>\n<p>13/14 jobs are green. Remaining failure is <code>Nightly tests</code> → <code>wasmtime-fuzzing/oom</code>, but it doesn't look related to this PR:</p>\n<ul>\n<li>All individual <code>oom::*</code> tests print <code>ok</code> (including <code>table_grow</code>, the last to log).</li>\n<li>Process then aborts with <code>memory allocation of 8 bytes failed</code> + SIGABRT during teardown.</li>\n<li>Same pattern on every run since rebase onto current <code>main</code>.</li>\n</ul>\n<p>Our changes that touch instance/allocation are guarded on <code>is_eagerly_initialized_funcref_table</code>, so it only fires for module instantiation with funcref tables under the predicate. The failing tests create <code>Table::new</code> directly with <code>enable_compiler(false)</code>, no module instantiation; the new code path is never reached.</p>\n<p>Same <code>Nightly tests</code> job passes on recent <code>main</code> runs (<code>26267350231</code>, <code>26204292060</code>, <code>26140078343</code>) and was skipped on the parent PR #13445 (no test-nightly trigger). The 8-byte OOM at teardown after all tests passed reads as runner-side memory pressure rather than a real regression. Happy to dig further if maintainers can confirm whether this is a known infra issue, or if you want me to bisect locally — my pinned nightly toolchain doesn't accept the <code>arc_try_new</code> cfg gate so I can't reproduce the exact CI build flags here.</p>\n</blockquote>",
+        "id": 596930253,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779434949
+    },
+    {
+        "content": "<p>matthargett edited a <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447#issuecomment-4514975776\">comment</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>:</p>\n<blockquote>\n<h2>CI status</h2>\n<p>13/14 jobs are green. Remaining failure is <code>Nightly tests</code> → <code>wasmtime-fuzzing/oom</code>, but it doesn't look related to this PR:</p>\n<ul>\n<li>All individual <code>oom::*</code> tests print <code>ok</code> (including <code>table_grow</code>, the last to log).</li>\n<li>Process then aborts with <code>memory allocation of 8 bytes failed</code> + SIGABRT during teardown.</li>\n<li>Same pattern on every run since rebase onto current <code>main</code>.</li>\n</ul>\n<p>Our changes that touch instance/allocation are guarded on <code>is_eagerly_initialized_funcref_table</code>, so it only fires for module instantiation with funcref tables under the predicate. The failing tests create <code>Table::new</code> directly with <code>enable_compiler(false)</code>, no module instantiation; the new code path is never reached.</p>\n<p>Same <code>Nightly tests</code> job passes on recent <code>main</code> runs (<code>26267350231</code>, <code>26204292060</code>, <code>26140078343</code>) and was skipped on the parent PR #13445 (no test-nightly trigger). The 8-byte OOM at teardown after all tests passed reads as runner-side memory pressure rather than a real regression. Happy to dig further if folks can confirm whether this is a known infra issue, or if you want me to bisect locally — my pinned nightly toolchain doesn't accept the <code>arc_try_new</code> cfg gate so I can't reproduce the exact CI build flags here.</p>\n</blockquote>",
+        "id": 596930474,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779435025
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>cranelift</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>.</p>",
+        "id": 596960812,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779443522
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>cranelift:area:machinst</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>.</p>",
+        "id": 596960813,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779443522
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>cranelift:meta</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>.</p>",
+        "id": 596960815,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779443522
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>isle</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>.</p>",
+        "id": 596960819,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779443523
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>.</p>",
+        "id": 596960820,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779443523
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>pulley</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>.</p>",
+        "id": 596960821,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779443523
+    },
+    {
+        "content": "<p>github-actions[bot] <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447#issuecomment-4517627434\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>:</p>\n<blockquote>\n<h4>Subscribe to Label Action</h4>\n<p>cc @cfallin, @fitzgen</p>\n<p>&lt;details&gt;<br>\nThis issue or pull request has been labeled: \"cranelift\", \"cranelift:area:machinst\", \"cranelift:meta\", \"isle\", \"pulley\", \"wasmtime:api\"</p>\n<p>Thus the following users have been cc'd because of the following labels:</p>\n<ul>\n<li>cfallin: isle</li>\n<li>fitzgen: isle, pulley</li>\n</ul>\n<p>To subscribe or unsubscribe from this label, edit the &lt;code&gt;.github/subscribe-to-label.json&lt;/code&gt; configuration file.</p>\n<p><a href=\"https://github.com/bytecodealliance/subscribe-to-label-action\">Learn more.</a><br>\n&lt;/details&gt;</p>\n</blockquote>",
+        "id": 596960926,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779443549
+    },
+    {
+        "content": "<p>alexcrichton <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447#issuecomment-4525790957\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>:</p>\n<blockquote>\n<p>Thanks for the PR, and like the previous PR this is stacked on we'd appreciate a bit more care taken when communicating here. Extensively documenting all these numbers is fine, but for example I've no idea what any of these benchmarks are or where their source is. I also don't really know how to reason about how the speedups seem to be balanced by slowdowns, especially in the middle column for the iPhone XS. For \"PMU\", \"Icestorm\", \"Processing\", \"Discarded\", etc, could you explain what those words all mean? I'm not entirely sure myself...</p>\n<p>Procedurally it's fine to stack PRs on one another, but given the quantity of commits here this'll probably not get a review until afterhttps://github.com/bytecodealliance/wasmtime/pull/13445 has landed and this is rebased. Alternatively, if you'd like, feel free to split out things from this PR (for example the pulley opcodes) and have them land separately.</p>\n</blockquote>",
+        "id": 597316482,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779549745
+    },
+    {
+        "content": "<p>matthargett <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447#issuecomment-4568559221\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>:</p>\n<blockquote>\n<blockquote>\n<p>Thanks for the PR, and like the previous PR this is stacked on we'd appreciate a bit more care taken when communicating here. Extensively documenting all these numbers is fine, but for example I've no idea what any of these benchmarks are or where their source is. I also don't really know how to reason about how the speedups seem to be balanced by slowdowns, especially in the middle column for the iPhone XS. For \"PMU\", \"Icestorm\", \"Processing\", \"Discarded\", etc, could you explain what those words all mean? I'm not entirely sure myself...</p>\n<p>Procedurally it's fine to stack PRs on one another, but given the quantity of commits here this'll probably not get a review until afterhttps://github.com/<a href=\"https://github.com/bytecodealliance/wasmtime/pull/13445\">/pull/13445</a> has landed and this is rebased. Alternatively, if you'd like, feel free to split out things from this PR (for example the pulley opcodes) and have them land separately.</p>\n</blockquote>\n<p>PMU is a reference to xcode/xctrace's instruments for profiling, and Processing vs Discarded is CPU pipeline frontend vs backend efficiency. (Discarded is when branch prediction is wrong, so speculative execution results are pure waste.) Icestorm is the name for the effiicency cores (E-cores) of the device, which I'm focusing on to try and get the best performance-per-watt out of the decisions/choices rather than high-wattage and/or performance core uplift to consider the work \"done\". </p>\n<p>I fully admit I wasn't up to speed on all the jargon and code/marketing names for the separate silicon IP and profiler tooling in these devices until I started this work. I've tried to use the higher-level terms efficiency cores where possible, but also want to make it easy for people to do their own web/AI searches so they have an easier time than I did on the research and execution. I've been deep into x86, x64, Qualcomm XR2, and Zen 2 profiling and optimziation before, but not on Apple hardware.</p>\n<p>the benchmarks in in the repo I've referenced before: <a href=\"https://github.com/rebeckerspecialties/wasm-benchmark/\">https://github.com/rebeckerspecialties/wasm-benchmark/</a> . this shoudl allow anyone to reproduce the WASM runtime performance \"bakeoff\" on their own Apple devices (iPhone, iPad, Apple TV 4K, Apple Watch, etc). I'm trying to show my work as much as I can here so this can have the best user-visible uplift possible for the extra complexity. IME, performance profiling and optimization can often be a bit hyperbolic and I'm doing my best to show that I'm being data-driven on the real devices I have available to me.</p>\n</blockquote>",
+        "id": 598428047,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1780004262
+    },
+    {
+        "content": "<p>alexcrichton edited a <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447#issuecomment-4525790957\">comment</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>:</p>\n<blockquote>\n<p>Thanks for the PR, and like the previous PR this is stacked on we'd appreciate a bit more care taken when communicating here. Extensively documenting all these numbers is fine, but for example I've no idea what any of these benchmarks are or where their source is. I also don't really know how to reason about how the speedups seem to be balanced by slowdowns, especially in the middle column for the iPhone XS. For \"PMU\", \"Icestorm\", \"Processing\", \"Discarded\", etc, could you explain what those words all mean? I'm not entirely sure myself...</p>\n<p>Procedurally it's fine to stack PRs on one another, but given the quantity of commits here this'll probably not get a review until after <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13445\">https://github.com/bytecodealliance/wasmtime/pull/13445</a> has landed and this is rebased. Alternatively, if you'd like, feel free to split out things from this PR (for example the pulley opcodes) and have them land separately.</p>\n</blockquote>",
+        "id": 598440578,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1780011524
+    },
+    {
+        "content": "<p>matthargett updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13447\">PR #13447</a>.</p>",
+        "id": 601987875,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781144309
+    }
+]

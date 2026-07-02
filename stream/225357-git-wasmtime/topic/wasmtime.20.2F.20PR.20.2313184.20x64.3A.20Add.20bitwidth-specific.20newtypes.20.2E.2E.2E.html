@@ -1,0 +1,212 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #13184 x64: Add bitwidth-specific newtypes ... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313184.20x64.3A.20Add.20bitwidth-specific.20newtypes.20.2E.2E.2E.html">wasmtime / PR #13184 x64: Add bitwidth-specific newtypes ...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="590614597"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313184%20x64%3A%20Add%20bitwidth-specific%20newtypes%20.../near/590614597" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313184.20x64.3A.20Add.20bitwidth-specific.20newtypes.20.2E.2E.2E.html#590614597">(Apr 24 2026 at 04:20)</a>:</h4>
+<p>cfallin opened <a href="https://github.com/bytecodealliance/wasmtime/pull/13184">PR #13184</a> from <code>cfallin:cranelift-x64-reg-width-types</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>This change addresses the kind of lowering mismatch that we saw in CVE-2026-24116 ([advisory]): a case where an instruction lowering reasons about a narrower value (e.g. a scalar <code>f64</code>) in a wider register (e.g. a 128-bit XMM), and implicit conversions cause load-sinking to happen in a way that leads to a larger-than-expected load from memory.</p>
+<p>Background: in Cranelift in general, we have an "upper bits undefined" invariant. That is, a 32/64-bit FP value can live in a 128-bit XMM register, or 8/16/32-bit integer can live in a 64-bit GPR, with no problem. The instruction lowering sequences generally deal fine with this: e.g., an <code>add</code> instruction doesn't care what is in the upper bits (garbage in, garbage out, and carry only flows from lower to upper, not the other way).</p>
+<p>However, load-sinking, designed to be as "automatic" as possible to apply in all of the places where it is applicable, throws a wrench into this: because we don't make a distinction about how large the actual operand is, and many layers of the ISLE deal only in register-related operand types (<code>RegMem</code>, <code>GprMem</code> or <code>XmmMem</code>), we can get an implicit load of the <em>entire</em> register width when we had started with a narrowly-typed value. This is a miscompile that can become serious if paired with a user of Cranelift (e.g. Wasmtime) that relies on certain characteristics of out-of-bound accesses to maintain a sandbox.</p>
+<p>In this PR, we take the approach discussed in #12477: we add newtypes for all <em>specific</em> bit-widths of operand, to make the distinction solely at metacopmilation time (i.e., when the ISLE DSL itself is typechecked) in the lowering patterns. The expected widths flow upward from the auto-generated instruction constructors in the assembler layer. We use specific types almost universally; in a few cases where helpers do a dynamic dispatch on type, we have specific generic-to-specific-width converters that <em>also</em> take the <code>ty</code> and assert that it has the correct width. Then, finally and most importantly, the auto-conversions for load sinking will only work (and will release-assert otherwise) if the type-width of the corresponding <code>Value</code> matches.</p>
+<p>As a result of doing this large refactor, three separate bugs in sunk-load width were found; see the new filetests. They are:</p>
+<ul>
+<li>
+<p><code>bitselect</code> on scalar f32/f64 args could sink a load, and would use a SIMD instruction that could fold a load and do a 128-bit load. (Wasm lowering only uses <code>bitselect</code> with 128-bit args.)</p>
+</li>
+<li>
+<p><code>swiden_low</code> and <code>uwiden_low</code> could fold a 128-bit load and do a 64-bit load (i.e., could <em>narrow</em> the memory op) because the SSE4.1 instruction takes a 64-bit source operand. (Wasm lowering inserts bitcasts that prevent load-sinking in this case.)</p>
+</li>
+<li>
+<p><code>fcvt_from_sint</code> could likewise turn a 128-bit load into a 64-bit load. (Wasm lowering likewise foils the bug with bitcasts.)</p>
+</li>
+</ul>
+<p>I verified that none of them are reachable from Wasm, fortunately, so we don't have a repeat of the above CVE.</p>
+<p>[advisory]:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-vc8c-j3xm-xj73">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-vc8c-j3xm-xj73</a></p>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+</blockquote>
+
+
+
+<a name="590614599"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313184%20x64%3A%20Add%20bitwidth-specific%20newtypes%20.../near/590614599" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313184.20x64.3A.20Add.20bitwidth-specific.20newtypes.20.2E.2E.2E.html#590614599">(Apr 24 2026 at 04:20)</a>:</h4>
+<p>cfallin requested <a href="https://github.com/alexcrichton">alexcrichton</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13184">PR #13184</a>.</p>
+
+
+
+<a name="590614600"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313184%20x64%3A%20Add%20bitwidth-specific%20newtypes%20.../near/590614600" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313184.20x64.3A.20Add.20bitwidth-specific.20newtypes.20.2E.2E.2E.html#590614600">(Apr 24 2026 at 04:20)</a>:</h4>
+<p>cfallin requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13184">PR #13184</a>.</p>
+
+
+
+<a name="590614652"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313184%20x64%3A%20Add%20bitwidth-specific%20newtypes%20.../near/590614652" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313184.20x64.3A.20Add.20bitwidth-specific.20newtypes.20.2E.2E.2E.html#590614652">(Apr 24 2026 at 04:21)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13184">PR #13184</a>.</p>
+
+
+
+<a name="590614675"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313184%20x64%3A%20Add%20bitwidth-specific%20newtypes%20.../near/590614675" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313184.20x64.3A.20Add.20bitwidth-specific.20newtypes.20.2E.2E.2E.html#590614675">(Apr 24 2026 at 04:21)</a>:</h4>
+<p>cfallin edited <a href="https://github.com/bytecodealliance/wasmtime/pull/13184">PR #13184</a>:</p>
+<blockquote>
+<p>This change addresses the kind of lowering mismatch that we saw in CVE-2026-24116 ([advisory]): a case where an instruction lowering reasons about a narrower value (e.g. a scalar <code>f64</code>) in a wider register (e.g. a 128-bit XMM), and implicit conversions cause load-sinking to happen in a way that leads to a larger-than-expected load from memory.</p>
+<p>Background: in Cranelift in general, we have an "upper bits undefined" invariant. That is, a 32/64-bit FP value can live in a 128-bit XMM register, or 8/16/32-bit integer can live in a 64-bit GPR, with no problem. The instruction lowering sequences generally deal fine with this: e.g., an <code>add</code> instruction doesn't care what is in the upper bits (garbage in, garbage out, and carry only flows from lower to upper, not the other way).</p>
+<p>However, load-sinking, designed to be as "automatic" as possible to apply in all of the places where it is applicable, throws a wrench into this: because we don't make a distinction about how large the actual operand is, and many layers of the ISLE deal only in register-related operand types (<code>RegMem</code>, <code>GprMem</code> or <code>XmmMem</code>), we can get an implicit load of the <em>entire</em> register width when we had started with a narrowly-typed value. This is a miscompile that can become serious if paired with a user of Cranelift (e.g. Wasmtime) that relies on certain characteristics of out-of-bound accesses to maintain a sandbox.</p>
+<p>In this PR, we take the approach discussed in #12477: we add newtypes for all <em>specific</em> bit-widths of operand, to make the distinction solely at metacopmilation time (i.e., when the ISLE DSL itself is typechecked) in the lowering patterns. The expected widths flow upward from the auto-generated instruction constructors in the assembler layer. We use specific types almost universally; in a few cases where helpers do a dynamic dispatch on type, we have specific generic-to-specific-width converters that <em>also</em> take the <code>ty</code> and assert that it has the correct width. Then, finally and most importantly, the auto-conversions for load sinking will only work (and will release-assert otherwise) if the type-width of the corresponding <code>Value</code> matches.</p>
+<p>As a result of doing this large refactor, three separate bugs in sunk-load width were found; see the new filetests. They are:</p>
+<ul>
+<li>
+<p><code>bitselect</code> on scalar f32/f64 args could sink a load, and would use a SIMD instruction that could fold a load and do a 128-bit load. (Wasm lowering only uses <code>bitselect</code> with 128-bit args.)</p>
+</li>
+<li>
+<p><code>swiden_low</code> and <code>uwiden_low</code> could fold a 128-bit load and do a 64-bit load (i.e., could <em>narrow</em> the memory op) because the SSE4.1 instruction takes a 64-bit source operand. (Wasm lowering inserts bitcasts that prevent load-sinking in this case.)</p>
+</li>
+<li>
+<p><code>fcvt_from_sint</code> could likewise turn a 128-bit load into a 64-bit load. (Wasm lowering likewise foils the bug with bitcasts.)</p>
+</li>
+</ul>
+<p>I verified that none of them are reachable from Wasm, fortunately, so we don't have a repeat of the above CVE.</p>
+<p>Fixes #12477.</p>
+<p>[advisory]:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-vc8c-j3xm-xj73">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-vc8c-j3xm-xj73</a></p>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+</blockquote>
+
+
+
+<a name="590639038"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313184%20x64%3A%20Add%20bitwidth-specific%20newtypes%20.../near/590639038" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313184.20x64.3A.20Add.20bitwidth-specific.20newtypes.20.2E.2E.2E.html#590639038">(Apr 24 2026 at 07:17)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13184">PR #13184</a>.</p>
+
+
+
+<a name="590639039"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313184%20x64%3A%20Add%20bitwidth-specific%20newtypes%20.../near/590639039" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313184.20x64.3A.20Add.20bitwidth-specific.20newtypes.20.2E.2E.2E.html#590639039">(Apr 24 2026 at 07:17)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift:area:x64</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13184">PR #13184</a>.</p>
+
+
+
+<a name="590639041"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313184%20x64%3A%20Add%20bitwidth-specific%20newtypes%20.../near/590639041" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313184.20x64.3A.20Add.20bitwidth-specific.20newtypes.20.2E.2E.2E.html#590639041">(Apr 24 2026 at 07:17)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift:meta</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13184">PR #13184</a>.</p>
+
+
+
+<a name="590639042"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313184%20x64%3A%20Add%20bitwidth-specific%20newtypes%20.../near/590639042" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313184.20x64.3A.20Add.20bitwidth-specific.20newtypes.20.2E.2E.2E.html#590639042">(Apr 24 2026 at 07:17)</a>:</h4>
+<p>github-actions[bot] added the label <code>isle</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13184">PR #13184</a>.</p>
+
+
+
+<a name="590639200"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313184%20x64%3A%20Add%20bitwidth-specific%20newtypes%20.../near/590639200" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313184.20x64.3A.20Add.20bitwidth-specific.20newtypes.20.2E.2E.2E.html#590639200">(Apr 24 2026 at 07:18)</a>:</h4>
+<p>github-actions[bot] <a href="https://github.com/bytecodealliance/wasmtime/pull/13184#issuecomment-4311376292">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13184">PR #13184</a>:</p>
+<blockquote>
+<h4>Subscribe to Label Action</h4>
+<p>cc @cfallin, @fitzgen</p>
+<p>&lt;details&gt;<br>
+This issue or pull request has been labeled: "cranelift", "cranelift:area:x64", "cranelift:meta", "isle"</p>
+<p>Thus the following users have been cc'd because of the following labels:</p>
+<ul>
+<li>cfallin: isle</li>
+<li>fitzgen: isle</li>
+</ul>
+<p>To subscribe or unsubscribe from this label, edit the &lt;code&gt;.github/subscribe-to-label.json&lt;/code&gt; configuration file.</p>
+<p><a href="https://github.com/bytecodealliance/subscribe-to-label-action">Learn more.</a><br>
+&lt;/details&gt;</p>
+</blockquote>
+
+
+
+<a name="590704051"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313184%20x64%3A%20Add%20bitwidth-specific%20newtypes%20.../near/590704051" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313184.20x64.3A.20Add.20bitwidth-specific.20newtypes.20.2E.2E.2E.html#590704051">(Apr 24 2026 at 12:36)</a>:</h4>
+<p>fitzgen submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13184#pullrequestreview-4170457648">PR review</a>:</p>
+<blockquote>
+<p>Did not read every line of isle that changed, but everything I sampled looked good. Focused more on the newtype definitions, which also look good.</p>
+</blockquote>
+
+
+
+<a name="590704285"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313184%20x64%3A%20Add%20bitwidth-specific%20newtypes%20.../near/590704285" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313184.20x64.3A.20Add.20bitwidth-specific.20newtypes.20.2E.2E.2E.html#590704285">(Apr 24 2026 at 12:37)</a>:</h4>
+<p>fitzgen added <a href="https://github.com/bytecodealliance/wasmtime/pull/13184">PR #13184 x64: Add bitwidth-specific newtypes for registers.</a> to the merge queue</p>
+
+
+
+<a name="590710353"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313184%20x64%3A%20Add%20bitwidth-specific%20newtypes%20.../near/590710353" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313184.20x64.3A.20Add.20bitwidth-specific.20newtypes.20.2E.2E.2E.html#590710353">(Apr 24 2026 at 13:01)</a>:</h4>
+<p>github-merge-queue[bot] removed <a href="https://github.com/bytecodealliance/wasmtime/pull/13184">PR #13184 x64: Add bitwidth-specific newtypes for registers.</a> from the merge queue</p>
+
+
+
+<a name="590729531"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313184%20x64%3A%20Add%20bitwidth-specific%20newtypes%20.../near/590729531" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313184.20x64.3A.20Add.20bitwidth-specific.20newtypes.20.2E.2E.2E.html#590729531">(Apr 24 2026 at 14:22)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/13184#issuecomment-4313898227">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13184">PR #13184</a>:</p>
+<blockquote>
+<p>Merge queue bounced with network error in <code>onnx-download</code>; retrying...</p>
+</blockquote>
+
+
+
+<a name="590729543"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313184%20x64%3A%20Add%20bitwidth-specific%20newtypes%20.../near/590729543" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313184.20x64.3A.20Add.20bitwidth-specific.20newtypes.20.2E.2E.2E.html#590729543">(Apr 24 2026 at 14:22)</a>:</h4>
+<p>cfallin added <a href="https://github.com/bytecodealliance/wasmtime/pull/13184">PR #13184 x64: Add bitwidth-specific newtypes for registers.</a> to the merge queue</p>
+
+
+
+<a name="590739980"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313184%20x64%3A%20Add%20bitwidth-specific%20newtypes%20.../near/590739980" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313184.20x64.3A.20Add.20bitwidth-specific.20newtypes.20.2E.2E.2E.html#590739980">(Apr 24 2026 at 15:11)</a>:</h4>
+<p>cfallin merged <a href="https://github.com/bytecodealliance/wasmtime/pull/13184">PR #13184</a>.</p>
+
+
+
+<a name="590739985"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313184%20x64%3A%20Add%20bitwidth-specific%20newtypes%20.../near/590739985" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313184.20x64.3A.20Add.20bitwidth-specific.20newtypes.20.2E.2E.2E.html#590739985">(Apr 24 2026 at 15:11)</a>:</h4>
+<p>cfallin removed <a href="https://github.com/bytecodealliance/wasmtime/pull/13184">PR #13184 x64: Add bitwidth-specific newtypes for registers.</a> from the merge queue</p>
+
+
+
+<hr><p>Last updated: Jul 02 2026 at 22:22 UTC</p>
+</html>

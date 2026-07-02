@@ -1,0 +1,1382 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13544 WASIp1 semantic ambiguity with ov... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313544.20WASIp1.20semantic.20ambiguity.20with.20ov.2E.2E.2E.html">wasmtime / issue #13544 WASIp1 semantic ambiguity with ov...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="599707207"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313544%20WASIp1%20semantic%20ambiguity%20with%20ov.../near/599707207" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313544.20WASIp1.20semantic.20ambiguity.20with.20ov.2E.2E.2E.html#599707207">(Jun 03 2026 at 06:59)</a>:</h4>
+<p>MacroModel opened <a href="https://github.com/bytecodealliance/wasmtime/issues/13544">issue #13544</a>:</p>
+<blockquote>
+<h1>WASIp1 semantic ambiguity with overlapping preopened directories can break POSIX path equivalence</h1>
+<h2>Summary</h2>
+<p>This is not a Wasmtime implementation bug. It is a semantic ambiguity that falls<br>
+out of the WASIp1 preopen model when it is exposed through POSIX-like APIs.<br>
+Wasmtime currently allows overlapping WASI preopened directory names such as:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>--dir /host/a::/
+--dir /host/b::/lib
+</code></pre></div>
+<p>If <code>/host/a</code> also contains a real <code>lib</code> subdirectory, POSIX-like guests can observe<br>
+two different host directories for the same logical path:</p>
+<div class="codehilite" data-code-language="C"><pre><span></span><code><span class="kt">int</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">"/"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">via_root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">openat</span><span class="p">(</span><span class="n">root</span><span class="p">,</span><span class="w"> </span><span class="s">"lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="n">via_absolute</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">"/lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+</code></pre></div>
+<p>Under POSIX path semantics, <code>openat(open("/"), "lib/marker.txt")</code> and<br>
+<code>open("/lib/marker.txt")</code> should resolve to the same object. With overlapping<br>
+WASIp1 preopens, they can resolve to different host directories.</p>
+<p>This is surprising for POSIX-like runtimes such as wasi-libc and Rust <code>std</code>, and it<br>
+can cause users to believe a more specific preopen masks or overrides a subtree when<br>
+it does not.</p>
+<p>The goal of this issue is therefore not to report an incorrect implementation of<br>
+WASIp1. Rather, it is to document a confusing and potentially dangerous ambiguity<br>
+and to propose that Wasmtime provide a diagnostic or an explicit opt-in for this<br>
+configuration.</p>
+<h2>Environment</h2>
+<p>Observed with a local Wasmtime build:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>wasmtime 46.0.0 (3f3f222b7 2026-06-02)
+</code></pre></div>
+<p>The behavior was also reproduced with an installed Wasmtime 35.0.0 binary.</p>
+<h2>Minimal directory setup</h2>
+<p>Create two different host directories. Directory <code>a</code> is mounted at guest <code>/</code>.<br>
+Directory <code>b</code> is mounted at guest <code>/lib</code>. Directory <code>a</code> also has its own <code>lib</code><br>
+subdirectory:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>mkdir<span class="w"> </span>-p<span class="w"> </span>/tmp/wasi-overlap/a/lib
+mkdir<span class="w"> </span>-p<span class="w"> </span>/tmp/wasi-overlap/b
+
+<span class="nb">printf</span><span class="w"> </span><span class="s1">'from-a-lib\n'</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/wasi-overlap/a/lib/marker.txt
+<span class="nb">printf</span><span class="w"> </span><span class="s1">'from-b-mounted-lib\n'</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/wasi-overlap/b/marker.txt
+</code></pre></div>
+<h2>C/C++ wasi-libc reproduction</h2>
+<p><code>control.cc</code>:</p>
+<div class="codehilite" data-code-language="C++"><pre><span></span><code><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;cerrno&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;cstdio&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;cstring&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;fcntl.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;unistd.h&gt;</span>
+
+<span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">read_path</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">path</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">fd</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: open failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">buf</span><span class="p">[</span><span class="mi">128</span><span class="p">];</span>
+<span class="w">    </span><span class="kt">ssize_t</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">buf</span><span class="p">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">n</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: read failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">n</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="sc">'\0'</span><span class="p">;</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">);</span>
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">read_openat</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">root_fd</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">path</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">openat</span><span class="p">(</span><span class="n">root_fd</span><span class="p">,</span><span class="w"> </span><span class="n">path</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">fd</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: openat failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">buf</span><span class="p">[</span><span class="mi">128</span><span class="p">];</span>
+<span class="w">    </span><span class="kt">ssize_t</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">buf</span><span class="p">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">n</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: read failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">n</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="sc">'\0'</span><span class="p">;</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">);</span>
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">root_fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">"/"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">root_fd</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"open root: failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"open root: ok</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">read_path</span><span class="p">(</span><span class="s">"open /lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="s">"/lib/marker.txt"</span><span class="p">);</span>
+<span class="w">    </span><span class="n">read_openat</span><span class="p">(</span><span class="n">root_fd</span><span class="p">,</span><span class="w"> </span><span class="s">"open / then openat lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="s">"lib/marker.txt"</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">root_fd</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Example compile command:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>clang++<span class="w"> </span>-o<span class="w"> </span>control.wasm<span class="w"> </span>control.cc<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-Ofast<span class="w"> </span>-Wno-deprecated-ofast<span class="w"> </span>-s<span class="w"> </span>-flto<span class="w"> </span>-fuse-ld<span class="o">=</span>lld<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-fno-rtti<span class="w"> </span>-fno-unwind-tables<span class="w"> </span>-fno-asynchronous-unwind-tables<span class="w"> </span>-fno-exceptions<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--target<span class="o">=</span>wasm32-wasip1<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--sysroot<span class="o">=</span><span class="s2">"/Users/liyinan/Documents/MacroModel/src/wasi-libc/build-mvp/sysroot"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-std<span class="o">=</span>c++26<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-mno-bulk-memory<span class="w"> </span>-mno-bulk-memory-opt<span class="w"> </span>-mno-nontrapping-fptoint<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-mno-sign-ext<span class="w"> </span>-mno-mutable-globals<span class="w"> </span>-mno-multivalue<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-mno-reference-types<span class="w"> </span>-mno-call-indirect-overlong
+</code></pre></div>
+<p>Run:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>wasmtime<span class="w"> </span>run<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dir<span class="w"> </span>/tmp/wasi-overlap/a::/<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dir<span class="w"> </span>/tmp/wasi-overlap/b::/lib<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>control.wasm
+</code></pre></div>
+<p>Actual output:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>open root: ok
+open /lib/marker.txt: from-b-mounted-lib
+
+open / then openat lib/marker.txt: from-a-lib
+</code></pre></div>
+<p>The absolute path lookup reaches the <code>/lib</code> preopen, while the directory-fd-relative<br>
+lookup reaches the real <code>lib</code> directory inside the <code>/</code> preopen.</p>
+<h2>Rust reproduction</h2>
+<p>The same behavior can also be demonstrated with Rust <code>std</code>. The <code>open_at</code> helper is<br>
+currently behind Rust's WASI extension feature, so this is best treated as an<br>
+auxiliary reproduction; the C/C++ wasi-libc case above is sufficient on its own.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#![feature(wasi_ext)]</span>
+
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">fs</span><span class="p">::{</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">File</span><span class="p">,</span><span class="w"> </span><span class="n">OpenOptions</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">io</span><span class="p">::{</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">Read</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">os</span><span class="p">::</span><span class="n">wasi</span><span class="p">::</span><span class="n">fs</span><span class="p">::</span><span class="n">OpenOptionsExt</span><span class="p">;</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">read</span><span class="p">(</span><span class="k">mut</span><span class="w"> </span><span class="n">file</span><span class="p">:</span><span class="w"> </span><span class="nc">File</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">io</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">String</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="w">    </span><span class="n">file</span><span class="p">.</span><span class="n">read_to_string</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">s</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(</span><span class="n">s</span><span class="p">.</span><span class="n">trim</span><span class="p">().</span><span class="n">to_owned</span><span class="p">())</span>
+<span class="p">}</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">io</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">abs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fs</span><span class="p">::</span><span class="n">read_to_string</span><span class="p">(</span><span class="s">"/lib/marker.txt"</span><span class="p">)</span><span class="o">?</span><span class="p">.</span><span class="n">trim</span><span class="p">().</span><span class="n">to_owned</span><span class="p">();</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">File</span><span class="p">::</span><span class="n">open</span><span class="p">(</span><span class="s">"/"</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">via_root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read</span><span class="p">(</span><span class="n">OpenOptions</span><span class="p">::</span><span class="n">new</span><span class="p">().</span><span class="n">read</span><span class="p">(</span><span class="kc">true</span><span class="p">).</span><span class="n">open_at</span><span class="p">(</span><span class="o">&amp;</span><span class="n">root</span><span class="p">,</span><span class="w"> </span><span class="s">"lib/marker.txt"</span><span class="p">)</span><span class="o">?</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"open /lib/marker.txt: {abs}"</span><span class="p">);</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"open / then openat lib/marker.txt: {via_root}"</span><span class="p">);</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"same: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">abs</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">via_root</span><span class="p">);</span>
+
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Observed output:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>open /lib/marker.txt: from-b-mounted-lib
+open / then openat lib/marker.txt: from-a-lib
+same: false
+</code></pre></div>
+<h2>Expected behavior</h2>
+<p>For a POSIX-like guest, these two operations should be path-equivalent:</p>
+<div class="codehilite" data-code-language="C"><pre><span></span><code><span class="n">open</span><span class="p">(</span><span class="s">"/lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">)</span>
+<span class="n">openat</span><span class="p">(</span><span class="n">open</span><span class="p">(</span><span class="s">"/"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">),</span><span class="w"> </span><span class="s">"lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">)</span>
+</code></pre></div>
+<p>Raw WASIp1 is capability-oriented and does not define a POSIX mount namespace.<br>
+However, when Wasmtime's CLI preopens are used by POSIX-like guests, users can<br>
+reasonably expect the configured guest paths to approximate a guest-visible<br>
+directory tree. In that context, overlapping guest paths should either preserve this<br>
+equivalence or be reported as ambiguous.</p>
+<h2>Actual behavior</h2>
+<p>WASIp1 exposes each preopen as an independent directory capability. A POSIX-like<br>
+guest runtime resolves absolute paths by matching preopen names, so <code>/lib/...</code> can<br>
+select the more specific <code>/lib</code> preopen. However, once the guest has opened <code>/</code>, the<br>
+resulting directory descriptor is the host directory <code>/host/a</code>; a subsequent<br>
+<code>openat(root_fd, "lib/...")</code> is performed relative to that host directory and does<br>
+not re-consult the preopen table.</p>
+<p>This creates a split namespace:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>guest /lib via absolute path       -&gt; /host/b
+guest / + relative lib via openat  -&gt; /host/a/lib
+</code></pre></div>
+<h2>Why this matters</h2>
+<p>This can violate application assumptions imported from POSIX:</p>
+<ul>
+<li>Path normalization and path decomposition are no longer equivalent.</li>
+<li>
+<p>Code that first opens a base directory and then uses <code>openat</code> can see different<br>
+  files than code using the absolute path.</p>
+</li>
+<li>
+<p>Users may reasonably expect <code>--dir b::/lib</code> to overlay or mask <code>/lib</code> under the<br>
+  root preopen, but it does not.</p>
+</li>
+<li>
+<p>A more specific preopen may give a false impression that a subtree has been<br>
+  replaced, while the original subtree remains reachable through the parent<br>
+  directory descriptor.</p>
+</li>
+</ul>
+<p>This is not necessarily a sandbox escape, because the parent preopen already grants<br>
+access to <code>/host/a</code>. It is also not a Wasmtime correctness bug against WASIp1: the<br>
+raw WASIp1 model is based on independent directory capabilities. The problem is<br>
+that the resulting guest namespace is ambiguous and non-POSIX-like in a way that<br>
+can be hard to notice.</p>
+<h2>Relevant implementation behavior</h2>
+<p>At a high level:</p>
+<ul>
+<li><code>WasiCtxBuilder::preopened_dir</code> records each <code>(Dir, guest_path)</code> pair independently.</li>
+<li><code>wasi:filesystem/preopens.get-directories</code> returns the preopens as a list.</li>
+<li>
+<p><code>descriptor.open-at</code> opens relative to the specific directory descriptor passed by<br>
+  the guest.</p>
+</li>
+<li>
+<p>There is no overlay mount table consulted when opening a path relative to an<br>
+  already-opened directory descriptor.</p>
+</li>
+</ul>
+<p>That behavior is consistent with capability-oriented WASIp1 handles. The ambiguity<br>
+appears when these handles are combined with POSIX-like absolute path APIs provided<br>
+by guest runtimes such as wasi-libc.</p>
+<h2>Suggested mitigations</h2>
+<h3>Option 1: Warn by default</h3>
+<p>Wasmtime could detect overlapping guest preopen paths and emit a warning as a<br>
+usability diagnostic, for example:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>warning: overlapping WASI preopened directories '/' and '/lib' may be ambiguous.
+         POSIX-like guests may observe open("/lib") and openat(open("/"), "lib")
+         resolving to different host directories.
+</code></pre></div>
+<p>The check should operate on normalized guest paths:</p>
+<ul>
+<li>collapse repeated slashes,</li>
+<li>remove <code>.</code> path components,</li>
+<li>remove trailing slashes,</li>
+<li>compare path components rather than string prefixes.</li>
+</ul>
+<p>For example, all of the following should be treated as the same guest path shape:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>/lib
+//lib///
+./lib
+</code></pre></div>
+<p>The warning should trigger when one guest preopen path is an ancestor of another<br>
+guest preopen path, such as:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>/ and /lib
+/usr and /usr/lib
+. and ./lib
+</code></pre></div>
+<p>It is probably better to warn for any overlapping guest paths rather than only when<br>
+the parent host directory currently contains a matching child, because the host<br>
+directory contents can change after Wasmtime starts.</p>
+<h3>Option 2: Reject by default, require explicit opt-in</h3>
+<p>A stricter and less surprising CLI behavior would be to reject overlapping guest<br>
+preopen paths unless the user explicitly allows them:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>error: overlapping WASI preopened directories '/' and '/lib' are ambiguous.
+       Use --allow-overlapping-wasi-dirs to permit this behavior.
+</code></pre></div>
+<p>Possible CLI names:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>--allow-overlapping-wasi-dirs
+--wasi-overlapping-dirs=allow
+--wasi-dir-overlap=allow
+</code></pre></div>
+<p>This would make the WASIp1 ambiguity explicit while preserving compatibility for<br>
+users who intentionally rely on independent overl<br>
+[message truncated]</p>
+</blockquote>
+
+
+
+<a name="599707483"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313544%20WASIp1%20semantic%20ambiguity%20with%20ov.../near/599707483" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313544.20WASIp1.20semantic.20ambiguity.20with.20ov.2E.2E.2E.html#599707483">(Jun 03 2026 at 07:01)</a>:</h4>
+<p>MacroModel edited <a href="https://github.com/bytecodealliance/wasmtime/issues/13544">issue #13544</a>:</p>
+<blockquote>
+<h1>WASIp1 semantic ambiguity with overlapping preopened directories can break POSIX path equivalence</h1>
+<h2>Summary</h2>
+<p>This is not a Wasmtime implementation bug. It is a semantic ambiguity that falls<br>
+out of the WASIp1 preopen model when it is exposed through POSIX-like APIs.<br>
+Wasmtime currently allows overlapping WASI preopened directory names such as:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>--dir /host/a::/
+--dir /host/b::/lib
+</code></pre></div>
+<p>If <code>/host/a</code> also contains a real <code>lib</code> subdirectory, POSIX-like guests can observe<br>
+two different host directories for the same logical path:</p>
+<div class="codehilite" data-code-language="C"><pre><span></span><code><span class="kt">int</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">"/"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">via_root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">openat</span><span class="p">(</span><span class="n">root</span><span class="p">,</span><span class="w"> </span><span class="s">"lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="n">via_absolute</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">"/lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+</code></pre></div>
+<p>Under POSIX path semantics, <code>openat(open("/"), "lib/marker.txt")</code> and<br>
+<code>open("/lib/marker.txt")</code> should resolve to the same object. With overlapping<br>
+WASIp1 preopens, they can resolve to different host directories.</p>
+<p>This is surprising for POSIX-like runtimes such as wasi-libc and Rust <code>std</code>, and it<br>
+can cause users to believe a more specific preopen masks or overrides a subtree when<br>
+it does not.</p>
+<p>The goal of this issue is therefore not to report an incorrect implementation of<br>
+WASIp1. Rather, it is to document a confusing and potentially dangerous ambiguity<br>
+and to propose that Wasmtime provide a diagnostic or an explicit opt-in for this<br>
+configuration.</p>
+<h2>Environment</h2>
+<p>Observed with a local Wasmtime build:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>wasmtime 46.0.0 (3f3f222b7 2026-06-02)
+</code></pre></div>
+<p>The behavior was also reproduced with an installed Wasmtime 35.0.0 binary.</p>
+<h2>Minimal directory setup</h2>
+<p>Create two different host directories. Directory <code>a</code> is mounted at guest <code>/</code>.<br>
+Directory <code>b</code> is mounted at guest <code>/lib</code>. Directory <code>a</code> also has its own <code>lib</code><br>
+subdirectory:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>mkdir<span class="w"> </span>-p<span class="w"> </span>/tmp/wasi-overlap/a/lib
+mkdir<span class="w"> </span>-p<span class="w"> </span>/tmp/wasi-overlap/b
+
+<span class="nb">printf</span><span class="w"> </span><span class="s1">'from-a-lib\n'</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/wasi-overlap/a/lib/marker.txt
+<span class="nb">printf</span><span class="w"> </span><span class="s1">'from-b-mounted-lib\n'</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/wasi-overlap/b/marker.txt
+</code></pre></div>
+<h2>C/C++ wasi-libc reproduction</h2>
+<p><code>control.cc</code>:</p>
+<div class="codehilite" data-code-language="C++"><pre><span></span><code><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;cerrno&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;cstdio&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;cstring&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;fcntl.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;unistd.h&gt;</span>
+
+<span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">read_path</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">path</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">fd</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: open failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">buf</span><span class="p">[</span><span class="mi">128</span><span class="p">];</span>
+<span class="w">    </span><span class="kt">ssize_t</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">buf</span><span class="p">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">n</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: read failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">n</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="sc">'\0'</span><span class="p">;</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">);</span>
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">read_openat</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">root_fd</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">path</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">openat</span><span class="p">(</span><span class="n">root_fd</span><span class="p">,</span><span class="w"> </span><span class="n">path</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">fd</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: openat failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">buf</span><span class="p">[</span><span class="mi">128</span><span class="p">];</span>
+<span class="w">    </span><span class="kt">ssize_t</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">buf</span><span class="p">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">n</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: read failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">n</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="sc">'\0'</span><span class="p">;</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">);</span>
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">root_fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">"/"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">root_fd</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"open root: failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"open root: ok</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">read_path</span><span class="p">(</span><span class="s">"open /lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="s">"/lib/marker.txt"</span><span class="p">);</span>
+<span class="w">    </span><span class="n">read_openat</span><span class="p">(</span><span class="n">root_fd</span><span class="p">,</span><span class="w"> </span><span class="s">"open / then openat lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="s">"lib/marker.txt"</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">root_fd</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Example compile command:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>clang++<span class="w"> </span>-o<span class="w"> </span>control.wasm<span class="w"> </span>control.cc<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-Ofast<span class="w"> </span>-Wno-deprecated-ofast<span class="w"> </span>-s<span class="w"> </span>-flto<span class="w"> </span>-fuse-ld<span class="o">=</span>lld<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-fno-rtti<span class="w"> </span>-fno-unwind-tables<span class="w"> </span>-fno-asynchronous-unwind-tables<span class="w"> </span>-fno-exceptions<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--target<span class="o">=</span>wasm32-wasip1<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--sysroot<span class="o">=</span><span class="s2">"/Users/MacroModel/Documents/MacroModel/src/wasi-libc/build-mvp/sysroot"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-std<span class="o">=</span>c++26<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-mno-bulk-memory<span class="w"> </span>-mno-bulk-memory-opt<span class="w"> </span>-mno-nontrapping-fptoint<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-mno-sign-ext<span class="w"> </span>-mno-mutable-globals<span class="w"> </span>-mno-multivalue<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-mno-reference-types<span class="w"> </span>-mno-call-indirect-overlong
+</code></pre></div>
+<p>Run:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>wasmtime<span class="w"> </span>run<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dir<span class="w"> </span>/tmp/wasi-overlap/a::/<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dir<span class="w"> </span>/tmp/wasi-overlap/b::/lib<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>control.wasm
+</code></pre></div>
+<p>Actual output:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>open root: ok
+open /lib/marker.txt: from-b-mounted-lib
+
+open / then openat lib/marker.txt: from-a-lib
+</code></pre></div>
+<p>The absolute path lookup reaches the <code>/lib</code> preopen, while the directory-fd-relative<br>
+lookup reaches the real <code>lib</code> directory inside the <code>/</code> preopen.</p>
+<h2>Rust reproduction</h2>
+<p>The same behavior can also be demonstrated with Rust <code>std</code>. The <code>open_at</code> helper is<br>
+currently behind Rust's WASI extension feature, so this is best treated as an<br>
+auxiliary reproduction; the C/C++ wasi-libc case above is sufficient on its own.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#![feature(wasi_ext)]</span>
+
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">fs</span><span class="p">::{</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">File</span><span class="p">,</span><span class="w"> </span><span class="n">OpenOptions</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">io</span><span class="p">::{</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">Read</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">os</span><span class="p">::</span><span class="n">wasi</span><span class="p">::</span><span class="n">fs</span><span class="p">::</span><span class="n">OpenOptionsExt</span><span class="p">;</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">read</span><span class="p">(</span><span class="k">mut</span><span class="w"> </span><span class="n">file</span><span class="p">:</span><span class="w"> </span><span class="nc">File</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">io</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">String</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="w">    </span><span class="n">file</span><span class="p">.</span><span class="n">read_to_string</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">s</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(</span><span class="n">s</span><span class="p">.</span><span class="n">trim</span><span class="p">().</span><span class="n">to_owned</span><span class="p">())</span>
+<span class="p">}</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">io</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">abs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fs</span><span class="p">::</span><span class="n">read_to_string</span><span class="p">(</span><span class="s">"/lib/marker.txt"</span><span class="p">)</span><span class="o">?</span><span class="p">.</span><span class="n">trim</span><span class="p">().</span><span class="n">to_owned</span><span class="p">();</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">File</span><span class="p">::</span><span class="n">open</span><span class="p">(</span><span class="s">"/"</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">via_root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read</span><span class="p">(</span><span class="n">OpenOptions</span><span class="p">::</span><span class="n">new</span><span class="p">().</span><span class="n">read</span><span class="p">(</span><span class="kc">true</span><span class="p">).</span><span class="n">open_at</span><span class="p">(</span><span class="o">&amp;</span><span class="n">root</span><span class="p">,</span><span class="w"> </span><span class="s">"lib/marker.txt"</span><span class="p">)</span><span class="o">?</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"open /lib/marker.txt: {abs}"</span><span class="p">);</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"open / then openat lib/marker.txt: {via_root}"</span><span class="p">);</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"same: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">abs</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">via_root</span><span class="p">);</span>
+
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Observed output:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>open /lib/marker.txt: from-b-mounted-lib
+open / then openat lib/marker.txt: from-a-lib
+same: false
+</code></pre></div>
+<h2>Expected behavior</h2>
+<p>For a POSIX-like guest, these two operations should be path-equivalent:</p>
+<div class="codehilite" data-code-language="C"><pre><span></span><code><span class="n">open</span><span class="p">(</span><span class="s">"/lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">)</span>
+<span class="n">openat</span><span class="p">(</span><span class="n">open</span><span class="p">(</span><span class="s">"/"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">),</span><span class="w"> </span><span class="s">"lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">)</span>
+</code></pre></div>
+<p>Raw WASIp1 is capability-oriented and does not define a POSIX mount namespace.<br>
+However, when Wasmtime's CLI preopens are used by POSIX-like guests, users can<br>
+reasonably expect the configured guest paths to approximate a guest-visible<br>
+directory tree. In that context, overlapping guest paths should either preserve this<br>
+equivalence or be reported as ambiguous.</p>
+<h2>Actual behavior</h2>
+<p>WASIp1 exposes each preopen as an independent directory capability. A POSIX-like<br>
+guest runtime resolves absolute paths by matching preopen names, so <code>/lib/...</code> can<br>
+select the more specific <code>/lib</code> preopen. However, once the guest has opened <code>/</code>, the<br>
+resulting directory descriptor is the host directory <code>/host/a</code>; a subsequent<br>
+<code>openat(root_fd, "lib/...")</code> is performed relative to that host directory and does<br>
+not re-consult the preopen table.</p>
+<p>This creates a split namespace:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>guest /lib via absolute path       -&gt; /host/b
+guest / + relative lib via openat  -&gt; /host/a/lib
+</code></pre></div>
+<h2>Why this matters</h2>
+<p>This can violate application assumptions imported from POSIX:</p>
+<ul>
+<li>Path normalization and path decomposition are no longer equivalent.</li>
+<li>
+<p>Code that first opens a base directory and then uses <code>openat</code> can see different<br>
+  files than code using the absolute path.</p>
+</li>
+<li>
+<p>Users may reasonably expect <code>--dir b::/lib</code> to overlay or mask <code>/lib</code> under the<br>
+  root preopen, but it does not.</p>
+</li>
+<li>
+<p>A more specific preopen may give a false impression that a subtree has been<br>
+  replaced, while the original subtree remains reachable through the parent<br>
+  directory descriptor.</p>
+</li>
+</ul>
+<p>This is not necessarily a sandbox escape, because the parent preopen already grants<br>
+access to <code>/host/a</code>. It is also not a Wasmtime correctness bug against WASIp1: the<br>
+raw WASIp1 model is based on independent directory capabilities. The problem is<br>
+that the resulting guest namespace is ambiguous and non-POSIX-like in a way that<br>
+can be hard to notice.</p>
+<h2>Relevant implementation behavior</h2>
+<p>At a high level:</p>
+<ul>
+<li><code>WasiCtxBuilder::preopened_dir</code> records each <code>(Dir, guest_path)</code> pair independently.</li>
+<li><code>wasi:filesystem/preopens.get-directories</code> returns the preopens as a list.</li>
+<li>
+<p><code>descriptor.open-at</code> opens relative to the specific directory descriptor passed by<br>
+  the guest.</p>
+</li>
+<li>
+<p>There is no overlay mount table consulted when opening a path relative to an<br>
+  already-opened directory descriptor.</p>
+</li>
+</ul>
+<p>That behavior is consistent with capability-oriented WASIp1 handles. The ambiguity<br>
+appears when these handles are combined with POSIX-like absolute path APIs provided<br>
+by guest runtimes such as wasi-libc.</p>
+<h2>Suggested mitigations</h2>
+<h3>Option 1: Warn by default</h3>
+<p>Wasmtime could detect overlapping guest preopen paths and emit a warning as a<br>
+usability diagnostic, for example:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>warning: overlapping WASI preopened directories '/' and '/lib' may be ambiguous.
+         POSIX-like guests may observe open("/lib") and openat(open("/"), "lib")
+         resolving to different host directories.
+</code></pre></div>
+<p>The check should operate on normalized guest paths:</p>
+<ul>
+<li>collapse repeated slashes,</li>
+<li>remove <code>.</code> path components,</li>
+<li>remove trailing slashes,</li>
+<li>compare path components rather than string prefixes.</li>
+</ul>
+<p>For example, all of the following should be treated as the same guest path shape:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>/lib
+//lib///
+./lib
+</code></pre></div>
+<p>The warning should trigger when one guest preopen path is an ancestor of another<br>
+guest preopen path, such as:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>/ and /lib
+/usr and /usr/lib
+. and ./lib
+</code></pre></div>
+<p>It is probably better to warn for any overlapping guest paths rather than only when<br>
+the parent host directory currently contains a matching child, because the host<br>
+directory contents can change after Wasmtime starts.</p>
+<h3>Option 2: Reject by default, require explicit opt-in</h3>
+<p>A stricter and less surprising CLI behavior would be to reject overlapping guest<br>
+preopen paths unless the user explicitly allows them:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>error: overlapping WASI preopened directories '/' and '/lib' are ambiguous.
+       Use --allow-overlapping-wasi-dirs to permit this behavior.
+</code></pre></div>
+<p>Possible CLI names:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>--allow-overlapping-wasi-dirs
+--wasi-overlapping-dirs=allow
+--wasi-dir-overlap=allow
+</code></pre></div>
+<p>This would make the WASIp1 ambiguity explicit while preserving compatibility for<br>
+users who intentionally rely on independent ov<br>
+[message truncated]</p>
+</blockquote>
+
+
+
+<a name="599709696"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313544%20WASIp1%20semantic%20ambiguity%20with%20ov.../near/599709696" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313544.20WASIp1.20semantic.20ambiguity.20with.20ov.2E.2E.2E.html#599709696">(Jun 03 2026 at 07:12)</a>:</h4>
+<p>MacroModel edited <a href="https://github.com/bytecodealliance/wasmtime/issues/13544">issue #13544</a>:</p>
+<blockquote>
+<h1>WASIp1 semantic ambiguity with overlapping preopened directories can break POSIX path equivalence</h1>
+<h2>Summary</h2>
+<p>This is not a Wasmtime implementation bug. It is a semantic ambiguity that falls<br>
+out of the WASIp1 preopen model when it is exposed through POSIX-like APIs.<br>
+Wasmtime currently allows overlapping WASI preopened directory names such as:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>--dir /host/a::/
+--dir /host/b::/lib
+</code></pre></div>
+<p>If <code>/host/a</code> also contains a real <code>lib</code> subdirectory, POSIX-like guests can observe<br>
+two different host directories for the same logical path:</p>
+<div class="codehilite" data-code-language="C"><pre><span></span><code><span class="kt">int</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">"/"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">via_root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">openat</span><span class="p">(</span><span class="n">root</span><span class="p">,</span><span class="w"> </span><span class="s">"lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="n">via_absolute</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">"/lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+</code></pre></div>
+<p>Under POSIX path semantics, <code>openat(open("/"), "lib/marker.txt")</code> and<br>
+<code>open("/lib/marker.txt")</code> should resolve to the same object. With overlapping<br>
+WASIp1 preopens, they can resolve to different host directories.</p>
+<p>This is surprising for POSIX-like runtimes such as wasi-libc and Rust <code>std</code>, and it<br>
+can cause users to believe a more specific preopen masks or overrides a subtree when<br>
+it does not.</p>
+<p>The goal of this issue is therefore not to report an incorrect implementation of<br>
+WASIp1. Rather, it is to document a confusing and potentially dangerous ambiguity<br>
+and to propose that Wasmtime provide a diagnostic or an explicit opt-in for this<br>
+configuration.</p>
+<h2>Environment</h2>
+<p>Observed with a local Wasmtime build:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>wasmtime 46.0.0 (3f3f222b7 2026-06-02)
+</code></pre></div>
+<p>The behavior was also reproduced with an installed Wasmtime 35.0.0 binary.</p>
+<h2>Minimal directory setup</h2>
+<p>Create two different host directories. Directory <code>a</code> is mounted at guest <code>/</code>.<br>
+Directory <code>b</code> is mounted at guest <code>/lib</code>. Directory <code>a</code> also has its own <code>lib</code><br>
+subdirectory:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>mkdir<span class="w"> </span>-p<span class="w"> </span>/tmp/wasi-overlap/a/lib
+mkdir<span class="w"> </span>-p<span class="w"> </span>/tmp/wasi-overlap/b
+
+<span class="nb">printf</span><span class="w"> </span><span class="s1">'from-a-lib\n'</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/wasi-overlap/a/lib/marker.txt
+<span class="nb">printf</span><span class="w"> </span><span class="s1">'from-b-mounted-lib\n'</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/wasi-overlap/b/marker.txt
+</code></pre></div>
+<h2>C/C++ wasip1-libc reproduction</h2>
+<p><code>control.cc</code>:</p>
+<div class="codehilite" data-code-language="C++"><pre><span></span><code><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;cerrno&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;cstdio&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;cstring&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;fcntl.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;unistd.h&gt;</span>
+
+<span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">read_path</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">path</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">fd</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: open failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">buf</span><span class="p">[</span><span class="mi">128</span><span class="p">];</span>
+<span class="w">    </span><span class="kt">ssize_t</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">buf</span><span class="p">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">n</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: read failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">n</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="sc">'\0'</span><span class="p">;</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">);</span>
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">read_openat</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">root_fd</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">path</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">openat</span><span class="p">(</span><span class="n">root_fd</span><span class="p">,</span><span class="w"> </span><span class="n">path</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">fd</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: openat failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">buf</span><span class="p">[</span><span class="mi">128</span><span class="p">];</span>
+<span class="w">    </span><span class="kt">ssize_t</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">buf</span><span class="p">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">n</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: read failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">n</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="sc">'\0'</span><span class="p">;</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">);</span>
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">root_fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">"/"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">root_fd</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"open root: failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"open root: ok</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">read_path</span><span class="p">(</span><span class="s">"open /lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="s">"/lib/marker.txt"</span><span class="p">);</span>
+<span class="w">    </span><span class="n">read_openat</span><span class="p">(</span><span class="n">root_fd</span><span class="p">,</span><span class="w"> </span><span class="s">"open / then openat lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="s">"lib/marker.txt"</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">root_fd</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Example compile command:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>clang++<span class="w"> </span>-o<span class="w"> </span>control.wasm<span class="w"> </span>control.cc<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-Ofast<span class="w"> </span>-Wno-deprecated-ofast<span class="w"> </span>-s<span class="w"> </span>-flto<span class="w"> </span>-fuse-ld<span class="o">=</span>lld<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-fno-rtti<span class="w"> </span>-fno-unwind-tables<span class="w"> </span>-fno-asynchronous-unwind-tables<span class="w"> </span>-fno-exceptions<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--target<span class="o">=</span>wasm32-wasip1<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--sysroot<span class="o">=</span><span class="s2">"/Users/MacroModel/Documents/MacroModel/src/wasi-libc/build-mvp/sysroot"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-std<span class="o">=</span>c++26<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-mno-bulk-memory<span class="w"> </span>-mno-bulk-memory-opt<span class="w"> </span>-mno-nontrapping-fptoint<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-mno-sign-ext<span class="w"> </span>-mno-mutable-globals<span class="w"> </span>-mno-multivalue<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-mno-reference-types<span class="w"> </span>-mno-call-indirect-overlong
+</code></pre></div>
+<p>Run:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>wasmtime<span class="w"> </span>run<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dir<span class="w"> </span>/tmp/wasi-overlap/a::/<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dir<span class="w"> </span>/tmp/wasi-overlap/b::/lib<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>control.wasm
+</code></pre></div>
+<p>Actual output:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>open root: ok
+open /lib/marker.txt: from-b-mounted-lib
+
+open / then openat lib/marker.txt: from-a-lib
+</code></pre></div>
+<p>The absolute path lookup reaches the <code>/lib</code> preopen, while the directory-fd-relative<br>
+lookup reaches the real <code>lib</code> directory inside the <code>/</code> preopen.</p>
+<h2>Rust reproduction</h2>
+<p>The same behavior can also be demonstrated with Rust <code>std</code>. The <code>open_at</code> helper is<br>
+currently behind Rust's WASI extension feature, so this is best treated as an<br>
+auxiliary reproduction; the C/C++ wasi-libc case above is sufficient on its own.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#![feature(wasi_ext)]</span>
+
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">fs</span><span class="p">::{</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">File</span><span class="p">,</span><span class="w"> </span><span class="n">OpenOptions</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">io</span><span class="p">::{</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">Read</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">os</span><span class="p">::</span><span class="n">wasi</span><span class="p">::</span><span class="n">fs</span><span class="p">::</span><span class="n">OpenOptionsExt</span><span class="p">;</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">read</span><span class="p">(</span><span class="k">mut</span><span class="w"> </span><span class="n">file</span><span class="p">:</span><span class="w"> </span><span class="nc">File</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">io</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">String</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="w">    </span><span class="n">file</span><span class="p">.</span><span class="n">read_to_string</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">s</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(</span><span class="n">s</span><span class="p">.</span><span class="n">trim</span><span class="p">().</span><span class="n">to_owned</span><span class="p">())</span>
+<span class="p">}</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">io</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">abs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fs</span><span class="p">::</span><span class="n">read_to_string</span><span class="p">(</span><span class="s">"/lib/marker.txt"</span><span class="p">)</span><span class="o">?</span><span class="p">.</span><span class="n">trim</span><span class="p">().</span><span class="n">to_owned</span><span class="p">();</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">File</span><span class="p">::</span><span class="n">open</span><span class="p">(</span><span class="s">"/"</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">via_root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read</span><span class="p">(</span><span class="n">OpenOptions</span><span class="p">::</span><span class="n">new</span><span class="p">().</span><span class="n">read</span><span class="p">(</span><span class="kc">true</span><span class="p">).</span><span class="n">open_at</span><span class="p">(</span><span class="o">&amp;</span><span class="n">root</span><span class="p">,</span><span class="w"> </span><span class="s">"lib/marker.txt"</span><span class="p">)</span><span class="o">?</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"open /lib/marker.txt: {abs}"</span><span class="p">);</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"open / then openat lib/marker.txt: {via_root}"</span><span class="p">);</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"same: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">abs</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">via_root</span><span class="p">);</span>
+
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Observed output:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>open /lib/marker.txt: from-b-mounted-lib
+open / then openat lib/marker.txt: from-a-lib
+same: false
+</code></pre></div>
+<h2>Expected behavior</h2>
+<p>For a POSIX-like guest, these two operations should be path-equivalent:</p>
+<div class="codehilite" data-code-language="C"><pre><span></span><code><span class="n">open</span><span class="p">(</span><span class="s">"/lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">)</span>
+<span class="n">openat</span><span class="p">(</span><span class="n">open</span><span class="p">(</span><span class="s">"/"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">),</span><span class="w"> </span><span class="s">"lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">)</span>
+</code></pre></div>
+<p>Raw WASIp1 is capability-oriented and does not define a POSIX mount namespace.<br>
+However, when Wasmtime's CLI preopens are used by POSIX-like guests, users can<br>
+reasonably expect the configured guest paths to approximate a guest-visible<br>
+directory tree. In that context, overlapping guest paths should either preserve this<br>
+equivalence or be reported as ambiguous.</p>
+<h2>Actual behavior</h2>
+<p>WASIp1 exposes each preopen as an independent directory capability. A POSIX-like<br>
+guest runtime resolves absolute paths by matching preopen names, so <code>/lib/...</code> can<br>
+select the more specific <code>/lib</code> preopen. However, once the guest has opened <code>/</code>, the<br>
+resulting directory descriptor is the host directory <code>/host/a</code>; a subsequent<br>
+<code>openat(root_fd, "lib/...")</code> is performed relative to that host directory and does<br>
+not re-consult the preopen table.</p>
+<p>This creates a split namespace:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>guest /lib via absolute path       -&gt; /host/b
+guest / + relative lib via openat  -&gt; /host/a/lib
+</code></pre></div>
+<h2>Why this matters</h2>
+<p>This can violate application assumptions imported from POSIX:</p>
+<ul>
+<li>Path normalization and path decomposition are no longer equivalent.</li>
+<li>
+<p>Code that first opens a base directory and then uses <code>openat</code> can see different<br>
+  files than code using the absolute path.</p>
+</li>
+<li>
+<p>Users may reasonably expect <code>--dir b::/lib</code> to overlay or mask <code>/lib</code> under the<br>
+  root preopen, but it does not.</p>
+</li>
+<li>
+<p>A more specific preopen may give a false impression that a subtree has been<br>
+  replaced, while the original subtree remains reachable through the parent<br>
+  directory descriptor.</p>
+</li>
+</ul>
+<p>This is not necessarily a sandbox escape, because the parent preopen already grants<br>
+access to <code>/host/a</code>. It is also not a Wasmtime correctness bug against WASIp1: the<br>
+raw WASIp1 model is based on independent directory capabilities. The problem is<br>
+that the resulting guest namespace is ambiguous and non-POSIX-like in a way that<br>
+can be hard to notice.</p>
+<h2>Relevant implementation behavior</h2>
+<p>At a high level:</p>
+<ul>
+<li><code>WasiCtxBuilder::preopened_dir</code> records each <code>(Dir, guest_path)</code> pair independently.</li>
+<li><code>wasi:filesystem/preopens.get-directories</code> returns the preopens as a list.</li>
+<li>
+<p><code>descriptor.open-at</code> opens relative to the specific directory descriptor passed by<br>
+  the guest.</p>
+</li>
+<li>
+<p>There is no overlay mount table consulted when opening a path relative to an<br>
+  already-opened directory descriptor.</p>
+</li>
+</ul>
+<p>That behavior is consistent with capability-oriented WASIp1 handles. The ambiguity<br>
+appears when these handles are combined with POSIX-like absolute path APIs provided<br>
+by guest runtimes such as wasi-libc.</p>
+<h2>Suggested mitigations</h2>
+<h3>Option 1: Warn by default</h3>
+<p>Wasmtime could detect overlapping guest preopen paths and emit a warning as a<br>
+usability diagnostic, for example:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>warning: overlapping WASI preopened directories '/' and '/lib' may be ambiguous.
+         POSIX-like guests may observe open("/lib") and openat(open("/"), "lib")
+         resolving to different host directories.
+</code></pre></div>
+<p>The check should operate on normalized guest paths:</p>
+<ul>
+<li>collapse repeated slashes,</li>
+<li>remove <code>.</code> path components,</li>
+<li>remove trailing slashes,</li>
+<li>compare path components rather than string prefixes.</li>
+</ul>
+<p>For example, all of the following should be treated as the same guest path shape:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>/lib
+//lib///
+./lib
+</code></pre></div>
+<p>The warning should trigger when one guest preopen path is an ancestor of another<br>
+guest preopen path, such as:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>/ and /lib
+/usr and /usr/lib
+. and ./lib
+</code></pre></div>
+<p>It is probably better to warn for any overlapping guest paths rather than only when<br>
+the parent host directory currently contains a matching child, because the host<br>
+directory contents can change after Wasmtime starts.</p>
+<h3>Option 2: Reject by default, require explicit opt-in</h3>
+<p>A stricter and less surprising CLI behavior would be to reject overlapping guest<br>
+preopen paths unless the user explicitly allows them:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>error: overlapping WASI preopened directories '/' and '/lib' are ambiguous.
+       Use --allow-overlapping-wasi-dirs to permit this behavior.
+</code></pre></div>
+<p>Possible CLI names:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>--allow-overlapping-wasi-dirs
+--wasi-overlapping-dirs=allow
+--wasi-dir-overlap=allow
+</code></pre></div>
+<p>This would make the WASIp1 ambiguity explicit while preserving compatibility for<br>
+users who intentionally rely on independent <br>
+[message truncated]</p>
+</blockquote>
+
+
+
+<a name="599715128"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313544%20WASIp1%20semantic%20ambiguity%20with%20ov.../near/599715128" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313544.20WASIp1.20semantic.20ambiguity.20with.20ov.2E.2E.2E.html#599715128">(Jun 03 2026 at 07:37)</a>:</h4>
+<p>MacroModel edited <a href="https://github.com/bytecodealliance/wasmtime/issues/13544">issue #13544</a>:</p>
+<blockquote>
+<h1>WASI preopen semantic ambiguity with overlapping directories can break POSIX path equivalence</h1>
+<h2>Summary</h2>
+<p>This is not a Wasmtime implementation bug. It is a semantic ambiguity that falls<br>
+out of the WASI preopen model when it is exposed through POSIX-like APIs.<br>
+The issue was first observed with WASIp1, but the same preopen/open-at structure<br>
+also exists in WASIp2 and WASIp3. Wasmtime currently allows overlapping WASI<br>
+preopened directory names such as:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>--dir /host/a::/
+--dir /host/b::/lib
+</code></pre></div>
+<p>If <code>/host/a</code> also contains a real <code>lib</code> subdirectory, POSIX-like guests can observe<br>
+two different host directories for the same logical path:</p>
+<div class="codehilite" data-code-language="C"><pre><span></span><code><span class="kt">int</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">"/"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">via_root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">openat</span><span class="p">(</span><span class="n">root</span><span class="p">,</span><span class="w"> </span><span class="s">"lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="n">via_absolute</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">"/lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+</code></pre></div>
+<p>Under POSIX path semantics, <code>openat(open("/"), "lib/marker.txt")</code> and<br>
+<code>open("/lib/marker.txt")</code> should resolve to the same object. With overlapping<br>
+WASI preopens, they can resolve to different host directories.</p>
+<p>This is surprising for POSIX-like runtimes such as wasi-libc and Rust <code>std</code>, and it<br>
+can cause users to believe a more specific preopen masks or overrides a subtree when<br>
+it does not.</p>
+<p>The goal of this issue is therefore not to report an incorrect implementation of<br>
+WASI. Rather, it is to document a confusing and potentially dangerous ambiguity and<br>
+to propose that Wasmtime provide a diagnostic or an explicit opt-in for this<br>
+configuration.</p>
+<h2>Environment</h2>
+<p>Observed with a local Wasmtime build:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>wasmtime 46.0.0 (3f3f222b7 2026-06-02)
+</code></pre></div>
+<p>The behavior was also reproduced with an installed Wasmtime 35.0.0 binary.</p>
+<h2>Minimal directory setup</h2>
+<p>Create two different host directories. Directory <code>a</code> is mounted at guest <code>/</code>.<br>
+Directory <code>b</code> is mounted at guest <code>/lib</code>. Directory <code>a</code> also has its own <code>lib</code><br>
+subdirectory:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>mkdir<span class="w"> </span>-p<span class="w"> </span>/tmp/wasi-overlap/a/lib
+mkdir<span class="w"> </span>-p<span class="w"> </span>/tmp/wasi-overlap/b
+
+<span class="nb">printf</span><span class="w"> </span><span class="s1">'from-a-lib\n'</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/wasi-overlap/a/lib/marker.txt
+<span class="nb">printf</span><span class="w"> </span><span class="s1">'from-b-mounted-lib\n'</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/wasi-overlap/b/marker.txt
+</code></pre></div>
+<h2>C/C++ wasi-libc reproduction</h2>
+<p><code>control.cc</code>:</p>
+<div class="codehilite" data-code-language="C++"><pre><span></span><code><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;cerrno&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;cstdio&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;cstring&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;fcntl.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;unistd.h&gt;</span>
+
+<span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">read_path</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">path</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">fd</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: open failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">buf</span><span class="p">[</span><span class="mi">128</span><span class="p">];</span>
+<span class="w">    </span><span class="kt">ssize_t</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">buf</span><span class="p">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">n</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: read failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">n</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="sc">'\0'</span><span class="p">;</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">);</span>
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">read_openat</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">root_fd</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">path</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">openat</span><span class="p">(</span><span class="n">root_fd</span><span class="p">,</span><span class="w"> </span><span class="n">path</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">fd</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: openat failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">buf</span><span class="p">[</span><span class="mi">128</span><span class="p">];</span>
+<span class="w">    </span><span class="kt">ssize_t</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">buf</span><span class="p">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">n</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: read failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">n</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="sc">'\0'</span><span class="p">;</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">);</span>
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">root_fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">"/"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">root_fd</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"open root: failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"open root: ok</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">read_path</span><span class="p">(</span><span class="s">"open /lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="s">"/lib/marker.txt"</span><span class="p">);</span>
+<span class="w">    </span><span class="n">read_openat</span><span class="p">(</span><span class="n">root_fd</span><span class="p">,</span><span class="w"> </span><span class="s">"open / then openat lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="s">"lib/marker.txt"</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">root_fd</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Example compile command:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>clang++<span class="w"> </span>-o<span class="w"> </span>control.wasm<span class="w"> </span>control.cc<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-Ofast<span class="w"> </span>-Wno-deprecated-ofast<span class="w"> </span>-s<span class="w"> </span>-flto<span class="w"> </span>-fuse-ld<span class="o">=</span>lld<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-fno-rtti<span class="w"> </span>-fno-unwind-tables<span class="w"> </span>-fno-asynchronous-unwind-tables<span class="w"> </span>-fno-exceptions<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--target<span class="o">=</span>wasm32-wasip1<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--sysroot<span class="o">=</span><span class="s2">"/Users/MacroModel/Documents/MacroModel/src/wasi-libc/build-mvp/sysroot"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-std<span class="o">=</span>c++26<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-mno-bulk-memory<span class="w"> </span>-mno-bulk-memory-opt<span class="w"> </span>-mno-nontrapping-fptoint<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-mno-sign-ext<span class="w"> </span>-mno-mutable-globals<span class="w"> </span>-mno-multivalue<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-mno-reference-types<span class="w"> </span>-mno-call-indirect-overlong
+</code></pre></div>
+<p>Run:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>wasmtime<span class="w"> </span>run<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dir<span class="w"> </span>/tmp/wasi-overlap/a::/<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dir<span class="w"> </span>/tmp/wasi-overlap/b::/lib<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>control.wasm
+</code></pre></div>
+<p>Actual output:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>open root: ok
+open /lib/marker.txt: from-b-mounted-lib
+
+open / then openat lib/marker.txt: from-a-lib
+</code></pre></div>
+<p>The absolute path lookup reaches the <code>/lib</code> preopen, while the directory-fd-relative<br>
+lookup reaches the real <code>lib</code> directory inside the <code>/</code> preopen.</p>
+<h2>Scope across WASI Preview 1, 2, and 3</h2>
+<p>This ambiguity is not specific to one guest language or to a single Wasmtime<br>
+implementation path.</p>
+<h3>WASIp1</h3>
+<p>The C/C++ wasi-libc reproduction above demonstrates the issue with the WASIp1<br>
+POSIX compatibility layer. A Rust <code>std</code> reproduction is also included below.</p>
+<h3>WASIp2</h3>
+<p>The same C++ source was also compiled with a <code>wasm32-wasip2</code> sysroot and run as a<br>
+component. A Rust <code>std</code> component targeting <code>wasm32-wasip2</code> was also tested. Both<br>
+produced the same split:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>open root: ok
+open /lib/marker.txt: from-b-mounted-lib
+
+open / then openat lib/marker.txt: from-a-lib
+</code></pre></div>
+<p>This is expected from the WASIp2 filesystem shape: <code>wasi:filesystem/preopens</code><br>
+returns a list of <code>(descriptor, string)</code> pairs, and<br>
+<code>wasi:filesystem/types.descriptor.open-at</code> opens relative to the specific<br>
+descriptor passed by the guest. A POSIX-like runtime that maps absolute paths to<br>
+preopen names can therefore observe the same split namespace.</p>
+<h3>WASIp3</h3>
+<p>I do not have a complete <code>wasm32-wasip3</code> libc sysroot available locally for a<br>
+libc/POSIX binary reproduction. However, a Rust WASIp3 component using WIT<br>
+bindings was tested. It directly uses <code>preopens.get-directories</code> and<br>
+<code>descriptor.open-at</code>, and it also observes the same split:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>preopen /lib + open_at marker.txt: from-b-mounted-lib
+preopen / + open_at lib/marker.txt: from-a-lib
+same: false
+</code></pre></div>
+<p>This is expected from the WASIp3 filesystem shape: <code>preopens.get-directories</code><br>
+returns preopened descriptors and their names, and <code>descriptor.open-at</code> opens<br>
+relative to a descriptor.</p>
+<p>Wasmtime's WASIp3 host implementation follows the same descriptor-relative shape.<br>
+Therefore, this class of ambiguity also exists in WASIp3 at the raw capability<br>
+level, and any POSIX-like WASIp3 runtime that exposes absolute paths over preopened<br>
+descriptors would inherit the same issue.</p>
+<p>In other words, this should be treated as a general WASI preopen semantic<br>
+ambiguity, originally observed in WASIp1 and reproduced in WASIp2, rather than as<br>
+a Wasmtime bug in a particular preview.</p>
+<h2>Rust reproductions</h2>
+<p>The same behavior can also be demonstrated from Rust.</p>
+<h3>Rust <code>std</code> reproduction for WASIp1/WASIp2</h3>
+<p>The <code>open_at</code> helper is currently behind Rust's WASI extension feature. For<br>
+<code>wasm32-wasip1</code>, use <code>#![feature(wasi_ext)]</code>. For <code>wasm32-wasip2</code>, Rust also<br>
+requires the <code>wasip2</code> feature gate, as shown below. This was tested with<br>
+<code>RUSTC_BOOTSTRAP=1</code> for local reproduction.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#![feature(wasi_ext, wasip2)]</span>
+
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">fs</span><span class="p">::{</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">File</span><span class="p">,</span><span class="w"> </span><span class="n">OpenOptions</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">io</span><span class="p">::{</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">Read</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">os</span><span class="p">::</span><span class="n">wasi</span><span class="p">::</span><span class="n">fs</span><span class="p">::</span><span class="n">OpenOptionsExt</span><span class="p">;</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">read</span><span class="p">(</span><span class="k">mut</span><span class="w"> </span><span class="n">file</span><span class="p">:</span><span class="w"> </span><span class="nc">File</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">io</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">String</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="w">    </span><span class="n">file</span><span class="p">.</span><span class="n">read_to_string</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">s</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(</span><span class="n">s</span><span class="p">.</span><span class="n">trim</span><span class="p">().</span><span class="n">to_owned</span><span class="p">())</span>
+<span class="p">}</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">io</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">abs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fs</span><span class="p">::</span><span class="n">read_to_string</span><span class="p">(</span><span class="s">"/lib/marker.txt"</span><span class="p">)</span><span class="o">?</span><span class="p">.</span><span class="n">trim</span><span class="p">().</span><span class="n">to_owned</span><span class="p">();</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">File</span><span class="p">::</span><span class="n">open</span><span class="p">(</span><span class="s">"/"</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">via_root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read</span><span class="p">(</span><span class="n">OpenOptions</span><span class="p">::</span><span class="n">new</span><span class="p">().</span><span class="n">read</span><span class="p">(</span><span class="kc">true</span><span class="p">).</span><span class="n">open_at</span><span class="p">(</span><span class="o">&amp;</span><span class="n">root</span><span class="p">,</span><span class="w"> </span><span class="s">"lib/marker.txt"</span><span class="p">)</span><span class="o">?</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"open /lib/marker.txt: {abs}"</span><span class="p">);</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"open / then openat lib/marker.txt: {via_root}"</span><span class="p">);</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"same: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">abs</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">via_root</span><span class="p">);</span>
+
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Observed output:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>open /lib/marker.txt: from-b-mounted-lib
+open / then openat lib/marker.txt: from-a-lib
+same: false
+</code></pre></div>
+<p>For WASIp2 this was compiled with:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code><span class="nv">RUSTC_BOOTSTRAP</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>rustc<span class="w"> </span>--target<span class="w"> </span>wasm32-wasip2<span class="w"> </span>rust-openat.rs<span class="w"> </span>-o<span class="w"> </span>rust-openat-p2.wasm
+</code></pre></div>
+<p>Running <code>rust-openat-p2.wasm</code> with the same overlapping preopens produced the same<br>
+output:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>open /lib/marker.txt: from-b-mounted-lib
+open / then openat lib/marker.txt: from-a-lib
+same: false
+</code></pre></div>
+<h3>Rust/WIT reproduction for WASIp3</h3>
+<p>Because I do not have a complete <code>wasm32-wasip3</code> Rust <code>std</code> target or libc sysroot<br>
+available locally, the WASIp3 Rust reproduction uses WIT bindings directly. This<br>
+demonstrates the raw WASIp3 capability-level ambiguity.</p>
+<p>The following is a reduced version of the Rust component used for the test:</p>
+<p><div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">test_programs</span><span class="p">::</span><span class="n">p3</span><span class="p">::</span><span class="n">wasi</span><span class="p">;</span>
+<span class="k">use</span><span class="w"> </span><span class="n">test_programs</span><span class="p">::</span><span class="n">p3</span><span class="p">::</span><span class="n">wasi</span><span class="p">::</span><span class="n">filesystem</span><span class="p">::</span><span class="n">types</span><span class="p">::{</span>
+<span class="w">    </span><span class="n">Descriptor</span><span class="p">,</span><span class="w"> </span><span class="n">DescriptorFlags</span><span class="p">,</span><span class="w"> </span><span class="n">OpenFlags</span><span class="p">,</span><span class="w"> </span><span class="n">PathFlags</span><span class="p">,</span>
+<span class="p">};</span>
+
+<span class="k">struct</span><span class="w"> </span><span class="nc">Component</span><span class="p">;</span>
+
+<span class="n">test_programs</span><span class="p">::</span><span class="n">p3</span><span class="p">::</span><span class="n">export</span><span class="o">!</span><span class="p">(</span><span class="n">Component</span><span class="p">);</span>
+
+<span class="k">impl</span><span class="w"> </span><span class="n">test_programs</span><span class="p">::</span><span class="n">p3</span><span class="p">::</span><span class="n">exports</span><span class="p">::</span><span class="n">wasi</span><span class="p">::</span><span class="n">cli</span><span class="p">::</span><span class="n">run</span><span class="p">::</span><span class="n">Guest</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">Component</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">run</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">(),</span><span class="w"> </span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">preopens</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">wasi</span><span class="p">::</span><span class="n">filesystem</span><span class="p">::</span><span class="n">preopens</span><span class="p">::</span><span class="n">get_directories</span><span class="p">();</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">None</span><span class="p">;</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">lib</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">None</span><span class="p">;</span>
+
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">dir</span><span class="p">,</span><span class="w"> </span><span class="n">name</span><span class="p">)</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">preopens</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">match</span><span class="w"> </span><span class="n">name</span><span class="p">.</span><span class="n">as_str</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="s">"/"</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">dir</span><span class="p">),</span>
+<span class="w">                </span><span class="s">"/lib"</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">lib</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">dir</span><span class="p">),</span>
+<span class="w">                </span><span class="n">_</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{}</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}</span>
+
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">root</span><span class="p">.</span><span class="n">expect</span><span class="p">(</span><span class="s">"missing / preopen"</span><span class="p">);</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">lib</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">lib</span><span class="p">.</span><span class="n">expect</span><span class="p">(</span><span class="s">"missing /lib preopen"</span><span class="p">);</span>
+
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">via_abs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read_file</span><span class="p">(</span>
+<span class="w">            </span><span class="o">&amp;</span><span class="n">lib</span><span class="p">.</span><span class="n">open_at</span><span class="p">(</span>
+<span class="w">                </span><span class="n">PathFlags</span><span class="p">::</span><span class="n">empty</span><span class="p">(),</span>
+<span class="w">                </span><span class="s">"marker.txt"</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span>
+<span class="w">                </span><span class="n">OpenFlags</span><span class="p">::</span><span class="n">empty</span><span class="p">(),</span>
+<span class="w">                </span><span class="n">DescriptorFlags</span><span class="p">::</span><span class="n">READ</span><span class="p">,</span>
+<span class="w">            </span><span class="p">)</span>
+<span class="w">            </span><span class="p">.</span><span class="k">await</span>
+<span class="w">            </span><span class="p">.</span><span class="n">expect</span><span class="p">(</span><span class="s">"open marker through /lib preopen"</span><span class="p">),</span>
+<span class="w">        </span><span class="p">)</span>
+<span class="w">        </span><span class="p">.</span><span class="k">await</span><span class="p">;</span>
+
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">via_root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read_file</span><span class="p">(</span>
+<span class="w">            </span><span class="o">&amp;</span><span class="n">root</span>
+<span class="w">                </span><span class="p">.</span><span class="n">open_at</span><span class="p">(</span>
+<span class="w">                    </span><span class="n">PathFlags</span><span class="p">::</span><span class="n">empty</span><span class="p">(),</span>
+<span class="w">                    </span><span class="s">"lib/marker.txt"</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span>
+<span class="w">                    </span><span class="n">OpenFlags</span><span class="p">::</span><span class="n">empty</span><span class="p">(),</span>
+<span class="w">                    </span><span class="n">DescriptorFlags</span><span class="p">::</span><span class="n">READ</span><span class="p">,</span>
+<span class="w">                </span><span class="p">)</span>
+<span class="w">                </span><span class="p">.</span><span class="k">await</span>
+<span class="w">                </span><span class="p">.</span><span class="n">expect</span><span class="p">(</span><span class="s">"open marker through root preopen"</span><span class="p">)</span>
+<span class="p">[</span><span class="n">message</span><span class="w"> </span><span class="n">truncated</span><span class="p">]</span>
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="599719028"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313544%20WASIp1%20semantic%20ambiguity%20with%20ov.../near/599719028" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313544.20WASIp1.20semantic.20ambiguity.20with.20ov.2E.2E.2E.html#599719028">(Jun 03 2026 at 07:53)</a>:</h4>
+<p>MacroModel edited <a href="https://github.com/bytecodealliance/wasmtime/issues/13544">issue #13544</a>:</p>
+<blockquote>
+<h1>WASI preopen ambiguity in POSIX-like runtimes can break path equivalence</h1>
+<h2>Summary</h2>
+<p>This is not a Wasmtime implementation bug. It is a semantic ambiguity that falls<br>
+out of the WASI preopen model when it is exposed through POSIX-like APIs.<br>
+The issue was first observed with WASIp1, and it can also be reproduced with<br>
+WASIp2 when using POSIX-like guest runtimes such as wasi-libc or Rust <code>std</code>.<br>
+Wasmtime currently allows overlapping WASI preopened directory names such as:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>--dir /host/a::/
+--dir /host/b::/lib
+</code></pre></div>
+<p>If <code>/host/a</code> also contains a real <code>lib</code> subdirectory, POSIX-like guests can observe<br>
+two different host directories for the same logical path:</p>
+<div class="codehilite" data-code-language="C"><pre><span></span><code><span class="kt">int</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">"/"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">via_root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">openat</span><span class="p">(</span><span class="n">root</span><span class="p">,</span><span class="w"> </span><span class="s">"lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="n">via_absolute</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">"/lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+</code></pre></div>
+<p>Under POSIX path semantics, <code>openat(open("/"), "lib/marker.txt")</code> and<br>
+<code>open("/lib/marker.txt")</code> should resolve to the same object. With overlapping<br>
+WASI preopens, they can resolve to different host directories.</p>
+<p>This is surprising for POSIX-like runtimes such as wasi-libc and Rust <code>std</code>, and it<br>
+can cause users to believe a more specific preopen masks or overrides a subtree when<br>
+it does not.</p>
+<p>The goal of this issue is therefore not to report an incorrect implementation of<br>
+WASI. Rather, it is to document a confusing and potentially dangerous ambiguity and<br>
+to propose that Wasmtime provide a diagnostic or an explicit opt-in for this<br>
+configuration.</p>
+<h2>Environment</h2>
+<p>Observed with a local Wasmtime build:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>wasmtime 46.0.0 (3f3f222b7 2026-06-02)
+</code></pre></div>
+<p>The behavior was also reproduced with an installed Wasmtime 35.0.0 binary.</p>
+<h2>Minimal directory setup</h2>
+<p>Create two different host directories. Directory <code>a</code> is mounted at guest <code>/</code>.<br>
+Directory <code>b</code> is mounted at guest <code>/lib</code>. Directory <code>a</code> also has its own <code>lib</code><br>
+subdirectory:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>mkdir<span class="w"> </span>-p<span class="w"> </span>/tmp/wasi-overlap/a/lib
+mkdir<span class="w"> </span>-p<span class="w"> </span>/tmp/wasi-overlap/b
+
+<span class="nb">printf</span><span class="w"> </span><span class="s1">'from-a-lib\n'</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/wasi-overlap/a/lib/marker.txt
+<span class="nb">printf</span><span class="w"> </span><span class="s1">'from-b-mounted-lib\n'</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/wasi-overlap/b/marker.txt
+</code></pre></div>
+<h2>C/C++ wasi-libc reproduction</h2>
+<p><code>control.cc</code>:</p>
+<div class="codehilite" data-code-language="C++"><pre><span></span><code><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;cerrno&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;cstdio&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;cstring&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;fcntl.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;unistd.h&gt;</span>
+
+<span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">read_path</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">path</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">fd</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: open failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">buf</span><span class="p">[</span><span class="mi">128</span><span class="p">];</span>
+<span class="w">    </span><span class="kt">ssize_t</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">buf</span><span class="p">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">n</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: read failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">n</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="sc">'\0'</span><span class="p">;</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">);</span>
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">read_openat</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">root_fd</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">path</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">openat</span><span class="p">(</span><span class="n">root_fd</span><span class="p">,</span><span class="w"> </span><span class="n">path</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">fd</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: openat failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">buf</span><span class="p">[</span><span class="mi">128</span><span class="p">];</span>
+<span class="w">    </span><span class="kt">ssize_t</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">buf</span><span class="p">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">n</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: read failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">n</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="sc">'\0'</span><span class="p">;</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"%s: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">label</span><span class="p">,</span><span class="w"> </span><span class="n">buf</span><span class="p">);</span>
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">root_fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">"/"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">root_fd</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"open root: failed: %s</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">printf</span><span class="p">(</span><span class="s">"open root: ok</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">read_path</span><span class="p">(</span><span class="s">"open /lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="s">"/lib/marker.txt"</span><span class="p">);</span>
+<span class="w">    </span><span class="n">read_openat</span><span class="p">(</span><span class="n">root_fd</span><span class="p">,</span><span class="w"> </span><span class="s">"open / then openat lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="s">"lib/marker.txt"</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">root_fd</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Example compile command:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>clang++<span class="w"> </span>-o<span class="w"> </span>control.wasm<span class="w"> </span>control.cc<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-Ofast<span class="w"> </span>-Wno-deprecated-ofast<span class="w"> </span>-s<span class="w"> </span>-flto<span class="w"> </span>-fuse-ld<span class="o">=</span>lld<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-fno-rtti<span class="w"> </span>-fno-unwind-tables<span class="w"> </span>-fno-asynchronous-unwind-tables<span class="w"> </span>-fno-exceptions<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--target<span class="o">=</span>wasm32-wasip1<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--sysroot<span class="o">=</span><span class="s2">"/Users/MacroModel/Documents/MacroModel/src/wasi-libc/build-mvp/sysroot"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-std<span class="o">=</span>c++26<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-mno-bulk-memory<span class="w"> </span>-mno-bulk-memory-opt<span class="w"> </span>-mno-nontrapping-fptoint<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-mno-sign-ext<span class="w"> </span>-mno-mutable-globals<span class="w"> </span>-mno-multivalue<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-mno-reference-types<span class="w"> </span>-mno-call-indirect-overlong
+</code></pre></div>
+<p>Run:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>wasmtime<span class="w"> </span>run<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dir<span class="w"> </span>/tmp/wasi-overlap/a::/<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dir<span class="w"> </span>/tmp/wasi-overlap/b::/lib<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>control.wasm
+</code></pre></div>
+<p>Actual output:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>open root: ok
+open /lib/marker.txt: from-b-mounted-lib
+
+open / then openat lib/marker.txt: from-a-lib
+</code></pre></div>
+<p>The absolute path lookup reaches the <code>/lib</code> preopen, while the directory-fd-relative<br>
+lookup reaches the real <code>lib</code> directory inside the <code>/</code> preopen.</p>
+<h2>Scope across WASI previews</h2>
+<p>This ambiguity is not specific to one guest language or to a single Wasmtime<br>
+implementation path. However, it is specifically about POSIX-like path APIs.</p>
+<h3>WASIp1</h3>
+<p>The C/C++ wasi-libc reproduction above demonstrates the issue with the WASIp1<br>
+POSIX compatibility layer. A Rust <code>std</code> reproduction is also included below.</p>
+<h3>WASIp2</h3>
+<p>The same C++ source was also compiled with a <code>wasm32-wasip2</code> sysroot and run as a<br>
+component. A Rust <code>std</code> component targeting <code>wasm32-wasip2</code> was also tested. Both<br>
+produced the same split:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>open root: ok
+open /lib/marker.txt: from-b-mounted-lib
+
+open / then openat lib/marker.txt: from-a-lib
+</code></pre></div>
+<p>This is expected from the WASIp2 filesystem shape: <code>wasi:filesystem/preopens</code><br>
+returns a list of <code>(descriptor, string)</code> pairs, and<br>
+<code>wasi:filesystem/types.descriptor.open-at</code> opens relative to the specific<br>
+descriptor passed by the guest. A POSIX-like runtime that maps absolute paths to<br>
+preopen names can therefore observe the same split namespace.</p>
+<h3>WASIp3</h3>
+<p>This issue does not claim a WASIp3 bug. The raw WASIp3 filesystem API is not a<br>
+POSIX API and does not itself provide <code>open("/")</code> or <code>open("/lib")</code> operations.<br>
+Opening one imported/preopened descriptor and then opening a relative path from it<br>
+is normal capability-oriented WASI behavior, not a POSIX path-equivalence problem.</p>
+<p>Therefore, WASIp3 is only relevant if a future POSIX-like WASIp3 guest runtime<br>
+introduces absolute-path APIs over preopened descriptors. Without such a POSIX-like<br>
+layer, the specific issue described here does not apply to WASIp3.</p>
+<h2>Rust reproductions</h2>
+<p>The same behavior can also be demonstrated from Rust.</p>
+<h3>Rust <code>std</code> reproduction for WASIp1/WASIp2</h3>
+<p>The <code>open_at</code> helper is currently behind Rust's WASI extension feature. For<br>
+<code>wasm32-wasip1</code>, use <code>#![feature(wasi_ext)]</code>. For <code>wasm32-wasip2</code>, Rust also<br>
+requires the <code>wasip2</code> feature gate, as shown below. This was tested with<br>
+<code>RUSTC_BOOTSTRAP=1</code> for local reproduction.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#![feature(wasi_ext, wasip2)]</span>
+
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">fs</span><span class="p">::{</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">File</span><span class="p">,</span><span class="w"> </span><span class="n">OpenOptions</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">io</span><span class="p">::{</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">Read</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">os</span><span class="p">::</span><span class="n">wasi</span><span class="p">::</span><span class="n">fs</span><span class="p">::</span><span class="n">OpenOptionsExt</span><span class="p">;</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">read</span><span class="p">(</span><span class="k">mut</span><span class="w"> </span><span class="n">file</span><span class="p">:</span><span class="w"> </span><span class="nc">File</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">io</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">String</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="w">    </span><span class="n">file</span><span class="p">.</span><span class="n">read_to_string</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">s</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(</span><span class="n">s</span><span class="p">.</span><span class="n">trim</span><span class="p">().</span><span class="n">to_owned</span><span class="p">())</span>
+<span class="p">}</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">io</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">abs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fs</span><span class="p">::</span><span class="n">read_to_string</span><span class="p">(</span><span class="s">"/lib/marker.txt"</span><span class="p">)</span><span class="o">?</span><span class="p">.</span><span class="n">trim</span><span class="p">().</span><span class="n">to_owned</span><span class="p">();</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">File</span><span class="p">::</span><span class="n">open</span><span class="p">(</span><span class="s">"/"</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">via_root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read</span><span class="p">(</span><span class="n">OpenOptions</span><span class="p">::</span><span class="n">new</span><span class="p">().</span><span class="n">read</span><span class="p">(</span><span class="kc">true</span><span class="p">).</span><span class="n">open_at</span><span class="p">(</span><span class="o">&amp;</span><span class="n">root</span><span class="p">,</span><span class="w"> </span><span class="s">"lib/marker.txt"</span><span class="p">)</span><span class="o">?</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"open /lib/marker.txt: {abs}"</span><span class="p">);</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"open / then openat lib/marker.txt: {via_root}"</span><span class="p">);</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">"same: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">abs</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">via_root</span><span class="p">);</span>
+
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Observed output:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>open /lib/marker.txt: from-b-mounted-lib
+open / then openat lib/marker.txt: from-a-lib
+same: false
+</code></pre></div>
+<p>For WASIp2 this was compiled with:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code><span class="nv">RUSTC_BOOTSTRAP</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>rustc<span class="w"> </span>--target<span class="w"> </span>wasm32-wasip2<span class="w"> </span>rust-openat.rs<span class="w"> </span>-o<span class="w"> </span>rust-openat-p2.wasm
+</code></pre></div>
+<p>Running <code>rust-openat-p2.wasm</code> with the same overlapping preopens produced the same<br>
+output:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>open /lib/marker.txt: from-b-mounted-lib
+open / then openat lib/marker.txt: from-a-lib
+same: false
+</code></pre></div>
+<h2>Expected behavior</h2>
+<p>For a POSIX-like guest, these two operations should be path-equivalent:</p>
+<div class="codehilite" data-code-language="C"><pre><span></span><code><span class="n">open</span><span class="p">(</span><span class="s">"/lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">)</span>
+<span class="n">openat</span><span class="p">(</span><span class="n">open</span><span class="p">(</span><span class="s">"/"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">),</span><span class="w"> </span><span class="s">"lib/marker.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">)</span>
+</code></pre></div>
+<p>Raw WASI is capability-oriented and does not define a POSIX mount namespace.<br>
+However, when Wasmtime's CLI preopens are used by POSIX-like guests, users can<br>
+reasonably expect the configured guest paths to approximate a guest-visible<br>
+directory tree. In that context, overlapping guest paths should either preserve this<br>
+equivalence or be reported as ambiguous.</p>
+<h2>Actual behavior</h2>
+<p>WASI exposes each preopen as an independent directory capability. A POSIX-like<br>
+guest runtime resolves absolute paths by matching preopen names, so <code>/lib/...</code> can<br>
+select the more specific <code>/lib</code> preopen. However, once the guest has opened <code>/</code>, the<br>
+resulting directory descriptor is the host directory <code>/host/a</code>; a subsequent<br>
+<code>openat(root_fd, "lib/...")</code> is performed relative to that host directory and does<br>
+not re-consult the preopen table.</p>
+<p>This creates a split namespace:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>guest /lib via absolute path       -&gt; /host/b
+guest / + relative lib via openat  -&gt; /host/a/lib
+</code></pre></div>
+<h2>Why this matters</h2>
+<p>This can violate application assumptions imported from POSIX:</p>
+<ul>
+<li>Path normalization and path decomposition are no longer equivalent.</li>
+<li>
+<p>Code that first opens a base directory and then uses <code>openat</code> can see different<br>
+  files than code using the absolute path.</p>
+</li>
+<li>
+<p>Users may reasonably expect <code>--dir b::/lib</code> to overlay or mask <code>/lib</code> under the<br>
+  root preopen, but it does not.</p>
+</li>
+<li>
+<p>A more specific preopen may give a false impression that a subtree has been<br>
+  replaced, while the original subtree remains reachable through the parent<br>
+  directory descriptor.</p>
+</li>
+</ul>
+<p>This is not necessarily a sandbox escape, because the parent preopen already grants<br>
+access to <code>/host/a</code>. It is also not a Wasmtime correctness bug against WASI: the<br>
+raw WASI model is based on independent directory capabilities. The problem is that<br>
+the resulting guest namespace is ambiguous and non-POSIX-like in a way that can be<br>
+hard to notice.</p>
+<h2>Relevant implementation behavior</h2>
+<p>At a high level:</p>
+<ul>
+<li><code>WasiCtxBuilder::preopened_dir</code> records each <code>(Dir, guest_path)</code> pair independently.</li>
+<li>`wasi<br>
+[message truncated]</li>
+</ul>
+</blockquote>
+
+
+
+<a name="599834366"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313544%20WASIp1%20semantic%20ambiguity%20with%20ov.../near/599834366" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313544.20WASIp1.20semantic.20ambiguity.20with.20ov.2E.2E.2E.html#599834366">(Jun 03 2026 at 15:23)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/13544#issuecomment-4613983179">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13544">issue #13544</a>:</p>
+<blockquote>
+<p>Thanks for the report, and this is a now-well-known design flaw with the preopens system in WASI (cc <a href="https://github.com/WebAssembly/WASI/issues/742">https://github.com/WebAssembly/WASI/issues/742</a>).  I agree it'd be reasonable for Wasmtime to have some sort of warning here as well. Figuring out the best path forward here is going to be tricky as we ideally want to move towards a world with just one preopen.</p>
+</blockquote>
+
+
+
+<a name="599834380"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313544%20WASIp1%20semantic%20ambiguity%20with%20ov.../near/599834380" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313544.20WASIp1.20semantic.20ambiguity.20with.20ov.2E.2E.2E.html#599834380">(Jun 03 2026 at 15:23)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasi label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13544">Issue #13544</a>.</p>
+
+
+
+<hr><p>Last updated: Jul 02 2026 at 22:22 UTC</p>
+</html>

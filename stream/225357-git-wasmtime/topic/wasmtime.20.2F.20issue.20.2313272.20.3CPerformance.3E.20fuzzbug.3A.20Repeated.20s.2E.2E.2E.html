@@ -1,0 +1,452 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13272 &lt;Performance&gt; fuzzbug: Repeated s... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313272.20.3CPerformance.3E.20fuzzbug.3A.20Repeated.20s.2E.2E.2E.html">wasmtime / issue #13272 &lt;Performance&gt; fuzzbug: Repeated s...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="592933750"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313272%20%3CPerformance%3E%20fuzzbug%3A%20Repeated%20s.../near/592933750" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313272.20.3CPerformance.3E.20fuzzbug.3A.20Repeated.20s.2E.2E.2E.html#592933750">(May 05 2026 at 08:10)</a>:</h4>
+<p>gaaraw opened <a href="https://github.com/bytecodealliance/wasmtime/issues/13272">issue #13272</a>:</p>
+<blockquote>
+<h2>Describe the bug</h2>
+<p>Repeated small bounded bulk-memory operations appear to be much slower in Wasmtime than in Wasmer Cranelift in a minimal microbenchmark family.</p>
+<p>I first found this in generated differential tests for <code>memory.copy</code>, then reduced and checked it with a smaller reproducer plus several controls. The slowdown is not limited to one seed, and it is still present after varying copy length and src/dst relation.</p>
+<p><a href="https://github.com/user-attachments/files/27391229/test_cases.zip">test_cases.zip</a></p>
+<p>The clearest primary reproducer I found is:</p>
+<ul>
+<li><code>primary_reproducer_memory_copy_len32.wat</code></li>
+</ul>
+<p>Useful supporting controls are:</p>
+<ul>
+<li><code>supporting_control_memory_copy_len0.wat</code></li>
+<li><code>supporting_memory_fill_same_shape.wat</code></li>
+<li><code>supporting_memory_copy_len1.wat</code></li>
+<li><code>supporting_memory_copy_len64_safe.wat</code></li>
+<li><code>supporting_memory_copy_src_eq_dst_len32.wat</code></li>
+<li><code>supporting_memory_copy_src_plus1024_len32_safe.wat</code></li>
+</ul>
+<h2>Test Case</h2>
+<p>Primary reproducer loop body:</p>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="nb">local.get</span> <span class="nv">$i</span><span class="p">)</span>
+<span class="p">(</span><span class="nb">i32.wrap_i64</span><span class="p">)</span>
+<span class="p">(</span><span class="nb">i32.const</span> <span class="mf">65504</span><span class="p">)</span>
+<span class="p">(</span><span class="nb">i32.and</span><span class="p">)</span>
+<span class="p">(</span><span class="nb">local.get</span> <span class="nv">$i</span><span class="p">)</span>
+<span class="p">(</span><span class="nb">i32.wrap_i64</span><span class="p">)</span>
+<span class="p">(</span><span class="nb">i32.const</span> <span class="mf">1431655765</span><span class="p">)</span>
+<span class="p">(</span><span class="nb">i32.xor</span><span class="p">)</span>
+<span class="p">(</span><span class="nb">i32.const</span> <span class="mf">65504</span><span class="p">)</span>
+<span class="p">(</span><span class="nb">i32.and</span><span class="p">)</span>
+<span class="p">(</span><span class="nb">i32.const</span> <span class="mi">32</span><span class="p">)</span>
+<span class="p">(</span><span class="err">memory.copy</span><span class="p">)</span>
+</code></pre></div>
+<p>The reduced reproducer uses:</p>
+<ul>
+<li>trip count: <code>2^28</code></li>
+<li>one page of memory: <code>(memory 1)</code></li>
+<li>both src/dst addresses constrained to a small low-memory window</li>
+</ul>
+<p>The closest controls are:</p>
+<ul>
+<li>same shape, but <code>memory.copy</code> length changed to <code>0</code></li>
+<li>same shape, but <code>memory.copy</code> replaced with <code>memory.fill</code></li>
+<li>same shape, but copy lengths changed across <code>1/4/8/16/32/64</code></li>
+<li>same shape, but src/dst relation changed to <code>src == dst</code> and <code>src = dst + 1024</code></li>
+</ul>
+<h2>Steps to Reproduce</h2>
+<ol>
+<li>Build the primary testcase:</li>
+</ol>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>wat2wasm<span class="w"> </span>primary_reproducer_memory_copy_len32.wat<span class="w"> </span>-o<span class="w"> </span>primary_reproducer_memory_copy_len32.wasm
+</code></pre></div>
+<ol start="2">
+<li>Warm up once:</li>
+</ol>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>wasmtime<span class="w"> </span>primary_reproducer_memory_copy_len32.wasm
+</code></pre></div>
+<ol start="3">
+<li>Measure runtime:</li>
+</ol>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>perf<span class="w"> </span>stat<span class="w"> </span>-r<span class="w"> </span><span class="m">3</span><span class="w"> </span>-e<span class="w"> </span><span class="s1">'task-clock'</span><span class="w"> </span>wasmtime<span class="w"> </span>primary_reproducer_memory_copy_len32.wasm
+</code></pre></div>
+<ol start="4">
+<li>
+<p>For comparison, run the same flow on the supporting testcases listed above.</p>
+</li>
+<li>
+<p>If helpful, compare against Wasmer Cranelift with:</p>
+</li>
+</ol>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>wasmer<span class="w"> </span>run<span class="w"> </span>primary_reproducer_memory_copy_len32.wasm
+perf<span class="w"> </span>stat<span class="w"> </span>-r<span class="w"> </span><span class="m">3</span><span class="w"> </span>-e<span class="w"> </span><span class="s1">'task-clock'</span><span class="w"> </span>wasmer<span class="w"> </span>run<span class="w"> </span>primary_reproducer_memory_copy_len32.wasm
+</code></pre></div>
+<h2>Expected and actual Results</h2>
+<h3>Primary <code>memory.copy</code> reproducer and close controls</h3>
+<table>
+<thead>
+<tr>
+<th>testcase</th>
+<th>shape</th>
+<th style="text-align: right;">wasmer_cranelift (s)</th>
+<th style="text-align: right;">wasmtime (s)</th>
+<th style="text-align: right;">ratio</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>control_drop</td>
+<td>target removed</td>
+<td style="text-align: right;">0.09570</td>
+<td style="text-align: right;">0.08054</td>
+<td style="text-align: right;">0.84x</td>
+</tr>
+<tr>
+<td>memory.copy len=0</td>
+<td>xor-shaped src/dst, bounded window</td>
+<td style="text-align: right;">0.97108</td>
+<td style="text-align: right;">2.61960</td>
+<td style="text-align: right;">2.70x</td>
+</tr>
+<tr>
+<td>memory.copy len=32</td>
+<td>xor-shaped src/dst, bounded window</td>
+<td style="text-align: right;">0.76792</td>
+<td style="text-align: right;">2.68820</td>
+<td style="text-align: right;">3.50x</td>
+</tr>
+<tr>
+<td>memory.fill len=32</td>
+<td>same bounded address shape</td>
+<td style="text-align: right;">0.64743</td>
+<td style="text-align: right;">2.25270</td>
+<td style="text-align: right;">3.48x</td>
+</tr>
+</tbody>
+</table>
+<p>Observed pattern:</p>
+<ul>
+<li>the target-removed control is fast in both runtimes;</li>
+<li>Wasmtime is already much slower for <code>memory.copy len=0</code>;</li>
+<li>the slowdown remains for <code>memory.copy len=32</code>;</li>
+<li>a related bulk-memory instruction (<code>memory.fill</code>) shows a similar gap.</li>
+</ul>
+<p>This makes the anomaly look more like bulk-memory helper/runtime-path cost than payload movement cost.</p>
+<h3>Length sweep for <code>memory.copy</code></h3>
+<table>
+<thead>
+<tr>
+<th>testcase</th>
+<th style="text-align: right;">wasmer_cranelift (s)</th>
+<th style="text-align: right;">wasmtime (s)</th>
+<th style="text-align: right;">ratio</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>len=0</td>
+<td style="text-align: right;">0.97080</td>
+<td style="text-align: right;">2.73150</td>
+<td style="text-align: right;">2.81x</td>
+</tr>
+<tr>
+<td>len=1</td>
+<td style="text-align: right;">0.97112</td>
+<td style="text-align: right;">2.99300</td>
+<td style="text-align: right;">3.08x</td>
+</tr>
+<tr>
+<td>len=4</td>
+<td style="text-align: right;">0.89589</td>
+<td style="text-align: right;">2.82370</td>
+<td style="text-align: right;">3.15x</td>
+</tr>
+<tr>
+<td>len=8</td>
+<td style="text-align: right;">0.89769</td>
+<td style="text-align: right;">2.81460</td>
+<td style="text-align: right;">3.14x</td>
+</tr>
+<tr>
+<td>len=16</td>
+<td style="text-align: right;">0.91569</td>
+<td style="text-align: right;">2.77790</td>
+<td style="text-align: right;">3.03x</td>
+</tr>
+<tr>
+<td>len=32</td>
+<td style="text-align: right;">0.76524</td>
+<td style="text-align: right;">2.65780</td>
+<td style="text-align: right;">3.47x</td>
+</tr>
+<tr>
+<td>len=64 (safe window)</td>
+<td style="text-align: right;">0.76253</td>
+<td style="text-align: right;">2.68210</td>
+<td style="text-align: right;">3.52x</td>
+</tr>
+</tbody>
+</table>
+<p>Observed pattern:</p>
+<ul>
+<li>from <code>len=0</code> through <code>len=64</code>, the slowdown ratio stays broadly stable;</li>
+<li>the main trigger does not seem to be the payload size itself.</li>
+</ul>
+<h3>Src/dst relation sweep for <code>memory.copy len=32</code></h3>
+<table>
+<thead>
+<tr>
+<th>testcase</th>
+<th style="text-align: right;">wasmer_cranelift (s)</th>
+<th style="text-align: right;">wasmtime (s)</th>
+<th style="text-align: right;">ratio</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>src == dst</td>
+<td style="text-align: right;">0.75430</td>
+<td style="text-align: right;">2.61270</td>
+<td style="text-align: right;">3.46x</td>
+</tr>
+<tr>
+<td>src = dst + 1024 (safe)</td>
+<td style="text-align: right;">0.72937</td>
+<td style="text-align: right;">2.57010</td>
+<td style="text-align: right;">3.52x</td>
+</tr>
+</tbody>
+</table>
+<p>Observed pattern:</p>
+<ul>
+<li>the gap remains even when the copy is self-copy or a fixed-offset in-bounds copy;</li>
+<li>this does not look specific to the original xor-shaped address relation;</li>
+<li>this also does not look primarily driven by overlap semantics.</li>
+</ul>
+<h3>Family-level consistency</h3>
+<p>The original full-trip generated <code>memory_copy_*</code> seeds all showed <code>wasmtime &gt; wasmer_cranelift</code>:</p>
+<table>
+<thead>
+<tr>
+<th>testcase</th>
+<th style="text-align: right;">wasmer_cranelift (s)</th>
+<th style="text-align: right;">wasmtime (s)</th>
+<th style="text-align: right;">ratio</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>memory_copy_1</td>
+<td style="text-align: right;">12.1567</td>
+<td style="text-align: right;">39.8686</td>
+<td style="text-align: right;">3.28x</td>
+</tr>
+<tr>
+<td>memory_copy_2</td>
+<td style="text-align: right;">13.4606</td>
+<td style="text-align: right;">36.9620</td>
+<td style="text-align: right;">2.75x</td>
+</tr>
+<tr>
+<td>memory_copy_3</td>
+<td style="text-align: right;">19.7391</td>
+<td style="text-align: right;">36.3320</td>
+<td style="text-align: right;">1.84x</td>
+</tr>
+<tr>
+<td>memory_copy_4</td>
+<td style="text-align: right;">23.0015</td>
+<td style="text-align: right;">36.1513</td>
+<td style="text-align: right;">1.57x</td>
+</tr>
+<tr>
+<td>memory_copy_5</td>
+<td style="text-align: right;">9.9472</td>
+<td style="text-align: right;">37.0502</td>
+<td style="text-align: right;">3.72x</td>
+</tr>
+</tbody>
+</table>
+<p>Related <code>memory_fill_*</code> seeds also showed the same direction:</p>
+<table>
+<thead>
+<tr>
+<th>testcase</th>
+<th style="text-align: right;">wasmer_cranelift (s)</th>
+<th style="text-align: right;">wasmtime (s)</th>
+<th style="text-align: right;">ratio</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>memory_fill_1</td>
+<td style="text-align: right;">9.8347</td>
+<td style="text-align: right;">31.9666</td>
+<td style="text-align: right;">3.25x</td>
+</tr>
+<tr>
+<td>memory_fill_2</td>
+<td style="text-align: right;">12.0900</td>
+<td style="text-align: right;">32.1992</td>
+<td style="text-align: right;">2.66x</td>
+</tr>
+<tr>
+<td>memory_fill_3</td>
+<td style="text-align: right;">12.9405</td>
+<td style="text-align: right;">34.5910</td>
+<td style="text-align: right;">2.67x</td>
+</tr>
+</tbody>
+</table>
+<h2>Versions and Environment</h2>
+<ul>
+<li>wasmtime: 41.0.0 (4898322a4 2025-12-18)</li>
+<li>wasmer: 6.1.0</li>
+<li>WAMR: iwasm 2.4.4</li>
+<li>wasmedge: 0.16.1-18-gc457fe30</li>
+<li>wabt: 1.0.39</li>
+<li>llvm: 21.1.5</li>
+<li>Host OS: Ubuntu 22.04.5 LTS x64</li>
+<li>CPU: 12th Gen Intel® Core™ i7-12700 × 20</li>
+</ul>
+<h2>Extra Info</h2>
+<p>For the primary reduced testcase, I also checked Wasmtime CLIF to make sure the benchmark is still alive.</p>
+<p>I generated CLIF with:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>wasmtime<span class="w"> </span>compile<span class="w"> </span>-C<span class="w"> </span><span class="nv">cache</span><span class="o">=</span>n<span class="w"> </span>--emit-clif<span class="w"> </span>out_dir<span class="w"> </span>primary_reproducer_memory_copy_len32.wasm
+</code></pre></div>
+<p>In the generated CLIF for the hot loop, the operation is still lowered through a per-iteration builtin call equivalent to:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>call fn0(vmctx, 0, dst, 0, src, len)
+</code></pre></div>
+<p>The emitted builtin <code>wasmtime_builtin_memory_copy</code> still performs a deeper indirect runtime call:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>v11 = call_indirect sig0, v10(v0, v1, v2, v3, v4, v5)
+</code></pre></div>
+<p>So this does not look like dead-code elimination or a broken benchmark scaffold.</p>
+<p>The strongest trigger condition I can currently support is:</p>
+<ul>
+<li>repeated small bounded bulk-memory operations;</li>
+<li>one-page memory with a hot low-memory window;</li>
+<li>slowdown present for both <code>memory.copy</code> and <code>memory.fill</code>;</li>
+<li>largely independent of copy length (<code>0..64</code> in this sweep) and src/dst relation.</li>
+</ul>
+<p>I have not confirmed the internal root cause, so I’m only reporting the measured trigger pattern here.</p>
+</blockquote>
+
+
+
+<a name="592933753"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313272%20%3CPerformance%3E%20fuzzbug%3A%20Repeated%20s.../near/592933753" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313272.20.3CPerformance.3E.20fuzzbug.3A.20Repeated.20s.2E.2E.2E.html#592933753">(May 05 2026 at 08:10)</a>:</h4>
+<p><a href="https://github.com/gaaraw">gaaraw</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13272">Issue #13272</a>.</p>
+
+
+
+<a name="592933754"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313272%20%3CPerformance%3E%20fuzzbug%3A%20Repeated%20s.../near/592933754" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313272.20.3CPerformance.3E.20fuzzbug.3A.20Repeated.20s.2E.2E.2E.html#592933754">(May 05 2026 at 08:10)</a>:</h4>
+<p><a href="https://github.com/gaaraw">gaaraw</a> added the fuzz-bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13272">Issue #13272</a>.</p>
+
+
+
+<a name="593106851"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313272%20%3CPerformance%3E%20fuzzbug%3A%20Repeated%20s.../near/593106851" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313272.20.3CPerformance.3E.20fuzzbug.3A.20Repeated.20s.2E.2E.2E.html#593106851">(May 05 2026 at 21:16)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/13272#issuecomment-4383113514">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13272">issue #13272</a>:</p>
+<blockquote>
+<p>Wasmtime's implementation of <code>memory.{fill,copy}</code> right now is "unconditionally  call a libcall" which is known to be slower than more optimized strategies such as special-casing constant-sized memcpy's and translating directly. That being said it's also a significantly simpler implementation because we always have to implement a libcall-based fallback anyway.</p>
+<p>Can you detail a bit more why you feel this is a bug should be fixed? For example is this purely for fuzzing? If so performance of an exact shape of something is not guaranteed to be the same across engines, so I suspect you're going to have a difficult time fuzzing that. </p>
+<p>On one hand this seems like an optimization we could implement in Wasmtime, but on the other hand that requires nontrivial work, has risk, and needs justification. If the justification is "significantly simplifies a guest toolchain", that seems worth it, but my impression is toolchains like LLVM <a href="https://godbolt.org/z/f94onP7s6">already hand-unroll <code>memory.copy</code> into component parts</a>. Personally I don't feel "performance differential fuzzing" is the best justification for this sort of performance work myself, but others could also reasonably differ.</p>
+<p>Also, FWIW, is this issue AI-generated? There's a huge amount of information to sift through when the issue is more-or-less <code>memory.copy</code> is faster in one engine than another, and most of the other information is just noise around that.</p>
+</blockquote>
+
+
+
+<a name="593144351"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313272%20%3CPerformance%3E%20fuzzbug%3A%20Repeated%20s.../near/593144351" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313272.20.3CPerformance.3E.20fuzzbug.3A.20Repeated.20s.2E.2E.2E.html#593144351">(May 06 2026 at 02:34)</a>:</h4>
+<p>gaaraw <a href="https://github.com/bytecodealliance/wasmtime/issues/13272#issuecomment-4384668352">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13272">issue #13272</a>:</p>
+<blockquote>
+<p>Thanks, this is helpful context.</p>
+<p>You're right that my original report was too long. Also yes: it was AI-assisted, and I agree it ended up noisier than it should have been.</p>
+<p>The short version of what I'm claiming is:</p>
+<ul>
+<li>not that Wasmtime is incorrect;</li>
+<li>but that repeated small <code>memory.copy</code> / <code>memory.fill</code> operations seem to have a large fixed overhead in Wasmtime relative to other engines, including Wasmer Cranelift;</li>
+<li>and that the evidence points more to <strong>call-path/libcall overhead</strong> than to payload-movement cost.</li>
+</ul>
+<p>The strongest evidence is the reduced 2^28-trip controls:</p>
+<table>
+<thead>
+<tr>
+<th>testcase</th>
+<th style="text-align: right;">Wasmer Cranelift</th>
+<th style="text-align: right;">Wasmtime</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>memory.copy len=0</code></td>
+<td style="text-align: right;">0.97s</td>
+<td style="text-align: right;">2.62s</td>
+</tr>
+<tr>
+<td><code>memory.copy len=32</code></td>
+<td style="text-align: right;">0.77s</td>
+<td style="text-align: right;">2.69s</td>
+</tr>
+<tr>
+<td><code>memory.fill len=32</code></td>
+<td style="text-align: right;">0.65s</td>
+<td style="text-align: right;">2.25s</td>
+</tr>
+</tbody>
+</table>
+<p><code>len=0</code> is the key result: when the copy length is zero, the payload work is effectively gone, but most of the gap remains. That makes this look much more like bulk-memory helper/libcall overhead than byte-copy cost.</p>
+<p>This also matches the emitted Wasmtime CLIF: the hot loop still performs a per-iteration builtin call, and that builtin still performs a deeper indirect runtime call. So a plausible explanation is that small bulk-memory ops are still going through a generic helper path rather than being specialized/inlined in the small constant-size case.</p>
+<p>I am not claiming that as a confirmed root cause, but I think it is a real, repeatable execution-shape signal rather than just fuzzing noise.<br>
+</p>
+</blockquote>
+
+
+
+<a name="593281545"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313272%20%3CPerformance%3E%20fuzzbug%3A%20Repeated%20s.../near/593281545" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313272.20.3CPerformance.3E.20fuzzbug.3A.20Repeated.20s.2E.2E.2E.html#593281545">(May 06 2026 at 14:49)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> removed the bug label from <a href="https://github.com/bytecodealliance/wasmtime/issues/13272">Issue #13272</a>.</p>
+
+
+
+<a name="593281546"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313272%20%3CPerformance%3E%20fuzzbug%3A%20Repeated%20s.../near/593281546" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313272.20.3CPerformance.3E.20fuzzbug.3A.20Repeated.20s.2E.2E.2E.html#593281546">(May 06 2026 at 14:49)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> removed the fuzz-bug label from <a href="https://github.com/bytecodealliance/wasmtime/issues/13272">Issue #13272</a>.</p>
+
+
+
+<a name="593281548"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313272%20%3CPerformance%3E%20fuzzbug%3A%20Repeated%20s.../near/593281548" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313272.20.3CPerformance.3E.20fuzzbug.3A.20Repeated.20s.2E.2E.2E.html#593281548">(May 06 2026 at 14:49)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the performance label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13272">Issue #13272</a>.</p>
+
+
+
+<a name="594661113"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313272%20%3CPerformance%3E%20fuzzbug%3A%20Repeated%20s.../near/594661113" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313272.20.3CPerformance.3E.20fuzzbug.3A.20Repeated.20s.2E.2E.2E.html#594661113">(May 12 2026 at 19:25)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/13272#issuecomment-4433985783">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13272">issue #13272</a>:</p>
+<blockquote>
+<blockquote>
+<p>This also matches the emitted Wasmtime CLIF: the hot loop still performs a per-iteration builtin call, and that builtin still performs a deeper indirect runtime call. So a plausible explanation is that small bulk-memory ops are still going through a generic helper path rather than being specialized/inlined in the small constant-size case.</p>
+</blockquote>
+<p>As Alex said, it doesn't make sense for us to inline special cases for <code>len=0</code> (or any small <code>len</code>) because toolchains already emit inline code for small <code>memory.copy</code>s and all that. That is, <code>(loop (memory.copy))</code> is not an interesting performance test case because real toolchains already emit code like <code>(if (is-small-copy) (then (inline-copy)) (else (memory.copy))</code> instead of just <code>(memory.copy)</code> directly.</p>
+<p>But if our libcalls are significantly slower than other engine's libcalls, then that is maybe more interesting.</p>
+</blockquote>
+
+
+
+<a name="596846254"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313272%20%3CPerformance%3E%20fuzzbug%3A%20Repeated%20s.../near/596846254" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313272.20.3CPerformance.3E.20fuzzbug.3A.20Repeated.20s.2E.2E.2E.html#596846254">(May 21 2026 at 20:45)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/13272#issuecomment-4512624052">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13272">issue #13272</a>:</p>
+<blockquote>
+<p>After <a href="https://github.com/bytecodealliance/wasmtime/pull/13368">https://github.com/bytecodealliance/wasmtime/pull/13368</a> and <a href="https://github.com/bytecodealliance/wasmtime/pull/13367">https://github.com/bytecodealliance/wasmtime/pull/13367</a> Wasmtime is ~2x faster across the board. There is still no optimization for constant-length short memcpy/memset, however, which will be the lion's share of what's remaining.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Jul 02 2026 at 22:22 UTC</p>
+</html>

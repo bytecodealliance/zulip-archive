@@ -1,0 +1,225 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #13708 Trap on sync stream/future cancel an... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313708.20Trap.20on.20sync.20stream.2Ffuture.20cancel.20an.2E.2E.2E.html">wasmtime / PR #13708 Trap on sync stream/future cancel an...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="605810473"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313708%20Trap%20on%20sync%20stream/future%20cancel%20an.../near/605810473" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313708.20Trap.20on.20sync.20stream.2Ffuture.20cancel.20an.2E.2E.2E.html#605810473">(Jun 22 2026 at 17:54)</a>:</h4>
+<p>GodlyDonuts opened <a href="https://github.com/bytecodealliance/wasmtime/pull/13708">PR #13708</a> from <code>GodlyDonuts:async-cancel-waitable-set-trap</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>Fixes #13690.</p>
+<p>[component-model#647] tightened the trap rules for synchronous stream/future<br>
+operations: a synchronous <code>read</code>/<code>write</code> must trap if the waitable it operates<br>
+on has already been added to a waitable set. That PR extended the same rule to<br>
+<code>{stream,future}.cancel-{read,write}</code> and <code>subtask.cancel</code>, but Wasmtime only<br>
+implemented it for <code>read</code>/<code>write</code>. As a result the upstream<br>
+<code>trap-if-sync-and-waitable-set.wast</code> test hits an <code>unreachable</code> on the cancel<br>
+cases today instead of trapping.</p>
+<h3>Why it was missing</h3>
+<p>The check lives in <code>wait_for_event</code>, the single point every blocking<br>
+synchronous read/write funnels through before suspending:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="n">waitable</span><span class="p">.</span><span class="n">common</span><span class="p">(</span><span class="n">state</span><span class="p">)</span><span class="o">?</span><span class="p">.</span><span class="n">set</span><span class="p">.</span><span class="n">is_some</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">bail</span><span class="o">!</span><span class="p">(</span><span class="n">Trap</span><span class="p">::</span><span class="n">WaitableSyncAndAsync</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The cancel paths don't reliably reach it. When there is nothing pending to wait<br>
+on, <code>cancel_read</code>/<code>cancel_write</code> take an early return with a <code>Cancelled</code> code,<br>
+and <code>subtask.cancel</code> can resolve a starting/finished subtask without ever<br>
+suspending. In those cases the waitable-set check was never run, so the cancel<br>
+succeeded where the spec requires a trap.</p>
+<h3>Fix</h3>
+<p>Pull the check into a small helper on <code>Waitable</code>:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">fn</span><span class="w"> </span><span class="nf">trap_if_in_waitable_set</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">state</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">ConcurrentState</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">common</span><span class="p">(</span><span class="n">state</span><span class="p">)</span><span class="o">?</span><span class="p">.</span><span class="n">set</span><span class="p">.</span><span class="n">is_some</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">bail</span><span class="o">!</span><span class="p">(</span><span class="n">Trap</span><span class="p">::</span><span class="n">WaitableSyncAndAsync</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="p">}</span>
+</code></pre></div>
+<p><code>wait_for_event</code> now calls it (no behavior change), and the three synchronous<br>
+cancel entry points — <code>cancel_read</code>, <code>cancel_write</code>, and <code>subtask_cancel</code> —<br>
+call it up front, guarded by <code>!async_</code> to match the neighbouring<br>
+<code>check_blocking</code> guards. The async variants are deliberately untouched: being a<br>
+member of a waitable set is the whole point of an asynchronous cancel.</p>
+<h3>Testing</h3>
+<p>Added <code>tests/misc_testsuite/component-model/async/cancel-sync-and-waitable.wast</code><br>
+covering all five operations (<code>future.cancel-{read,write}</code>,<br>
+<code>stream.cancel-{read,write}</code>, and <code>subtask.cancel</code>). Each starts a pending<br>
+operation, joins the waitable to a fresh set, and asserts the synchronous<br>
+cancel traps; this mirrors the upstream <code>trap-if-sync-and-waitable-set.wast</code>. I<br>
+verified each case regresses (returns a cancel code / completes normally rather<br>
+than trapping) when its individual guard is removed.</p>
+<p><code>cargo test --test wast --features component-model-async</code> and the cancellation<br>
+integration tests in <code>tests/all/component_model/async.rs</code> both pass.</p>
+<p>[component-model#647]: <a href="https://github.com/WebAssembly/component-model/pull/647">https://github.com/WebAssembly/component-model/pull/647</a></p>
+</blockquote>
+
+
+
+<a name="605810481"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313708%20Trap%20on%20sync%20stream/future%20cancel%20an.../near/605810481" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313708.20Trap.20on.20sync.20stream.2Ffuture.20cancel.20an.2E.2E.2E.html#605810481">(Jun 22 2026 at 17:54)</a>:</h4>
+<p>GodlyDonuts requested <a href="https://github.com/cfallin">cfallin</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13708">PR #13708</a>.</p>
+
+
+
+<a name="605810482"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313708%20Trap%20on%20sync%20stream/future%20cancel%20an.../near/605810482" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313708.20Trap.20on.20sync.20stream.2Ffuture.20cancel.20an.2E.2E.2E.html#605810482">(Jun 22 2026 at 17:54)</a>:</h4>
+<p>GodlyDonuts requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13708">PR #13708</a>.</p>
+
+
+
+<a name="605813032"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313708%20Trap%20on%20sync%20stream/future%20cancel%20an.../near/605813032" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313708.20Trap.20on.20sync.20stream.2Ffuture.20cancel.20an.2E.2E.2E.html#605813032">(Jun 22 2026 at 18:03)</a>:</h4>
+<p>cfallin unassigned cfallin from <a href="https://github.com/bytecodealliance/wasmtime/pull/13708">PR #13708 Trap on sync stream/future cancel and subtask.cancel when in a waitable set</a>.</p>
+
+
+
+<a name="605813033"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313708%20Trap%20on%20sync%20stream/future%20cancel%20an.../near/605813033" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313708.20Trap.20on.20sync.20stream.2Ffuture.20cancel.20an.2E.2E.2E.html#605813033">(Jun 22 2026 at 18:03)</a>:</h4>
+<p>cfallin requested <a href="https://github.com/dicej">dicej</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13708">PR #13708</a>.</p>
+
+
+
+<a name="605813619"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313708%20Trap%20on%20sync%20stream/future%20cancel%20an.../near/605813619" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313708.20Trap.20on.20sync.20stream.2Ffuture.20cancel.20an.2E.2E.2E.html#605813619">(Jun 22 2026 at 18:05)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/13708#issuecomment-4771332360">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13708">PR #13708</a>:</p>
+<blockquote>
+<p>I'm going to redirect review to someone who knows much more about the CM async machinery (hope that's ok @dicej!).</p>
+</blockquote>
+
+
+
+<a name="605825932"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313708%20Trap%20on%20sync%20stream/future%20cancel%20an.../near/605825932" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313708.20Trap.20on.20sync.20stream.2Ffuture.20cancel.20an.2E.2E.2E.html#605825932">(Jun 22 2026 at 18:50)</a>:</h4>
+<p>GodlyDonuts edited <a href="https://github.com/bytecodealliance/wasmtime/pull/13708">PR #13708</a>:</p>
+<blockquote>
+<p>Fixes #13690.</p>
+<p>[component-model#647] tightened the trap rules for synchronous stream/future<br>
+operations: a synchronous <code>read</code>/<code>write</code> must trap if the waitable it operates<br>
+on has already been added to a waitable set. That PR extended the same rule to<br>
+<code>{stream,future}.cancel-{read,write}</code> and <code>subtask.cancel</code>, but Wasmtime only<br>
+implemented it for <code>read</code>/<code>write</code>. As a result the upstream<br>
+<code>trap-if-sync-and-waitable-set.wast</code> test hits an <code>unreachable</code> on the cancel<br>
+cases today instead of trapping.</p>
+<h3>Why it was missing</h3>
+<p>The check lives in <code>wait_for_event</code>, the single point every blocking<br>
+synchronous read/write funnels through before suspending:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="n">waitable</span><span class="p">.</span><span class="n">common</span><span class="p">(</span><span class="n">state</span><span class="p">)</span><span class="o">?</span><span class="p">.</span><span class="n">set</span><span class="p">.</span><span class="n">is_some</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">bail</span><span class="o">!</span><span class="p">(</span><span class="n">Trap</span><span class="p">::</span><span class="n">WaitableSyncAndAsync</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The cancel paths don't reliably reach it. When there is nothing pending to wait<br>
+on, <code>cancel_read</code>/<code>cancel_write</code> take an early return with a <code>Cancelled</code> code,<br>
+and <code>subtask.cancel</code> can resolve a starting/finished subtask without ever<br>
+suspending. In those cases the waitable-set check was never run, so the cancel<br>
+succeeded where the spec requires a trap.</p>
+<h3>Fix</h3>
+<p>Pull the check into a small helper on <code>Waitable</code>:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">fn</span><span class="w"> </span><span class="nf">trap_if_in_waitable_set</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">state</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">ConcurrentState</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">common</span><span class="p">(</span><span class="n">state</span><span class="p">)</span><span class="o">?</span><span class="p">.</span><span class="n">set</span><span class="p">.</span><span class="n">is_some</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">bail</span><span class="o">!</span><span class="p">(</span><span class="n">Trap</span><span class="p">::</span><span class="n">WaitableSyncAndAsync</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="p">}</span>
+</code></pre></div>
+<p><code>wait_for_event</code> now calls it (no behavior change), and the three synchronous<br>
+cancel entry points — <code>cancel_read</code>, <code>cancel_write</code>, and <code>subtask_cancel</code> —<br>
+call it up front, guarded by <code>!async_</code> to match the neighbouring<br>
+<code>check_blocking</code> guards. The async variants are deliberately untouched: being a<br>
+member of a waitable set is the whole point of an asynchronous cancel.</p>
+<h3>Testing</h3>
+<p>Added <code>tests/misc_testsuite/component-model/async/cancel-sync-and-waitable.wast</code><br>
+covering all five operations (<code>future.cancel-{read,write}</code>,<br>
+<code>stream.cancel-{read,write}</code>, and <code>subtask.cancel</code>). Each starts a pending<br>
+operation, joins the waitable to a fresh set, and asserts the synchronous<br>
+cancel traps; this mirrors the upstream <code>trap-if-sync-and-waitable-set.wast</code>. I<br>
+verified each case regresses (returns a cancel code / completes normally rather<br>
+than trapping) when its individual guard is removed.</p>
+<h3>Depends on <a href="https://github.com/bytecodealliance/wit-bindgen/issues/1638">bytecodealliance/wit-bindgen#1638</a></h3>
+<p>Enforcing this trap surfaces a latent bug in wit-bindgen's async runtime:<br>
+<code>cancel_inter_task_stream_read</code> issues a synchronous <code>stream.cancel-read</code> on its<br>
+inter-task wakeup stream while that stream is still in the task's waitable set<br>
+(it calls <code>remove_waitable</code> only afterwards). That is exactly the pattern this<br>
+trap now (correctly) rejects, so every <code>wasi:http@0.3.0</code> (p3) program built with<br>
+the current <code>wit-bindgen</code> traps during ordinary operation — which is what the<br>
+red p3 CI jobs here are.</p>
+<p><a href="https://github.com/bytecodealliance/wit-bindgen/issues/1638">bytecodealliance/wit-bindgen#1638</a> reorders that to leave the set before<br>
+cancelling, matching the unregister-then-cancel ordering the general<br>
+<code>WaitableOperation::cancel</code> path already uses. With that change applied locally<br>
+(via <code>[patch.crates-io]</code>), the full p3 suites pass again:</p>
+<ul>
+<li><code>wasmtime-wasi-http</code> p3: 25 passed</li>
+<li><code>wasmtime-wasi</code> p3: 27 passed</li>
+<li><code>component-model/async</code> wast (incl. the new test): 192 passed</li>
+</ul>
+<p>So this PR needs a <code>wit-bindgen</code> release containing #1638 and a corresponding<br>
+version bump before its p3 jobs go green. Happy to fold the bump in here once<br>
+that's available, or sequence it however you prefer.</p>
+<p>[component-model#647]: <a href="https://github.com/WebAssembly/component-model/pull/647">https://github.com/WebAssembly/component-model/pull/647</a></p>
+</blockquote>
+
+
+
+<a name="605857275"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313708%20Trap%20on%20sync%20stream/future%20cancel%20an.../near/605857275" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313708.20Trap.20on.20sync.20stream.2Ffuture.20cancel.20an.2E.2E.2E.html#605857275">(Jun 22 2026 at 20:51)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13708#pullrequestreview-4547992219">PR review</a>:</p>
+<blockquote>
+<p>LGTM, thanks!</p>
+<p>CI is failing, and it seems to point to <code>wit_bindgen::rt</code>'s internal machinery for handling inter-task communication.  I suspect a change will be needed in that project in order to get those tests passing.  I'm on vacation at the moment (and should not have opened my computer at all <span aria-label="sweat smile" class="emoji emoji-1f605" role="img" title="sweat smile">:sweat_smile:</span> ), but I can take a closer look when I get back if nobody beats me to it.</p>
+</blockquote>
+
+
+
+<a name="605860806"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313708%20Trap%20on%20sync%20stream/future%20cancel%20an.../near/605860806" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313708.20Trap.20on.20sync.20stream.2Ffuture.20cancel.20an.2E.2E.2E.html#605860806">(Jun 22 2026 at 21:05)</a>:</h4>
+<p>GodlyDonuts <a href="https://github.com/bytecodealliance/wasmtime/pull/13708#issuecomment-4773070766">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13708">PR #13708</a>:</p>
+<blockquote>
+<p>Thanks @dicej! That matches what I found — the trap fires in <code>wit-bindgen</code>'s <code>cancel_inter_task_stream_read</code>, which issues a synchronous <code>stream.cancel-read</code> on the inter-task wakeup stream while it's still in the task's waitable set (it calls <code>remove_waitable</code> only afterwards).</p>
+<p>I opened <a href="https://github.com/bytecodealliance/wit-bindgen/issues/1638">bytecodealliance/wit-bindgen#1638</a> to fix that: it reorders the two so the stream leaves the waitable set before the synchronous cancel, matching the unregister-then-cancel ordering the general <code>WaitableOperation::cancel</code> path already uses. With that patched in locally (<code>[patch.crates-io]</code>), the full p3 suites pass again — <code>wasmtime-wasi-http</code> p3 (25), <code>wasmtime-wasi</code> p3 (27), and <code>component-model/async</code> wast incl. the new test (192).</p>
+<p>So this just needs a <code>wit-bindgen</code> release containing #1638 and the corresponding bump here. Happy to fold the bump into this PR once it's available — no rush, enjoy your vacation. <span aria-label="slight smile" class="emoji emoji-1f642" role="img" title="slight smile">:slight_smile:</span><br>
+</p>
+</blockquote>
+
+
+
+<a name="605861028"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313708%20Trap%20on%20sync%20stream/future%20cancel%20an.../near/605861028" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313708.20Trap.20on.20sync.20stream.2Ffuture.20cancel.20an.2E.2E.2E.html#605861028">(Jun 22 2026 at 21:06)</a>:</h4>
+<p>GodlyDonuts edited a <a href="https://github.com/bytecodealliance/wasmtime/pull/13708#issuecomment-4773070766">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13708">PR #13708</a>:</p>
+<blockquote>
+<p>Thanks @dicej! That matches what I found, the trap fires in <code>wit-bindgen</code>'s <code>cancel_inter_task_stream_read</code>, which issues a synchronous <code>stream.cancel-read</code> on the inter-task wakeup stream while it's still in the task's waitable set (it calls <code>remove_waitable</code> only afterwards).</p>
+<p>I opened <a href="https://github.com/bytecodealliance/wit-bindgen/issues/1638">bytecodealliance/wit-bindgen#1638</a> to fix that: it reorders the two so the stream leaves the waitable set before the synchronous cancel, matching the unregister-then-cancel ordering the general <code>WaitableOperation::cancel</code> path already uses. With that patched in locally (<code>[patch.crates-io]</code>), the full p3 suites pass again, <code>wasmtime-wasi-http</code> p3 (25), <code>wasmtime-wasi</code> p3 (27), and <code>component-model/async</code> wast incl. the new test (192).</p>
+<p>So this just needs a <code>wit-bindgen</code> release containing #1638 and the corresponding bump here. Happy to fold the bump into this PR once it's available, no rush, enjoy your vacation. <span aria-label="slight smile" class="emoji emoji-1f642" role="img" title="slight smile">:slight_smile:</span><br>
+</p>
+</blockquote>
+
+
+
+<a name="605871203"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313708%20Trap%20on%20sync%20stream/future%20cancel%20an.../near/605871203" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313708.20Trap.20on.20sync.20stream.2Ffuture.20cancel.20an.2E.2E.2E.html#605871203">(Jun 22 2026 at 22:20)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13708">PR #13708</a>.</p>
+
+
+
+<a name="606292093"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313708%20Trap%20on%20sync%20stream/future%20cancel%20an.../near/606292093" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313708.20Trap.20on.20sync.20stream.2Ffuture.20cancel.20an.2E.2E.2E.html#606292093">(Jun 24 2026 at 16:25)</a>:</h4>
+<p>GodlyDonuts requested <a href="https://github.com/dicej">dicej</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13708">PR #13708</a>.</p>
+
+
+
+<a name="606293103"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313708%20Trap%20on%20sync%20stream/future%20cancel%20an.../near/606293103" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313708.20Trap.20on.20sync.20stream.2Ffuture.20cancel.20an.2E.2E.2E.html#606293103">(Jun 24 2026 at 16:29)</a>:</h4>
+<p>GodlyDonuts <a href="https://github.com/bytecodealliance/wasmtime/pull/13708#issuecomment-4791485513">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13708">PR #13708</a>:</p>
+<blockquote>
+<p>wit-bindgen#1638 is merged, thanks @alexcrichton. Only thing left here is a wit-bindgen release that carries it plus a matching version bump in this PR. I'll put the bump up as soon as there's something on <a href="http://crates.io">crates.io</a> to point at. Verified locally that the p3 suites go green with the fix in, so CI should be clean once it's bumped.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Jul 02 2026 at 22:22 UTC</p>
+</html>

@@ -1,0 +1,264 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #13334 cranelift(x64): lower bare `ctz`/`cl... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20.60ctz.60.2F.60cl.2E.2E.2E.html">wasmtime / PR #13334 cranelift(x64): lower bare `ctz`/`cl...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="594338695"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313334%20cranelift%28x64%29%3A%20lower%20bare%20%60ctz%60/%60cl.../near/594338695" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20.60ctz.60.2F.60cl.2E.2E.2E.html#594338695">(May 11 2026 at 15:58)</a>:</h4>
+<p>ggreif edited <a href="https://github.com/bytecodealliance/wasmtime/pull/13334">PR #13334</a>.</p>
+
+
+
+<a name="594343284"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313334%20cranelift%28x64%29%3A%20lower%20bare%20%60ctz%60/%60cl.../near/594343284" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20.60ctz.60.2F.60cl.2E.2E.2E.html#594343284">(May 11 2026 at 16:16)</a>:</h4>
+<p>ggreif edited <a href="https://github.com/bytecodealliance/wasmtime/pull/13334">PR #13334</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p>Follow-up to #13332. That PR added egraph rules collapsing <code>(eq (ctz X) 0)</code> / <code>(ne (ctz X) 0)</code> / <code>(eq (clz X) 0)</code> / <code>(ne (clz X) 0)</code> to direct LSB / sign-bit tests — but only when the comparison is mediated by an explicit <code>icmp</code>. The wasm front-end translates <code>wasm if (ctz X)</code> to <code>brif (ireduce.i32 (ctz.i64 X))</code> directly (no <code>icmp</code>), so the egraph rules don't fire on the wasm-natural shape.</p>
+<p>This PR closes the gap by specialising <code>is_nonzero</code> in the x64 backend — the helper that all <code>brif</code>/<code>select</code>/<code>trapif</code> lowerings funnel through.</p>
+<h2>Rules</h2>
+<p>In <code>cranelift/codegen/src/isa/x64/inst.isle</code>:</p>
+<div class="codehilite" data-code-language="isle"><pre><span></span><code>(rule 3 (is_nonzero (ctz (ty_32_or_64 ty) val))
+      (CondResult.CC (x64_test ty val (RegMemImm.Imm 1)) (CC.Z)))
+(rule 3 (is_nonzero (ireduce _ (ctz (ty_32_or_64 ty) val)))
+      (CondResult.CC (x64_test ty val (RegMemImm.Imm 1)) (CC.Z)))
+(rule 3 (is_nonzero (clz (ty_32_or_64 ty) val))
+      (let ((gpr Gpr val)) (CondResult.CC (x64_test ty gpr gpr) (CC.NS))))
+(rule 3 (is_nonzero (ireduce _ (clz (ty_32_or_64 ty) val)))
+      (let ((gpr Gpr val)) (CondResult.CC (x64_test ty gpr gpr) (CC.NS))))
+</code></pre></div>
+<p>The <code>ireduce</code> variant catches the wasm front-end's <code>i32.wrap_i64</code> over a 64-bit <code>ctz</code>/<code>clz</code> — a no-op on values in [0, bitwidth].</p>
+<h2>Test deltas (<code>tests/disas/ctz-clz-bool-condition.wat</code>)</h2>
+<table>
+<thead>
+<tr>
+<th>consumer</th>
+<th>before</th>
+<th>after</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>if_ctz_bare_i32</code></td>
+<td>5 insns (<code>bsfl + cmovel + test + jne</code>)</td>
+<td><strong>2</strong> (<code>testl $1, %edx; je</code>)</td>
+</tr>
+<tr>
+<td><code>if_ctz_bare_i64</code></td>
+<td>5 insns (<code>bsfq + cmovq + test + jne</code>)</td>
+<td><strong>2</strong> (<code>testq $1, %rdx; je</code>)</td>
+</tr>
+<tr>
+<td><code>if_clz_bare_i32</code></td>
+<td>7 insns (<code>bsr + cmov + sub + test + jne</code>)</td>
+<td><strong>2</strong> (<code>testl + jns</code>)</td>
+</tr>
+</tbody>
+</table>
+<p>The icmp-mediated cases (collapsed by #13332's egraph rules) are unchanged. The numeric-comparison negative test (<code>(ctz X) == 4</code>) stays untouched.</p>
+<h2>Motivation</h2>
+<p>Motoko's <code>moc</code> codegen emits <code>i64.ctz X; i32.wrap_i64; if</code> for compactness/sign tests in the EOP backend (see <a href="https://github.com/caffeinelabs/motoko/issues/6103">caffeinelabs/motoko#6103</a>). Before this PR, that lowers to 5 native instructions per dispatch; after, 2.</p>
+<p>A concrete idiomatic example: in Motoko, the <code>let-else</code> pattern over <code>Result</code></p>
+<div class="codehilite" data-code-language="motoko"><pre><span></span><code>let #ok payload = queryProp(...) else return defaultValue;
+</code></pre></div>
+<p>desugars to a 2-arm refutable variant match (<code>#ok</code> vs <code>#err</code>). The variant-tag hashes are <code>hash("ok") = 0x611C</code> (LSB 0) and <code>hash("err") = 0x4D0765</code> (LSB 1) — they differ exactly at the LSB. The planned variant-switch <code>BitTest</code> dispatch (caffeinelabs/motoko's <code>gabor/variant-switch</code>) recognizes this and emits a single LSB-test for the dispatch; combined with this PR, the entire let-else lowers to <strong><code>load hash; testq $1, ...; jcc</code></strong> on x64 — three instructions for a pattern match. Every <code>Result</code>-returning API + every <code>let-else</code>-style early return collapses to this shape.</p>
+<p>Aggregated across hot paths (variant-switch dispatch, GC compact/heap discriminator, sign tests, …) this is meaningful.</p>
+<h2>Follow-ups (not in this PR)</h2>
+<ul>
+<li>aarch64, riscv64, s390x analogues — separate PRs once x64 reviewer feedback lands.</li>
+<li><code>select</code>-consumer variant — <code>select</code> already routes through <code>is_nonzero_cmp</code> → <code>is_nonzero</code>, so this PR's rules cover it too without extra work.</li>
+</ul>
+</blockquote>
+
+
+
+<a name="594343413"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313334%20cranelift%28x64%29%3A%20lower%20bare%20%60ctz%60/%60cl.../near/594343413" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20.60ctz.60.2F.60cl.2E.2E.2E.html#594343413">(May 11 2026 at 16:17)</a>:</h4>
+<p>ggreif has marked <a href="https://github.com/bytecodealliance/wasmtime/pull/13334">PR #13334</a> as ready for review.</p>
+
+
+
+<a name="594343430"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313334%20cranelift%28x64%29%3A%20lower%20bare%20%60ctz%60/%60cl.../near/594343430" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20.60ctz.60.2F.60cl.2E.2E.2E.html#594343430">(May 11 2026 at 16:17)</a>:</h4>
+<p>ggreif requested <a href="https://github.com/uweigand">uweigand</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13334">PR #13334</a>.</p>
+
+
+
+<a name="594343433"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313334%20cranelift%28x64%29%3A%20lower%20bare%20%60ctz%60/%60cl.../near/594343433" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20.60ctz.60.2F.60cl.2E.2E.2E.html#594343433">(May 11 2026 at 16:17)</a>:</h4>
+<p>ggreif requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13334">PR #13334</a>.</p>
+
+
+
+<a name="594343436"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313334%20cranelift%28x64%29%3A%20lower%20bare%20%60ctz%60/%60cl.../near/594343436" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20.60ctz.60.2F.60cl.2E.2E.2E.html#594343436">(May 11 2026 at 16:17)</a>:</h4>
+<p>ggreif requested <a href="https://github.com/pchickey">pchickey</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13334">PR #13334</a>.</p>
+
+
+
+<a name="594343437"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313334%20cranelift%28x64%29%3A%20lower%20bare%20%60ctz%60/%60cl.../near/594343437" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20.60ctz.60.2F.60cl.2E.2E.2E.html#594343437">(May 11 2026 at 16:17)</a>:</h4>
+<p>ggreif requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13334">PR #13334</a>.</p>
+
+
+
+<a name="594360686"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313334%20cranelift%28x64%29%3A%20lower%20bare%20%60ctz%60/%60cl.../near/594360686" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20.60ctz.60.2F.60cl.2E.2E.2E.html#594360686">(May 11 2026 at 17:35)</a>:</h4>
+<p>ggreif edited <a href="https://github.com/bytecodealliance/wasmtime/pull/13334">PR #13334</a>.</p>
+
+
+
+<a name="594403641"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313334%20cranelift%28x64%29%3A%20lower%20bare%20%60ctz%60/%60cl.../near/594403641" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20.60ctz.60.2F.60cl.2E.2E.2E.html#594403641">(May 11 2026 at 21:06)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13334">PR #13334</a>.</p>
+
+
+
+<a name="594403642"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313334%20cranelift%28x64%29%3A%20lower%20bare%20%60ctz%60/%60cl.../near/594403642" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20.60ctz.60.2F.60cl.2E.2E.2E.html#594403642">(May 11 2026 at 21:06)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift:area:x64</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13334">PR #13334</a>.</p>
+
+
+
+<a name="594446333"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313334%20cranelift%28x64%29%3A%20lower%20bare%20%60ctz%60/%60cl.../near/594446333" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20.60ctz.60.2F.60cl.2E.2E.2E.html#594446333">(May 12 2026 at 01:49)</a>:</h4>
+<p>alexcrichton unassigned uweigand from <a href="https://github.com/bytecodealliance/wasmtime/pull/13334">PR #13334 cranelift(x64): lower bare <code>ctz</code>/<code>clz</code> boolean tests via <code>test</code>+CC</a>.</p>
+
+
+
+<a name="594446651"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313334%20cranelift%28x64%29%3A%20lower%20bare%20%60ctz%60/%60cl.../near/594446651" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20.60ctz.60.2F.60cl.2E.2E.2E.html#594446651">(May 12 2026 at 01:52)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/13334#issuecomment-4426680877">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13334">PR #13334</a>:</p>
+<blockquote>
+<p>@cfallin or @fitzgen do y'all have any ideas about how to sort of deduplicate this with the optimization rules landed in <a href="https://github.com/bytecodealliance/wasmtime/pull/13332">https://github.com/bytecodealliance/wasmtime/pull/13332</a>? It feels a bit unfortunate that we need basically the same rules twice, once for general expressions and once because <code>cond != 0</code> is implicit in all conditional-y locations (<code>brif</code>, <code>select</code>, <code>trapnz</code>, etc). Without redefining how those instructions work I'm not sure how to avoid the duplication myself, but figured I'd ask if y'all had ideas. Another option might be to only have these rules in backends as opposed to also the mid-end, but that also doesn't feel great, the duplication probably isn't so bad.</p>
+</blockquote>
+
+
+
+<a name="594616642"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313334%20cranelift%28x64%29%3A%20lower%20bare%20%60ctz%60/%60cl.../near/594616642" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20.60ctz.60.2F.60cl.2E.2E.2E.html#594616642">(May 12 2026 at 16:07)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/13334#issuecomment-4432473104">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13334">PR #13334</a>:</p>
+<blockquote>
+<p>Left a comment over <a href="https://github.com/bytecodealliance/wasmtime/pull/13336#issuecomment-4432447379">here</a>; putting these rules in the backend is definitely the wrong place IMHO, as aside from the software-engineering aspects (repetition) we want these simplifications to compose with other mid-end opts when possible.</p>
+<p>I agree it'd be great to find a way to factor out simplifications for all "non-zero test" cases in the mid-end. I suppose we could define a helper <code>simplify_nonzero</code> and then invoke that with toplevel <code>simplify_skeleton</code> rules on <code>brif</code>, <code>trapnz</code>, etc...</p>
+</blockquote>
+
+
+
+<a name="594682176"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313334%20cranelift%28x64%29%3A%20lower%20bare%20%60ctz%60/%60cl.../near/594682176" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20.60ctz.60.2F.60cl.2E.2E.2E.html#594682176">(May 12 2026 at 21:12)</a>:</h4>
+<p>ggreif <a href="https://github.com/bytecodealliance/wasmtime/pull/13334#issuecomment-4434876882">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13334">PR #13334</a>:</p>
+<blockquote>
+<p>Following on from @cfallin's <code>(brif (clz x))</code> → <code>(brif (band x (iconst 1)))</code> sketch in #13336: I think the LSB extract pairs with <code>ctz</code>, not <code>clz</code>. There are actually four cases — two per producer — and the bit-extract direction is determined by the producer:</p>
+<table>
+<thead>
+<tr>
+<th>pattern</th>
+<th>tests</th>
+<th>mid-end simplification</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>(brif (eqz (ctz x)))</code></td>
+<td>LSB set</td>
+<td><code>(brif (band x 1))</code> or <code>(brif (shl x N-1))</code></td>
+</tr>
+<tr>
+<td><code>(brif (ctz x))</code></td>
+<td>LSB clear</td>
+<td>inverse of either</td>
+</tr>
+<tr>
+<td><code>(brif (eqz (clz x)))</code></td>
+<td>HSB set</td>
+<td><code>(brif (ushr x N-1))</code></td>
+</tr>
+<tr>
+<td><code>(brif (clz x))</code></td>
+<td>HSB clear</td>
+<td><code>(brif (eqz (ushr x N-1)))</code></td>
+</tr>
+</tbody>
+</table>
+<p>For the LSB case <code>band x 1</code> and <code>shl x (N-1)</code> have the same wasm byte cost (small-const + op). For the HSB case <code>ushr x (N-1)</code> is strictly cheaper than the equivalent <code>band</code> with <code>1 &lt;&lt; (N-1)</code>: small consts like <code>31</code>/<code>63</code> are 1 byte LEB128, but <code>0x80000000</code> is 5 bytes — so prefer the shift form for HSB.</p>
+<p>I'll try the <code>simplify_skeleton</code>-on-<code>brif</code> route locally with these rules and report back. If it lets me drop the backend duplication in this PR (and #13336), I'll push; otherwise I'll close and rethink.</p>
+</blockquote>
+
+
+
+<a name="594685966"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313334%20cranelift%28x64%29%3A%20lower%20bare%20%60ctz%60/%60cl.../near/594685966" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20.60ctz.60.2F.60cl.2E.2E.2E.html#594685966">(May 12 2026 at 21:33)</a>:</h4>
+<p>ggreif <a href="https://github.com/bytecodealliance/wasmtime/pull/13334#issuecomment-4435018929">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13334">PR #13334</a>:</p>
+<blockquote>
+<p>Update — the <code>simplify_skeleton</code> extension does work, and it lets us retire both this PR and #13336.</p>
+<p><strong>Approach</strong> (~50 lines total):</p>
+<ol>
+<li>New <code>SkeletonInstSimplification::ReplaceBranchCond(Value)</code> variant — narrow rewrite that swaps argument 0 of an existing <code>brif</code> without touching its opcode or successors. CFG-safe by construction.</li>
+<li>Driver patch in <code>cranelift/codegen/src/egraph/mod.rs</code>: allow <code>Opcode::Brif</code> through the previously-blanket <code>is_branch()</code> skip; apply <code>ReplaceBranchCond</code> by writing through <code>inst_args_mut</code>.</li>
+<li><code>prelude_opt.isle</code> adds a <code>replace_branch_cond</code> constructor.</li>
+<li>Two new rules in <code>opts/icmp.isle</code>:<br>
+<code>isle
+   (rule (simplify_skeleton (brif (ctz x_ty X) _ _))
+         (replace_branch_cond
+           (eq $I8 (band x_ty X (iconst_u x_ty 1)) (iconst_u x_ty 0))))
+   (rule (simplify_skeleton (brif (clz x_ty X) _ _))
+         (replace_branch_cond (sge $I8 X (iconst_u x_ty 0))))
+   </code></li>
+</ol>
+<p><strong>Results</strong> on the 2-op <code>brif (ctz x)</code> / <code>brif (clz x)</code> patterns this PR targets:</p>
+<table>
+<thead>
+<tr>
+<th>platform</th>
+<th>producer</th>
+<th>mid-end alone (no backend rules)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>x86_64</td>
+<td><code>brif (ctz v0)</code></td>
+<td><code>testl $1, %edi; je</code> ✓ (matches what this PR's x64 rules produce)</td>
+</tr>
+<tr>
+<td>x86_64</td>
+<td><code>brif (clz v0)</code></td>
+<td><code>testl %edi, %edi; jge</code> ✓ (matches #13336's intent)</td>
+</tr>
+<tr>
+<td>aarch64</td>
+<td><code>brif (ctz v0)</code></td>
+<td><code>tbz w0, #0</code> — single-instruction test-and-branch, <strong>tighter</strong> than #13336's <code>tst+cmp+b.cc</code></td>
+</tr>
+</tbody>
+</table>
+<p>All 70 cranelift egraph filetests pass. The <code>replace_branch_cond</code> mechanism composes with future similar <code>brif</code>-cond simplifications (any value-level rewrite whose result is "0/non-0-equivalent to the original" qualifies).</p>
+<p>I'll push the mid-end branch as a new PR, with revert commits for this PR and #13336. Closing once that lands cleanly.</p>
+</blockquote>
+
+
+
+<a name="594689688"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313334%20cranelift%28x64%29%3A%20lower%20bare%20%60ctz%60/%60cl.../near/594689688" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20.60ctz.60.2F.60cl.2E.2E.2E.html#594689688">(May 12 2026 at 21:57)</a>:</h4>
+<p>ggreif <a href="https://github.com/bytecodealliance/wasmtime/pull/13334#issuecomment-4435149475">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13334">PR #13334</a>:</p>
+<blockquote>
+<p>Closing in favor of #13343 — the mid-end <code>simplify_skeleton</code>-on-<code>brif</code> extension subsumes this PR's x64 backend rules, the aarch64 rules in #13336, and covers riscv64 and s390x at the same time without any per-backend rule. Cross-backend comparison table is in <a href="https://github.com/bytecodealliance/wasmtime/pull/13343#issuecomment-4435120706">the PR comment</a>.</p>
+</blockquote>
+
+
+
+<a name="594689690"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313334%20cranelift%28x64%29%3A%20lower%20bare%20%60ctz%60/%60cl.../near/594689690" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20.60ctz.60.2F.60cl.2E.2E.2E.html#594689690">(May 12 2026 at 21:57)</a>:</h4>
+<p><span aria-label="cross mark" class="emoji emoji-274c" role="img" title="cross mark">:cross_mark:</span> ggreif closed without merge <a href="https://github.com/bytecodealliance/wasmtime/pull/13334">PR #13334</a>.</p>
+
+
+
+<hr><p>Last updated: Jul 02 2026 at 22:22 UTC</p>
+</html>

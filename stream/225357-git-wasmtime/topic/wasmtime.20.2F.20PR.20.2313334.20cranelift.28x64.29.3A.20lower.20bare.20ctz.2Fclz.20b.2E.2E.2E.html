@@ -1,0 +1,76 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #13334 cranelift(x64): lower bare ctz/clz b... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20ctz.2Fclz.20b.2E.2E.2E.html">wasmtime / PR #13334 cranelift(x64): lower bare ctz/clz b...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="594338553"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313334%20cranelift%28x64%29%3A%20lower%20bare%20ctz/clz%20b.../near/594338553" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313334.20cranelift.28x64.29.3A.20lower.20bare.20ctz.2Fclz.20b.2E.2E.2E.html#594338553">(May 11 2026 at 15:57)</a>:</h4>
+<p>ggreif opened <a href="https://github.com/bytecodealliance/wasmtime/pull/13334">PR #13334</a> from <code>ggreif:gabor/ctz-clz-brif-lowering</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p>Follow-up to #13332. That PR added egraph rules collapsing <code>(eq (ctz X) 0)</code> / <code>(ne (ctz X) 0)</code> / <code>(eq (clz X) 0)</code> / <code>(ne (clz X) 0)</code> to direct LSB / sign-bit tests — but only when the comparison is mediated by an explicit <code>icmp</code>. The wasm front-end translates <code>wasm if (ctz X)</code> to <code>brif (ireduce.i32 (ctz.i64 X))</code> directly (no <code>icmp</code>), so the egraph rules don't fire on the wasm-natural shape.</p>
+<p>This PR closes the gap by specialising <code>is_nonzero</code> in the x64 backend — the helper that all <code>brif</code>/<code>select</code>/<code>trapif</code> lowerings funnel through.</p>
+<h2>Rules</h2>
+<p>In <code>cranelift/codegen/src/isa/x64/inst.isle</code>:</p>
+<div class="codehilite" data-code-language="isle"><pre><span></span><code>(rule 3 (is_nonzero (ctz (ty_32_or_64 ty) val))
+      (CondResult.CC (x64_test ty val (RegMemImm.Imm 1)) (CC.Z)))
+(rule 3 (is_nonzero (ireduce _ (ctz (ty_32_or_64 ty) val)))
+      (CondResult.CC (x64_test ty val (RegMemImm.Imm 1)) (CC.Z)))
+(rule 3 (is_nonzero (clz (ty_32_or_64 ty) val))
+      (let ((gpr Gpr val)) (CondResult.CC (x64_test ty gpr gpr) (CC.NS))))
+(rule 3 (is_nonzero (ireduce _ (clz (ty_32_or_64 ty) val)))
+      (let ((gpr Gpr val)) (CondResult.CC (x64_test ty gpr gpr) (CC.NS))))
+</code></pre></div>
+<p>The <code>ireduce</code> variant catches the wasm front-end's <code>i32.wrap_i64</code> over a 64-bit <code>ctz</code>/<code>clz</code> — a no-op on values in [0, bitwidth].</p>
+<h2>Test deltas (<code>tests/disas/ctz-clz-bool-condition.wat</code>)</h2>
+<table>
+<thead>
+<tr>
+<th>consumer</th>
+<th>before</th>
+<th>after</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>if_ctz_bare_i32</code></td>
+<td>5 insns (<code>bsfl + cmovel + test + jne</code>)</td>
+<td><strong>2</strong> (<code>testl \$1, %edx; je</code>)</td>
+</tr>
+<tr>
+<td><code>if_ctz_bare_i64</code></td>
+<td>5 insns (<code>bsfq + cmovq + test + jne</code>)</td>
+<td><strong>2</strong> (<code>testq \$1, %rdx; je</code>)</td>
+</tr>
+<tr>
+<td><code>if_clz_bare_i32</code></td>
+<td>7 insns (<code>bsr + cmov + sub + test + jne</code>)</td>
+<td><strong>2</strong> (<code>testl + jns</code>)</td>
+</tr>
+</tbody>
+</table>
+<p>The icmp-mediated cases (collapsed by #13332's egraph rules) are unchanged. The numeric-comparison negative test (<code>(ctz X) == 4</code>) stays untouched.</p>
+<h2>Motivation</h2>
+<p>Motoko's <code>moc</code> codegen emits <code>i64.ctz X; i32.wrap_i64; if</code> for compactness/sign tests in the EOP backend (see <a href="https://github.com/caffeinelabs/motoko/issues/6103">caffeinelabs/motoko#6103</a>). Before this PR, that lowers to 5 native instructions per dispatch; after, 2.</p>
+<p>A concrete idiomatic example: in Motoko, the <code>let-else</code> pattern over <code>Result</code></p>
+<div class="codehilite" data-code-language="motoko"><pre><span></span><code>let #ok payload = queryProp(...) else return defaultValue;
+</code></pre></div>
+<p>desugars to a 2-arm refutable variant match (<code>#ok</code> vs <code>#err</code>). The variant-tag hashes are \`hash(\"ok\") = 0x611C\` (LSB 0) and \`hash(\"err\") = 0x4D0765\` (LSB 1) — they differ exactly at the LSB. The planned variant-switch \`BitTest\` dispatch (caffeinelabs/motoko's \`gabor/variant-switch\`) recognizes this and emits a single LSB-test for the dispatch; combined with this PR, the entire let-else lowers to <strong>\`load hash; testq \$1, ...; jcc\`</strong> on x64 — three instructions for a pattern match. Every \`Result\`-returning API + every \`let-else\`-style early return collapses to this shape.</p>
+<p>Aggregated across hot paths (variant-switch dispatch, GC compact/heap discriminator, sign tests, …) this is meaningful.</p>
+<h2>Follow-ups (not in this PR)</h2>
+<ul>
+<li>aarch64, riscv64, s390x analogues — separate PRs once x64 reviewer feedback lands.</li>
+<li>\`select\`-consumer variant — \`select\` already routes through \`is_nonzero_cmp\` → \`is_nonzero\`, so this PR's rules cover it too without extra work.</li>
+</ul>
+</blockquote>
+
+
+
+<hr><p>Last updated: Jul 02 2026 at 22:22 UTC</p>
+</html>

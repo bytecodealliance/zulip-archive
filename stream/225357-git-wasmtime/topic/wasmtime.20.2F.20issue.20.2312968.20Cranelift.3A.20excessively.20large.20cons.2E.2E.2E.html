@@ -1,0 +1,99 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #12968 Cranelift: excessively large cons... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312968.20Cranelift.3A.20excessively.20large.20cons.2E.2E.2E.html">wasmtime / issue #12968 Cranelift: excessively large cons...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="583823940"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312968%20Cranelift%3A%20excessively%20large%20cons.../near/583823940" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312968.20Cranelift.3A.20excessively.20large.20cons.2E.2E.2E.html#583823940">(Apr 06 2026 at 15:48)</a>:</h4>
+<p>cfallin opened <a href="https://github.com/bytecodealliance/wasmtime/issues/12968">issue #12968</a>:</p>
+<blockquote>
+<p>In Cranelift's <code>MachBuffer</code>, which manages the physical layout and intra-function relocation/label patching of machine code, we currently have functionality for <em>constant pools</em> and <em>deferred traps</em> that ride along with the "islands" of jump veneers used to extend label distances.</p>
+<p>The original implementation of <code>MachBuffer</code> did not have these concepts (they were added later in #6011 and #6384) and the effect of these on the veneer generation invariants is somewhat problematic. A recently discovered case: on aarch64, where the range for a forward reference to a constant pool (from an <code>ldr</code> instruction) is limited by a 19-bit offset field, building a <em>single</em> basic block with more than ~64k constant loads (e.g. <code>vconst</code> instructions) is sufficient to cause an assertion failure, because we cannot insert an island in the middle of a basic block.</p>
+<p>The correctness of the original design of veneer islands rested on a few key choices: (i) we check the forward label reference deadline (nearest expiring range) against the worst-case basic block size between every pair of basic blocks, emitting an island if necessary; (ii) a basic block can only add a few new unresolved forward label references (from the terminator branch; note that <code>br_table</code> uses 32-bit PC-rel jump offsets in a table so isn't relevant here), so we can't "generate deadlines faster than we can meet them" so to speak; and (iii) <em>every</em> label reference had either a veneer or natively supported a range large enough for our largest input module (e.g. 2GiB on x86-64), so we could always extend.</p>
+<p>Constants and deferred traps break this model: they can increase the island size arbitrarily as we pass through a single basic block during emission, such that we can create a closer deadline than we can possibly meet, and they can also push out the start of branch veneers when we do decide to emit an island such that they are already out-of-range. And, constant references cannot have veneers: unlike a branch, where we can always put another branch at the target, we are emitting data that will be loaded directly.</p>
+<p>There are several fixes that might seem to preserve constant pools and deferred traps:</p>
+<ul>
+<li>We could support emission of islands in the middle of basic blocks.</li>
+<li>We could interleave the handling of constants/deferred traps and veneers in island emission, sorting by deadline, rather than handle one or the other first. (We previously did veneers first, but that created problems for constant range; now we do constant first, and that creates problems for veneer range.)</li>
+<li>We could always emit long-range references to the constant pool (e.g. <code>ADRP</code>+<code>ADR</code> on aarch64, which has a multi-GiB PC-rel range)</li>
+<li>Or we could give up and do both inline again, like we did pre-2023. (This means that a constant load either jumps around the inline constant, or uses a sequence of instructions to build it up on RISC ISAs, e.g. <code>MOVK</code>+<code>MOVZ</code> on aarch64.)</li>
+</ul>
+<p>A few thoughts:</p>
+<ul>
+<li>Islands in the middle of basic blocks are certainly possible, but complicate emission code somewhat. Effectively we need to emit a jump around the island, that jump needs to have a large enough range for the island size, and we need to account for that jump when checking the deadline. All solvable issues. Code quality suffers (mid-block jump always taken) but maybe that's the price to pay with very very large function bodies; and it's fundamentally unavoidable if blocks are arbitrarily large.</li>
+<li>Interleaving constants+veneers, I think/will claim, is also necessary: with arbitrary large pending island size, it's possible to force island emission with a reference of shorter range either to a constant or branch target, and so we need to be able to start the island with the most urgent deadline in either case.</li>
+</ul>
+<p>I think combining those two bits, plus always considering deadlines wrt worst-case island size, is sufficient, but I would want to write a proof (like I did for label resolution/tracking) to be sure.</p>
+<p>I want to get a temperature check from others, though: this is also getting pretty complex, and there's a certain appeal of the simplicity we had pre-2023. We know it works no matter what. Is there any appetite to going back to that?</p>
+</blockquote>
+
+
+
+<a name="583831664"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312968%20Cranelift%3A%20excessively%20large%20cons.../near/583831664" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312968.20Cranelift.3A.20excessively.20large.20cons.2E.2E.2E.html#583831664">(Apr 06 2026 at 16:39)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/12968#issuecomment-4193528679">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12968">issue #12968</a>:</p>
+<blockquote>
+<blockquote>
+<p>we cannot insert an island in the middle of a basic block</p>
+</blockquote>
+<p>Question on this: we do sort of support this I thought? VCode's default emission doesn't do this but each backend has manual calls to <code>.emit_island(...)</code> in instructions that aren't factored into the worst-case size of an instruction (e.g. jump tables). In that sense I thought that we at least had the capability to emit islands within a block, and the refinement of what you're saying here though is that VCode emission doesn't do that by default.</p>
+<p>If that's true, is there any reason we couldn't promote that check to also happening on each instruction emitted in VCode? (e.g. either before or after).</p>
+<blockquote>
+<p>Is there any appetite to going back to that?</p>
+</blockquote>
+<p>Personally I'd say that this boils down to performance. I'm not sure we're necessarily equipped to measure the performance impact of this though. Over time my hunch is that some of these improvements were "yeah asm looks better" while some may have been "this measured noticably better". I wouldn't be confident that our current sightglass suite would encompass all of this to the point of being able to measure "what if traps/constants are inline again". I'd mostly be worried about simd-related code where any one optimization can be irrelevant 99% of the time and then it's absolutely critical for that one loop that shows up.</p>
+<p>Not to say I'm not sympathetic to the complexity argument, however. I agree that things have gotten a lot hairier over time. There's also further optimizations I'd like to see at some point, such as merging constant pools across functions and <a href="https://github.com/bytecodealliance/wasmtime/issues/9402">moving them out of the executable <code>.text</code> section</a>.</p>
+<hr>
+<p>What if we had a sort of middle ground in reducing the complexity here? First would be to change codegen for references to constants to always have a multi-gigabyte range (e.g. <code>adrp</code> + <code>adr</code> on aarch64). Effectively moving constant polls out of <code>MachBuffer</code> entirely (or at least from islands). That'd still leave #9402 on the table for example while probably still preserving most perf around that (in #9402 seems like native compilers at least default to long-range references, although iunno if they all have relaxation on-by-default to optimize that link-time).</p>
+<p>Then we'd only have the problem of deferred traps, but that might be easier to handle by emitting islands more often. That's a control-flow jump so would be able to be extended pretty easily.</p>
+<p>That wouldn't exactly get to pre-2023 complexity but might retain most of the performance improvements post-2023 as well?</p>
+</blockquote>
+
+
+
+<a name="584322886"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312968%20Cranelift%3A%20excessively%20large%20cons.../near/584322886" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312968.20Cranelift.3A.20excessively.20large.20cons.2E.2E.2E.html#584322886">(Apr 08 2026 at 22:07)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/12968#issuecomment-4210011026">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/12968">issue #12968</a>:</p>
+<blockquote>
+<p>Yep, agreed that keeping the nicer behavior (straightline code without jumps around dead stuff) is better if we can help it.</p>
+<p>Yes, you're right that we do have explicit island emission points for certain unbounded-size instructions (<code>br_table</code>s for example); and nothing in principle prevents us from doing this more generally in the <code>VCode::emit</code> main loop, checking the deadline after every inst and doing a jump around an island.</p>
+<p>It's maybe even simpler, if we take the assumption that almost no real code (and even more likely no performance-sensitive code) will have islands, to say that we don't even try to align islands to inter-block gaps. Just emit them when the deadline calls for them. That neatly avoids the issue of arbitrarily-large "island debts" accumulating in one block in a way that can't be resolved.</p>
+<p>The combined constants-and-traps-and-branch-veneers deadline handling is also the Right Way to handle this, and I'm not confident we won't have a long tail of weird issues if we don't solve it that way, so I'm leaning toward just doing it. I'll try to tackle this when I get a sliver of free time soon.</p>
+</blockquote>
+
+
+
+<a name="595537303"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2312968%20Cranelift%3A%20excessively%20large%20cons.../near/595537303" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2312968.20Cranelift.3A.20excessively.20large.20cons.2E.2E.2E.html#595537303">(May 16 2026 at 22:34)</a>:</h4>
+<p>cfallin closed <a href="https://github.com/bytecodealliance/wasmtime/issues/12968">issue #12968</a>:</p>
+<blockquote>
+<p>In Cranelift's <code>MachBuffer</code>, which manages the physical layout and intra-function relocation/label patching of machine code, we currently have functionality for <em>constant pools</em> and <em>deferred traps</em> that ride along with the "islands" of jump veneers used to extend label distances.</p>
+<p>The original implementation of <code>MachBuffer</code> did not have these concepts (they were added later in #6011 and #6384) and the effect of these on the veneer generation invariants is somewhat problematic. A recently discovered case: on aarch64, where the range for a forward reference to a constant pool (from an <code>ldr</code> instruction) is limited by a 19-bit offset field, building a <em>single</em> basic block with more than ~64k constant loads (e.g. <code>vconst</code> instructions) is sufficient to cause an assertion failure, because we cannot insert an island in the middle of a basic block.</p>
+<p>The correctness of the original design of veneer islands rested on a few key choices: (i) we check the forward label reference deadline (nearest expiring range) against the worst-case basic block size between every pair of basic blocks, emitting an island if necessary; (ii) a basic block can only add a few new unresolved forward label references (from the terminator branch; note that <code>br_table</code> uses 32-bit PC-rel jump offsets in a table so isn't relevant here), so we can't "generate deadlines faster than we can meet them" so to speak; and (iii) <em>every</em> label reference had either a veneer or natively supported a range large enough for our largest input module (e.g. 2GiB on x86-64), so we could always extend.</p>
+<p>Constants and deferred traps break this model: they can increase the island size arbitrarily as we pass through a single basic block during emission, such that we can create a closer deadline than we can possibly meet, and they can also push out the start of branch veneers when we do decide to emit an island such that they are already out-of-range. And, constant references cannot have veneers: unlike a branch, where we can always put another branch at the target, we are emitting data that will be loaded directly.</p>
+<p>There are several fixes that might seem to preserve constant pools and deferred traps:</p>
+<ul>
+<li>We could support emission of islands in the middle of basic blocks.</li>
+<li>We could interleave the handling of constants/deferred traps and veneers in island emission, sorting by deadline, rather than handle one or the other first. (We previously did veneers first, but that created problems for constant range; now we do constant first, and that creates problems for veneer range.)</li>
+<li>We could always emit long-range references to the constant pool (e.g. <code>ADRP</code>+<code>ADR</code> on aarch64, which has a multi-GiB PC-rel range)</li>
+<li>Or we could give up and do both inline again, like we did pre-2023. (This means that a constant load either jumps around the inline constant, or uses a sequence of instructions to build it up on RISC ISAs, e.g. <code>MOVK</code>+<code>MOVZ</code> on aarch64.)</li>
+</ul>
+<p>A few thoughts:</p>
+<ul>
+<li>Islands in the middle of basic blocks are certainly possible, but complicate emission code somewhat. Effectively we need to emit a jump around the island, that jump needs to have a large enough range for the island size, and we need to account for that jump when checking the deadline. All solvable issues. Code quality suffers (mid-block jump always taken) but maybe that's the price to pay with very very large function bodies; and it's fundamentally unavoidable if blocks are arbitrarily large.</li>
+<li>Interleaving constants+veneers, I think/will claim, is also necessary: with arbitrary large pending island size, it's possible to force island emission with a reference of shorter range either to a constant or branch target, and so we need to be able to start the island with the most urgent deadline in either case.</li>
+</ul>
+<p>I think combining those two bits, plus always considering deadlines wrt worst-case island size, is sufficient, but I would want to write a proof (like I did for label resolution/tracking) to be sure.</p>
+<p>I want to get a temperature check from others, though: this is also getting pretty complex, and there's a certain appeal of the simplicity we had pre-2023. We know it works no matter what. Is there any appetite to going back to that?</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Jul 02 2026 at 22:22 UTC</p>
+</html>

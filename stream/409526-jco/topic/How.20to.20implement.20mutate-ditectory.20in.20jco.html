@@ -1,0 +1,73 @@
+<html>
+<head><meta charset="utf-8"><title>How to implement mutate-ditectory in jco · jco · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/409526-jco/index.html">jco</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/409526-jco/topic/How.20to.20implement.20mutate-ditectory.20in.20jco.html">How to implement mutate-ditectory in jco</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="581876018"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/409526-jco/topic/How%20to%20implement%20mutate-ditectory%20in%20jco/near/581876018" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Mendy Berger <a href="https://bytecodealliance.github.io/zulip-archive/stream/409526-jco/topic/How.20to.20implement.20mutate-ditectory.20in.20jco.html#581876018">(Mar 26 2026 at 11:43)</a>:</h4>
+<p>I'm trying to implement wasi:fs mutate-ditectory in jco and am confused by how wasmtime deals with it.</p>
+<p>I'm trying to understand how descriptor-flags — and the mutate-directory flag in particular — is supposed to behave. A couple of things we've noticed with wasmtime:</p>
+<ol>
+<li>It doesn't appear to actually check mutate-directory.</li>
+<li>It passes down directory permissions from the parent, even if the guest didn't explicitly request them.</li>
+</ol>
+<p>We're trying to determine whether this is a deviation from the spec, and if so, whether jco should align with wasmtime's behavior or follow the spec strictly.</p>
+<p>Thoughts anyone?</p>
+
+
+
+<a name="581880572"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/409526-jco/topic/How%20to%20implement%20mutate-ditectory%20in%20jco/near/581880572" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/409526-jco/topic/How.20to.20implement.20mutate-ditectory.20in.20jco.html#581880572">(Mar 26 2026 at 12:04)</a>:</h4>
+<p>To expand on the context above (before we move this discussion):</p>
+<p>This is in relation to this PR (if you want to eyeball some code!):<br>
+<a href="https://github.com/bytecodealliance/jco/pull/1303">https://github.com/bytecodealliance/jco/pull/1303</a></p>
+<p>If I were to attempt to summarize where we're at now in the interest of saving time:</p>
+<ol>
+<li>Jco's <code>preview2-shim</code> library never handled mutate-directory properly (or at all!)</li>
+<li>Jco has a test suite that is borrowed from upstream wasmtime w/ p1 components in it</li>
+<li>Fixing <code>preview2-shim</code> to properly handle mutate-directory causes failures in the p1 components upstream</li>
+<li>IIRC those components are coming through adapted (am I wrong about this? <a href="https://github.com/bytecodealliance/wasmtime/blob/main/crates/test-programs/artifacts/build.rs">build.rs looks to be composing p1_ prefixed components</a>), but we're <em>not</em> seeing mutate-directory set on them properly, when the root <em>has</em> been set with mutate-directory (see the PR above, every new preopen gets it by default in that PR).</li>
+<li>We're seeing "RO filesystem" errors ostensibly caused by (4)</li>
+</ol>
+<p>P1 did not have mutate directory AFAIK so I think this was a P1 -&gt; P2 thing specifically (if anyone can still remember back that far!)</p>
+<p>When I look at upstream <code>wasmtime</code>, I see that P1 ctx is doing <a href="https://github.com/bytecodealliance/wasmtime/blob/837d02fa310bd500894ea5e1677713812920c253/crates/wasi/src/filesystem.rs#L545">a little bit of munging to get p1's write open mode to also translate to mutate directory</a>. That code <em>seems</em> to me like where p1 components are getting the ability to run properly in host designed for/properly adhering to P2.</p>
+<p>That said, looking through I can't find the <em>exact</em> codepath that makes this work -- is my understanding correct here?</p>
+<p>Does the <a href="https://github.com/bytecodealliance/wasmtime/blob/837d02fa310bd500894ea5e1677713812920c253/crates/wasi/src/ctx.rs#L303">preopened dir automatically get WRITE</a>, then that WRITE is eventually <a href="https://github.com/bytecodealliance/wasmtime/blob/837d02fa310bd500894ea5e1677713812920c253/crates/wasi/src/filesystem.rs#L545">turned back into mutate directory when the flags are checked</a>?</p>
+<p>Trying to figure out what exactly wasmtime is doing to smooth this over, and why the logic in Jco is falling afoul of adapted P1 components in that PR.<br>
+<em>if</em> we're understanding the adjustment wasmtime is making correctly, and we're going for backwards compat/not breaking existing users, then the fix seems to be to augment <a href="https://github.com/MendyBerger/jco/blob/a30be4afaca69ad7addca52f991ad7c591f364c5/packages/preview2-shim/lib/nodejs/filesystem.js#L357">Jco's openAt</a> (on that branch) to interpret <code>WRITE</code> permissions on directories that are opened as <code>MUTATE_DIRECTORY</code>s so that it can be propagated down.</p>
+<p>Would love some feedback here <span class="user-mention" data-user-id="344849">@Yosh Wuyts</span> <span class="user-mention" data-user-id="253992">@Pat Hickey</span> and anyone that might have context from back then!</p>
+
+
+
+<a name="582498924"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/409526-jco/topic/How%20to%20implement%20mutate-ditectory%20in%20jco/near/582498924" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Yosh Wuyts <a href="https://bytecodealliance.github.io/zulip-archive/stream/409526-jco/topic/How.20to.20implement.20mutate-ditectory.20in.20jco.html#582498924">(Mar 30 2026 at 07:58)</a>:</h4>
+<p>reading through this, I don't actually recall much about this. Sorry I can't add much historical context here</p>
+
+
+
+<a name="582569717"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/409526-jco/topic/How%20to%20implement%20mutate-ditectory%20in%20jco/near/582569717" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/409526-jco/topic/How.20to.20implement.20mutate-ditectory.20in.20jco.html#582569717">(Mar 30 2026 at 13:52)</a>:</h4>
+<p>No worries, thanks for chiming in -- yeah it's quite a while ago and the code is <em>almost</em> self-explanatory. We must be missing something obvious here.</p>
+
+
+
+<a name="582864590"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/409526-jco/topic/How%20to%20implement%20mutate-ditectory%20in%20jco/near/582864590" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Mendy Berger <a href="https://bytecodealliance.github.io/zulip-archive/stream/409526-jco/topic/How.20to.20implement.20mutate-ditectory.20in.20jco.html#582864590">(Mar 31 2026 at 17:59)</a>:</h4>
+<p>I also filed an issue against wasmtime for this <a href="https://github.com/bytecodealliance/wasmtime/issues/12912">https://github.com/bytecodealliance/wasmtime/issues/12912</a></p>
+
+
+
+<a name="582873528"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/409526-jco/topic/How%20to%20implement%20mutate-ditectory%20in%20jco/near/582873528" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/409526-jco/topic/How.20to.20implement.20mutate-ditectory.20in.20jco.html#582873528">(Mar 31 2026 at 18:47)</a>:</h4>
+<p>I alas also don't really have much more context to add here. My best guess is that there were ambitions to make a better permissions/hierarchy than POSIX and it may never have come to fruition, and it might be time to scale things back</p>
+
+
+
+<hr><p>Last updated: Jul 02 2026 at 22:22 UTC</p>
+</html>

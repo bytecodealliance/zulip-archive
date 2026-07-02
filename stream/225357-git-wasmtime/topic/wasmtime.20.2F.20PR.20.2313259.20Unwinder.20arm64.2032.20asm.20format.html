@@ -1,0 +1,142 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #13259 Unwinder arm64 32 asm format · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313259.20Unwinder.20arm64.2032.20asm.20format.html">wasmtime / PR #13259 Unwinder arm64 32 asm format</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="592627442"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313259%20Unwinder%20arm64%2032%20asm%20format/near/592627442" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313259.20Unwinder.20arm64.2032.20asm.20format.html#592627442">(May 04 2026 at 03:51)</a>:</h4>
+<p>matthargett opened <a href="https://github.com/bytecodealliance/wasmtime/pull/13259">PR #13259</a> from <code>rebeckerspecialties:unwinder-arm64_32-asm-format</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>Two-commit series enabling <code>wasmtime</code> to build for <code>arm64_32-apple-watchos</code><br>
+(Apple Watch Series 4+ ILP32 ABI). Verified end-to-end on a real Apple<br>
+Watch SE 2 (S8 SoC, watchOS 11.6.2) running an 11-workload Pulley<br>
+benchmark.</p>
+<h2>Commit 1 — \`unwinder: explicit 64-bit register view in aarch64 inline asm for arm64_32\`</h2>
+<p>\`crates/unwinder/src/arch/aarch64.rs\` has two inline-asm blocks that<br>
+operate on a \`usize\`-typed register placeholder. On aarch64 \`usize\` is<br>
+u64 and the implicit register format (\`x&lt;N&gt;\`) is unambiguous and<br>
+correct. On <strong>arm64_32</strong> (Apple Watch S4+, ILP32 ABI: 64-bit registers,<br>
+32-bit pointers), \`usize\` is u32 and the formatter is ambiguous between<br>
+\`w&lt;N&gt;\` (32-bit lane) and \`x&lt;N&gt;\` (64-bit GPR view) — exactly what<br>
+rustc's \`asm_sub_register\` lint flags. There's also a real correctness<br>
+hazard: unwinder code that handles a return address would have a<br>
+32-bit value in a 64-bit GPR, and the wrong format spec could insert a<br>
+sub-register move that drops the upper bits at the wrong moment.</p>
+<p>\`lr\` and \`sp\` are 64-bit-only — there is no addressable 32-bit alias<br>
+of either, so the only valid register view in the specific \`mov\`<br>
+instructions used here is \`x\`. Lock that in explicitly via \`{0:x}\`<br>
+and \`{pc:x}\`. The compiler zero-extends u32 → x&lt;N&gt; on the way in and<br>
+truncates x&lt;N&gt; → u32 on the way out automatically; \`xpaclri\`<br>
+operates on the full LR as before.</p>
+<p>No behavior change on aarch64; silences two \`asm_sub_register\` warnings<br>
+on arm64_32-apple-watchos.</p>
+<h2>Commit 2 — \`Bump mach2 dep from 0.4.2 to 0.6\`</h2>
+<p>\`mach2 v0.4.2\` emits \`compile_error!(\"mach requires macOS or iOS\")\`<br>
+on any target where neither \`target_os = \"macos\"\` nor \`ios\` matches,<br>
+plus a matching narrow \`target_vendor\` gate on its \`libc\` build-dep.<br>
+That blocks Apple watchOS / tvOS / visionOS targets — wasmtime's<br>
+\`runtime\` feature pulls \`mach2\` in unconditionally so the build fails<br>
+with both \`error: mach requires macOS or iOS\` and<br>
+\`error[E0463]: can't find crate for libc\`.</p>
+<p>The fix has been upstream in mach2 since <strong>0.6.0</strong> (commit \`538ce75\`,<br>
+2025-08-16, \"Add support for tvOS, watchOS and visionOS\"): both gates<br>
+widen to \`cfg(target_vendor = \"apple\")\`. The mach2 module API<br>
+wasmtime imports<br>
+(\`exc\`, \`exception_types\`, \`kern_return\`, \`mach_init\`, \`mach_port\`,<br>
+\`message\`, \`ndr\`, \`port\`, \`thread_act\`, \`thread_status\`) is<br>
+unchanged between 0.4.2 and 0.6.0; only internal libc/core::ffi<br>
+type-plumbing differs. Bumping the workspace dep is sufficient — no<br>
+changes in \`machports.rs\`.</p>
+<p>Verified by building \`wasmtime\` as a \`staticlib\` for<br>
+\`arm64_32-apple-watchos\` under<br>
+\`nightly-2026-01-25 + -Z build-std=std,panic_abort\` with<br>
+\`--features pulley,runtime,std,cranelift,anyhow\`. The dev-only path<br>
+(\`cranelift-jit -&gt; region -&gt; mach2 0.4.x\`) keeps an older mach2 in the<br>
+lockfile for cranelift-jit's own host tests; that path is not part of<br>
+any production embedder build and stays unchanged.</p>
+<h2>End-to-end verification</h2>
+<p>This 2-commit stack + the companion target-lexicon \`Arm64_32\` patch<br>
+(submitted separately to bytecodealliance/target-lexicon) is enough to<br>
+build a Pulley-only static library for arm64_32-apple-watchos and link<br>
+it into a watchOS app. On real hardware (Apple Watch SE 2, S8 SoC):</p>
+<table>
+<thead>
+<tr>
+<th>workload</th>
+<th style="text-align: right;">run-time on SE 2</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>fib(30)</td>
+<td style="text-align: right;">125.33 ms</td>
+</tr>
+<tr>
+<td>fib_tail(100000) [return_call]</td>
+<td style="text-align: right;">0.566 ms</td>
+</tr>
+<tr>
+<td>sieve(10000)</td>
+<td style="text-align: right;">0.763 ms</td>
+</tr>
+<tr>
+<td>crc32(64 KiB)</td>
+<td style="text-align: right;">5.288 ms</td>
+</tr>
+<tr>
+<td>matmul simd128 64×64</td>
+<td style="text-align: right;">4.079 ms</td>
+</tr>
+<tr>
+<td>matmul relaxed-simd FMA</td>
+<td style="text-align: right;">3.242 ms</td>
+</tr>
+<tr>
+<td>convolution 256×256</td>
+<td style="text-align: right;">10.83 ms</td>
+</tr>
+<tr>
+<td>audio DSP 1000 frames × 512</td>
+<td style="text-align: right;">1463.99 ms</td>
+</tr>
+<tr>
+<td>bulk_memory (memory.copy/fill)</td>
+<td style="text-align: right;">30.69 ms</td>
+</tr>
+<tr>
+<td>call_indirect (200 K dispatches)</td>
+<td style="text-align: right;">36.45 ms</td>
+</tr>
+</tbody>
+</table>
+<p>All results match the host-Rust reference function byte-for-byte.</p>
+</blockquote>
+
+
+
+<a name="592627444"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313259%20Unwinder%20arm64%2032%20asm%20format/near/592627444" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313259.20Unwinder.20arm64.2032.20asm.20format.html#592627444">(May 04 2026 at 03:51)</a>:</h4>
+<p>matthargett requested <a href="https://github.com/dicej">dicej</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13259">PR #13259</a>.</p>
+
+
+
+<a name="592627445"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313259%20Unwinder%20arm64%2032%20asm%20format/near/592627445" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313259.20Unwinder.20arm64.2032.20asm.20format.html#592627445">(May 04 2026 at 03:51)</a>:</h4>
+<p>matthargett requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13259">PR #13259</a>.</p>
+
+
+
+<a name="592627446"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313259%20Unwinder%20arm64%2032%20asm%20format/near/592627446" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313259.20Unwinder.20arm64.2032.20asm.20format.html#592627446">(May 04 2026 at 03:51)</a>:</h4>
+<p>matthargett requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-default-reviewers">wasmtime-default-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13259">PR #13259</a>.</p>
+
+
+
+<hr><p>Last updated: Jul 02 2026 at 22:22 UTC</p>
+</html>

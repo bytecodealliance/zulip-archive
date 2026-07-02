@@ -1,0 +1,655 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #13460 cranelift: inline small constant-len... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html">wasmtime / PR #13460 cranelift: inline small constant-len...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="597190285"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597190285" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597190285">(May 23 2026 at 01:01)</a>:</h4>
+<p>gfx requested <a href="https://github.com/apps/copilot-pull-request-reviewer">Copilot</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>.</p>
+
+
+
+<a name="597190286"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597190286" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597190286">(May 23 2026 at 01:01)</a>:</h4>
+<p>gfx opened <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a> from <code>wado-lang:array-copy-inline</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>Small, statically-sized <code>array.copy</code>s of scalar elements currently go through the <code>memory_copy</code> libcall, just like every other size. For tiny copies the libcall's fixed per-call cost — a wasm↔host transition plus an indirect call — dominates the actual <code>memmove</code>, so <code>array.copy</code> is far slower than it should be for small fixed-size copies (enough that a hand-written <code>array.get</code>/<code>array.set</code> loop can beat it).</p>
+<p>This PR expands such copies inline, as a sequence of loads followed by stores, when the element type is scalar and the length is a compile-time constant of at most 8 elements.</p>
+<h2>Speed</h2>
+<p><code>array.copy</code> of N <code>i32</code> elements, ns per copy, release build, lower is better:</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">N</th>
+<th style="text-align: right;">before (libcall)</th>
+<th style="text-align: right;">after (inline)</th>
+<th style="text-align: right;">speedup</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">4.60</td>
+<td style="text-align: right;">1.27</td>
+<td style="text-align: right;"><strong>3.6×</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">3.36</td>
+<td style="text-align: right;">1.27</td>
+<td style="text-align: right;"><strong>2.6×</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">4.17</td>
+<td style="text-align: right;">1.43</td>
+<td style="text-align: right;"><strong>2.9×</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">4.88</td>
+<td style="text-align: right;">2.00</td>
+<td style="text-align: right;"><strong>2.4×</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The inline path also beats the manual element-by-element loop that was previously the faster workaround. The gap is larger still in unoptimized builds, where the libcall body itself is not optimized (~24 ns/call drops to a couple ns).</p>
+<p>&lt;details&gt;&lt;summary&gt;Methodology&lt;/summary&gt;</p>
+<p>ns per whole-array copy = (wall time at N iterations − wall time at 0 iterations) / N, taking the min of several repetitions, default config, x86_64. The 0-iteration baseline cancels out module compilation and array allocation. The "before" column is measured with a dynamic length (forcing the libcall) and the "after" column with a constant length (inline), at the same N.<br>
+&lt;/details&gt;</p>
+<h2>Correctness &amp; scope</h2>
+<ul>
+<li>Every element is <strong>loaded before any is stored</strong>, so overlapping source/destination ranges keep <code>array.copy</code>'s <code>memmove</code> semantics.</li>
+<li>Dynamic or larger lengths, and tables, still use the <code>memory_copy</code> libcall — there its <code>memmove</code> amortizes the call overhead.</li>
+<li>The bound of 8 elements comes from measurement: the inline-vs-libcall crossover is around 16 elements, but the largest wins cluster at ≤ 8 while inline code size grows with the element count.</li>
+</ul>
+<h2>Tests</h2>
+<ul>
+<li><code>tests/disas/array-copy-inline.wat</code> locks the codegen (the libcall is gone; loads-then-stores remain).</li>
+<li><code>tests/misc_testsuite/gc/array-copy-inline.wast</code> checks correctness for every element size (i8/i16/i32/i64/f32/f64/v128), the threshold boundary (8 inline vs 9 libcall), and overlapping copies; the wast harness runs it across the DRC, null, and copying collectors.</li>
+</ul>
+<p><span aria-label="robot" class="emoji emoji-1f916" role="img" title="robot">:robot:</span> Generated with <a href="https://claude.com/claude-code">Claude Code</a><br>
+</p>
+</blockquote>
+
+
+
+<a name="597190287"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597190287" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597190287">(May 23 2026 at 01:01)</a>:</h4>
+<p>gfx requested <a href="https://github.com/cfallin">cfallin</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>.</p>
+
+
+
+<a name="597190288"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597190288" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597190288">(May 23 2026 at 01:01)</a>:</h4>
+<p>gfx requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>.</p>
+
+
+
+<a name="597190290"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597190290" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597190290">(May 23 2026 at 01:01)</a>:</h4>
+<p>gfx requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>.</p>
+
+
+
+<a name="597190436"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597190436" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597190436">(May 23 2026 at 01:03)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> Copilot submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#pullrequestreview-4349428770">PR review</a>:</p>
+<blockquote>
+<h2>Pull request overview</h2>
+<blockquote>
+<p>[!NOTE]<br>
+Copilot was unable to run its full agentic suite in this review.</p>
+</blockquote>
+<p>Adds an optimization to inline small, statically-sized <code>array.copy</code> operations in Cranelift to avoid the fixed overhead of the <code>memory_copy</code> libcall, and introduces tests to lock down both codegen shape and runtime semantics.</p>
+<p><strong>Changes:</strong></p>
+<ul>
+<li>Inline-expand constant-length <code>array.copy</code> for small copies (&lt;= 8 elements) into explicit loads+stores with <code>memmove</code> semantics.</li>
+<li>Add runtime GC tests covering element sizes/types, overlap semantics, and the 8/9-element threshold.</li>
+<li>Add a disassembly-based “shape” test to ensure the inline expansion remains stable.</li>
+</ul>
+<h3>Reviewed changes</h3>
+<p>Copilot reviewed 3 out of 3 changed files in this pull request and generated 2 comments.</p>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>tests/misc_testsuite/gc/array-copy-inline.wast</td>
+<td>New runtime tests validating correctness across element sizes, threshold behavior, and overlap (<code>memmove</code>) semantics.</td>
+</tr>
+<tr>
+<td>tests/disas/array-copy-inline.wat</td>
+<td>New disassembly test to lock in the expected inline load-then-store codegen sequence.</td>
+</tr>
+<tr>
+<td>crates/cranelift/src/func_environ.rs</td>
+<td>Implements the inline expansion for small constant-length <code>array.copy</code> and a helper to detect constant lengths.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<p><span aria-label="light bulb" class="emoji emoji-1f4a1" role="img" title="light bulb">:light_bulb:</span> &lt;a href="/bytecodealliance/wasmtime/new/main?filename=.github/instructions/*.instructions.md" class="Link--inTextBlock" target="_blank" rel="noopener noreferrer"&gt;Add Copilot custom instructions&lt;/a&gt; for smarter, more guided reviews. &lt;a href="<a href="https://docs.github.com/en/copilot/customizing-copilot/adding-repository-custom-instructions-for-github-copilot">https://docs.github.com/en/copilot/customizing-copilot/adding-repository-custom-instructions-for-github-copilot</a>" class="Link--inTextBlock" target="_blank" rel="noopener noreferrer"&gt;Learn how to get started&lt;/a&gt;.</p>
+</blockquote>
+
+
+
+<a name="597190437"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597190437" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597190437">(May 23 2026 at 01:03)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> Copilot created <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#discussion_r3291775227">PR review comment</a>:</p>
+<blockquote>
+<p>The doc comment says \"scalar\" <code>array.copy</code>, but the implementation also supports 16-byte elements (v128 via <code>I8X16</code>) and copies f32/f64 by using integer load/store types of the same width. Please adjust the wording to reflect that this is a bitwise copy for fixed-size element widths (including v128), not strictly \"scalar\" in the wasm type sense.</p>
+</blockquote>
+
+
+
+<a name="597190438"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597190438" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597190438">(May 23 2026 at 01:03)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> Copilot created <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#discussion_r3291775220">PR review comment</a>:</p>
+<blockquote>
+<p>The local <code>elem_size</code> shadows the <code>elem_size</code> parameter, which makes the code harder to read and easier to misuse during future edits. Rename the local to something like <code>elem_size_i32</code>/<code>elem_stride</code> (and update uses) to avoid shadowing.<br>
+</p>
+</blockquote>
+
+
+
+<a name="597190736"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597190736" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597190736">(May 23 2026 at 01:06)</a>:</h4>
+<p>gfx updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>.</p>
+
+
+
+<a name="597191245"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597191245" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597191245">(May 23 2026 at 01:13)</a>:</h4>
+<p>gfx updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>.</p>
+
+
+
+<a name="597191378"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597191378" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597191378">(May 23 2026 at 01:14)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> gfx submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#pullrequestreview-4349447870">PR review</a>.</p>
+
+
+
+<a name="597191379"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597191379" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597191379">(May 23 2026 at 01:14)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> gfx created <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#discussion_r3291792540">PR review comment</a>:</p>
+<blockquote>
+<p>Done in 023d5e5 — the local is now <code>stride</code> (and the element count <code>count</code>), which also removes the same shadowing of the <code>n</code> parameter.</p>
+</blockquote>
+
+
+
+<a name="597191381"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597191381" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597191381">(May 23 2026 at 01:14)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> gfx submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#pullrequestreview-4349447961">PR review</a>.</p>
+
+
+
+<a name="597191382"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597191382" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597191382">(May 23 2026 at 01:14)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> gfx created <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#discussion_r3291792585">PR review comment</a>:</p>
+<blockquote>
+<p>Fixed in 023d5e5 — the doc now describes a bitwise copy by element width (<code>f32</code>/<code>f64</code> go through <code>i32</code>/<code>i64</code>, <code>v128</code> through <code>i8x16</code>) instead of calling it "scalar".</p>
+</blockquote>
+
+
+
+<a name="597317230"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597317230" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597317230">(May 23 2026 at 15:34)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#issuecomment-4525817268">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>:</p>
+<blockquote>
+<p>Thanks for this! If you're willing I believe there's a better, more general, but slightly-more-difficult-to-work-with, location for this optimization to be located. Specifically within <code>raw_bulk_memory_operation</code> I think it'd be reasonable to test for the byte length and see if it's a constant. That way this would uniformly handle all constant-length bulk copies rather than just <code>array.copy</code>. Additionally it's also fine to perform "wrong width" loads/stores where, for example, <code>i8x16</code> could be used to load values all the time when the size is &gt; 16 bytes as opposed to only when the array element is <code>v128</code>.</p>
+<p>Does that sound reasonable to you? And would you be interested to move this optimization to there?</p>
+</blockquote>
+
+
+
+<a name="597357835"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597357835" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597357835">(May 24 2026 at 00:44)</a>:</h4>
+<p>gfx updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>.</p>
+
+
+
+<a name="597357839"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597357839" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597357839">(May 24 2026 at 00:44)</a>:</h4>
+<p>gfx <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#issuecomment-4526954722">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>:</p>
+<blockquote>
+<p>Done in d9a6a14467 — moved into <code>raw_bulk_memory_operation</code>, keyed on a constant byte length, so <code>memory.copy</code> and <code>table.copy</code> get it too, not just <code>array.copy</code>. Loads/stores are now width-agnostic (greedy <code>i8x16</code>→<code>i64</code>→…→<code>i8</code>), and <code>BulkOp::MemoryCopy</code> carries entity-appropriate flags (GC corrupt-trap / little+heap / table region; none assume alignment).</p>
+<p>The threshold is now byte-based at 128 B. Measured on aarch64, inline is ~1.7–2.7× faster than the libcall up to 128 B; at 256 B the load-all-then-store-all sequence ties the libcall, so it falls back there. Inlined-copy fuel is charged by byte length to match the libcall.</p>
+</blockquote>
+
+
+
+<a name="597358065"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597358065" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597358065">(May 24 2026 at 00:48)</a>:</h4>
+<p>gfx updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>.</p>
+
+
+
+<a name="597358144"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597358144" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597358144">(May 24 2026 at 00:49)</a>:</h4>
+<p>gfx edited <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>:</p>
+<blockquote>
+<p>Small, constant-length bulk copies — <code>memory.copy</code>, <code>table.copy</code>, and <code>array.copy</code> — currently go through the <code>memory_copy</code> libcall regardless of size. For tiny copies the libcall's fixed per-call cost — a wasm↔host transition plus an indirect call — dominates the actual <code>memmove</code>, so they are far slower than they need to be.</p>
+<p>This PR expands such copies inline, as wide loads followed by stores, when the copy length is a compile-time constant of at most 128 bytes.</p>
+<blockquote>
+<p><strong>Updated after code review</strong> (thanks @alexcrichton): this started out <code>array.copy</code>-specific and element-count-based. Following the review suggestion it now lives in <code>raw_bulk_memory_operation</code>, keyed on the constant <em>byte</em> length, so it covers all constant-length bulk copies uniformly — and it uses width-agnostic accesses (greedy <code>i8x16</code> → <code>i64</code> → … → <code>i8</code>) instead of one load/store per element.</p>
+</blockquote>
+<h2>Speed</h2>
+<p><code>i32</code> array copies, ns per copy, release build, aarch64 (Apple M3 Pro), lower is better:</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">bytes</th>
+<th style="text-align: right;">libcall</th>
+<th style="text-align: right;">inline</th>
+<th style="text-align: right;">speedup</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">3.9</td>
+<td style="text-align: right;">1.9</td>
+<td style="text-align: right;"><strong>2.0×</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">4.8</td>
+<td style="text-align: right;">2.0</td>
+<td style="text-align: right;"><strong>2.4×</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">5.2</td>
+<td style="text-align: right;">2.4</td>
+<td style="text-align: right;"><strong>2.2×</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">4.1</td>
+<td style="text-align: right;">2.3</td>
+<td style="text-align: right;"><strong>1.8×</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">4.6</td>
+<td style="text-align: right;">2.7</td>
+<td style="text-align: right;"><strong>1.7×</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">5.9</td>
+<td style="text-align: right;">5.9</td>
+<td style="text-align: right;">1.0× (libcall)</td>
+</tr>
+</tbody>
+</table>
+<p>Because the inline path is width-agnostic, <code>i8</code>/<code>i16</code> arrays and <code>memory.copy</code> of the same byte length behave the same.</p>
+<p>&lt;details&gt;&lt;summary&gt;Methodology&lt;/summary&gt;</p>
+<p>ns per copy = wall time / iteration count for a function that runs ~1e6 copies in a loop (so the per-call host↔wasm transition and the allocation are amortized away), taking the median of several repetitions. The "libcall" column uses a dynamic length (forcing the libcall) and the "inline" column a constant length, in the same module at the same size. A small fixed per-iteration readback keeps the copy from being optimized away, which puts a ~2 ns floor on the absolute numbers; the inline-vs-libcall ratio is the signal.<br>
+&lt;/details&gt;</p>
+<h2>Correctness &amp; scope</h2>
+<ul>
+<li>The byte range is covered greedily with the widest convenient access; <strong>every chunk is loaded before any is stored</strong>, so overlapping source/destination ranges keep <code>memmove</code> semantics.</li>
+<li><code>BulkOp::MemoryCopy</code> carries entity-appropriate access flags (GC-heap corruption trap for arrays, little-endian heap region for linear memory, table region for tables); none assume alignment, since wide chunks may straddle element boundaries.</li>
+<li>Dynamic lengths, and constant lengths above 128 bytes, keep the libcall, whose <code>memmove</code> amortizes the call cost — past 128 bytes inline merely ties it (see the 256-byte row). Reference-typed array elements and lazily-initialized funcref tables still take the per-element loop, unchanged.</li>
+<li>The 128-byte bound is from measurement: inline wins by ~1.7–2.7× through 128 bytes and ties the libcall by 256, where the cost of loading every chunk before storing catches up.</li>
+<li>Fuel for an inlined copy is charged by byte length, matching the libcall.</li>
+</ul>
+<h2>Tests</h2>
+<ul>
+<li><code>tests/disas/array-copy-inline.wat</code> and <code>tests/disas/memory-copy-inline.wat</code> lock the codegen (the libcall is gone; wide loads-then-stores remain, including the greedy <code>i8x16</code> + <code>i64</code> + <code>i32</code> split).</li>
+<li><code>tests/misc_testsuite/gc/array-copy-inline.wast</code> checks correctness for every element width (i8/i16/i32/i64/f32/f64/v128), the threshold boundary (16 inline vs 17 libcall <code>i64</code>s, i.e. 128 vs 136 bytes), and overlapping copies; the wast harness runs it across the DRC, null, and copying collectors.</li>
+</ul>
+<p><span aria-label="robot" class="emoji emoji-1f916" role="img" title="robot">:robot:</span> Generated with <a href="https://claude.com/claude-code">Claude Code</a><br>
+</p>
+</blockquote>
+
+
+
+<a name="597358348"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597358348" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597358348">(May 24 2026 at 00:52)</a>:</h4>
+<p>gfx edited <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>:</p>
+<blockquote>
+<p>Small, constant-length bulk copies — <code>memory.copy</code>, <code>table.copy</code>, and <code>array.copy</code> — currently go through the <code>memory_copy</code> libcall regardless of size. For tiny copies the libcall's fixed per-call cost — a wasm↔host transition plus an indirect call — dominates the actual <code>memmove</code>, so they are far slower than they need to be.</p>
+<p>This PR expands such copies inline, as wide loads followed by stores, when the copy length is a compile-time constant of at most 128 bytes.</p>
+<blockquote>
+<p><strong>Updated after code review</strong> (thanks @alexcrichton): this started out <code>array.copy</code>-specific and element-count-based. Following the review suggestion it now lives in <code>raw_bulk_memory_operation</code>, keyed on the constant <em>byte</em> length, so it covers all constant-length bulk copies uniformly — and it uses width-agnostic accesses (greedy <code>i8x16</code> → <code>i64</code> → … → <code>i8</code>) instead of one load/store per element.</p>
+</blockquote>
+<h2>Speed</h2>
+<p><code>i32</code> array copies, ns per copy, release build, aarch64 (Apple M3 Pro), lower is better:</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">bytes</th>
+<th style="text-align: right;">libcall</th>
+<th style="text-align: right;">inline</th>
+<th style="text-align: right;">speedup</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">3.9</td>
+<td style="text-align: right;">1.9</td>
+<td style="text-align: right;"><strong>2.0×</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">4.8</td>
+<td style="text-align: right;">2.0</td>
+<td style="text-align: right;"><strong>2.4×</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">5.2</td>
+<td style="text-align: right;">2.4</td>
+<td style="text-align: right;"><strong>2.2×</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">4.1</td>
+<td style="text-align: right;">2.3</td>
+<td style="text-align: right;"><strong>1.8×</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">4.6</td>
+<td style="text-align: right;">2.7</td>
+<td style="text-align: right;"><strong>1.7×</strong></td>
+</tr>
+<tr>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">5.9</td>
+<td style="text-align: right;">5.9</td>
+<td style="text-align: right;">1.0× (libcall)</td>
+</tr>
+</tbody>
+</table>
+<p>Because the inline path is width-agnostic, <code>i8</code>/<code>i16</code> arrays and <code>memory.copy</code> of the same byte length behave the same.</p>
+<p>&lt;details&gt;&lt;summary&gt;Methodology&lt;/summary&gt;</p>
+<p>ns per copy = wall time / iteration count for a function that runs ~1e6 copies in a loop (so the per-call host↔wasm transition and the allocation are amortized away), taking the median of several repetitions. The "libcall" column uses a dynamic length (forcing the libcall) and the "inline" column a constant length, in the same module at the same size. A small fixed per-iteration readback keeps the copy from being optimized away, which puts a ~2 ns floor on the absolute numbers; the inline-vs-libcall ratio is the signal.<br>
+&lt;/details&gt;</p>
+<h2>Correctness &amp; scope</h2>
+<ul>
+<li>The byte range is covered greedily with the widest convenient access; <strong>every chunk is loaded before any is stored</strong>, so overlapping source/destination ranges keep <code>memmove</code> semantics.</li>
+<li><code>BulkOp::MemoryCopy</code> carries entity-appropriate access flags (GC-heap corruption trap for arrays, little-endian heap region for linear memory, table region for tables); none assume alignment, since wide chunks may straddle element boundaries.</li>
+<li>The length must be a compile-time constant: the expansion is fully unrolled, branch-free straight-line code, so the chunk widths and offsets are fixed when the code is emitted. Dynamic lengths (and constant lengths above 128 bytes) keep the libcall, whose <code>memmove</code> is the right tool when the length is unknown or large — past 128 bytes inline merely ties it (see the 256-byte row). Reference-typed array elements and lazily-initialized funcref tables still take the per-element loop, unchanged.</li>
+<li>The 128-byte bound is from measurement: inline wins by ~1.7–2.7× through 128 bytes and ties the libcall by 256, where the cost of loading every chunk before storing catches up.</li>
+<li>Fuel for an inlined copy is charged by byte length, matching the libcall.</li>
+</ul>
+<h2>Tests</h2>
+<ul>
+<li><code>tests/disas/array-copy-inline.wat</code> and <code>tests/disas/memory-copy-inline.wat</code> lock the codegen (the libcall is gone; wide loads-then-stores remain, including the greedy <code>i8x16</code> + <code>i64</code> + <code>i32</code> split).</li>
+<li><code>tests/misc_testsuite/gc/array-copy-inline.wast</code> checks correctness for every element width (i8/i16/i32/i64/f32/f64/v128), the threshold boundary (16 inline vs 17 libcall <code>i64</code>s, i.e. 128 vs 136 bytes), and overlapping copies; the wast harness runs it across the DRC, null, and copying collectors.</li>
+</ul>
+<p><span aria-label="robot" class="emoji emoji-1f916" role="img" title="robot">:robot:</span> Generated with <a href="https://claude.com/claude-code">Claude Code</a></p>
+</blockquote>
+
+
+
+<a name="597358569"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597358569" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597358569">(May 24 2026 at 00:58)</a>:</h4>
+<p>gfx updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>.</p>
+
+
+
+<a name="597358808"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597358808" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597358808">(May 24 2026 at 01:02)</a>:</h4>
+<p>gfx updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>.</p>
+
+
+
+<a name="597359661"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597359661" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597359661">(May 24 2026 at 01:20)</a>:</h4>
+<p>gfx edited <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>.</p>
+
+
+
+<a name="597392812"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597392812" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597392812">(May 24 2026 at 11:29)</a>:</h4>
+<p>gfx <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#issuecomment-4528379667">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>:</p>
+<blockquote>
+<ul>
+<li>[x] improve the code based on the review</li>
+<li>[x] read the AI guidline of BA</li>
+</ul>
+</blockquote>
+
+
+
+<a name="597392840"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597392840" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597392840">(May 24 2026 at 11:29)</a>:</h4>
+<p>gfx deleted a <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#issuecomment-4528379667">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>:</p>
+<blockquote>
+<ul>
+<li>[x] improve the code based on the review</li>
+<li>[x] read the AI guidline of BA</li>
+</ul>
+</blockquote>
+
+
+
+<a name="597405928"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597405928" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597405928">(May 24 2026 at 14:58)</a>:</h4>
+<p>alexcrichton unassigned cfallin from <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460 cranelift: inline small constant-length <code>array.copy</code> for performance</a>.</p>
+
+
+
+<a name="597405929"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597405929" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597405929">(May 24 2026 at 14:58)</a>:</h4>
+<p>alexcrichton requested <a href="https://github.com/alexcrichton">alexcrichton</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>.</p>
+
+
+
+<a name="597406624"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597406624" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597406624">(May 24 2026 at 15:09)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#pullrequestreview-4353002824">PR review</a>.</p>
+
+
+
+<a name="597406626"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597406626" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597406626">(May 24 2026 at 15:09)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#discussion_r3294847631">PR review comment</a>:</p>
+<blockquote>
+<p>One thing that I'd be a bit worried about here is that types are ignored and the operations aren't actually performed, this is just plumbing <code>iconst</code> values. I think that this'll require actually handling the input/output types of the operation, for example <code>ireduce</code> would alter the value of a immediate with the upper bits set.</p>
+<p>One possible alternative to this, however, is to plumb the raw length of the operation through the <code>BulkOp::MemoryCopy</code> value. It's already a bit unfortunate to duplicate const-eval here and while understandable we might be able to sidestep it. Ideally, for example, this would purely match <code>iconst</code> and nothing else, and the need to match <code>uextend</code>/<code>ireduce</code>/<code>imul_imm</code> is due to the code generated here otherwise. If, though, the original length were plumbed (as-is present in wasm) through the <code>BulkOp::MemoryCopy</code> that might mean that <code>iconst</code> would only be necessary here.</p>
+<p>To handle that, could you see if this could be updated to only match <code>iconst</code> and then the necessary variable plumbed through to here? Failing that, though, I think this'll need to be a more complicated implementation which handles the types that are happening in each operation.</p>
+</blockquote>
+
+
+
+<a name="597406627"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597406627" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597406627">(May 24 2026 at 15:09)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#discussion_r3294841442">PR review comment</a>:</p>
+<blockquote>
+<p>For this I'd recommend having <code>if bytes &lt;= INLINE_COPY_MAX_BYTES</code> with perhaps an early-return of 0 to avoid generating any code. (using a range with <code>contains</code> feels a bit overkill here)</p>
+</blockquote>
+
+
+
+<a name="597406628"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597406628" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597406628">(May 24 2026 at 15:09)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#discussion_r3294849340">PR review comment</a>:</p>
+<blockquote>
+<p>Threading <code>flags</code> here can be a bit finnicky -- would you be up for benchmarking without threading <code>flags</code> to here? For example using <code>MemFlagsData::trusted()</code> here for loads/stores. While it makes sense that we could do it and theoretically optimize further I'd ideally like to start simpler if we can and skip passing <code>flags</code> around. If there's a noticable performance boost threading <code>flags</code> around, though, that's a different situation to be in.</p>
+</blockquote>
+
+
+
+<a name="597721895"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597721895" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597721895">(May 26 2026 at 02:51)</a>:</h4>
+<p>gfx updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>.</p>
+
+
+
+<a name="597721923"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597721923" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597721923">(May 26 2026 at 02:51)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> gfx submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#pullrequestreview-4360086852">PR review</a>.</p>
+
+
+
+<a name="597721924"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597721924" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597721924">(May 26 2026 at 02:51)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> gfx created <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#discussion_r3300900933">PR review comment</a>:</p>
+<blockquote>
+<p>Done in fa4a65f: the gate is now <code>bytes &lt;= INLINE_COPY_MAX_BYTES</code>. The zero-length case falls out naturally — <code>emit_inline_memcpy(0)</code> decomposes into zero chunks, so the load/store loops emit nothing.</p>
+</blockquote>
+
+
+
+<a name="597721934"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597721934" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597721934">(May 26 2026 at 02:51)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> gfx submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#pullrequestreview-4360087138">PR review</a>.</p>
+
+
+
+<a name="597721935"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597721935" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597721935">(May 26 2026 at 02:51)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> gfx created <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#discussion_r3300901132">PR review comment</a>:</p>
+<blockquote>
+<p>Done in fa4a65f: plumbed the wasm length through <code>BulkOp::MemoryCopy { const_len: Option&lt;u64&gt; }</code>, so <code>value_as_const_int</code> now matches only <code>iconst</code> (no more <code>uextend</code>/<code>ireduce</code>/<code>imul_imm</code>). The byte length is computed in Rust at the call site as <code>count.checked_mul(elem_size)</code>.</p>
+</blockquote>
+
+
+
+<a name="597721940"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597721940" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597721940">(May 26 2026 at 02:51)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> gfx submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#pullrequestreview-4360087197">PR review</a>.</p>
+
+
+
+<a name="597721941"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597721941" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597721941">(May 26 2026 at 02:51)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> gfx created <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#discussion_r3300901177">PR review comment</a>:</p>
+<blockquote>
+<p>Done in fa4a65f: dropped the threaded flags; <code>emit_inline_memcpy</code> now uses <code>MemFlagsData::trusted()</code>. Verified on x86_64 + aarch64 that the asm is identical (movdqu / ldr q). Each load only feeds its paired store, so the x64 <code>aligned</code> flag never lets a load fold into an alignment-requiring SSE operand — there is a comment in the body explaining this.</p>
+</blockquote>
+
+
+
+<a name="597722131"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597722131" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597722131">(May 26 2026 at 02:54)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> gfx edited <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#discussion_r3300901177">PR review comment</a>.</p>
+
+
+
+<a name="597908880"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597908880" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597908880">(May 26 2026 at 17:56)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#pullrequestreview-4366210711">PR review</a>:</p>
+<blockquote>
+<p>Looks great, thanks again for this!</p>
+</blockquote>
+
+
+
+<a name="597908904"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597908904" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597908904">(May 26 2026 at 17:56)</a>:</h4>
+<p>alexcrichton added <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460 cranelift: inline small constant-length <code>array.copy</code> for performance</a> to the merge queue.</p>
+
+
+
+<a name="597936172"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597936172" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597936172">(May 26 2026 at 20:15)</a>:</h4>
+<p>github-merge-queue[bot] removed <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460 cranelift: inline small constant-length <code>array.copy</code> for performance</a> from the merge queue.</p>
+
+
+
+<a name="597951349"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597951349" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597951349">(May 26 2026 at 21:55)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#issuecomment-4549307125">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>:</p>
+<blockquote>
+<p>Locally the test is failing as:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">running</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="n">test</span>
+<span class="n">test</span><span class="w"> </span><span class="n">fuel</span><span class="p">::</span><span class="n">craneliftpulley_run</span><span class="w"> </span><span class="o">..</span><span class="p">.</span><span class="w"> </span><span class="n">FAILED</span>
+
+<span class="n">failures</span><span class="p">:</span>
+
+<span class="o">----</span><span class="w"> </span><span class="n">fuel</span><span class="p">::</span><span class="n">craneliftpulley_run</span><span class="w"> </span><span class="n">stdout</span><span class="w"> </span><span class="o">----</span>
+
+<span class="n">thread</span><span class="w"> </span><span class="o">'&lt;</span><span class="n">unnamed</span><span class="o">&gt;'</span><span class="w"> </span><span class="p">(</span><span class="mi">3621049</span><span class="p">)</span><span class="w"> </span><span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">cranelift</span><span class="o">/</span><span class="n">codegen</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">isa</span><span class="o">/</span><span class="n">pulley_shared</span><span class="o">/</span><span class="n">inst</span><span class="o">/</span><span class="n">emit</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">469</span><span class="p">:</span><span class="mi">13</span><span class="p">:</span>
+<span class="nc">assertion</span><span class="w"> </span><span class="err">`</span><span class="n">left</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">right</span><span class="err">`</span><span class="w"> </span><span class="n">failed</span>
+<span class="w">  </span><span class="n">left</span><span class="p">:</span><span class="w"> </span><span class="nc">Big</span>
+<span class="w"> </span><span class="n">right</span><span class="p">:</span><span class="w"> </span><span class="nc">Little</span>
+<span class="n">note</span><span class="p">:</span><span class="w"> </span><span class="nc">run</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="err">`</span><span class="n">RUST_BACKTRACE</span><span class="o">=</span><span class="mi">1</span><span class="err">`</span><span class="w"> </span><span class="n">environment</span><span class="w"> </span><span class="n">variable</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">display</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="n">backtrace</span>
+
+
+<span class="n">failures</span><span class="p">:</span>
+<span class="w">    </span><span class="nc">fuel</span><span class="p">::</span><span class="n">craneliftpulley_run</span>
+</code></pre></div>
+<p>I'll try to dig in tomorrow to take a look</p>
+</blockquote>
+
+
+
+<a name="597951447"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597951447" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597951447">(May 26 2026 at 21:56)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#issuecomment-4549316796">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>:</p>
+<blockquote>
+<p>In the meantime, if you're willing to test, unconditionally doing little endian loads/stores would probably fix this since I think the issue is Pulley doesn't implement big-endian v128 loads/stores. I think at least, would still need to confirm.</p>
+</blockquote>
+
+
+
+<a name="597982524"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597982524" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597982524">(May 27 2026 at 02:30)</a>:</h4>
+<p>gfx updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>.</p>
+
+
+
+<a name="597982987"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597982987" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597982987">(May 27 2026 at 02:34)</a>:</h4>
+<p>gfx <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#issuecomment-4550740736">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>:</p>
+<blockquote>
+<p>Thanks! Added a <code>pulley64be</code> regression test and fixed it in 20708699b4 (red-green). Pinning the inline chunk flags to <code>Little</code> is safe since each load feeds only its paired store and is never observed as a number.</p>
+</blockquote>
+
+
+
+<a name="597983127"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/597983127" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#597983127">(May 27 2026 at 02:36)</a>:</h4>
+<p>gfx edited a <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#issuecomment-4550740736">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>:</p>
+<blockquote>
+<p>Thanks! Added a <code>pulley64be</code> regression test and fixed it in 20708699b4 (with red-green TDD). Pinning the inline chunk flags to <code>Little</code> is safe since each load feeds only its paired store and is never observed as a number.</p>
+</blockquote>
+
+
+
+<a name="598089491"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/598089491" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#598089491">(May 27 2026 at 13:33)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13460#pullrequestreview-4372751273">PR review</a>.</p>
+
+
+
+<a name="598089541"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/598089541" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#598089541">(May 27 2026 at 13:33)</a>:</h4>
+<p>alexcrichton added <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460 cranelift: inline small constant-length <code>array.copy</code> for performance</a> to the merge queue.</p>
+
+
+
+<a name="598096296"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/598096296" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#598096296">(May 27 2026 at 13:59)</a>:</h4>
+<p><span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span> alexcrichton merged <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460</a>.</p>
+
+
+
+<a name="598096299"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313460%20cranelift%3A%20inline%20small%20constant-len.../near/598096299" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313460.20cranelift.3A.20inline.20small.20constant-len.2E.2E.2E.html#598096299">(May 27 2026 at 13:59)</a>:</h4>
+<p>alexcrichton removed <a href="https://github.com/bytecodealliance/wasmtime/pull/13460">PR #13460 cranelift: inline small constant-length <code>array.copy</code> for performance</a> from the merge queue.</p>
+
+
+
+<hr><p>Last updated: Jul 02 2026 at 22:22 UTC</p>
+</html>
