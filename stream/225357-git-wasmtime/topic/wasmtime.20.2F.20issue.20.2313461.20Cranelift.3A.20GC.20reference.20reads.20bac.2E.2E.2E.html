@@ -1,0 +1,381 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13461 Cranelift: GC reference reads bac... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313461.20Cranelift.3A.20GC.20reference.20reads.20bac.2E.2E.2E.html">wasmtime / issue #13461 Cranelift: GC reference reads bac...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="597192377"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313461%20Cranelift%3A%20GC%20reference%20reads%20bac.../near/597192377" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313461.20Cranelift.3A.20GC.20reference.20reads.20bac.2E.2E.2E.html#597192377">(May 23 2026 at 01:27)</a>:</h4>
+<p>gfx opened <a href="https://github.com/bytecodealliance/wasmtime/issues/13461">issue #13461</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p>A Wasm GC <code>(ref null $t)</code> value that is live across a call safepoint can read back as<br>
+<strong>null</strong> after the call, making a <code>ref.as_non_null</code> (or <code>struct.get</code>/<code>array.get</code>) on a<br>
+provably non-null value trap with <code>wasm trap: null reference</code>. The same module runs<br>
+correctly on 44.0.0.</p>
+<p><code>git bisect</code> (over <code>v44.0.1..v45.0.0</code>) points at:</p>
+<blockquote>
+<p><strong>24938c41630e2662ebcdb0a37137f02fd48c4d07</strong> — <em>"Handle alias values in <code>SafepointSpiller::rewrite_use</code>"</em> (#13228)</p>
+</blockquote>
+<p>That PR makes the safepoint spiller reload aliased needs-stack-map values from their<br>
+stack slot after safepoints (needed for the new moving collector). For the affected<br>
+value, the post-safepoint reload appears to read a slot that was never spilled, so the<br>
+use sees <code>null</code>.</p>
+<ul>
+<li>
+<p>Reproduces with <strong>every collector</strong> (<code>drc</code> / <code>null</code> / <code>copying</code>) and at **every<br>
+  Cranelift opt level**, because the reload code is emitted unconditionally.</p>
+</li>
+<li>
+<p>The follow-up #13449 (<em>"include every SSA value bound to a variable in stack maps"</em>)<br>
+  does <strong>not</strong> fix this case.</p>
+</li>
+<li>
+<p><strong>Still present on <code>main</code></strong> — tested <code>fa50c6a150</code> (46.0.0-dev).</p>
+</li>
+</ul>
+<h2>Reproduction</h2>
+<p>A self-contained regression test (<code>.wast</code>) is on this branch:</p>
+<p><strong>https://github.com/wado-lang/wasmtime/blob/gfx/repro-gc-safepoint-reload-null/tests/misc_testsuite/gc/safepoint-reload-aliased-ref-null.wast</strong></p>
+<p>It is a standard <code>tests/misc_testsuite/gc/</code> test — <code>(assert_return (invoke "run"))</code> on a<br>
+GC module. <code>run</code> returns without trapping on 44.0.0 and traps with <code>null reference</code> on<br>
+45.0.0 and <code>main</code>.</p>
+<p>You can also run the module directly:</p>
+<div class="codehilite" data-code-language="Bash Session"><pre><span></span><code><span class="gp">$ </span><span class="nv">FEATURES</span><span class="o">=</span><span class="s2">"-Wgc=y -Wfunction-references=y -Wwide-arithmetic=y -Wsimd=y -Wthreads=y -Wreference-types=y"</span>
+
+<span class="gp"># </span><span class="m">44</span>.0.0<span class="w"> </span>—<span class="w"> </span>OK<span class="w"> </span><span class="o">(</span><span class="nb">exit</span><span class="w"> </span><span class="m">0</span><span class="o">)</span>
+<span class="gp">$ </span>wasmtime<span class="w"> </span>run<span class="w"> </span><span class="nv">$FEATURES</span><span class="w"> </span>--invoke<span class="w"> </span>run<span class="w"> </span>repro.wasm
+
+<span class="gp"># </span><span class="m">45</span>.0.0<span class="w"> </span>/<span class="w"> </span>main<span class="w"> </span>—<span class="w"> </span>traps
+<span class="gp">$ </span>wasmtime<span class="w"> </span>run<span class="w"> </span><span class="nv">$FEATURES</span><span class="w"> </span>--invoke<span class="w"> </span>run<span class="w"> </span>repro.wasm
+<span class="go">...</span>
+<span class="go">    wasm trap: null reference</span>
+</code></pre></div>
+<p>The module was produced by a real frontend (the <a href="https://github.com/wado-lang/wado">Wado</a><br>
+compiler): it JSON-deserializes a two-field struct in a loop. The trapping<br>
+<code>ref.as_non_null</code> reads a struct-access object that is built with <code>struct.new</code> (so it<br>
+cannot be null) and is held in a local that is live across the call fetching the next<br>
+field; on the second loop iteration the reloaded local reads back null. The module passes<br>
+<code>wasm-tools validate --features all</code>.</p>
+<h3>On minimization</h3>
+<p>I could not reduce this with <code>wasm-tools shrink</code> (0% — the module is already DCE'd and the<br>
+miscompile is register-allocation-sensitive, so any structural mutation hides it). Happy<br>
+to provide the source program or help with a CLIF-level reduction.</p>
+<h2>Environment</h2>
+<ul>
+<li>Cranelift/wasmtime 45.0.0 (<code>377cd917a</code>) and <code>main</code> (<code>fa50c6a150</code>, 46.0.0-dev)</li>
+<li>host: aarch64-apple-darwin, Cranelift backend</li>
+<li>first bad commit: <code>24938c41630e2662ebcdb0a37137f02fd48c4d07</code> (#13228)<br>
+</li>
+</ul>
+</blockquote>
+
+
+
+<a name="597192933"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313461%20Cranelift%3A%20GC%20reference%20reads%20bac.../near/597192933" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313461.20Cranelift.3A.20GC.20reference.20reads.20bac.2E.2E.2E.html#597192933">(May 23 2026 at 01:34)</a>:</h4>
+<p>gfx edited <a href="https://github.com/bytecodealliance/wasmtime/issues/13461">issue #13461</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p>A Wasm GC <code>(ref null $t)</code> value that is live across a call safepoint can read back as<br>
+<strong>null</strong> after the call, making a <code>ref.as_non_null</code> (or <code>struct.get</code>/<code>array.get</code>) on a<br>
+provably non-null value trap with <code>wasm trap: null reference</code>. The same module runs<br>
+correctly on 44.0.0.</p>
+<p><code>git bisect</code> (over <code>v44.0.1..v45.0.0</code>) points at:</p>
+<blockquote>
+<p><strong>24938c41630e2662ebcdb0a37137f02fd48c4d07</strong> — <em>"Handle alias values in <code>SafepointSpiller::rewrite_use</code>"</em> (#13228)</p>
+</blockquote>
+<p>That PR makes the safepoint spiller reload aliased needs-stack-map values from their<br>
+stack slot after safepoints (needed for the new moving collector). For the affected<br>
+value, the post-safepoint reload appears to read a slot that was never spilled, so the<br>
+use sees <code>null</code>.</p>
+<ul>
+<li>
+<p>Reproduces with <strong>every collector</strong> (<code>drc</code> / <code>null</code> / <code>copying</code>) and at **every<br>
+  Cranelift opt level**, because the reload code is emitted unconditionally.</p>
+</li>
+<li>
+<p>The follow-up #13449 (<em>"include every SSA value bound to a variable in stack maps"</em>)<br>
+  does <strong>not</strong> fix this case.</p>
+</li>
+<li>
+<p><strong>Still present on <code>main</code></strong> — tested <code>fa50c6a150</code> (46.0.0-dev).</p>
+</li>
+</ul>
+<h2>Reproduction</h2>
+<p>A self-contained regression test (<code>.wast</code>) is on this branch:</p>
+<p><strong>https://github.com/wado-lang/wasmtime/blob/gfx/repro-gc-safepoint-reload-null/tests/misc_testsuite/gc/safepoint-reload-aliased-ref-null.wast</strong></p>
+<p>It is a standard <code>tests/misc_testsuite/gc/</code> test — <code>(assert_return (invoke "run"))</code> on a<br>
+GC module. <code>run</code> returns without trapping on 44.0.0 and traps with <code>null reference</code> on<br>
+45.0.0 and <code>main</code>.</p>
+<p>You can also run the module directly:</p>
+<div class="codehilite" data-code-language="Bash Session"><pre><span></span><code><span class="gp">$ </span><span class="nv">FEATURES</span><span class="o">=</span><span class="s2">"-Wgc=y -Wfunction-references=y -Wwide-arithmetic=y -Wsimd=y -Wthreads=y -Wreference-types=y"</span>
+
+<span class="gp"># </span><span class="m">44</span>.0.0<span class="w"> </span>—<span class="w"> </span>OK<span class="w"> </span><span class="o">(</span><span class="nb">exit</span><span class="w"> </span><span class="m">0</span><span class="o">)</span>
+<span class="gp">$ </span>wasmtime<span class="w"> </span>run<span class="w"> </span><span class="nv">$FEATURES</span><span class="w"> </span>--invoke<span class="w"> </span>run<span class="w"> </span>repro.wasm
+
+<span class="gp"># </span><span class="m">45</span>.0.0<span class="w"> </span>/<span class="w"> </span>main<span class="w"> </span>—<span class="w"> </span>traps
+<span class="gp">$ </span>wasmtime<span class="w"> </span>run<span class="w"> </span><span class="nv">$FEATURES</span><span class="w"> </span>--invoke<span class="w"> </span>run<span class="w"> </span>repro.wasm
+<span class="go">...</span>
+<span class="go">    wasm trap: null reference</span>
+</code></pre></div>
+<p>The module was produced by a real frontend (the <a href="https://github.com/wado-lang/wado">Wado</a><br>
+compiler): it JSON-deserializes a two-field struct in a loop. The trapping<br>
+<code>ref.as_non_null</code> reads a struct-access object that is built with <code>struct.new</code> (so it<br>
+cannot be null) and is held in a local that is live across the call fetching the next<br>
+field; on the second loop iteration the reloaded local reads back null. The module passes<br>
+<code>wasm-tools validate --features all</code>.</p>
+<h3>On minimization</h3>
+<p>I could not reduce this with <code>wasm-tools shrink</code> (0% — the module is already DCE'd and the<br>
+miscompile is register-allocation-sensitive, so any structural mutation might hide it). Happy<br>
+to provide the source program or help with a CLIF-level reduction.</p>
+<h2>Environment</h2>
+<ul>
+<li>Cranelift/wasmtime 45.0.0 (<code>377cd917a</code>) and <code>main</code> (<code>fa50c6a150</code>, 46.0.0-dev)</li>
+<li>host: aarch64-apple-darwin, Cranelift backend</li>
+<li>first bad commit: <code>24938c41630e2662ebcdb0a37137f02fd48c4d07</code> (#13228)<br>
+</li>
+</ul>
+</blockquote>
+
+
+
+<a name="597317296"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313461%20Cranelift%3A%20GC%20reference%20reads%20bac.../near/597317296" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313461.20Cranelift.3A.20GC.20reference.20reads.20bac.2E.2E.2E.html#597317296">(May 23 2026 at 15:35)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasm-proposal:gc label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13461">Issue #13461</a>.</p>
+
+
+
+<a name="597317298"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313461%20Cranelift%3A%20GC%20reference%20reads%20bac.../near/597317298" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313461.20Cranelift.3A.20GC.20reference.20reads.20bac.2E.2E.2E.html#597317298">(May 23 2026 at 15:35)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/13461#issuecomment-4525820267">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13461">issue #13461</a>:</p>
+<blockquote>
+<p>cc @fitzgen </p>
+</blockquote>
+
+
+
+<a name="597339269"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313461%20Cranelift%3A%20GC%20reference%20reads%20bac.../near/597339269" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313461.20Cranelift.3A.20GC.20reference.20reads.20bac.2E.2E.2E.html#597339269">(May 23 2026 at 20:33)</a>:</h4>
+<p>vouillon <a href="https://github.com/bytecodealliance/wasmtime/issues/13461#issuecomment-4526461187">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13461">issue #13461</a>:</p>
+<blockquote>
+<p>Claude suggests to swap these two steps:</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/fa50c6a150d4cb9aebaa82e95f739aa97b3fb76c/cranelift/frontend/src/frontend/safepoints.rs#L762-L776">https://github.com/bytecodealliance/wasmtime/blob/fa50c6a150d4cb9aebaa82e95f739aa97b3fb76c/cranelift/frontend/src/frontend/safepoints.rs#L762-L776</a></p>
+<p>The spiller's stack-slot allocator reuses slots via a free-list. The reuse  invariant is: a slot freed at a def can only be handed back out to values  processed strictly later in the pass (= strictly earlier in program order),  so liveness guarantees no overlap. Per-instruction the pass currently runs  <code>rewrite_def</code> → <code>rewrite_safepoint</code> → <code>rewrite_use</code>.</p>
+<p>That order breaks the invariant whenever a single instruction is both a  safepoint and the def of a needs-stack-map value (e.g. <code>v_def = call $alloc</code>).  <code>rewrite_def</code> frees <code>v_def</code>'s slot into the pool, then <code>rewrite_safepoint</code> requests   slots for everything live across the call; any live-across value that  doesn't yet have a slot pops <code>v_def</code>'s just-freed slot. The IR ends up storing  <code>v_def</code> into a slot that another live-across value is also reading from, and in   a loop the next iteration's reload returns <code>v_def</code> instead of the original  value — manifesting as <code>wasm trap: null</code> reference on <code>ref.as_non_null</code>.</p>
+<p>The bug pre-existed #13228; that commit only made it observable by rewriting  aliased uses into <code>stack_loads</code> instead of leaving them as direct register  reads.</p>
+<p>Fix: do <code>rewrite_safepoint</code> before <code>rewrite_def</code> so live-across slots are  reserved before <code>v_def</code>'s slot is returned to the pool. The two steps commute  (disjoint state: stack-map metadata vs. inserting a <code>stack_store</code>), and  <code>rewrite_def</code>'s freed slot then only becomes available to values processed  later in the pass, restoring the invariant.<br>
+</p>
+</blockquote>
+
+
+
+<a name="597340164"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313461%20Cranelift%3A%20GC%20reference%20reads%20bac.../near/597340164" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313461.20Cranelift.3A.20GC.20reference.20reads.20bac.2E.2E.2E.html#597340164">(May 23 2026 at 20:45)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/13461#issuecomment-4526486319">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13461">issue #13461</a>:</p>
+<blockquote>
+<blockquote>
+<p>Claude suggests to swap these two steps:</p>
+</blockquote>
+<p>Hi @vouillon -- without commenting on the rest of your message, <em>please do not do this</em>. Our <a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">AI tool usage policy</a> requires a human in the loop, and copying/pasting something straight from your agent is <em>explicitly</em> against the spirit of our policy. We are talking to <em>you</em>, and <em>you</em> take responsibility for everything you say and all code that you post here. If you do not have enough of a solid grasp on your contributions to speak yourself about them, but have to transparently delegate to your agent, then that is a good sign that you should spend more time understanding it yourself first. (You are of course free to use an agent internally; but we interact with <em>you</em> only.) Doing otherwise is an "extractive contribution" per our policy: it says that you don't want to bother parsing and working through details but just want to throw that work at us. Thanks!</p>
+</blockquote>
+
+
+
+<a name="597344709"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313461%20Cranelift%3A%20GC%20reference%20reads%20bac.../near/597344709" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313461.20Cranelift.3A.20GC.20reference.20reads.20bac.2E.2E.2E.html#597344709">(May 23 2026 at 22:08)</a>:</h4>
+<p>vouillon <a href="https://github.com/bytecodealliance/wasmtime/issues/13461#issuecomment-4526650743">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13461">issue #13461</a>:</p>
+<blockquote>
+<blockquote>
+<blockquote>
+<p>Claude suggests to swap these two steps:</p>
+</blockquote>
+<p>Hi <a href="https://github.com/vouillon">@vouillon</a> -- without commenting on the rest of your message, _please do not do this_. Our <a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">AI tool usage policy</a> requires a human in the loop, and copying/pasting something straight from your agent is _explicitly_ against the spirit of our policy. We are talking to _you_, and _you_ take responsibility for everything you say and all code that you post here. If you do not have enough of a solid grasp on your contributions to speak yourself about them, but have to transparently delegate to your agent, then that is a good sign that you should spend more time understanding it yourself first. (You are of course free to use an agent internally; but we interact with _you_ only.) Doing otherwise is an "extractive contribution" per our policy: it says that you don't want to bother parsing and working through details but just want to throw that work at us. Thanks!</p>
+</blockquote>
+<p>Sorry, I should have phrased this differently, and should have been clearer.  This change fixes the issue, and does not seem to break anything, including a quite large test suite with which I found two other issues (#13449  and #13450). I have also read the AI-generated explanation, and it makes a lot of sense to me. So, even though I have not taken the time to make a PR, I thought it would save you some time to have this information. (<em>"Our golden rule is that a contribution should be worth more to the project than the time it takes to review it."</em>)</p>
+</blockquote>
+
+
+
+<a name="597346882"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313461%20Cranelift%3A%20GC%20reference%20reads%20bac.../near/597346882" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313461.20Cranelift.3A.20GC.20reference.20reads.20bac.2E.2E.2E.html#597346882">(May 23 2026 at 22:33)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/13461#issuecomment-4526699296">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13461">issue #13461</a>:</p>
+<blockquote>
+<p>Per our AI guidelines, such a note would be quite welcome -- if written by a human rather than "Claude seems to say: \&lt;dump\&gt;". I hope you can appreciate that we get increasingly large mountains of very verbose AI output, some of it right, some of it wrong, and some of it <em>not even wrong</em> in extraordinarily strange ways, and so the only realistic approach with our limited time is to consider all such text as un-reviewed by a human until proven otherwise. That's the essence behind our policy. A "I've tested this fix and it works, what do you think?" note would have led to a <em>much</em> better reception!</p>
+</blockquote>
+
+
+
+<a name="597346920"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313461%20Cranelift%3A%20GC%20reference%20reads%20bac.../near/597346920" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313461.20Cranelift.3A.20GC.20reference.20reads.20bac.2E.2E.2E.html#597346920">(May 23 2026 at 22:34)</a>:</h4>
+<p>cfallin edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/13461#issuecomment-4526699296">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13461">issue #13461</a>:</p>
+<blockquote>
+<p>Per our AI guidelines, such a note would be quite welcome -- if written by a human rather than "Claude suggests: \&lt;dump\&gt;". I hope you can appreciate that we get increasingly large mountains of very verbose AI output, some of it right, some of it wrong, and some of it <em>not even wrong</em> in extraordinarily strange ways, and so the only realistic approach with our limited time is to consider all such text as un-reviewed by a human until proven otherwise. That's the essence behind our policy. A "I've tested this fix and it works, what do you think?" note would have led to a <em>much</em> better reception!</p>
+</blockquote>
+
+
+
+<a name="597350370"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313461%20Cranelift%3A%20GC%20reference%20reads%20bac.../near/597350370" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313461.20Cranelift.3A.20GC.20reference.20reads.20bac.2E.2E.2E.html#597350370">(May 23 2026 at 23:40)</a>:</h4>
+<p>vouillon edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/13461#issuecomment-4526461187">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13461">issue #13461</a>:</p>
+<blockquote>
+<p>Swapping these two steps seems to fix the issue:</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/fa50c6a150d4cb9aebaa82e95f739aa97b3fb76c/cranelift/frontend/src/frontend/safepoints.rs#L762-L776">https://github.com/bytecodealliance/wasmtime/blob/fa50c6a150d4cb9aebaa82e95f739aa97b3fb76c/cranelift/frontend/src/frontend/safepoints.rs#L762-L776</a></p>
+<p>The rational is that one should reserve slots for all the needs-stack-map values before releasing the slot for the value defined by the instruction. Otherwise, one can assign the same slot for both a value live across the instruction and the value just defined.</p>
+</blockquote>
+
+
+
+<a name="597405522"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313461%20Cranelift%3A%20GC%20reference%20reads%20bac.../near/597405522" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313461.20Cranelift.3A.20GC.20reference.20reads.20bac.2E.2E.2E.html#597405522">(May 24 2026 at 14:52)</a>:</h4>
+<p>gfx <a href="https://github.com/bytecodealliance/wasmtime/issues/13461#issuecomment-4529067695">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13461">issue #13461</a>:</p>
+<blockquote>
+<p>We're hitting another miscompile from #13228 that #13469 does not fix — a second case on a non-moving (<code>drc</code>) collector, which is what <a href="https://github.com/wado-lang/wado">Wado</a> uses.</p>
+<p>Bisected (clean, over <code>[#13217..v45.0.0]</code>) to #13228 (<code>24938c4163</code>). The same wado-generated wasm runs on wasmtime 44 and traps on 45; stock <code>v45.0.0</code> traps, and so does our fork with #13469 already applied.</p>
+<p>Reproduce (failing source + details in this gist: <a href="https://gist.github.com/gfx/50948a70258ab94e1dd52011894a4848">https://gist.github.com/gfx/50948a70258ab94e1dd52011894a4848</a>):</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/wado-lang/wado
+<span class="nb">cd</span><span class="w"> </span>wado
+git<span class="w"> </span>checkout<span class="w"> </span>gfx/wasmtime-45
+git<span class="w"> </span>submodule<span class="w"> </span>update<span class="w"> </span>--init<span class="w"> </span>vendor/wasmtime<span class="w">   </span><span class="c1"># = wado-lang/wasmtime @ gfx/wasmtime-45 (v45.0.0 + #13469)</span>
+cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w"> </span>--bin<span class="w"> </span>wado
+./target/release/wado<span class="w"> </span><span class="nb">test</span><span class="w"> </span>-O3<span class="w"> </span>package-gale/src/codegen_lr_label_test.wado
+</code></pre></div>
+<p>Traps in a GC-reference-heavy codegen function:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">error</span><span class="w"> </span><span class="k">while</span><span class="w"> </span><span class="n">executing</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">wasm</span><span class="w"> </span><span class="n">backtrace</span><span class="p">:</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">:</span><span class="w"> </span><span class="o">..</span><span class="p">.</span><span class="o">!</span><span class="p">.</span><span class="o">/</span><span class="n">codegen</span><span class="p">.</span><span class="n">wado</span><span class="o">/</span><span class="n">emit_lr_alt_struct</span>
+<span class="w">    </span><span class="mi">3</span><span class="p">:</span><span class="w"> </span><span class="o">..</span><span class="p">.</span><span class="o">!</span><span class="p">.</span><span class="o">/</span><span class="n">codegen</span><span class="p">.</span><span class="n">wado</span><span class="o">/</span><span class="n">generate</span>
+<span class="w">    </span><span class="mi">4</span><span class="p">:</span><span class="w"> </span><span class="o">..</span><span class="p">.</span><span class="o">!</span><span class="n">__test_0_labeled_left_recursive_alt_routes_through_gen_scan_lr_functions</span>
+</code></pre></div>
+<p>The same source on wasmtime 44 (wado <code>main</code>) passes. It needs <code>-O3</code> (aggressive inlining) and reproduces with cranelift opt level <code>none</code> (the test harness uses <code>Config::cranelift_opt_level(OptLevel::None)</code>).</p>
+<p>I tried to reduce this to a standalone <code>wasmtime run</code> case but couldn't get one to fire: invoking the same <code>.wasm</code> through its component export does not trap — it only reproduces through the test harness's instantiate-and-call path, so it's regalloc-fragile like the original #13461 repro. Happy to dig further if a smaller case would help.</p>
+<p>Since #13228's own commit message notes these reloads are unnecessary for non-moving collectors, and it has now produced two distinct miscompiles for them (this and #13461), I'd lean toward reverting #13228 rather than fixing it case by case.</p>
+</blockquote>
+
+
+
+<a name="597405671"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313461%20Cranelift%3A%20GC%20reference%20reads%20bac.../near/597405671" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313461.20Cranelift.3A.20GC.20reference.20reads.20bac.2E.2E.2E.html#597405671">(May 24 2026 at 14:54)</a>:</h4>
+<p>gfx edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/13461#issuecomment-4529067695">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13461">issue #13461</a>:</p>
+<blockquote>
+<p>We're hitting another miscompile from #13228 that #13469 does not fix — a second case on a non-moving (<code>drc</code>) collector, which is what <a href="https://github.com/wado-lang/wado">Wado</a> uses.</p>
+<p>Bisected (clean, over <code>[#13217..v45.0.0]</code>) to #13228 (<code>24938c4163</code>). The same wado-generated wasm runs on wasmtime 44 and traps on 45; stock <code>v45.0.0</code> traps, and so does our fork with #13469 already applied.</p>
+<p>Reproduce (failing source + details in this gist: <a href="https://gist.github.com/gfx/50948a70258ab94e1dd52011894a4848">https://gist.github.com/gfx/50948a70258ab94e1dd52011894a4848</a>):</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/wado-lang/wado
+<span class="nb">cd</span><span class="w"> </span>wado
+git<span class="w"> </span>checkout<span class="w"> </span>gfx/wasmtime-45
+git<span class="w"> </span>submodule<span class="w"> </span>update<span class="w"> </span>--init<span class="w"> </span>vendor/wasmtime<span class="w">   </span><span class="c1"># = wado-lang/wasmtime @ gfx/wasmtime-45 (v45.0.0 + #13469)</span>
+cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w"> </span>--bin<span class="w"> </span>wado
+./target/release/wado<span class="w"> </span><span class="nb">test</span><span class="w"> </span>-O3<span class="w"> </span>package-gale/src/codegen_lr_label_test.wado
+</code></pre></div>
+<p>Traps in a GC-reference-heavy codegen function:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">error</span><span class="w"> </span><span class="k">while</span><span class="w"> </span><span class="n">executing</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">wasm</span><span class="w"> </span><span class="n">backtrace</span><span class="p">:</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">:</span><span class="w"> </span><span class="o">..</span><span class="p">.</span><span class="o">!</span><span class="p">.</span><span class="o">/</span><span class="n">codegen</span><span class="p">.</span><span class="n">wado</span><span class="o">/</span><span class="n">emit_lr_alt_struct</span>
+<span class="w">    </span><span class="mi">3</span><span class="p">:</span><span class="w"> </span><span class="o">..</span><span class="p">.</span><span class="o">!</span><span class="p">.</span><span class="o">/</span><span class="n">codegen</span><span class="p">.</span><span class="n">wado</span><span class="o">/</span><span class="n">generate</span>
+<span class="w">    </span><span class="mi">4</span><span class="p">:</span><span class="w"> </span><span class="o">..</span><span class="p">.</span><span class="o">!</span><span class="n">__test_0_labeled_left_recursive_alt_routes_through_gen_scan_lr_functions</span>
+</code></pre></div>
+<p>The same source on wasmtime 44 (wado <code>main</code>) passes. It needs <code>wado -O3</code> and reproduces with cranelift opt level <code>none</code> (the test harness uses <code>Config::cranelift_opt_level(OptLevel::None)</code>).</p>
+<p>I tried to reduce this to a standalone <code>wasmtime run</code> case but couldn't get one to fire: invoking the same <code>.wasm</code> through its component export does not trap — it only reproduces through the test harness's instantiate-and-call path, so it's regalloc-fragile like the original #13461 repro. Happy to dig further if a smaller case would help.</p>
+<p>Since #13228's own commit message notes these reloads are unnecessary for non-moving collectors, and it has now produced two distinct miscompiles for them (this and #13461), I'd lean toward reverting #13228 rather than fixing it case by case.</p>
+</blockquote>
+
+
+
+<a name="597809399"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313461%20Cranelift%3A%20GC%20reference%20reads%20bac.../near/597809399" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313461.20Cranelift.3A.20GC.20reference.20reads.20bac.2E.2E.2E.html#597809399">(May 26 2026 at 10:45)</a>:</h4>
+<p>vouillon <a href="https://github.com/bytecodealliance/wasmtime/issues/13461#issuecomment-4543575447">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13461">issue #13461</a>:</p>
+<blockquote>
+<blockquote>
+<p>We're hitting another miscompile from <a href="https://github.com/bytecodealliance/wasmtime/pull/13228">#13228</a> that <a href="https://github.com/bytecodealliance/wasmtime/pull/13469">#13469</a> does not fix — a second case on a non-moving (<code>drc</code>) collector, which is what <a href="https://github.com/wado-lang/wado">Wado</a> uses.</p>
+</blockquote>
+<p>This other issue should be fixed by #13480.</p>
+</blockquote>
+
+
+
+<a name="597810946"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313461%20Cranelift%3A%20GC%20reference%20reads%20bac.../near/597810946" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313461.20Cranelift.3A.20GC.20reference.20reads.20bac.2E.2E.2E.html#597810946">(May 26 2026 at 10:54)</a>:</h4>
+<p>vouillon <a href="https://github.com/bytecodealliance/wasmtime/issues/13461#issuecomment-4543654582">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13461">issue #13461</a>:</p>
+<blockquote>
+<blockquote>
+<p>Per our AI guidelines, such a note would be quite welcome -- if written by a human rather than "Claude suggests: &lt;dump&gt;". I hope you can appreciate that we get increasingly large mountains of very verbose AI output, some of it right, some of it wrong, and some of it _not even wrong_ in extraordinarily strange ways, and so the only realistic approach with our limited time is to consider all such text as un-reviewed by a human until proven otherwise. That's the essence behind our policy. A "I've tested this fix and it works, what do you think?" note would have led to a _much_ better reception!</p>
+</blockquote>
+<p>I totally understand. I apologize for my clumsy message. I'll be more careful going forward.</p>
+</blockquote>
+
+
+
+<a name="598178190"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313461%20Cranelift%3A%20GC%20reference%20reads%20bac.../near/598178190" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313461.20Cranelift.3A.20GC.20reference.20reads.20bac.2E.2E.2E.html#598178190">(May 27 2026 at 20:37)</a>:</h4>
+<p>fitzgen closed <a href="https://github.com/bytecodealliance/wasmtime/issues/13461">issue #13461</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p>A Wasm GC <code>(ref null $t)</code> value that is live across a call safepoint can read back as<br>
+<strong>null</strong> after the call, making a <code>ref.as_non_null</code> (or <code>struct.get</code>/<code>array.get</code>) on a<br>
+provably non-null value trap with <code>wasm trap: null reference</code>. The same module runs<br>
+correctly on 44.0.0.</p>
+<p><code>git bisect</code> (over <code>v44.0.1..v45.0.0</code>) points at:</p>
+<blockquote>
+<p><strong>24938c41630e2662ebcdb0a37137f02fd48c4d07</strong> — <em>"Handle alias values in <code>SafepointSpiller::rewrite_use</code>"</em> (#13228)</p>
+</blockquote>
+<p>That PR makes the safepoint spiller reload aliased needs-stack-map values from their<br>
+stack slot after safepoints (needed for the new moving collector). For the affected<br>
+value, the post-safepoint reload appears to read a slot that was never spilled, so the<br>
+use sees <code>null</code>.</p>
+<ul>
+<li>
+<p>Reproduces with <strong>every collector</strong> (<code>drc</code> / <code>null</code> / <code>copying</code>) and at **every<br>
+  Cranelift opt level**, because the reload code is emitted unconditionally.</p>
+</li>
+<li>
+<p>The follow-up #13449 (<em>"include every SSA value bound to a variable in stack maps"</em>)<br>
+  does <strong>not</strong> fix this case.</p>
+</li>
+<li>
+<p><strong>Still present on <code>main</code></strong> — tested <code>fa50c6a150</code> (46.0.0-dev).</p>
+</li>
+</ul>
+<h2>Reproduction</h2>
+<p>A self-contained regression test (<code>.wast</code>) is on this branch:</p>
+<p><strong>https://github.com/wado-lang/wasmtime/blob/gfx/repro-gc-safepoint-reload-null/tests/misc_testsuite/gc/safepoint-reload-aliased-ref-null.wast</strong></p>
+<p>It is a standard <code>tests/misc_testsuite/gc/</code> test — <code>(assert_return (invoke "run"))</code> on a<br>
+GC module. <code>run</code> returns without trapping on 44.0.0 and traps with <code>null reference</code> on<br>
+45.0.0 and <code>main</code>.</p>
+<p>You can also run the module directly:</p>
+<div class="codehilite" data-code-language="Bash Session"><pre><span></span><code><span class="gp">$ </span><span class="nv">FEATURES</span><span class="o">=</span><span class="s2">"-Wgc=y -Wfunction-references=y -Wwide-arithmetic=y -Wsimd=y -Wthreads=y -Wreference-types=y"</span>
+
+<span class="gp"># </span><span class="m">44</span>.0.0<span class="w"> </span>—<span class="w"> </span>OK<span class="w"> </span><span class="o">(</span><span class="nb">exit</span><span class="w"> </span><span class="m">0</span><span class="o">)</span>
+<span class="gp">$ </span>wasmtime<span class="w"> </span>run<span class="w"> </span><span class="nv">$FEATURES</span><span class="w"> </span>--invoke<span class="w"> </span>run<span class="w"> </span>repro.wasm
+
+<span class="gp"># </span><span class="m">45</span>.0.0<span class="w"> </span>/<span class="w"> </span>main<span class="w"> </span>—<span class="w"> </span>traps
+<span class="gp">$ </span>wasmtime<span class="w"> </span>run<span class="w"> </span><span class="nv">$FEATURES</span><span class="w"> </span>--invoke<span class="w"> </span>run<span class="w"> </span>repro.wasm
+<span class="go">...</span>
+<span class="go">    wasm trap: null reference</span>
+</code></pre></div>
+<p>The module was produced by a real frontend (the <a href="https://github.com/wado-lang/wado">Wado</a><br>
+compiler): it JSON-deserializes a two-field struct in a loop. The trapping<br>
+<code>ref.as_non_null</code> reads a struct-access object that is built with <code>struct.new</code> (so it<br>
+cannot be null) and is held in a local that is live across the call fetching the next<br>
+field; on the second loop iteration the reloaded local reads back null. The module passes<br>
+<code>wasm-tools validate --features all</code>.</p>
+<h3>On minimization</h3>
+<p>I could not reduce this with <code>wasm-tools shrink</code> (0% — the module is already DCE'd and the<br>
+miscompile is register-allocation-sensitive, so any structural mutation might hide it). Happy<br>
+to provide the source program or help with a CLIF-level reduction.</p>
+<h2>Environment</h2>
+<ul>
+<li>Cranelift/wasmtime 45.0.0 (<code>377cd917a</code>) and <code>main</code> (<code>fa50c6a150</code>, 46.0.0-dev)</li>
+<li>host: aarch64-apple-darwin, Cranelift backend</li>
+<li>first bad commit: <code>24938c41630e2662ebcdb0a37137f02fd48c4d07</code> (#13228)<br>
+</li>
+</ul>
+</blockquote>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

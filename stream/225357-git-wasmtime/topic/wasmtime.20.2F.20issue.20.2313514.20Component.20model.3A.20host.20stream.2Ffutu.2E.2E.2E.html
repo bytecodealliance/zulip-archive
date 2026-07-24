@@ -1,0 +1,787 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13514 Component model: host stream/futu... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313514.20Component.20model.3A.20host.20stream.2Ffutu.2E.2E.2E.html">wasmtime / issue #13514 Component model: host stream/futu...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="598695812"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313514%20Component%20model%3A%20host%20stream/futu.../near/598695812" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313514.20Component.20model.3A.20host.20stream.2Ffutu.2E.2E.2E.html#598695812">(May 30 2026 at 07:40)</a>:</h4>
+<p>gfx opened <a href="https://github.com/bytecodealliance/wasmtime/issues/13514">issue #13514</a>:</p>
+<blockquote>
+<p>When a host registers a stream consumer via <code>StreamReader::pipe</code> (or hands the<br>
+guest a host-driven future/stream via <code>FutureReader::new</code> / a host-written<br>
+stream) and the <strong>guest then drops its end</strong>, the <code>TransmitState</code> and both<br>
+<code>TransmitHandle</code>s are never reclaimed from the instance's concurrent-state<br>
+table. The host-side end is left in <code>HostReady</code> and is never finalized, so the<br>
+slots leak for the lifetime of the instance. A guest that performs many such<br>
+operations in a loop fills the table and eventually traps with <code>resource table
+has no free keys</code>.</p>
+<p>This is in the core component runtime<br>
+(<code>crates/wasmtime/src/runtime/component/concurrent/futures_and_streams.rs</code>),<br>
+independent of <code>wasmtime-wasi</code>.</p>
+<h3>Test Case</h3>
+<p>The leak is in host-side transmit bookkeeping, so there is no single standalone<br>
+<code>.wasm</code> that triggers it: reproducing it requires a host driving the public<br>
+<code>StreamReader::pipe</code> / <code>FutureReader::new</code> APIs <em>and</em> a guest that drops its end<br>
+while the host end is still <code>HostReady</code>. The minimal reproduction is therefore a<br>
+pair of in-tree <code>crates/misc/component-async-tests</code> cases (full source in *Steps<br>
+to Reproduce*), using only public host APIs and no <code>wasi:*</code> data flow.</p>
+<h3>Steps to Reproduce</h3>
+<h4>Case 1 — host consumer (<code>host_drop_writer</code> / <code>ReadState::HostReady</code>)</h4>
+<p>The guest hands the host the readable end of a fresh stream, **keeps the<br>
+writable end**, writes one byte once the host attaches a consumer, then drops<br>
+the writer. The writer-drop reaches <code>host_drop_writer</code> with the read side still<br>
+<code>HostReady</code>.</p>
+<ul>
+<li>
+<p>Add an interface + world to <code>crates/misc/component-async-tests/wit/test.wit</code>:</p>
+<p>```wit<br>
+interface host-consumer-drop {<br>
+  // Returns the readable end of a fresh stream while the guest keeps the<br>
+  // writable end; writes one byte once a consumer attaches, then drops it.<br>
+  get: async func() -&gt; stream&lt;u8&gt;;<br>
+}</p>
+<p>world host-consumer-drop-guest {<br>
+  export host-consumer-drop;<br>
+}<br>
+```</p>
+</li>
+<li>
+<p>Add a guest test program at<br>
+<code>crates/test-programs/src/bin/async_host_consumer_drop.rs</code>:</p>
+<p>```rust<br>
+mod bindings {<br>
+    wit_bindgen::generate!({<br>
+        path: "../misc/component-async-tests/wit",<br>
+        world: "host-consumer-drop-guest",<br>
+        async: true,<br>
+    });</p>
+<div class="codehilite"><pre><span></span><code>use super::Component;
+export!(Component);
+</code></pre></div>
+
+<p>}</p>
+<p>use {bindings::exports::local::local::host_consumer_drop::Guest, wit_bindgen::StreamReader};</p>
+<p>struct Component;</p>
+<p>impl Guest for Component {<br>
+    async fn get() -&gt; StreamReader&lt;u8&gt; {<br>
+        let (mut tx, rx) = bindings::wit_stream::new();<br>
+        // The host attaches a consumer (read side -&gt; <code>HostReady</code>); the write<br>
+        // below blocks until that consumer reads, after which we drop the<br>
+        // writer. Dropping it while the consumer is still <code>HostReady</code> leaks.<br>
+        wit_bindgen::spawn(async move {<br>
+            assert!(tx.write_one(42).await.is_none());<br>
+            drop(tx);<br>
+        });<br>
+        rx<br>
+    }<br>
+}</p>
+<p>fn main() {}<br>
+```</p>
+</li>
+<li>
+<p>Add a host test (e.g. in <code>tests/scenario/streams.rs</code>):</p>
+<p>```rust<br>
+mod host_consumer_drop {<br>
+    wasmtime::component::bindgen!({<br>
+        path: "wit",<br>
+        world: "host-consumer-drop-guest",<br>
+        exports: { default: store | async },<br>
+    });<br>
+}</p>
+<p>#[tokio::test]<br>
+pub async fn async_host_consumer_drop() -&gt; Result&lt;()&gt; {<br>
+    let engine = Engine::new(&amp;config())?;<br>
+    let component = make_component(<br>
+        &amp;engine,<br>
+        &amp;[test_programs_artifacts::ASYNC_HOST_CONSUMER_DROP_COMPONENT],<br>
+    )<br>
+    .await?;</p>
+<div class="codehilite"><pre><span></span><code>let mut linker = Linker::new(&amp;engine);
+wasmtime_wasi::p2::add_to_linker_async(&amp;mut linker)?;
+
+let mut store = Store::new(
+    &amp;engine,
+    Ctx {
+        wasi: WasiCtxBuilder::new().inherit_stdio().build(),
+        table: ResourceTable::default(),
+        continue_: false,
+    },
+);
+
+let instance = linker.instantiate_async(&amp;mut store, &amp;component).await?;
+let guest = host_consumer_drop::HostConsumerDropGuest::new(&amp;mut store, &amp;instance)?;
+store
+    .run_concurrent(async move |accessor| {
+        let stream = guest
+            .local_local_host_consumer_drop()
+            .call_get(accessor)
+            .await?;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        accessor.with(move |store| stream.pipe(store, PipeConsumer::new(tx)))?;
+        assert_eq!(rx.next().await, Some(42));
+        assert!(rx.next().await.is_none());
+
+        wasmtime::error::Ok(())
+    })
+    .await??;
+
+store.assert_concurrent_state_empty();
+Ok(())
+</code></pre></div>
+
+<p>}<br>
+```</p>
+</li>
+</ul>
+<h4>Case 2 — host producer (<code>host_drop_reader</code> / <code>WriteState::HostReady</code>)</h4>
+<p>The host hands the guest two host-produced futures via <code>FutureReader::new</code>; the<br>
+guest reads one and drops the other. This reuses the existing <code>closed-streams</code><br>
+guest (<code>local::local::closed::read-future</code>, whose <code>_rx_ignored</code> argument is<br>
+dropped), so it is a drop-in host test with no new guest:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#[tokio::test]</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">async_host_producer_drop</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">engine</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Engine</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">config</span><span class="p">())</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">component</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">make_component</span><span class="p">(</span>
+<span class="w">        </span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span>
+<span class="w">        </span><span class="o">&amp;</span><span class="p">[</span><span class="n">test_programs_artifacts</span><span class="p">::</span><span class="n">ASYNC_CLOSED_STREAMS_COMPONENT</span><span class="p">],</span>
+<span class="w">    </span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">linker</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Linker</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">engine</span><span class="p">);</span>
+<span class="w">    </span><span class="n">wasmtime_wasi</span><span class="p">::</span><span class="n">p2</span><span class="p">::</span><span class="n">add_to_linker_async</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">linker</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Store</span><span class="p">::</span><span class="n">new</span><span class="p">(</span>
+<span class="w">        </span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span>
+<span class="w">        </span><span class="n">Ctx</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">wasi</span><span class="p">:</span><span class="w"> </span><span class="nc">WasiCtxBuilder</span><span class="p">::</span><span class="n">new</span><span class="p">().</span><span class="n">inherit_stdio</span><span class="p">().</span><span class="n">build</span><span class="p">(),</span>
+<span class="w">            </span><span class="n">table</span><span class="p">:</span><span class="w"> </span><span class="nc">ResourceTable</span><span class="p">::</span><span class="n">default</span><span class="p">(),</span>
+<span class="w">            </span><span class="n">continue_</span><span class="p">:</span><span class="w"> </span><span class="nc">false</span><span class="p">,</span>
+<span class="w">        </span><span class="p">},</span>
+<span class="w">    </span><span class="p">);</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">instance</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">linker</span><span class="p">.</span><span class="n">instantiate_async</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">component</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">42_</span><span class="k">u8</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="n">tx</span><span class="p">,</span><span class="w"> </span><span class="n">rx</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">oneshot</span><span class="p">::</span><span class="n">channel</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">rx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">FutureReader</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="n">OneshotProducer</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">rx</span><span class="p">))</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="n">_</span><span class="p">,</span><span class="w"> </span><span class="n">rx_ignored</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">oneshot</span><span class="p">::</span><span class="n">channel</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">rx_ignored</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">FutureReader</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="n">OneshotProducer</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">rx_ignored</span><span class="p">))</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">closed_streams</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">closed_streams</span><span class="p">::</span><span class="n">bindings</span><span class="p">::</span><span class="n">ClosedStreams</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">instance</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="n">store</span>
+<span class="w">        </span><span class="p">.</span><span class="n">run_concurrent</span><span class="p">(</span><span class="k">async</span><span class="w"> </span><span class="k">move</span><span class="w"> </span><span class="o">|</span><span class="n">accessor</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">_</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tx</span><span class="p">.</span><span class="n">send</span><span class="p">(</span><span class="n">value</span><span class="p">);</span>
+<span class="w">            </span><span class="n">closed_streams</span>
+<span class="w">                </span><span class="p">.</span><span class="n">local_local_closed</span><span class="p">()</span>
+<span class="w">                </span><span class="p">.</span><span class="n">call_read_future</span><span class="p">(</span><span class="n">accessor</span><span class="p">,</span><span class="w"> </span><span class="n">rx</span><span class="p">,</span><span class="w"> </span><span class="n">value</span><span class="p">,</span><span class="w"> </span><span class="n">rx_ignored</span><span class="p">)</span>
+<span class="w">                </span><span class="p">.</span><span class="k">await</span>
+<span class="w">        </span><span class="p">})</span>
+<span class="w">        </span><span class="p">.</span><span class="k">await</span><span class="o">??</span><span class="p">;</span>
+
+<span class="w">    </span><span class="n">store</span><span class="p">.</span><span class="n">assert_concurrent_state_empty</span><span class="p">();</span>
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="p">}</span>
+</code></pre></div>
+<ul>
+<li>Run: <code>cargo test -p component-async-tests --test test_all async_host_</code></li>
+</ul>
+<h3>Expected Results</h3>
+<p>Both tests pass: when the guest drops its end of a stream/future, the host<br>
+consumer/producer is finalized and the transmit (state + both handles) is<br>
+reclaimed, so <code>assert_concurrent_state_empty()</code> succeeds after a clean run.</p>
+<h3>Actual Results</h3>
+<p>Both tests fail with leftover entries in the concurrent-state table:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">non</span><span class="o">-</span><span class="n">empty</span><span class="w"> </span><span class="n">table</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="mi">5</span><span class="p">]</span><span class="w">            </span><span class="c1">// Case 1: 1 stream transmit (state + 2 handles)</span>
+<span class="n">non</span><span class="o">-</span><span class="n">empty</span><span class="w"> </span><span class="n">table</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="mi">5</span><span class="p">]</span><span class="w">   </span><span class="c1">// Case 2: 2 future transmits</span>
+</code></pre></div>
+<p>(In Case 2 <em>both</em> futures leak — reading a host-produced future and then<br>
+dropping the reader still strands the producer, alongside the never-read<br>
+<code>rx_ignored</code>.) The transmits are never reclaimed, so a long-running guest that<br>
+loops over such operations eventually traps with <code>resource table has no free
+keys</code>.</p>
+<p>Root cause, in<br>
+<code>crates/wasmtime/src/runtime/component/concurrent/futures_and_streams.rs</code> — two<br>
+match arms are no-ops where they must finalize the stranded host end. Both<br>
+functions are <code>StoreOpaque</code> methods reached from <code>Instance::guest_drop_readable</code><br>
+/ <code>Instance::guest_drop_writable</code>:</p>
+<ul>
+<li>
+<p><code>host_drop_reader</code> — guest drops the <strong>readable</strong> end while the host producer<br>
+  is <code>WriteState::HostReady</code>:</p>
+<p><code>rust
+WriteState::HostReady { .. } =&gt; {}
+</code></p>
+</li>
+<li>
+<p><code>host_drop_writer</code> — guest drops the <strong>writable</strong> end while the host consumer<br>
+  is <code>ReadState::HostReady</code>:</p>
+<p><code>rust
+ReadState::HostReady { .. } | ReadState::HostToHost { .. } =&gt; {}
+</code></p>
+</li>
+</ul>
+<p>A <code>TransmitState</code> is only removed by <code>delete_transmit</code>, which is reached only<br>
+once the <em>other</em> end is already <code>Dropped</code>. With these no-ops, one end stays<br>
+<code>HostReady</code> forever and the transmit is never deleted. (The host producer set up<br>
+by <code>new_transmit</code> is purely reactive — it has no self-cleanup future that<br>
+observes the drop — so nothing else reclaims it either.)</p>
+<h3>Versions and Environment</h3>
+<p>Wasmtime version or commit: <code>main</code>, 46.0.0-dev (commit <code>9c49989a2e</code>)</p>
+<p>Operating system: macOS 26.5</p>
+<p>Architecture: aarch64 (Apple Silicon)</p>
+<p>The leak is deterministic host-side bookkeeping and is not OS/architecture<br>
+specific.</p>
+<h3>Extra Info</h3>
+<p>Proposed fix: finalize the stranded host end on guest drop — when the guest's<br>
+end is now <code>Dropped</code> and the host end is <code>HostReady</code>, set the host end to<br>
+<code>Dropped</code> and call <code>delete_transmit</code> (reclaiming the state + both handles and<br>
+dropping the host consumer/producer). A change covering exactly these two arms<br>
+takes both reproductions above from leaking to empty, and the full<br>
+<code>component-async-tests</code> suite stays green. I'm happy to open a PR with the fix<br>
+and these two tests.</p>
+<p>On test coverage: <code>round_trip*</code> / <code>post_return</code> call<br>
+<code>assert_concurrent_state_empty</code>, but exercise read-based guest↔guest flows. The<br>
+existing <code>.pipe()</code>-based host-consumer scenarios (<code>tests/scenario/streams.rs</code>,<br>
+<code>tests/scenario/transmit.rs</code>) do not assert an empty concurrent state, so this<br>
+guest-drop path was untested.</p>
+<p>Related: #12091 proposes a <code>close()</code> method on the<br>
+<code>{Future,Stream}{Producer,Consumer}</code> traits, motivated by the fact that today a<br>
+host can only detect a guest-side drop via <code>Drop</code>. This bug compounds that: on<br>
+the <code>HostReady</code> guest-drop path the host producer/consumer is never finalized at<br>
+all, so even the current <code>Drop</code>-based detection never fires. Finalizing the<br>
+stranded host end (the fix above) is also the natural place from which a future<br>
+<code>close()</code> hook would be invoked.<br>
+</p>
+</blockquote>
+
+
+
+<a name="598695814"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313514%20Component%20model%3A%20host%20stream/futu.../near/598695814" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313514.20Component.20model.3A.20host.20stream.2Ffutu.2E.2E.2E.html#598695814">(May 30 2026 at 07:40)</a>:</h4>
+<p><a href="https://github.com/gfx">gfx</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13514">Issue #13514</a>.</p>
+
+
+
+<a name="598701085"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313514%20Component%20model%3A%20host%20stream/futu.../near/598701085" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313514.20Component.20model.3A.20host.20stream.2Ffutu.2E.2E.2E.html#598701085">(May 30 2026 at 09:10)</a>:</h4>
+<p>gfx edited <a href="https://github.com/bytecodealliance/wasmtime/issues/13514">issue #13514</a>:</p>
+<blockquote>
+<p>When a host registers a stream consumer via <code>StreamReader::pipe</code> (or hands the<br>
+guest a host-driven future/stream via <code>FutureReader::new</code> / a host-written<br>
+stream) and the <strong>guest then drops its end</strong>, the <code>TransmitState</code> and both<br>
+<code>TransmitHandle</code>s are never reclaimed from the instance's concurrent-state<br>
+table. The host-side end is left in <code>HostReady</code> and is never finalized, so the<br>
+slots leak for the lifetime of the instance. A guest that performs many such<br>
+operations in a loop fills the table and eventually traps with <code>resource table
+has no free keys</code>.</p>
+<p>This is in the core component runtime<br>
+(<code>crates/wasmtime/src/runtime/component/concurrent/futures_and_streams.rs</code>),<br>
+independent of <code>wasmtime-wasi</code>.</p>
+<h3>Test Case</h3>
+<p>The leak is in host-side transmit bookkeeping, so there is no single standalone<br>
+<code>.wasm</code> that triggers it: reproducing it requires a host driving the public<br>
+<code>StreamReader::pipe</code> / <code>FutureReader::new</code> APIs <em>and</em> a guest that drops its end<br>
+while the host end is still <code>HostReady</code>. The minimal reproduction is therefore a<br>
+pair of in-tree <code>crates/misc/component-async-tests</code> cases (full source in *Steps<br>
+to Reproduce*), using only public host APIs and no <code>wasi:*</code> data flow.</p>
+<h3>Steps to Reproduce</h3>
+<h4>Case 1 — host consumer (<code>host_drop_writer</code> / <code>ReadState::HostReady</code>)</h4>
+<p>The guest hands the host the readable end of a fresh stream, **keeps the<br>
+writable end**, writes one byte once the host attaches a consumer, then drops<br>
+the writer. The writer-drop reaches <code>host_drop_writer</code> with the read side still<br>
+<code>HostReady</code>.</p>
+<ul>
+<li>
+<p>Add an interface + world to <code>crates/misc/component-async-tests/wit/test.wit</code>:</p>
+<p>```wit<br>
+interface host-consumer-drop {<br>
+  // Returns the readable end of a fresh stream while the guest keeps the<br>
+  // writable end; writes one byte once a consumer attaches, then drops it.<br>
+  get: async func() -&gt; stream&lt;u8&gt;;<br>
+}</p>
+<p>world host-consumer-drop-guest {<br>
+  export host-consumer-drop;<br>
+}<br>
+```</p>
+</li>
+<li>
+<p>Add a guest test program at<br>
+<code>crates/test-programs/src/bin/async_host_consumer_drop.rs</code>:</p>
+<p>```rust<br>
+mod bindings {<br>
+    wit_bindgen::generate!({<br>
+        path: "../misc/component-async-tests/wit",<br>
+        world: "host-consumer-drop-guest",<br>
+        async: true,<br>
+    });</p>
+<div class="codehilite"><pre><span></span><code>use super::Component;
+export!(Component);
+</code></pre></div>
+
+<p>}</p>
+<p>use {bindings::exports::local::local::host_consumer_drop::Guest, wit_bindgen::StreamReader};</p>
+<p>struct Component;</p>
+<p>impl Guest for Component {<br>
+    async fn get() -&gt; StreamReader&lt;u8&gt; {<br>
+        let (mut tx, rx) = bindings::wit_stream::new();<br>
+        // The host attaches a consumer (read side -&gt; <code>HostReady</code>); the write<br>
+        // below blocks until that consumer reads, after which we drop the<br>
+        // writer. Dropping it while the consumer is still <code>HostReady</code> leaks.<br>
+        wit_bindgen::spawn(async move {<br>
+            assert!(tx.write_one(42).await.is_none());<br>
+            drop(tx);<br>
+        });<br>
+        rx<br>
+    }<br>
+}</p>
+<p>fn main() {}<br>
+```</p>
+</li>
+<li>
+<p>Add a host test (e.g. in <code>tests/scenario/streams.rs</code>):</p>
+<p>```rust<br>
+mod host_consumer_drop {<br>
+    wasmtime::component::bindgen!({<br>
+        path: "wit",<br>
+        world: "host-consumer-drop-guest",<br>
+        exports: { default: store | async },<br>
+    });<br>
+}</p>
+<p>#[tokio::test]<br>
+pub async fn async_host_consumer_drop() -&gt; Result&lt;()&gt; {<br>
+    let engine = Engine::new(&amp;config())?;<br>
+    let component = make_component(<br>
+        &amp;engine,<br>
+        &amp;[test_programs_artifacts::ASYNC_HOST_CONSUMER_DROP_COMPONENT],<br>
+    )<br>
+    .await?;</p>
+<div class="codehilite"><pre><span></span><code>let mut linker = Linker::new(&amp;engine);
+wasmtime_wasi::p2::add_to_linker_async(&amp;mut linker)?;
+
+let mut store = Store::new(
+    &amp;engine,
+    Ctx {
+        wasi: WasiCtxBuilder::new().inherit_stdio().build(),
+        table: ResourceTable::default(),
+        continue_: false,
+    },
+);
+
+let instance = linker.instantiate_async(&amp;mut store, &amp;component).await?;
+let guest = host_consumer_drop::HostConsumerDropGuest::new(&amp;mut store, &amp;instance)?;
+store
+    .run_concurrent(async move |accessor| {
+        let stream = guest
+            .local_local_host_consumer_drop()
+            .call_get(accessor)
+            .await?;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        accessor.with(move |store| stream.pipe(store, PipeConsumer::new(tx)))?;
+        assert_eq!(rx.next().await, Some(42));
+        assert!(rx.next().await.is_none());
+
+        wasmtime::error::Ok(())
+    })
+    .await??;
+
+store.assert_concurrent_state_empty();
+Ok(())
+</code></pre></div>
+
+<p>}<br>
+```</p>
+</li>
+</ul>
+<h4>Case 2 — host producer (<code>host_drop_reader</code> / <code>WriteState::HostReady</code>)</h4>
+<p>The host hands the guest two host-produced futures via <code>FutureReader::new</code>; the<br>
+guest reads one and drops the other. This reuses the existing <code>closed-streams</code><br>
+guest (<code>local::local::closed::read-future</code>, whose <code>_rx_ignored</code> argument is<br>
+dropped), so it is a drop-in host test with no new guest:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#[tokio::test]</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">async_host_producer_drop</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">engine</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Engine</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">config</span><span class="p">())</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">component</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">make_component</span><span class="p">(</span>
+<span class="w">        </span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span>
+<span class="w">        </span><span class="o">&amp;</span><span class="p">[</span><span class="n">test_programs_artifacts</span><span class="p">::</span><span class="n">ASYNC_CLOSED_STREAMS_COMPONENT</span><span class="p">],</span>
+<span class="w">    </span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">linker</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Linker</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">engine</span><span class="p">);</span>
+<span class="w">    </span><span class="n">wasmtime_wasi</span><span class="p">::</span><span class="n">p2</span><span class="p">::</span><span class="n">add_to_linker_async</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">linker</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Store</span><span class="p">::</span><span class="n">new</span><span class="p">(</span>
+<span class="w">        </span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span>
+<span class="w">        </span><span class="n">Ctx</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">wasi</span><span class="p">:</span><span class="w"> </span><span class="nc">WasiCtxBuilder</span><span class="p">::</span><span class="n">new</span><span class="p">().</span><span class="n">inherit_stdio</span><span class="p">().</span><span class="n">build</span><span class="p">(),</span>
+<span class="w">            </span><span class="n">table</span><span class="p">:</span><span class="w"> </span><span class="nc">ResourceTable</span><span class="p">::</span><span class="n">default</span><span class="p">(),</span>
+<span class="w">            </span><span class="n">continue_</span><span class="p">:</span><span class="w"> </span><span class="nc">false</span><span class="p">,</span>
+<span class="w">        </span><span class="p">},</span>
+<span class="w">    </span><span class="p">);</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">instance</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">linker</span><span class="p">.</span><span class="n">instantiate_async</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">component</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">42_</span><span class="k">u8</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="n">tx</span><span class="p">,</span><span class="w"> </span><span class="n">rx</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">oneshot</span><span class="p">::</span><span class="n">channel</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">rx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">FutureReader</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="n">OneshotProducer</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">rx</span><span class="p">))</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="n">_</span><span class="p">,</span><span class="w"> </span><span class="n">rx_ignored</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">oneshot</span><span class="p">::</span><span class="n">channel</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">rx_ignored</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">FutureReader</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="n">OneshotProducer</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">rx_ignored</span><span class="p">))</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">closed_streams</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">closed_streams</span><span class="p">::</span><span class="n">bindings</span><span class="p">::</span><span class="n">ClosedStreams</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">instance</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="n">store</span>
+<span class="w">        </span><span class="p">.</span><span class="n">run_concurrent</span><span class="p">(</span><span class="k">async</span><span class="w"> </span><span class="k">move</span><span class="w"> </span><span class="o">|</span><span class="n">accessor</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">_</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tx</span><span class="p">.</span><span class="n">send</span><span class="p">(</span><span class="n">value</span><span class="p">);</span>
+<span class="w">            </span><span class="n">closed_streams</span>
+<span class="w">                </span><span class="p">.</span><span class="n">local_local_closed</span><span class="p">()</span>
+<span class="w">                </span><span class="p">.</span><span class="n">call_read_future</span><span class="p">(</span><span class="n">accessor</span><span class="p">,</span><span class="w"> </span><span class="n">rx</span><span class="p">,</span><span class="w"> </span><span class="n">value</span><span class="p">,</span><span class="w"> </span><span class="n">rx_ignored</span><span class="p">)</span>
+<span class="w">                </span><span class="p">.</span><span class="k">await</span>
+<span class="w">        </span><span class="p">})</span>
+<span class="w">        </span><span class="p">.</span><span class="k">await</span><span class="o">??</span><span class="p">;</span>
+
+<span class="w">    </span><span class="n">store</span><span class="p">.</span><span class="n">assert_concurrent_state_empty</span><span class="p">();</span>
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="p">}</span>
+</code></pre></div>
+<ul>
+<li>Run: <code>cargo test -p component-async-tests --test test_all async_host_</code></li>
+</ul>
+<h3>Expected Results</h3>
+<p>Both tests pass: when the guest drops its end of a stream/future, the host<br>
+consumer/producer is finalized and the transmit (state + both handles) is<br>
+reclaimed, so <code>assert_concurrent_state_empty()</code> succeeds after a clean run.</p>
+<h3>Actual Results</h3>
+<p>Both tests fail with leftover entries in the concurrent-state table:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">non</span><span class="o">-</span><span class="n">empty</span><span class="w"> </span><span class="n">table</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="mi">5</span><span class="p">]</span><span class="w">            </span><span class="c1">// Case 1: 1 stream transmit (state + 2 handles)</span>
+<span class="n">non</span><span class="o">-</span><span class="n">empty</span><span class="w"> </span><span class="n">table</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="mi">5</span><span class="p">]</span><span class="w">   </span><span class="c1">// Case 2: 2 future transmits</span>
+</code></pre></div>
+<p>(In Case 2 <em>both</em> futures leak — reading a host-produced future and then<br>
+dropping the reader still strands the producer, alongside the never-read<br>
+<code>rx_ignored</code>.) The transmits are never reclaimed, so a long-running guest that<br>
+loops over such operations eventually traps with <code>resource table has no free
+keys</code>.</p>
+<p>Root cause, in<br>
+<code>crates/wasmtime/src/runtime/component/concurrent/futures_and_streams.rs</code> — two<br>
+match arms are no-ops where they must finalize the stranded host end. Both<br>
+functions are <code>StoreOpaque</code> methods reached from <code>Instance::guest_drop_readable</code><br>
+/ <code>Instance::guest_drop_writable</code>:</p>
+<ul>
+<li>
+<p><code>host_drop_reader</code> — guest drops the <strong>readable</strong> end while the host producer<br>
+  is <code>WriteState::HostReady</code>:</p>
+<p><code>rust
+WriteState::HostReady { .. } =&gt; {}
+</code></p>
+</li>
+<li>
+<p><code>host_drop_writer</code> — guest drops the <strong>writable</strong> end while the host consumer<br>
+  is <code>ReadState::HostReady</code>:</p>
+<p><code>rust
+ReadState::HostReady { .. } | ReadState::HostToHost { .. } =&gt; {}
+</code></p>
+</li>
+</ul>
+<p>A <code>TransmitState</code> is only removed by <code>delete_transmit</code>, which is reached only<br>
+once the <em>other</em> end is already <code>Dropped</code>. With these no-ops, one end stays<br>
+<code>HostReady</code> forever and the transmit is never deleted. (The host producer set up<br>
+by <code>new_transmit</code> is purely reactive — it has no self-cleanup future that<br>
+observes the drop — so nothing else reclaims it either.)</p>
+<h3>Versions and Environment</h3>
+<p>Wasmtime version or commit: <code>main</code>, 46.0.0-dev (commit <code>9c49989a2e</code>)</p>
+<p>Operating system: macOS 26.5</p>
+<p>Architecture: aarch64 (Apple Silicon)</p>
+<p>The leak is deterministic host-side bookkeeping and is not OS/architecture<br>
+specific.</p>
+<h3>Extra Info</h3>
+<p>Proposed fix: finalize the stranded host end on guest drop — when the guest's<br>
+end is now <code>Dropped</code> and the host end is <code>HostReady</code>, set the host end to<br>
+<code>Dropped</code> and call <code>delete_transmit</code> (reclaiming the state + both handles and<br>
+dropping the host consumer/producer). A change covering exactly these two arms<br>
+takes both reproductions above from leaking to empty, and the full<br>
+<code>component-async-tests</code> suite stays green. I'm happy to open a PR with the fix<br>
+and these two tests.</p>
+<p>On test coverage: <code>round_trip*</code> / <code>post_return</code> call<br>
+<code>assert_concurrent_state_empty</code>, but exercise read-based guest↔guest flows. The<br>
+existing <code>.pipe()</code>-based host-consumer scenarios (<code>tests/scenario/streams.rs</code>,<br>
+<code>tests/scenario/transmit.rs</code>) do not assert an empty concurrent state, so this<br>
+guest-drop path was untested.</p>
+<p>Related: #12091 proposes a <code>close()</code> method on the<br>
+<code>{Future,Stream}{Producer,Consumer}</code> traits, motivated by the fact that today a<br>
+host can only detect a guest-side drop via <code>Drop</code>. This bug compounds that: on<br>
+the <code>HostReady</code> guest-drop path the host producer/consumer is never finalized at<br>
+all, so even the current <code>Drop</code>-based detection never fires. Finalizing the<br>
+stranded host end (the fix above) is also the natural place from which a future<br>
+<code>close()</code> hook would be invoked.</p>
+<p>Related: <a href="https://github.com/wado-lang/wado/pull/1236">https://github.com/wado-lang/wado/pull/1236</a></p>
+</blockquote>
+
+
+
+<a name="600133465"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313514%20Component%20model%3A%20host%20stream/futu.../near/600133465" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313514.20Component.20model.3A.20host.20stream.2Ffutu.2E.2E.2E.html#600133465">(Jun 04 2026 at 16:48)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the wasm-proposal:component-model-async label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13514">Issue #13514</a>.</p>
+
+
+
+<a name="603542260"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313514%20Component%20model%3A%20host%20stream/futu.../near/603542260" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313514.20Component.20model.3A.20host.20stream.2Ffutu.2E.2E.2E.html#603542260">(Jun 16 2026 at 00:15)</a>:</h4>
+<p>alexcrichton closed <a href="https://github.com/bytecodealliance/wasmtime/issues/13514">issue #13514</a>:</p>
+<blockquote>
+<p>When a host registers a stream consumer via <code>StreamReader::pipe</code> (or hands the<br>
+guest a host-driven future/stream via <code>FutureReader::new</code> / a host-written<br>
+stream) and the <strong>guest then drops its end</strong>, the <code>TransmitState</code> and both<br>
+<code>TransmitHandle</code>s are never reclaimed from the instance's concurrent-state<br>
+table. The host-side end is left in <code>HostReady</code> and is never finalized, so the<br>
+slots leak for the lifetime of the instance. A guest that performs many such<br>
+operations in a loop fills the table and eventually traps with <code>resource table
+has no free keys</code>.</p>
+<p>This is in the core component runtime<br>
+(<code>crates/wasmtime/src/runtime/component/concurrent/futures_and_streams.rs</code>),<br>
+independent of <code>wasmtime-wasi</code>.</p>
+<h3>Test Case</h3>
+<p>The leak is in host-side transmit bookkeeping, so there is no single standalone<br>
+<code>.wasm</code> that triggers it: reproducing it requires a host driving the public<br>
+<code>StreamReader::pipe</code> / <code>FutureReader::new</code> APIs <em>and</em> a guest that drops its end<br>
+while the host end is still <code>HostReady</code>. The minimal reproduction is therefore a<br>
+pair of in-tree <code>crates/misc/component-async-tests</code> cases (full source in *Steps<br>
+to Reproduce*), using only public host APIs and no <code>wasi:*</code> data flow.</p>
+<h3>Steps to Reproduce</h3>
+<h4>Case 1 — host consumer (<code>host_drop_writer</code> / <code>ReadState::HostReady</code>)</h4>
+<p>The guest hands the host the readable end of a fresh stream, **keeps the<br>
+writable end**, writes one byte once the host attaches a consumer, then drops<br>
+the writer. The writer-drop reaches <code>host_drop_writer</code> with the read side still<br>
+<code>HostReady</code>.</p>
+<ul>
+<li>
+<p>Add an interface + world to <code>crates/misc/component-async-tests/wit/test.wit</code>:</p>
+<p>```wit<br>
+interface host-consumer-drop {<br>
+  // Returns the readable end of a fresh stream while the guest keeps the<br>
+  // writable end; writes one byte once a consumer attaches, then drops it.<br>
+  get: async func() -&gt; stream&lt;u8&gt;;<br>
+}</p>
+<p>world host-consumer-drop-guest {<br>
+  export host-consumer-drop;<br>
+}<br>
+```</p>
+</li>
+<li>
+<p>Add a guest test program at<br>
+<code>crates/test-programs/src/bin/async_host_consumer_drop.rs</code>:</p>
+<p>```rust<br>
+mod bindings {<br>
+    wit_bindgen::generate!({<br>
+        path: "../misc/component-async-tests/wit",<br>
+        world: "host-consumer-drop-guest",<br>
+        async: true,<br>
+    });</p>
+<div class="codehilite"><pre><span></span><code>use super::Component;
+export!(Component);
+</code></pre></div>
+
+<p>}</p>
+<p>use {bindings::exports::local::local::host_consumer_drop::Guest, wit_bindgen::StreamReader};</p>
+<p>struct Component;</p>
+<p>impl Guest for Component {<br>
+    async fn get() -&gt; StreamReader&lt;u8&gt; {<br>
+        let (mut tx, rx) = bindings::wit_stream::new();<br>
+        // The host attaches a consumer (read side -&gt; <code>HostReady</code>); the write<br>
+        // below blocks until that consumer reads, after which we drop the<br>
+        // writer. Dropping it while the consumer is still <code>HostReady</code> leaks.<br>
+        wit_bindgen::spawn(async move {<br>
+            assert!(tx.write_one(42).await.is_none());<br>
+            drop(tx);<br>
+        });<br>
+        rx<br>
+    }<br>
+}</p>
+<p>fn main() {}<br>
+```</p>
+</li>
+<li>
+<p>Add a host test (e.g. in <code>tests/scenario/streams.rs</code>):</p>
+<p>```rust<br>
+mod host_consumer_drop {<br>
+    wasmtime::component::bindgen!({<br>
+        path: "wit",<br>
+        world: "host-consumer-drop-guest",<br>
+        exports: { default: store | async },<br>
+    });<br>
+}</p>
+<p>#[tokio::test]<br>
+pub async fn async_host_consumer_drop() -&gt; Result&lt;()&gt; {<br>
+    let engine = Engine::new(&amp;config())?;<br>
+    let component = make_component(<br>
+        &amp;engine,<br>
+        &amp;[test_programs_artifacts::ASYNC_HOST_CONSUMER_DROP_COMPONENT],<br>
+    )<br>
+    .await?;</p>
+<div class="codehilite"><pre><span></span><code>let mut linker = Linker::new(&amp;engine);
+wasmtime_wasi::p2::add_to_linker_async(&amp;mut linker)?;
+
+let mut store = Store::new(
+    &amp;engine,
+    Ctx {
+        wasi: WasiCtxBuilder::new().inherit_stdio().build(),
+        table: ResourceTable::default(),
+        continue_: false,
+    },
+);
+
+let instance = linker.instantiate_async(&amp;mut store, &amp;component).await?;
+let guest = host_consumer_drop::HostConsumerDropGuest::new(&amp;mut store, &amp;instance)?;
+store
+    .run_concurrent(async move |accessor| {
+        let stream = guest
+            .local_local_host_consumer_drop()
+            .call_get(accessor)
+            .await?;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        accessor.with(move |store| stream.pipe(store, PipeConsumer::new(tx)))?;
+        assert_eq!(rx.next().await, Some(42));
+        assert!(rx.next().await.is_none());
+
+        wasmtime::error::Ok(())
+    })
+    .await??;
+
+store.assert_concurrent_state_empty();
+Ok(())
+</code></pre></div>
+
+<p>}<br>
+```</p>
+</li>
+</ul>
+<h4>Case 2 — host producer (<code>host_drop_reader</code> / <code>WriteState::HostReady</code>)</h4>
+<p>The host hands the guest two host-produced futures via <code>FutureReader::new</code>; the<br>
+guest reads one and drops the other. This reuses the existing <code>closed-streams</code><br>
+guest (<code>local::local::closed::read-future</code>, whose <code>_rx_ignored</code> argument is<br>
+dropped), so it is a drop-in host test with no new guest:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#[tokio::test]</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">async_host_producer_drop</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">engine</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Engine</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">config</span><span class="p">())</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">component</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">make_component</span><span class="p">(</span>
+<span class="w">        </span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span>
+<span class="w">        </span><span class="o">&amp;</span><span class="p">[</span><span class="n">test_programs_artifacts</span><span class="p">::</span><span class="n">ASYNC_CLOSED_STREAMS_COMPONENT</span><span class="p">],</span>
+<span class="w">    </span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">linker</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Linker</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">engine</span><span class="p">);</span>
+<span class="w">    </span><span class="n">wasmtime_wasi</span><span class="p">::</span><span class="n">p2</span><span class="p">::</span><span class="n">add_to_linker_async</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">linker</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Store</span><span class="p">::</span><span class="n">new</span><span class="p">(</span>
+<span class="w">        </span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span>
+<span class="w">        </span><span class="n">Ctx</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">wasi</span><span class="p">:</span><span class="w"> </span><span class="nc">WasiCtxBuilder</span><span class="p">::</span><span class="n">new</span><span class="p">().</span><span class="n">inherit_stdio</span><span class="p">().</span><span class="n">build</span><span class="p">(),</span>
+<span class="w">            </span><span class="n">table</span><span class="p">:</span><span class="w"> </span><span class="nc">ResourceTable</span><span class="p">::</span><span class="n">default</span><span class="p">(),</span>
+<span class="w">            </span><span class="n">continue_</span><span class="p">:</span><span class="w"> </span><span class="nc">false</span><span class="p">,</span>
+<span class="w">        </span><span class="p">},</span>
+<span class="w">    </span><span class="p">);</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">instance</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">linker</span><span class="p">.</span><span class="n">instantiate_async</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">component</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">42_</span><span class="k">u8</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="n">tx</span><span class="p">,</span><span class="w"> </span><span class="n">rx</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">oneshot</span><span class="p">::</span><span class="n">channel</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">rx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">FutureReader</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="n">OneshotProducer</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">rx</span><span class="p">))</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="n">_</span><span class="p">,</span><span class="w"> </span><span class="n">rx_ignored</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">oneshot</span><span class="p">::</span><span class="n">channel</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">rx_ignored</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">FutureReader</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="n">OneshotProducer</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">rx_ignored</span><span class="p">))</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">closed_streams</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">closed_streams</span><span class="p">::</span><span class="n">bindings</span><span class="p">::</span><span class="n">ClosedStreams</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">instance</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="n">store</span>
+<span class="w">        </span><span class="p">.</span><span class="n">run_concurrent</span><span class="p">(</span><span class="k">async</span><span class="w"> </span><span class="k">move</span><span class="w"> </span><span class="o">|</span><span class="n">accessor</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">_</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tx</span><span class="p">.</span><span class="n">send</span><span class="p">(</span><span class="n">value</span><span class="p">);</span>
+<span class="w">            </span><span class="n">closed_streams</span>
+<span class="w">                </span><span class="p">.</span><span class="n">local_local_closed</span><span class="p">()</span>
+<span class="w">                </span><span class="p">.</span><span class="n">call_read_future</span><span class="p">(</span><span class="n">accessor</span><span class="p">,</span><span class="w"> </span><span class="n">rx</span><span class="p">,</span><span class="w"> </span><span class="n">value</span><span class="p">,</span><span class="w"> </span><span class="n">rx_ignored</span><span class="p">)</span>
+<span class="w">                </span><span class="p">.</span><span class="k">await</span>
+<span class="w">        </span><span class="p">})</span>
+<span class="w">        </span><span class="p">.</span><span class="k">await</span><span class="o">??</span><span class="p">;</span>
+
+<span class="w">    </span><span class="n">store</span><span class="p">.</span><span class="n">assert_concurrent_state_empty</span><span class="p">();</span>
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="p">}</span>
+</code></pre></div>
+<ul>
+<li>Run: <code>cargo test -p component-async-tests --test test_all async_host_</code></li>
+</ul>
+<h3>Expected Results</h3>
+<p>Both tests pass: when the guest drops its end of a stream/future, the host<br>
+consumer/producer is finalized and the transmit (state + both handles) is<br>
+reclaimed, so <code>assert_concurrent_state_empty()</code> succeeds after a clean run.</p>
+<h3>Actual Results</h3>
+<p>Both tests fail with leftover entries in the concurrent-state table:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">non</span><span class="o">-</span><span class="n">empty</span><span class="w"> </span><span class="n">table</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="mi">5</span><span class="p">]</span><span class="w">            </span><span class="c1">// Case 1: 1 stream transmit (state + 2 handles)</span>
+<span class="n">non</span><span class="o">-</span><span class="n">empty</span><span class="w"> </span><span class="n">table</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="mi">5</span><span class="p">]</span><span class="w">   </span><span class="c1">// Case 2: 2 future transmits</span>
+</code></pre></div>
+<p>(In Case 2 <em>both</em> futures leak — reading a host-produced future and then<br>
+dropping the reader still strands the producer, alongside the never-read<br>
+<code>rx_ignored</code>.) The transmits are never reclaimed, so a long-running guest that<br>
+loops over such operations eventually traps with <code>resource table has no free
+keys</code>.</p>
+<p>Root cause, in<br>
+<code>crates/wasmtime/src/runtime/component/concurrent/futures_and_streams.rs</code> — two<br>
+match arms are no-ops where they must finalize the stranded host end. Both<br>
+functions are <code>StoreOpaque</code> methods reached from <code>Instance::guest_drop_readable</code><br>
+/ <code>Instance::guest_drop_writable</code>:</p>
+<ul>
+<li>
+<p><code>host_drop_reader</code> — guest drops the <strong>readable</strong> end while the host producer<br>
+  is <code>WriteState::HostReady</code>:</p>
+<p><code>rust
+WriteState::HostReady { .. } =&gt; {}
+</code></p>
+</li>
+<li>
+<p><code>host_drop_writer</code> — guest drops the <strong>writable</strong> end while the host consumer<br>
+  is <code>ReadState::HostReady</code>:</p>
+<p><code>rust
+ReadState::HostReady { .. } | ReadState::HostToHost { .. } =&gt; {}
+</code></p>
+</li>
+</ul>
+<p>A <code>TransmitState</code> is only removed by <code>delete_transmit</code>, which is reached only<br>
+once the <em>other</em> end is already <code>Dropped</code>. With these no-ops, one end stays<br>
+<code>HostReady</code> forever and the transmit is never deleted. (The host producer set up<br>
+by <code>new_transmit</code> is purely reactive — it has no self-cleanup future that<br>
+observes the drop — so nothing else reclaims it either.)</p>
+<h3>Versions and Environment</h3>
+<p>Wasmtime version or commit: <code>main</code>, 46.0.0-dev (commit <code>9c49989a2e</code>)</p>
+<p>Operating system: macOS 26.5</p>
+<p>Architecture: aarch64 (Apple Silicon)</p>
+<p>The leak is deterministic host-side bookkeeping and is not OS/architecture<br>
+specific.</p>
+<h3>Extra Info</h3>
+<p>Proposed fix: finalize the stranded host end on guest drop — when the guest's<br>
+end is now <code>Dropped</code> and the host end is <code>HostReady</code>, set the host end to<br>
+<code>Dropped</code> and call <code>delete_transmit</code> (reclaiming the state + both handles and<br>
+dropping the host consumer/producer). A change covering exactly these two arms<br>
+takes both reproductions above from leaking to empty, and the full<br>
+<code>component-async-tests</code> suite stays green. I'm happy to open a PR with the fix<br>
+and these two tests.</p>
+<p>On test coverage: <code>round_trip*</code> / <code>post_return</code> call<br>
+<code>assert_concurrent_state_empty</code>, but exercise read-based guest↔guest flows. The<br>
+existing <code>.pipe()</code>-based host-consumer scenarios (<code>tests/scenario/streams.rs</code>,<br>
+<code>tests/scenario/transmit.rs</code>) do not assert an empty concurrent state, so this<br>
+guest-drop path was untested.</p>
+<p>Related: #12091 proposes a <code>close()</code> method on the<br>
+<code>{Future,Stream}{Producer,Consumer}</code> traits, motivated by the fact that today a<br>
+host can only detect a guest-side drop via <code>Drop</code>. This bug compounds that: on<br>
+the <code>HostReady</code> guest-drop path the host producer/consumer is never finalized at<br>
+all, so even the current <code>Drop</code>-based detection never fires. Finalizing the<br>
+stranded host end (the fix above) is also the natural place from which a future<br>
+<code>close()</code> hook would be invoked.</p>
+<p>Related: <a href="https://github.com/wado-lang/wado/pull/1236">https://github.com/wado-lang/wado/pull/1236</a></p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

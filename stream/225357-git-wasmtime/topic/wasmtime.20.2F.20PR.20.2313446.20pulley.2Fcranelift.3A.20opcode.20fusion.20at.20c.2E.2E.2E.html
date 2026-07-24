@@ -1,0 +1,359 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #13446 pulley/cranelift: opcode fusion at c... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313446.20pulley.2Fcranelift.3A.20opcode.20fusion.20at.20c.2E.2E.2E.html">wasmtime / PR #13446 pulley/cranelift: opcode fusion at c...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="596891345"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313446%20pulley/cranelift%3A%20opcode%20fusion%20at%20c.../near/596891345" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313446.20pulley.2Fcranelift.3A.20opcode.20fusion.20at.20c.2E.2E.2E.html#596891345">(May 22 2026 at 02:26)</a>:</h4>
+<p>matthargett opened <a href="https://github.com/bytecodealliance/wasmtime/pull/13446">PR #13446</a> from <code>rebeckerspecialties:claude/pulley-fusion-xband-brif-upstream</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<h2>TL;DR</h2>
+<p>Stacks on #13445 (per-table mutability tracking). Adds a fused dispatch op family at the <code>call_indirect</code> lazy-init brif site (similar in shape to WAMR's preprocessed-bytecode register IR) plus a <code>call_indirect{1,2,3,4}</code> family mirroring direct-call <code>call{1,2,3,4}</code>. Consistent <strong>4–8 % wallclock wins</strong> on polymorphic vtable workloads across iPhone 12 A14 Icestorm E-core, Apple Watch SE2 S8, and M4 Sawtooth E-core. iPhone XS A12 Tempest is mixed — branch-prediction pressure is the cross-microarch variable.</p>
+<p>Closes ~10 % of the Pulley/WAMR wallclock gap on the iPhone 12 vtable suite (vtable_poly4 1.73× → 1.58×) and pushes WAMR within <strong>1.16×</strong> on <code>xmrsplayer</code> on Apple Watch SE2 — the closest cross-device result in our matrix.</p>
+<h2>Dependency</h2>
+<p>Depends on #13445 landing first. Both PRs are stacked from the same fork branch; this PR's diff against <code>main</code> includes #13445's 11 commits at the bottom + 13 fusion commits on top. The fusion is gated on <code>is_eagerly_initialized_funcref_table</code> (the predicate added in #13445), so it only fires when the table-mutability proof holds.</p>
+<h2>Stack</h2>
+<p>13 commits on top of #13445:</p>
+<ul>
+<li><strong>Phases 1–3</strong>: collapse <code>band + brif + 2 xloads</code> at the call_indirect lazy-init tail (5 Pulley dispatches → 2 per call_indirect site).</li>
+<li><strong>Phase 4</strong>: <code>call_indirect{1,2,3,4}</code> opcodes mirror direct-call <code>call{1,2,3,4}</code>. <code>Inst::IndirectCall</code> bundles first 4 integer ABI args into the call opcode instead of synthesising <code>xmov</code>s via regalloc <code>reg_fixed_use</code>.</li>
+<li><strong>Correctness</strong>: handlers trap on null (a slow-path-aliasing review concern: <code>sink_pure_inst</code> of the continuation-block loads broke the lazy-init slow path's rejoin; trapping fails closed under the predicate); <code>#[cfg(debug_assertions)]</code> predecessor-count assertion in <code>pre_lower</code> to catch future structural regressions.</li>
+</ul>
+<h2>Wallclock medians, N=10, phase-4 vs <code>table-mutability-tracking</code> baseline</h2>
+<p><code>BENCH_TARGET_MS=2000</code>; <code>.utility</code> QoS on iOS / <code>taskpolicy -b</code> on M4.</p>
+<table>
+<thead>
+<tr>
+<th>workload</th>
+<th style="text-align: right;">iPhone 12 (A14)</th>
+<th style="text-align: right;">iPhone XS (A12)</th>
+<th style="text-align: right;">Watch SE2 (S8)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>call_indirect</td>
+<td style="text-align: right;">−2.48 %</td>
+<td style="text-align: right;">+0.18 %</td>
+<td style="text-align: right;">−0.50 %</td>
+</tr>
+<tr>
+<td>vtable_bi</td>
+<td style="text-align: right;"><strong>−7.45 %</strong></td>
+<td style="text-align: right;">+4.84 %</td>
+<td style="text-align: right;"><strong>−4.26 %</strong></td>
+</tr>
+<tr>
+<td>vtable_poly4</td>
+<td style="text-align: right;"><strong>−8.61 %</strong></td>
+<td style="text-align: right;">−2.96 %</td>
+<td style="text-align: right;"><strong>−4.76 %</strong></td>
+</tr>
+<tr>
+<td>vtable_poly6</td>
+<td style="text-align: right;"><strong>−5.32 %</strong></td>
+<td style="text-align: right;">+5.41 %</td>
+<td style="text-align: right;"><strong>−4.64 %</strong></td>
+</tr>
+<tr>
+<td>xmrsplayer</td>
+<td style="text-align: right;">+0.26 %</td>
+<td style="text-align: right;">−6.04 %</td>
+<td style="text-align: right;">+0.25 %</td>
+</tr>
+<tr>
+<td>graphql (AS)</td>
+<td style="text-align: right;">−0.13 %</td>
+<td style="text-align: right;">−3.63 %</td>
+<td style="text-align: right;">−0.74 %</td>
+</tr>
+<tr>
+<td>graphql (Porffor)</td>
+<td style="text-align: right;">+2.13 %</td>
+<td style="text-align: right;">+0.21 %</td>
+<td style="text-align: right;">+0.58 %</td>
+</tr>
+</tbody>
+</table>
+<h2>PMU buckets (single 12 s xctrace <code>CPU Counters</code> per workload)</h2>
+<p>iPhone 12 attach-mode + M4 launch-mode. Phase-4 bucket shares:</p>
+<ul>
+<li><strong>A14 Icestorm vtable suite</strong>: 20–38 % Processing, 4–18 % Discarded.</li>
+<li><strong>A14 Icestorm graphql + call_indirect</strong>: 9–13 % Processing, <strong>17–41 % Discarded</strong> — interpreter-loop mispredict pressure.</li>
+<li><strong>M4 Sawtooth, every workload</strong>: <strong>33–47 % Processing</strong> — back-end load-use latency on the dispatch tail dominates Sawtooth's wider issue width.</li>
+</ul>
+<p>Common bottleneck across A14 + M4 is Processing (back-end-bound). A12 Tempest doesn't expose <code>CounterMetricByThread</code>; iPhone XS is wallclock-only.</p>
+<h2>Verification</h2>
+<ul>
+<li>2237 / 2237 cranelift filetests</li>
+<li>13 / 13 <code>craneliftpulley_call_*</code> integration tests</li>
+<li>21 min <code>cargo fuzz run differential --no-default-features</code> with <code>ALLOWED_ENGINES=pulley,wasmtime</code> — 0 crashes / 0 divergences</li>
+</ul>
+<p>Cross-device measurement harness + raw N=10 logs + per-phase writeups: <a href="https://github.com/rebeckerspecialties/wasm-benchmark/pull/1">rebeckerspecialties/wasm-benchmark#1</a>.<br>
+</p>
+</blockquote>
+
+
+
+<a name="596891347"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313446%20pulley/cranelift%3A%20opcode%20fusion%20at%20c.../near/596891347" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313446.20pulley.2Fcranelift.3A.20opcode.20fusion.20at.20c.2E.2E.2E.html#596891347">(May 22 2026 at 02:26)</a>:</h4>
+<p>matthargett requested <a href="https://github.com/cfallin">cfallin</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13446">PR #13446</a>.</p>
+
+
+
+<a name="596891348"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313446%20pulley/cranelift%3A%20opcode%20fusion%20at%20c.../near/596891348" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313446.20pulley.2Fcranelift.3A.20opcode.20fusion.20at.20c.2E.2E.2E.html#596891348">(May 22 2026 at 02:26)</a>:</h4>
+<p>matthargett requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13446">PR #13446</a>.</p>
+
+
+
+<a name="596891349"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313446%20pulley/cranelift%3A%20opcode%20fusion%20at%20c.../near/596891349" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313446.20pulley.2Fcranelift.3A.20opcode.20fusion.20at.20c.2E.2E.2E.html#596891349">(May 22 2026 at 02:26)</a>:</h4>
+<p>matthargett requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13446">PR #13446</a>.</p>
+
+
+
+<a name="596891350"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313446%20pulley/cranelift%3A%20opcode%20fusion%20at%20c.../near/596891350" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313446.20pulley.2Fcranelift.3A.20opcode.20fusion.20at.20c.2E.2E.2E.html#596891350">(May 22 2026 at 02:26)</a>:</h4>
+<p>matthargett requested <a href="https://github.com/fitzgen">fitzgen</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13446">PR #13446</a>.</p>
+
+
+
+<a name="596891351"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313446%20pulley/cranelift%3A%20opcode%20fusion%20at%20c.../near/596891351" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313446.20pulley.2Fcranelift.3A.20opcode.20fusion.20at.20c.2E.2E.2E.html#596891351">(May 22 2026 at 02:26)</a>:</h4>
+<p>matthargett requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-default-reviewers">wasmtime-default-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13446">PR #13446</a>.</p>
+
+
+
+<a name="596893074"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313446%20pulley/cranelift%3A%20opcode%20fusion%20at%20c.../near/596893074" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313446.20pulley.2Fcranelift.3A.20opcode.20fusion.20at.20c.2E.2E.2E.html#596893074">(May 22 2026 at 02:44)</a>:</h4>
+<p>matthargett edited <a href="https://github.com/bytecodealliance/wasmtime/pull/13446">PR #13446</a>:</p>
+<blockquote>
+<h2>TL;DR</h2>
+<p>Stacks on #13445 (per-table mutability tracking). Adds a fused dispatch op family at the <code>call_indirect</code> lazy-init brif site (similar in shape to WAMR's preprocessed-bytecode register IR) plus a <code>call_indirect{1,2,3,4}</code> family mirroring direct-call <code>call{1,2,3,4}</code>. Consistent <strong>4–8 % wallclock wins</strong> on polymorphic vtable workloads across iPhone 12  E-core, Apple Watch SE2 , and M4 E-core. iPhone XS e-core is mixed and the reason, is visible in hand-rolled aarch64 assembly microbenchmarks: branch-prediction pressure is the cross-microarch variable.</p>
+<p>Closes ~10 % of the Pulley/WAMR wallclock gap on the iPhone 12 vtable suite (vtable_poly4 1.73× → 1.58×) and pushes WAMR within <strong>1.16×</strong> on <code>xmrsplayer</code> on Apple Watch SE2 — the closest cross-device result in our matrix.</p>
+<h2>Dependency</h2>
+<p>Depends on #13445 landing first. Both PRs are stacked from the same fork branch; this PR's diff against <code>main</code> includes #13445's 11 commits at the bottom + 13 fusion commits on top. The fusion is gated on <code>is_eagerly_initialized_funcref_table</code> (the predicate added in #13445), so it only fires when the table-mutability proof holds.</p>
+<h2>Stack</h2>
+<p>13 commits on top of #13445:</p>
+<ul>
+<li><strong>Phases 1–3</strong>: collapse <code>band + brif + 2 xloads</code> at the call_indirect lazy-init tail (5 Pulley dispatches → 2 per call_indirect site).</li>
+<li><strong>Phase 4</strong>: <code>call_indirect{1,2,3,4}</code> opcodes mirror direct-call <code>call{1,2,3,4}</code>. <code>Inst::IndirectCall</code> bundles first 4 integer ABI args into the call opcode instead of synthesising <code>xmov</code>s via regalloc <code>reg_fixed_use</code>.</li>
+<li><strong>Correctness</strong>: handlers trap on null (a slow-path-aliasing review concern: <code>sink_pure_inst</code> of the continuation-block loads broke the lazy-init slow path's rejoin; trapping fails closed under the predicate); <code>#[cfg(debug_assertions)]</code> predecessor-count assertion in <code>pre_lower</code> to catch future structural regressions, but lmk if this is overkill.</li>
+</ul>
+<h2>Wallclock medians, N=10, phase-4 vs <code>table-mutability-tracking</code> baseline</h2>
+<p><code>BENCH_TARGET_MS=2000</code>; <code>.utility</code> QoS on iOS / <code>taskpolicy -b</code> on M4.</p>
+<table>
+<thead>
+<tr>
+<th>workload</th>
+<th style="text-align: right;">iPhone 12 (A14)</th>
+<th style="text-align: right;">iPhone XS (A12)</th>
+<th style="text-align: right;">Watch SE2 (S8)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>call_indirect</td>
+<td style="text-align: right;">−2.48 %</td>
+<td style="text-align: right;">+0.18 %</td>
+<td style="text-align: right;">−0.50 %</td>
+</tr>
+<tr>
+<td>vtable_bi</td>
+<td style="text-align: right;"><strong>−7.45 %</strong></td>
+<td style="text-align: right;">+4.84 %</td>
+<td style="text-align: right;"><strong>−4.26 %</strong></td>
+</tr>
+<tr>
+<td>vtable_poly4</td>
+<td style="text-align: right;"><strong>−8.61 %</strong></td>
+<td style="text-align: right;">−2.96 %</td>
+<td style="text-align: right;"><strong>−4.76 %</strong></td>
+</tr>
+<tr>
+<td>vtable_poly6</td>
+<td style="text-align: right;"><strong>−5.32 %</strong></td>
+<td style="text-align: right;">+5.41 %</td>
+<td style="text-align: right;"><strong>−4.64 %</strong></td>
+</tr>
+<tr>
+<td>xmrsplayer</td>
+<td style="text-align: right;">+0.26 %</td>
+<td style="text-align: right;">−6.04 %</td>
+<td style="text-align: right;">+0.25 %</td>
+</tr>
+<tr>
+<td>graphql (AS)</td>
+<td style="text-align: right;">−0.13 %</td>
+<td style="text-align: right;">−3.63 %</td>
+<td style="text-align: right;">−0.74 %</td>
+</tr>
+<tr>
+<td>graphql (Porffor)</td>
+<td style="text-align: right;">+2.13 %</td>
+<td style="text-align: right;">+0.21 %</td>
+<td style="text-align: right;">+0.58 %</td>
+</tr>
+</tbody>
+</table>
+<h2>PMU buckets (single 12 s xctrace <code>CPU Counters</code> per workload)</h2>
+<ul>
+<li><strong>A14 Icestorm vtable suite</strong>: 20–38 % Processing, 4–18 % Discarded.</li>
+<li><strong>A14 Icestorm graphql + call_indirect</strong>: 9–13 % Processing, <strong>17–41 % Discarded</strong> interpreter-loop mispredict pressure but its kinda squirrely and I couldn't pin it down..</li>
+<li><strong>M4 Sawtooth, every workload</strong>: <strong>33–47 % Processing</strong> — back-end load-use latency on the dispatch tail dominates Sawtooth's wider issue width. The wide spread here is probably due to running the measurement and dev stack on the device itself.</li>
+</ul>
+<p>Common bottleneck across A14 + M4 is Processing (back-end-bound). I can't measure these advacned CPU counters on iPhone XS (A12) or Apple Watch, I can only get wall clock time and power draw.</p>
+<h2>Verification</h2>
+<ul>
+<li>2237 / 2237 cranelift filetests</li>
+<li>13 / 13 <code>craneliftpulley_call_*</code> integration tests</li>
+<li>21 min <code>cargo fuzz run differential --no-default-features</code> with <code>ALLOWED_ENGINES=pulley,wasmtime</code> — 0 crashes / 0 divergences</li>
+</ul>
+<h2>Extra credit</h2>
+<p>Cross-device measurement harness I built for this bake-off across WASM runtimes: <a href="https://github.com/rebeckerspecialties/wasm-benchmark/pull/1">https://github.com/rebeckerspecialties/wasm-benchmark/pull/1</a></p>
+<p>I submitted two PRs to WAMR to support exceptions and loose SIMD, so that it can run more of the benchmarks and generally have functional partity without losing its performance edge.</p>
+</blockquote>
+
+
+
+<a name="596897441"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313446%20pulley/cranelift%3A%20opcode%20fusion%20at%20c.../near/596897441" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313446.20pulley.2Fcranelift.3A.20opcode.20fusion.20at.20c.2E.2E.2E.html#596897441">(May 22 2026 at 03:26)</a>:</h4>
+<p>matthargett updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13446">PR #13446</a>.</p>
+
+
+
+<a name="596898506"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313446%20pulley/cranelift%3A%20opcode%20fusion%20at%20c.../near/596898506" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313446.20pulley.2Fcranelift.3A.20opcode.20fusion.20at.20c.2E.2E.2E.html#596898506">(May 22 2026 at 03:35)</a>:</h4>
+<p>matthargett updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13446">PR #13446</a>.</p>
+
+
+
+<a name="596898590"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313446%20pulley/cranelift%3A%20opcode%20fusion%20at%20c.../near/596898590" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313446.20pulley.2Fcranelift.3A.20opcode.20fusion.20at.20c.2E.2E.2E.html#596898590">(May 22 2026 at 03:36)</a>:</h4>
+<p>matthargett edited <a href="https://github.com/bytecodealliance/wasmtime/pull/13446">PR #13446</a>:</p>
+<blockquote>
+<h2>TL;DR</h2>
+<p>Stacks on #13445 (per-table mutability tracking). Adds a fused dispatch op family at the <code>call_indirect</code> lazy-init brif site (similar in shape to WAMR's preprocessed-bytecode register IR) plus a <code>call_indirect{1,2,3,4}</code> family mirroring direct-call <code>call{1,2,3,4}</code>. Consistent <strong>4–8 % wallclock wins</strong> on polymorphic vtable workloads across iPhone 12  E-core, Apple Watch SE2 , and M4 E-core. iPhone XS e-core is mixed and the reason, is visible in hand-rolled aarch64 assembly microbenchmarks: branch-prediction pressure is the cross-microarch variable.</p>
+<p>Closes ~10 % of the Pulley/WAMR wallclock gap on the iPhone 12 vtable suite (vtable_poly4 1.73× → 1.58×) and pushes WAMR within <strong>1.16×</strong> on <code>xmrsplayer</code> on Apple Watch SE2 — the closest cross-device result in our matrix.</p>
+<h2>Dependency</h2>
+<p>Depends on #13445 landing first. Both PRs are stacked from the same fork branch; this PR's diff against <code>main</code> includes #13445's 11 commits at the bottom + 13 fusion commits on top. The fusion is gated on <code>is_eagerly_initialized_funcref_table</code> (the predicate added in #13445), so it only fires when the table-mutability proof holds.</p>
+<h2>Stack</h2>
+<p>13 commits on top of #13445:</p>
+<ul>
+<li><strong>Phases 1–3</strong>: collapse <code>band + brif + 2 xloads</code> at the call_indirect lazy-init tail (5 Pulley dispatches → 2 per call_indirect site).</li>
+<li><strong>Phase 4</strong>: <code>call_indirect{1,2,3,4}</code> opcodes mirror direct-call <code>call{1,2,3,4}</code>. <code>Inst::IndirectCall</code> bundles first 4 integer ABI args into the call opcode instead of synthesising <code>xmov</code>s via regalloc <code>reg_fixed_use</code>.</li>
+<li><strong>Correctness</strong>: handlers trap on null (a slow-path-aliasing review concern: <code>sink_pure_inst</code> of the continuation-block loads broke the lazy-init slow path's rejoin; trapping fails closed under the predicate).</li>
+</ul>
+<h2>Wallclock medians, N=10, phase-4 vs <code>table-mutability-tracking</code> baseline</h2>
+<p><code>BENCH_TARGET_MS=2000</code>; <code>.utility</code> QoS on iOS / <code>taskpolicy -b</code> on M4.</p>
+<table>
+<thead>
+<tr>
+<th>workload</th>
+<th style="text-align: right;">iPhone 12 (A14)</th>
+<th style="text-align: right;">iPhone XS (A12)</th>
+<th style="text-align: right;">Watch SE2 (S8)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>call_indirect</td>
+<td style="text-align: right;">−2.48 %</td>
+<td style="text-align: right;">+0.18 %</td>
+<td style="text-align: right;">−0.50 %</td>
+</tr>
+<tr>
+<td>vtable_bi</td>
+<td style="text-align: right;"><strong>−7.45 %</strong></td>
+<td style="text-align: right;">+4.84 %</td>
+<td style="text-align: right;"><strong>−4.26 %</strong></td>
+</tr>
+<tr>
+<td>vtable_poly4</td>
+<td style="text-align: right;"><strong>−8.61 %</strong></td>
+<td style="text-align: right;">−2.96 %</td>
+<td style="text-align: right;"><strong>−4.76 %</strong></td>
+</tr>
+<tr>
+<td>vtable_poly6</td>
+<td style="text-align: right;"><strong>−5.32 %</strong></td>
+<td style="text-align: right;">+5.41 %</td>
+<td style="text-align: right;"><strong>−4.64 %</strong></td>
+</tr>
+<tr>
+<td>xmrsplayer</td>
+<td style="text-align: right;">+0.26 %</td>
+<td style="text-align: right;">−6.04 %</td>
+<td style="text-align: right;">+0.25 %</td>
+</tr>
+<tr>
+<td>graphql (AS)</td>
+<td style="text-align: right;">−0.13 %</td>
+<td style="text-align: right;">−3.63 %</td>
+<td style="text-align: right;">−0.74 %</td>
+</tr>
+<tr>
+<td>graphql (Porffor)</td>
+<td style="text-align: right;">+2.13 %</td>
+<td style="text-align: right;">+0.21 %</td>
+<td style="text-align: right;">+0.58 %</td>
+</tr>
+</tbody>
+</table>
+<h2>PMU buckets (single 12 s xctrace <code>CPU Counters</code> per workload)</h2>
+<ul>
+<li><strong>A14 Icestorm vtable suite</strong>: 20–38 % Processing, 4–18 % Discarded.</li>
+<li><strong>A14 Icestorm graphql + call_indirect</strong>: 9–13 % Processing, <strong>17–41 % Discarded</strong> interpreter-loop mispredict pressure but its kinda squirrely and I couldn't pin it down..</li>
+<li><strong>M4 Sawtooth, every workload</strong>: <strong>33–47 % Processing</strong> — back-end load-use latency on the dispatch tail dominates Sawtooth's wider issue width. The wide spread here is probably due to running the measurement and dev stack on the device itself.</li>
+</ul>
+<p>Common bottleneck across A14 + M4 is Processing (back-end-bound). I can't measure these advacned CPU counters on iPhone XS (A12) or Apple Watch, I can only get wall clock time and power draw.</p>
+<h2>Verification</h2>
+<ul>
+<li>2237 / 2237 cranelift filetests</li>
+<li>13 / 13 <code>craneliftpulley_call_*</code> integration tests</li>
+<li>21 min <code>cargo fuzz run differential --no-default-features</code> with <code>ALLOWED_ENGINES=pulley,wasmtime</code> — 0 crashes / 0 divergences</li>
+</ul>
+<h2>Extra credit</h2>
+<p>Cross-device measurement harness I built for this bake-off across WASM runtimes: <a href="https://github.com/rebeckerspecialties/wasm-benchmark/pull/1">https://github.com/rebeckerspecialties/wasm-benchmark/pull/1</a></p>
+<p>I submitted two PRs to WAMR to support exceptions and loose SIMD, so that it can run more of the benchmarks and generally have functional partity without losing its performance edge.<br>
+</p>
+</blockquote>
+
+
+
+<a name="596899076"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313446%20pulley/cranelift%3A%20opcode%20fusion%20at%20c.../near/596899076" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313446.20pulley.2Fcranelift.3A.20opcode.20fusion.20at.20c.2E.2E.2E.html#596899076">(May 22 2026 at 03:40)</a>:</h4>
+<p>matthargett updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13446">PR #13446</a>.</p>
+
+
+
+<a name="596902541"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313446%20pulley/cranelift%3A%20opcode%20fusion%20at%20c.../near/596902541" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313446.20pulley.2Fcranelift.3A.20opcode.20fusion.20at.20c.2E.2E.2E.html#596902541">(May 22 2026 at 04:08)</a>:</h4>
+<p>matthargett updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13446">PR #13446</a>.</p>
+
+
+
+<a name="596902901"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313446%20pulley/cranelift%3A%20opcode%20fusion%20at%20c.../near/596902901" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313446.20pulley.2Fcranelift.3A.20opcode.20fusion.20at.20c.2E.2E.2E.html#596902901">(May 22 2026 at 04:11)</a>:</h4>
+<p><span aria-label="cross mark" class="emoji emoji-274c" role="img" title="cross mark">:cross_mark:</span> matthargett closed without merge <a href="https://github.com/bytecodealliance/wasmtime/pull/13446">PR #13446</a>.</p>
+
+
+
+<a name="596903164"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313446%20pulley/cranelift%3A%20opcode%20fusion%20at%20c.../near/596903164" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313446.20pulley.2Fcranelift.3A.20opcode.20fusion.20at.20c.2E.2E.2E.html#596903164">(May 22 2026 at 04:13)</a>:</h4>
+<p>matthargett <a href="https://github.com/bytecodealliance/wasmtime/pull/13446#issuecomment-4514914222">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13446">PR #13446</a>:</p>
+<blockquote>
+<p>Reopened as #13447 (renamed branch). Same commits, same code; just a branch-name cleanup. CI is running there now.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

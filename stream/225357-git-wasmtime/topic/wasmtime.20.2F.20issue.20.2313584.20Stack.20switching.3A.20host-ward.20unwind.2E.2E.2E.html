@@ -1,0 +1,80 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13584 Stack switching: host-ward unwind... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313584.20Stack.20switching.3A.20host-ward.20unwind.2E.2E.2E.html">wasmtime / issue #13584 Stack switching: host-ward unwind...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="600883526"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313584%20Stack%20switching%3A%20host-ward%20unwind.../near/600883526" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313584.20Stack.20switching.3A.20host-ward.20unwind.2E.2E.2E.html#600883526">(Jun 06 2026 at 21:06)</a>:</h4>
+<p>Nymphium opened <a href="https://github.com/bytecodealliance/wasmtime/issues/13584">issue #13584</a>:</p>
+<blockquote>
+<h3>Summary</h3>
+<p>With the stack-switching proposal enabled, once a <code>resume</code> has executed, <strong>any subsequent host-ward unwind</strong> — <code>proc_exit</code>, a wasm trap, or an uncaught exception reaching the host — corrupts the fiber/stack allocator and aborts the process with <code>free(): invalid pointer</code> / <code>munmap_chunk(): invalid pointer</code> (SIGABRT). The <code>resume</code> is the trigger; no exceptions are involved in the minimal repro below. A <code>resume</code> that returns normally (process exits 0) is fine.</p>
+<h3>Steps to Reproduce</h3>
+<p>Minimal <code>.wat</code> (no exceptions, just <code>cont.new</code> + <code>resume</code> + <code>proc_exit</code>):</p>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">import</span> <span class="s2">"wasi_snapshot_preview1"</span> <span class="s2">"proc_exit"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$proc_exit</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span><span class="p">)))</span>
+  <span class="p">(</span><span class="k">memory</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"memory"</span><span class="p">)</span> <span class="mi">1</span><span class="p">)</span>
+  <span class="p">(</span><span class="k">type</span> <span class="nv">$ft</span> <span class="p">(</span><span class="k">func</span><span class="p">))</span>
+  <span class="p">(</span><span class="k">type</span> <span class="nv">$ct</span> <span class="p">(</span><span class="err">cont</span> <span class="nv">$ft</span><span class="p">))</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$body</span><span class="p">)</span>
+  <span class="p">(</span><span class="k">elem</span> <span class="err">declare</span> <span class="k">func</span> <span class="nv">$body</span><span class="p">)</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$start</span> <span class="p">(</span><span class="k">local</span> <span class="nv">$k</span> <span class="p">(</span><span class="err">ref</span> <span class="err">null</span> <span class="nv">$ct</span><span class="p">))</span>
+    <span class="err">ref.</span><span class="k">func</span> <span class="nv">$body</span>
+    <span class="err">cont.new</span> <span class="nv">$ct</span>
+    <span class="nb">local.set</span> <span class="nv">$k</span>
+    <span class="k">block</span> <span class="nv">$done</span>
+      <span class="p">(</span><span class="err">resume</span> <span class="nv">$ct</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$k</span><span class="p">))</span>
+      <span class="nb">br</span> <span class="nv">$done</span>
+    <span class="k">end</span>
+    <span class="nb">i32.const</span> <span class="mi">0</span>
+    <span class="nb">call</span> <span class="nv">$proc_exit</span><span class="p">)</span>
+  <span class="p">(</span><span class="k">start</span> <span class="nv">$start</span><span class="p">))</span>
+</code></pre></div>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">wasm</span><span class="o">-</span><span class="n">tools</span><span class="w"> </span><span class="n">parse</span><span class="w"> </span><span class="n">ss</span><span class="p">.</span><span class="n">wat</span><span class="w"> </span><span class="o">-</span><span class="n">o</span><span class="w"> </span><span class="n">ss</span><span class="p">.</span><span class="n">wasm</span>
+<span class="cp">$</span><span class="w"> </span><span class="n">wasmtime</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="o">-</span><span class="n">W</span><span class="w"> </span><span class="n">exceptions</span><span class="o">=</span><span class="n">y</span><span class="p">,</span><span class="n">function</span><span class="o">-</span><span class="n">references</span><span class="o">=</span><span class="n">y</span><span class="p">,</span><span class="n">stack</span><span class="o">-</span><span class="n">switching</span><span class="o">=</span><span class="n">y</span><span class="p">,</span><span class="n">tail</span><span class="o">-</span><span class="n">call</span><span class="o">=</span><span class="n">y</span><span class="w"> </span><span class="n">ss</span><span class="p">.</span><span class="n">wasm</span>
+</code></pre></div>
+<h3>Expected Results</h3>
+<p>The continuation runs to completion, <code>resume</code> returns to <code>$start</code>, and <code>proc_exit(0)</code> exits the process cleanly with code 0.</p>
+<h3>Actual Results</h3>
+<p>Process aborts (SIGABRT, exit 134) with a heap-allocator error:</p>
+<ul>
+<li><strong>wasmtime 45.0.0</strong>: <code>munmap_chunk(): invalid pointer</code></li>
+<li><strong>wasmtime 44.0.0</strong>: <code>free(): invalid pointer</code></li>
+</ul>
+<p>The same crash occurs if, instead of <code>proc_exit</code>, the post-<code>resume</code> code traps (e.g. <code>unreachable</code> / integer divide-by-zero) or lets an uncaught exception reach the host. <code>cont.new</code> <em>without</em> <code>resume</code> followed by <code>proc_exit</code> does <strong>not</strong> crash, so <code>resume</code> is the trigger. Guest-side attempts to clear state (nulling the cont local, clearing the table slot, nesting the workload in a child continuation, calling <code>proc_exit</code> from within a fiber) all still crash — the corruption appears to live in the per-store stack allocator.</p>
+<h3>Versions and Environment</h3>
+<ul>
+<li>Wasmtime: <strong>44.0.0 and 45.0.0</strong> (both reproduce), x86_64 Linux</li>
+<li>Flags: <code>-W exceptions=y,function-references=y,stack-switching=y,tail-call=y</code></li>
+</ul>
+<h3>Context</h3>
+<p>This is hit in practice by a language that compiles effect handlers to stack switching: any program that combines a <code>with @k</code>-style handler (a <code>resume</code>) with a later trap or uncaught-exception/<code>proc_exit</code> termination aborts instead of exiting cleanly. Programs that only ever exit 0 after a <code>resume</code> are unaffected.</p>
+<p>Filing as a distinct case under the stack-switching tracking issue (#10248). It seems related to the existing "Stack-switching crash with traps and missing bounds checks" item and to the note there that hostcalls from continuation stacks "should not be allowed", but I didn't find a dedicated issue for the <code>proc_exit</code>/host-unwind-after-<code>resume</code> double-free, so opening one with a self-contained repro.<br>
+</p>
+</blockquote>
+
+
+
+<a name="600926380"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313584%20Stack%20switching%3A%20host-ward%20unwind.../near/600926380" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313584.20Stack.20switching.3A.20host-ward.20unwind.2E.2E.2E.html#600926380">(Jun 06 2026 at 23:18)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasm-proposal:stack-switching label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13584">Issue #13584</a>.</p>
+
+
+
+<a name="600926461"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313584%20Stack%20switching%3A%20host-ward%20unwind.../near/600926461" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313584.20Stack.20switching.3A.20host-ward.20unwind.2E.2E.2E.html#600926461">(Jun 06 2026 at 23:18)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/13584#issuecomment-4640760790">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13584">issue #13584</a>:</p>
+<blockquote>
+<p>Thanks for the report, and stack-switching is known to be incomplete and is not recommended for users to enable at this point.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

@@ -1,0 +1,74 @@
+<html>
+<head><meta charset="utf-8"><title>p3 http helper and request/response deadlock · wasi · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/index.html">wasi</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/p3.20http.20helper.20and.20request.2Fresponse.20deadlock.html">p3 http helper and request/response deadlock</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="595887990"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/p3%20http%20helper%20and%20request/response%20deadlock/near/595887990" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Tomasz Andrzejak <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/p3.20http.20helper.20and.20request.2Fresponse.20deadlock.html#595887990">(May 18 2026 at 17:34)</a>:</h4>
+<p>Hey, </p>
+<p>While running the wasmtime p3 http components through jco, I hit a deadlock and I just wanted to sanity check a guest assumptions. The relevant code is in <a href="https://github.com/bytecodealliance/wasmtime/blob/main/crates/test-programs/src/p3/http.rs#L91">test-programs/src/p3/http.rs</a>. It creates the request body stream like this:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="k">mut</span><span class="w"> </span><span class="n">contents_tx</span><span class="p">,</span><span class="w"> </span><span class="n">contents_rx</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">wit_stream</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="n">trailers_tx</span><span class="p">,</span><span class="w"> </span><span class="n">trailers_rx</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">wit_future</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">||</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(</span><span class="nb">None</span><span class="p">));</span>
+<span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="n">request</span><span class="p">,</span><span class="w"> </span><span class="n">transmit</span><span class="p">)</span><span class="w"> </span><span class="o">=</span>
+<span class="w">     </span><span class="n">types</span><span class="p">::</span><span class="n">Request</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">headers</span><span class="p">,</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">contents_rx</span><span class="p">),</span><span class="w"> </span><span class="n">trailers_rx</span><span class="p">,</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">options</span><span class="p">));</span>
+</code></pre></div>
+<p>It then awaits <code>client::send(request)</code> before writing/dropping the request body stream. Only after a response is available it concurrently writes/drops the request body and collect the response:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="n">response</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">client</span><span class="p">::</span><span class="n">send</span><span class="p">(</span><span class="n">request</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<span class="w"> </span><span class="o">..</span><span class="p">.</span>
+<span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="p">((),</span><span class="w"> </span><span class="n">rx</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">join</span><span class="o">!</span><span class="p">(</span>
+<span class="w">     </span><span class="k">async</span><span class="w"> </span><span class="p">{</span>
+<span class="w">         </span><span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">buf</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">body</span><span class="w"> </span><span class="p">{</span>
+<span class="w">             </span><span class="kd">let</span><span class="w"> </span><span class="n">remaining</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">contents_tx</span><span class="p">.</span><span class="n">write_all</span><span class="p">(</span><span class="n">buf</span><span class="p">.</span><span class="n">into</span><span class="p">()).</span><span class="k">await</span><span class="p">;</span>
+<span class="w">             </span><span class="fm">assert!</span><span class="p">(</span><span class="n">remaining</span><span class="p">.</span><span class="n">is_empty</span><span class="p">());</span>
+<span class="w">         </span><span class="p">}</span>
+<span class="w">         </span><span class="nb">drop</span><span class="p">(</span><span class="n">contents_tx</span><span class="p">);</span>
+<span class="w">         </span><span class="n">_</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">trailers_tx</span><span class="p">.</span><span class="n">write</span><span class="p">(</span><span class="nb">Ok</span><span class="p">(</span><span class="nb">None</span><span class="p">)).</span><span class="k">await</span><span class="p">;</span>
+<span class="w">     </span><span class="p">},</span>
+<span class="w">     </span><span class="k">async</span><span class="w"> </span><span class="p">{</span>
+<span class="w">         </span><span class="kd">let</span><span class="w"> </span><span class="n">body</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">body_rx</span><span class="p">.</span><span class="n">collect</span><span class="p">().</span><span class="k">await</span><span class="p">;</span>
+<span class="w">         </span><span class="o">..</span><span class="p">.</span>
+<span class="w">     </span><span class="p">}</span>
+<span class="w"> </span><span class="p">);</span>
+</code></pre></div>
+<p>That works with the current wasmtime fixture server because the server sends the response without first waiting for the full request body. But I don't think that is a general http server requirement. A server may reasonably read request body chunks until request-body <code>eof</code> before sending response headers/status/body.</p>
+<p>In that case the guest can deadlock:</p>
+<ol>
+<li>guest creates a streaming request body</li>
+<li>guest calls <code>client::send(request).await</code></li>
+<li>server waits for request-body <code>eof</code> before sending a response</li>
+<li>guest only writes/drops <code>contents_tx</code> after client::send returns</li>
+<li>request-body <code>eof</code> is never sent, so the server never responds</li>
+</ol>
+<p>Here <code>eof</code> means the body terminator, not like tcp connection <code>eof</code>. For HTTP/1.1 chunked bodies, dropping/closing the body sender is what lets hyper send the terminating zero sized chunk. Until <code>contents_tx</code> is dropped, the server body stream can be open.</p>
+<p>So I think the guest is assuming that <code>client::send(request).await</code> can complete before the request body producer completes. Is that intentional? If not, one possible fix would be to allow concurrent progress for sending the request body and waiting for the response, e.g. move the request-body write/drop path into the outer <code>join!</code> so it can run concurrently with <code>client::send</code> rather than only after send returns.</p>
+<p>An example server loop that will cause guest to deadlock could look like this:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">handle</span><span class="p">(</span><span class="k">mut</span><span class="w"> </span><span class="n">req</span><span class="p">:</span><span class="w"> </span><span class="nc">Request</span><span class="o">&lt;</span><span class="n">Body</span><span class="o">&gt;</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="n">Response</span><span class="o">&lt;</span><span class="n">Body</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="n">Infallible</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">chunks</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="n">Bytes</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Vec</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+
+<span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">next</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">req</span><span class="p">.</span><span class="n">body_mut</span><span class="p">().</span><span class="n">data</span><span class="p">().</span><span class="k">await</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">match</span><span class="w"> </span><span class="n">next</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nb">Ok</span><span class="p">(</span><span class="n">chunk</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">chunks</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="n">chunk</span><span class="p">),</span>
+<span class="w">            </span><span class="nb">Err</span><span class="p">(</span><span class="n">err</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="fm">println!</span><span class="p">(</span><span class="s">"error: {err}"</span><span class="p">),</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="o">..</span><span class="p">.</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>I'm happy to prepare a PR if  needed.</p>
+
+
+
+<a name="595890351"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/p3%20http%20helper%20and%20request/response%20deadlock/near/595890351" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/p3.20http.20helper.20and.20request.2Fresponse.20deadlock.html#595890351">(May 18 2026 at 17:43)</a>:</h4>
+<p>Yeah, I agree that the test is assuming too much about how and when the server will send a response; using <code>join!</code> to send the body concurrently with the call to <code>client::send</code> sounds good to me.</p>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

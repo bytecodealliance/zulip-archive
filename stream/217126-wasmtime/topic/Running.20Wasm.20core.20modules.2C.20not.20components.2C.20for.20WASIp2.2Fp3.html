@@ -1,0 +1,57 @@
+<html>
+<head><meta charset="utf-8"><title>Running Wasm core modules, not components, for WASIp2/p3 · wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/index.html">wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Running.20Wasm.20core.20modules.2C.20not.20components.2C.20for.20WASIp2.2Fp3.html">Running Wasm core modules, not components, for WASIp2/p3</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="607824650"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Running%20Wasm%20core%20modules%2C%20not%20components%2C%20for%20WASIp2/p3/near/607824650" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Jim Teichgräber <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Running.20Wasm.20core.20modules.2C.20not.20components.2C.20for.20WASIp2.2Fp3.html#607824650">(Jul 02 2026 at 11:54)</a>:</h4>
+<p>Wasmtime, understandably, does not currently "automagically" convert Wasm core modules in to Wasm components (i.e. run the equivalent of <code>wasm-tools component new</code>), when core modules are passed to <code>wasmtime run</code>.</p>
+<p>This is very understandable, given that <code>wasmtime run</code> needs to support WASI p1 core modules, and WASI p2/p3 components, so it presumably couldn't simply just <em>always</em> try to convert any passed core module to a component, <em>even if that was desired</em>.</p>
+<p>But I'd like to ask, or possibly start a discussion on that last, part: <em>whether it might be desired</em> to be able to directly run core Wasm modules that simply use WASI &gt;=0.2 APIs with "normal" core imports and exports.</p>
+<p>Right now, the "hard" requirement for "componentization" (e.g. by <code>wasm-tools</code>) makes a lot of sense in terms of separation of concerns, of course, but it also means that compilers/toolchains targetting Wasm have to choose between:</p>
+<ol>
+<li>Output Wasm component binaries, essentially duplicating much of the work done by the <code>wit-component</code> crate to encode canon lift/lower, and higher-level WIT types directly into the binary.</li>
+<li>Same as 1., but instead of implementing this themselves, hook into this existing functionality in some way, either by using the <code>wit-component</code> crate (potentially through some FFI, depending on the implementation language), or by directly depending on the <code>wasm-tools</code> package as a runtime dependency to call <code>wasm-tools component new</code> for the user.</li>
+<li>Don't do 1. or 2., simply output a Wasm core module as a binary and let the user deal with it.</li>
+</ol>
+<p>Rust's wasm32-wasip2 target, being implemented in Rust, has an easy time using approach 2. (in <code>wasm-component-ld</code>, iiuc). Other implementations all have to make this call, and involve quite a bit of plumbing effort to make it easy for users, by implementing 1. or 2., or resort to 3. in case they cannot afford that effort.</p>
+<p>If Wasmtime was able to run core modules even in this case, that problem would be solved, and the expectation "simple binary output by compiler (without external tooling) is runnable by vm" would be fully restored, without these any hack to stitch together tools, like both solutions 1. and 2. feel like. Of course, the only thing that would happen in reality is the hack moves to Wasmtime, which is ugly in itself, but perhaps less ugly than having to re-implement this/re-make this decision in every toolchain?</p>
+<p>I'm curious about what people think of this. I've looked through the chat, as well as the issue tracker and couldn't really find an existing explicit discussion about this, sorry if I missed anything there.</p>
+
+
+
+<a name="607835249"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Running%20Wasm%20core%20modules%2C%20not%20components%2C%20for%20WASIp2/p3/near/607835249" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Till Schneidereit <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Running.20Wasm.20core.20modules.2C.20not.20components.2C.20for.20WASIp2.2Fp3.html#607835249">(Jul 02 2026 at 12:46)</a>:</h4>
+<p>as I see it, there are two key problems with this approach:</p>
+<ol>
+<li>the componentization applied by <code>wit-component</code> / <code>wasm-component-ld</code> relies on information in a custom section. Those are meant to be optional; stripping them is permissible at any step. That's okay as long as there is tight control of the pipeline between building a core module and componentizing it, as is the case right now. With this proposal, that would evaporate, and I'm not sure how we could do anything about it. This also means that your option (3) doesn't really exist: toolchains do have to provide more information about the interface than just emitting a core module with core module imports/exports implementing the canonical ABI. That's already the case, but will be even more so with more sophistication over time, such as direct support for WasmGC, or more wide-spread use of lifting/lowering options such as choosing different string encodings.</li>
+<li>the component model very deliberately doesn't privilege host-builtin APIs over those provided by other components: any component import can be provided by another component just as well as the runtime environment. With this proposal, we'd give up on that in practice, I think: we'd say "toolchain vendors, focus on use cases where the runtime environment provides everything that's needed to run your outputs, and ignore linking of components.</li>
+</ol>
+<p>Additionally, I would also gently push back on the framing of this as "hacks": same as a compiler targeting native code outputs <code>.o</code>, with the linker turning that into actual executables, I don't think there's anything particularly noteworthy about toolchains needing to wrap outputs into another layer. As you say, general-purpose tools do exist for this, and I think toolchains adopting <code>wasm-component-ld</code> instead of rolling their own linker would be perfectly fine as a common practice. They'd still have to provide the information needed for the linker to do its job, but as said above, that is pretty fundamental</p>
+
+
+
+<a name="607854347"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Running%20Wasm%20core%20modules%2C%20not%20components%2C%20for%20WASIp2/p3/near/607854347" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Running.20Wasm.20core.20modules.2C.20not.20components.2C.20for.20WASIp2.2Fp3.html#607854347">(Jul 02 2026 at 14:05)</a>:</h4>
+<p>In addition to the points that Till brought up, I would say that there's a strong distinction to be made between tooling conventions and what Wasmtime accepts at runtime. There's currently no standard for what <code>wasm-tools component new</code> does. There's no review process beyond the repository itself, there's no venue for standardization, etc. This is all exactly what the component-model is supposed to serve and best serves.  The closest approximation to this is <a href="https://github.com/WebAssembly/component-model/pull/378">the <code>BuildTargets.md</code> proposal</a>  which is not yet complete. Even then that would only be one possible piece of the puzzle, and my point is that if Wasmtime were to ever accept a core module as a substitute for a component there would need to be a standard definition of what it meant to do so</p>
+
+
+
+<a name="607867854"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/Running%20Wasm%20core%20modules%2C%20not%20components%2C%20for%20WASIp2/p3/near/607867854" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Jim Teichgräber <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/Running.20Wasm.20core.20modules.2C.20not.20components.2C.20for.20WASIp2.2Fp3.html#607867854">(Jul 02 2026 at 14:58)</a>:</h4>
+<p>Thank you both for your time in considering this and responding!</p>
+<p>First of all, I'm reading my message back again and have to agree that phrasing those as hacks, esp. without "", wasn't ideal. Separating concerns in this way is a perfectly valid approach of course, I didn't mean to suggest otherwise.</p>
+<p>Even though I came across <code>wasm-component-ld</code>, which obviously references linking, I hadn't considered the analogy to static linking of native binaries more deeply. I think there are some differences in the practicalities - most importantly that it's easy to assume any working system already has a linker installed - but it's a good way to think about it.</p>
+<p>All the points you bring up make a lot of sense, and seem only really solvable with actual hacks, like simply assuming the existence of those custom sections, or some "implicit" standard for the input format, which both seem like hairy options. </p>
+<p>Thanks again : )</p>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

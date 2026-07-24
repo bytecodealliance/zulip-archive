@@ -1,0 +1,746 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #13459 Implement the branch-hinting proposa... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html">wasmtime / PR #13459 Implement the branch-hinting proposa...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="597177340"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597177340" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597177340">(May 22 2026 at 23:04)</a>:</h4>
+<p>gfx opened <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a> from <code>wado-lang:gfx/branch-hinting-v2</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>Refs #9463. Supersedes #12483 (closed); this reworks that attempt to address<br>
+the review there.</p>
+<h2>What this does</h2>
+<p>Parses the <code>metadata.code.branch_hint</code> custom section and uses the hints to mark<br>
+cold blocks during Cranelift compilation, behind a new opt-in knob:</p>
+<ul>
+<li>
+<p><code>Config::wasm_branch_hinting(bool)</code> — <strong>off by default</strong>. Also <code>-W branch-hinting</code><br>
+  (CLI) and <code>wasmtime_config_wasm_branch_hinting_set</code> (C API).</p>
+</li>
+<li>
+<p>Applies to both <code>br_if</code> and <code>if</code> (the proposal hints both). For a hinted<br>
+  branch, the unlikely successor is marked cold via <code>FunctionBuilder::set_cold_block</code>.</p>
+</li>
+<li>
+<p>Hints are advisory: when the knob is off the section is ignored exactly as<br>
+  today, and when on it never changes execution semantics.</p>
+</li>
+</ul>
+<h2>Addressing the #12483 review</h2>
+<ul>
+<li>
+<p><strong>O(n), no per-offset map</strong> (cfallin/alexcrichton): the proposal lists hints in<br>
+  ascending PC order, so they are consumed with a forward cursor as translation<br>
+  visits increasing offsets (<code>FuncEnvironment::take_branch_hint</code>) — O(1)<br>
+  amortized, O(n) per function, no <code>HashMap&lt;offset, _&gt;</code>. We rely on the spec's<br>
+  ordering rather than re-sorting (validating malformed sections is left to a<br>
+  follow-up, see below).</p>
+</li>
+<li>
+<p><strong>Config knob, default off</strong> (fitzgen): there is no <code>WasmFeatures</code> bit for<br>
+  branch hinting (it is a pure custom section with nothing to validate in<br>
+<code>wasmparser</code>), so the knob lives in <code>Tunables</code> and is read by both the parser<br>
+  (<code>ModuleEnvironment</code>) and the compiler (<code>FuncEnvironment</code>). Per the proposal<br>
+  stability rules it stays off until fuzzed.</p>
+</li>
+<li>
+<p><strong><code>if</code> is handled</strong> (a gap in #12483, which only did <code>br_if</code>): all hints in<br>
+<code>tests/spec_testsuite/custom/branch_hint.wast</code> are on <code>if</code>. The <code>if</code> case<br>
+  includes the subtlety that the <code>else</code> block is sometimes allocated lazily<br>
+  (when <code>params == results</code>); a likely-taken hint there is deferred via<br>
+<code>ControlStackFrame::If { else_is_cold }</code> and applied when <code>Operator::Else</code><br>
+  creates the block.</p>
+</li>
+</ul>
+<p>The hint offset uses <code>builder.srcloc().bits()</code> (module-relative) minus the<br>
+function body's start (<code>body.get_binary_reader().original_position()</code>), matching<br>
+<code>wasmparser::BranchHint.func_offset</code>.</p>
+<p><code>Config::wasm_branch_hinting</code> only affects cold-block layout, so it is excluded<br>
+from the compiled-artifact compatibility check in <code>engine/serialization.rs</code><br>
+(an artifact loads into an engine configured either way).</p>
+<h2>Codegen evidence</h2>
+<p>In-tree, <code>tests/disas/branch-hinting-aarch64.wat</code> checks <code>$if_unlikely</code> with the<br>
+knob on: the unlikely then-block is hoisted out of line past <code>ret</code>, so the hot<br>
+path falls through. <code>tests/disas/branch-hinting-disabled.wat</code> is the same module<br>
+without the flag and asserts that nothing is marked cold.</p>
+<p>The off-vs-on contrast is clearest on a hot loop — from the objdump A/B in the<br>
+dogfood experiment linked below, per iteration the hot path goes from two taken<br>
+branches to one:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">off</span><span class="w"> </span><span class="err">—</span><span class="w"> </span><span class="n">cold</span><span class="w"> </span><span class="n">inline</span><span class="p">,</span><span class="w"> </span><span class="n">hot</span><span class="w"> </span><span class="n">path</span><span class="w"> </span><span class="n">branches</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">it</span><span class="w"> </span><span class="n">every</span><span class="w"> </span><span class="n">iteration</span><span class="p">:</span>
+<span class="w">    </span><span class="nc">cbnz</span><span class="w"> </span><span class="n">x0</span><span class="p">,</span><span class="w"> </span><span class="o">&lt;</span><span class="n">cold</span><span class="o">&gt;</span><span class="w">    </span><span class="p">;</span><span class="w"> </span><span class="o">~</span><span class="n">always</span><span class="w"> </span><span class="n">taken</span><span class="p">,</span><span class="w"> </span><span class="n">skip</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">inline</span><span class="w"> </span><span class="n">cold</span><span class="w"> </span><span class="n">body</span>
+<span class="w">    </span><span class="o">&lt;</span><span class="n">cold</span><span class="w"> </span><span class="n">body</span><span class="o">&gt;</span><span class="w">        </span><span class="p">;</span><span class="w"> </span><span class="n">wedged</span><span class="w"> </span><span class="n">between</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">hot</span><span class="w"> </span><span class="n">body</span><span class="w"> </span><span class="n">and</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="k">loop</span><span class="w"> </span><span class="n">back</span><span class="o">-</span><span class="n">edge</span>
+<span class="w">    </span><span class="n">add</span><span class="w">  </span><span class="n">x3</span><span class="p">,</span><span class="w"> </span><span class="p">#</span><span class="mi">1</span>
+<span class="w">    </span><span class="n">b</span><span class="w">    </span><span class="o">&lt;</span><span class="k">loop</span><span class="o">&gt;</span>
+
+<span class="n">on</span><span class="w"> </span><span class="err">—</span><span class="w"> </span><span class="n">cold</span><span class="w"> </span><span class="n">hoisted</span><span class="w"> </span><span class="n">past</span><span class="w"> </span><span class="err">`</span><span class="n">ret</span><span class="err">`</span><span class="p">,</span><span class="w"> </span><span class="n">hot</span><span class="w"> </span><span class="n">path</span><span class="w"> </span><span class="n">falls</span><span class="w"> </span><span class="n">through</span><span class="p">:</span>
+<span class="w">    </span><span class="nc">cbz</span><span class="w">  </span><span class="n">x0</span><span class="p">,</span><span class="w"> </span><span class="o">&lt;</span><span class="n">cold</span><span class="o">&gt;</span><span class="w">    </span><span class="p">;</span><span class="w"> </span><span class="o">~</span><span class="n">never</span><span class="w"> </span><span class="n">taken</span>
+<span class="w">    </span><span class="n">add</span><span class="w">  </span><span class="n">x3</span><span class="p">,</span><span class="w"> </span><span class="p">#</span><span class="mi">1</span>
+<span class="w">    </span><span class="n">b</span><span class="w">    </span><span class="o">&lt;</span><span class="k">loop</span><span class="o">&gt;</span>
+<span class="w">    </span><span class="n">ret</span>
+<span class="w">    </span><span class="o">&lt;</span><span class="n">cold</span><span class="w"> </span><span class="n">body</span><span class="o">&gt;</span><span class="w">        </span><span class="p">;</span><span class="w"> </span><span class="n">out</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">line</span>
+</code></pre></div>
+<h2>Performance</h2>
+<p>The transformation is the expected one (hot path tightened, cold path moved out<br>
+of line), but I'm not claiming a microbenchmark number here: on a tight loop on<br>
+Apple Silicon the wall-time delta is within noise — the eliminated forward<br>
+branch is perfectly predicted and the loop fits in L1i, so layout barely<br>
+matters. Branch hints pay off under i-cache pressure / large hot code, so the<br>
+credible place for a number is <code>/bench_x64</code> on a representative workload rather<br>
+than a microbenchmark. There is no runtime overhead either way: hints only<br>
+affect compile-time block layout, and with the knob off codegen is unchanged.</p>
+<p>This was dogfooded end-to-end against <a href="https://github.com/wado-lang/wado">Wado</a><br>
+output (a language that emits <code>metadata.code.branch_hint</code>): an objdump A/B on a<br>
+real Wado component shows the hints take effect. The harness and numbers are<br>
+published as a reproducible experiment:<br>
+&lt;<a href="https://github.com/wado-lang/wado/pull/1152">https://github.com/wado-lang/wado/pull/1152</a>&gt;.</p>
+<h2>Testing</h2>
+<ul>
+<li>
+<p><code>tests/disas/branch-hinting.wat</code> (x86_64, 5 cases): <code>br_if</code>/<code>if</code> × likely/unlikely,<br>
+  plus the lazily-allocated-<code>else</code> case — each marks the expected block cold.</p>
+</li>
+<li>
+<p><code>tests/disas/branch-hinting-aarch64.wat</code> (aarch64, <code>test = "compile"</code>): cold<br>
+  paths laid out-of-line in real machine code (the optimization is in<br>
+  target-independent Cranelift, so it applies on every backend).</p>
+</li>
+<li>
+<p><code>tests/disas/branch-hinting-disabled.wat</code>: the same hinted module with the knob<br>
+  off produces no cold blocks (no-regression).</p>
+</li>
+<li>
+<p><code>tests/all/branch_hinting.rs</code>: a hinted module produces identical results with<br>
+  the knob enabled, explicitly disabled, and at its default — confirming<br>
+  semantic neutrality.</p>
+</li>
+</ul>
+<h2>Scope and follow-ups</h2>
+<p>This is intentionally the codegen + knob slice. Tracked as follow-ups before<br>
+flipping the default on:</p>
+<ul>
+<li>
+<p>Validate the section and reject bad hints (the spec restricts hints to <code>br_if</code><br>
+  and <code>if</code> only). <code>branch_hint.wast</code> exercises both <code>assert_malformed_custom</code><br>
+  (duplicate hint, hint outside a function) and <code>assert_invalid_custom</code> (hint<br>
+  whose offset points at a non-branch instruction). Phase 1 ignores misplaced<br>
+  hints rather than rejecting them; making these pass needs the validation plus<br>
+<code>assert_{malformed,invalid}_custom</code> support in the wast runner, then ungating<br>
+  the test (currently skipped in <code>crates/test-util/src/wast.rs</code>).</p>
+</li>
+<li>
+<p><code>wasm-smith</code> branch-hint emission + fuzzing soak, then enable by default and<br>
+  update <code>module_generation_uses_expected_proposals</code>.</p>
+</li>
+</ul>
+<p>The stability matrix is updated accordingly (Tier 3, API/C-API done, Tests/Fuzzed<br>
+pending, off by default).</p>
+</blockquote>
+
+
+
+<a name="597177341"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597177341" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597177341">(May 22 2026 at 23:04)</a>:</h4>
+<p>gfx requested <a href="https://github.com/apps/copilot-pull-request-reviewer">Copilot</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="597177345"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597177345" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597177345">(May 22 2026 at 23:04)</a>:</h4>
+<p>gfx requested <a href="https://github.com/fitzgen">fitzgen</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="597177346"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597177346" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597177346">(May 22 2026 at 23:04)</a>:</h4>
+<p>gfx requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="597177347"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597177347" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597177347">(May 22 2026 at 23:04)</a>:</h4>
+<p>gfx requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="597177348"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597177348" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597177348">(May 22 2026 at 23:04)</a>:</h4>
+<p>gfx requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-default-reviewers">wasmtime-default-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="597177500"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597177500" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597177500">(May 22 2026 at 23:05)</a>:</h4>
+<p>gfx updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="597177676"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597177676" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597177676">(May 22 2026 at 23:08)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> Copilot submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#pullrequestreview-4349222611">PR review</a>:</p>
+<blockquote>
+<h2>Pull request overview</h2>
+<blockquote>
+<p>[!NOTE]<br>
+Copilot was unable to run its full agentic suite in this review.</p>
+</blockquote>
+<p>Adds opt-in support for the WebAssembly branch-hinting proposal by parsing <code>metadata.code.branch_hint</code> and using it to mark cold blocks during Cranelift compilation, with corresponding user-facing knobs and regression tests.</p>
+<p><strong>Changes:</strong></p>
+<ul>
+<li>Introduces a <code>Config::wasm_branch_hinting</code> toggle (plus CLI/C-API plumbing) to enable/disable parsing and use of branch-hint metadata.</li>
+<li>Parses the <code>metadata.code.branch_hint</code> custom section into per-function hint lists and threads them through Cranelift translation to mark cold blocks for <code>if</code>/<code>br_if</code>.</li>
+<li>Adds disassembly and runtime tests (including a “disabled by default” case) plus release/docs updates.</li>
+</ul>
+<h3>Reviewed changes</h3>
+<p>Copilot reviewed 18 out of 18 changed files in this pull request and generated 2 comments.</p>
+<p>&lt;details&gt;<br>
+&lt;summary&gt;Show a summary per file&lt;/summary&gt;</p>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>tests/disas/branch-hinting.wat</td>
+<td>New disas test ensuring hints mark the expected cold blocks when enabled.</td>
+</tr>
+<tr>
+<td>tests/disas/branch-hinting-disabled.wat</td>
+<td>New disas regression test ensuring hints are ignored by default (no <code>cold</code> blocks).</td>
+</tr>
+<tr>
+<td>tests/disas/branch-hinting-aarch64.wat</td>
+<td>New backend coverage showing hint-driven cold-path layout on aarch64.</td>
+</tr>
+<tr>
+<td>tests/all/main.rs</td>
+<td>Wires in the new Rust test module.</td>
+</tr>
+<tr>
+<td>tests/all/branch_hinting.rs</td>
+<td>Adds semantic-neutrality test across enabled/disabled/default configurations.</td>
+</tr>
+<tr>
+<td>docs/stability-wasm-proposals.md</td>
+<td>Documents branch-hinting status and adds tracking footnote.</td>
+</tr>
+<tr>
+<td>crates/wasmtime/src/engine/serialization.rs</td>
+<td>Treats <code>branch_hinting</code> as non-compat-affecting for serialized artifacts.</td>
+</tr>
+<tr>
+<td>crates/wasmtime/src/config.rs</td>
+<td>Adds <code>Config::wasm_branch_hinting</code> public API.</td>
+</tr>
+<tr>
+<td>crates/environ/src/tunables.rs</td>
+<td>Adds <code>branch_hinting</code> tunable with default <code>false</code>.</td>
+</tr>
+<tr>
+<td>crates/environ/src/compile/module_environ.rs</td>
+<td>Stores parsed branch hints in <code>ModuleTranslation</code> when enabled.</td>
+</tr>
+<tr>
+<td>crates/cranelift/src/translate/stack.rs</td>
+<td>Tracks deferred “else is cold” state for lazily-allocated else blocks.</td>
+</tr>
+<tr>
+<td>crates/cranelift/src/translate/code_translator.rs</td>
+<td>Applies branch hints for <code>if</code> and <code>br_if</code> by marking cold successor blocks.</td>
+</tr>
+<tr>
+<td>crates/cranelift/src/func_environ.rs</td>
+<td>Adds per-function hint cursoring and <code>take_branch_hint</code> lookup by srcloc.</td>
+</tr>
+<tr>
+<td>crates/cranelift/src/compiler.rs</td>
+<td>Feeds per-function hints and function-body start offset into <code>FuncEnvironment</code>.</td>
+</tr>
+<tr>
+<td>crates/cli-flags/src/lib.rs</td>
+<td>Exposes <code>-Wbranch-hinting</code> / wasm proposal flag wiring (opt-in, not in “all”).</td>
+</tr>
+<tr>
+<td>crates/c-api/src/config.rs</td>
+<td>Adds C API setter to enable/disable branch-hinting.</td>
+</tr>
+<tr>
+<td>crates/c-api/include/wasmtime/config.h</td>
+<td>Declares the new C API configuration property.</td>
+</tr>
+<tr>
+<td>RELEASES.md</td>
+<td>Notes the new opt-in branch-hinting support in release notes.</td>
+</tr>
+<tr>
+<td>&lt;/details&gt;</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<hr>
+<p><span aria-label="light bulb" class="emoji emoji-1f4a1" role="img" title="light bulb">:light_bulb:</span> &lt;a href="/bytecodealliance/wasmtime/new/main?filename=.github/instructions/*.instructions.md" class="Link--inTextBlock" target="_blank" rel="noopener noreferrer"&gt;Add Copilot custom instructions&lt;/a&gt; for smarter, more guided reviews. &lt;a href="<a href="https://docs.github.com/en/copilot/customizing-copilot/adding-repository-custom-instructions-for-github-copilot">https://docs.github.com/en/copilot/customizing-copilot/adding-repository-custom-instructions-for-github-copilot</a>" class="Link--inTextBlock" target="_blank" rel="noopener noreferrer"&gt;Learn how to get started&lt;/a&gt;.</p>
+</blockquote>
+
+
+
+<a name="597177677"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597177677" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597177677">(May 22 2026 at 23:08)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> Copilot created <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#discussion_r3291575001">PR review comment</a>:</p>
+<blockquote>
+<p>Making <code>ModuleTranslation::branch_hints</code> a public field exposes an internal representation (and its invariants, e.g. sorted offsets) as API surface. Consider keeping the field private and providing a small accessor (e.g., lookup by <code>FuncIndex</code> returning <code>&amp;[BranchHint]</code>) so you can change storage/validation strategy later without forcing downstream changes.</p>
+</blockquote>
+
+
+
+<a name="597177678"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597177678" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597177678">(May 22 2026 at 23:08)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> Copilot created <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#discussion_r3291575021">PR review comment</a>:</p>
+<blockquote>
+<p>Using <code>HashMap::insert</code> will overwrite any previously-parsed hints for the same function index, silently dropping earlier entries if the custom section contains duplicates. Even if full validation is deferred, it would be safer to either (a) append/extend an existing hint list (<code>entry(...).and_modify(|v| ...).or_insert(...)</code>) or (b) ignore/log duplicates deterministically to avoid losing hints unexpectedly.<br>
+</p>
+</blockquote>
+
+
+
+<a name="597180941"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597180941" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597180941">(May 22 2026 at 23:47)</a>:</h4>
+<p>gfx updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="597267056"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597267056" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597267056">(May 23 2026 at 04:01)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="597267058"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597267058" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597267058">(May 23 2026 at 04:01)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:c-api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="597267059"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597267059" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597267059">(May 23 2026 at 04:01)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:config</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="597267064"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597267064" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597267064">(May 23 2026 at 04:01)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:docs</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="597267178"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597267178" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597267178">(May 23 2026 at 04:02)</a>:</h4>
+<p>github-actions[bot] <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#issuecomment-4524098394">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>:</p>
+<blockquote>
+<h4>Label Messager: wasmtime:config</h4>
+<p>It looks like you are changing Wasmtime's configuration options. Make sure to<br>
+complete this check list:</p>
+<ul>
+<li>
+<p>[ ] If you added a new <code>Config</code> method, you wrote extensive documentation for<br>
+      it.</p>
+<p>&lt;details&gt;</p>
+<p>Our documentation should be of the following form:</p>
+<p>```text<br>
+Short, simple summary sentence.</p>
+<p>More details. These details can be multiple paragraphs. There should be<br>
+information about not just the method, but its parameters and results as<br>
+well.</p>
+<p>Is this method fallible? If so, when can it return an error?</p>
+<p>Can this method panic? If so, when does it panic?</p>
+<h1>Example</h1>
+<p>Optional example here.<br>
+```</p>
+<p>&lt;/details&gt;</p>
+</li>
+<li>
+<p>[ ] If you added a new <code>Config</code> method, or modified an existing one, you<br>
+  ensured that this configuration is exercised by the fuzz targets.</p>
+<p>&lt;details&gt;</p>
+<p>For example, if you expose a new strategy for allocating the next instance<br>
+slot inside the pooling allocator, you should ensure that at least one of our<br>
+fuzz targets exercises that new strategy.</p>
+<p>Often, all that is required of you is to ensure that there is a knob for this<br>
+configuration option in [<code>wasmtime_fuzzing::Config</code>][fuzzing-config] (or one<br>
+of its nested <code>struct</code>s).</p>
+<p>Rarely, this may require authoring a new fuzz target to specifically test this<br>
+configuration. See [our docs on fuzzing][fuzzing-docs] for more details.</p>
+<p>&lt;/details&gt;</p>
+</li>
+<li>
+<p>[ ] If you are enabling a configuration option by default, make sure that it<br>
+  has been fuzzed for at least two weeks before turning it on by default.</p>
+</li>
+</ul>
+<p>[fuzzing-config]: <a href="https://github.com/bytecodealliance/wasmtime/blob/ca0e8d0a1d8cefc0496dba2f77a670571d8fdcab/crates/fuzzing/src/generators.rs#L182-L194">https://github.com/bytecodealliance/wasmtime/blob/ca0e8d0a1d8cefc0496dba2f77a670571d8fdcab/crates/fuzzing/src/generators.rs#L182-L194</a><br>
+[fuzzing-docs]: <a href="https://docs.wasmtime.dev/contributing-fuzzing.html">https://docs.wasmtime.dev/contributing-fuzzing.html</a></p>
+<hr>
+<p>&lt;details&gt;</p>
+<p>To modify this label's message, edit the &lt;code&gt;.github/label-messager/wasmtime-config.md&lt;/code&gt; file.</p>
+<p>To add new label messages or remove existing label messages, edit the<br>
+&lt;code&gt;.github/label-messager.json&lt;/code&gt; configuration file.</p>
+<p><a href="https://github.com/bytecodealliance/label-messager-action">Learn more.</a></p>
+<p>&lt;/details&gt;</p>
+</blockquote>
+
+
+
+<a name="597317781"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597317781" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597317781">(May 23 2026 at 15:42)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#issuecomment-4525834921">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>:</p>
+<blockquote>
+<p>@gfx please take a moment to acquaint yourself with the BA's <a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">AI tool use policy</a>. Notably this looks like a very large wall of text generated by an AI. Please ensure that you are yourself in the loop on all communication because you, after all, own this change and are responsible for it.</p>
+</blockquote>
+
+
+
+<a name="597319119"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597319119" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597319119">(May 23 2026 at 16:01)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#pullrequestreview-4351015230">PR review</a>.</p>
+
+
+
+<a name="597319120"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597319120" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597319120">(May 23 2026 at 16:01)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#discussion_r3293054778">PR review comment</a>:</p>
+<blockquote>
+<p>This is quite wordy -- this just needs to refer to the tracking issue.</p>
+</blockquote>
+
+
+
+<a name="597319121"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597319121" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597319121">(May 23 2026 at 16:01)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#discussion_r3293054412">PR review comment</a>:</p>
+<blockquote>
+<p>You'll want to update at least the first two, possibly third, entry in this matrix. The proposal is <a href="https://github.com/WebAssembly/proposals/blob/main/finished-proposals.md">phase 5</a> and this PR includes tests. For "Finished" either the footnote should explicitly say what remains, or it should be checked off.</p>
+</blockquote>
+
+
+
+<a name="597319122"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597319122" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597319122">(May 23 2026 at 16:01)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#discussion_r3293057644">PR review comment</a>:</p>
+<blockquote>
+<p>Can this pass <code>-Wbranch-hinting=n</code> in the <code>flags</code> section? Also please make sure to phrase comments for readers of the code, not reviewers of the PR. This is committed documentation and does not need to refer to historical state which no one will remember once this lands. This only needs to indicate, for example, that this is testing codegen specifically ignores the custom section when the feature is disabled.</p>
+</blockquote>
+
+
+
+<a name="597319123"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597319123" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597319123">(May 23 2026 at 16:01)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#discussion_r3293055393">PR review comment</a>:</p>
+<blockquote>
+<p>Can this test be extracted to a <code>*.wast</code> file?</p>
+</blockquote>
+
+
+
+<a name="597319124"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597319124" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597319124">(May 23 2026 at 16:01)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#discussion_r3293074300">PR review comment</a>:</p>
+<blockquote>
+<p>Instead of returning <code>Option&lt;bool&gt;</code>, which an be confusing, could this yield a <code>BranchHint</code> itself directly? That way the <code>taken</code> field can be used and english-wise understoood quickly.</p>
+</blockquote>
+
+
+
+<a name="597319125"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597319125" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597319125">(May 23 2026 at 16:01)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#discussion_r3293067822">PR review comment</a>:</p>
+<blockquote>
+<p>Additionally, to avoid extra overhead, I'd recommend storing the raw decoder itself and saving that in a side table. There shouldn't be a need here to decode the entire section and heap-allocate it all in Wasmtime.</p>
+</blockquote>
+
+
+
+<a name="597319126"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597319126" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597319126">(May 23 2026 at 16:01)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#discussion_r3293065216">PR review comment</a>:</p>
+<blockquote>
+<p>This comment can be misleading because Wasmtime, spec-wise, can't guarantee anything or require anything of custom sections. This implementation does not validate branch hints nor does it fail on any malformed input. It should be sufficient to say that this ignores invalid sections and more generally does not perform any validation at all.</p>
+</blockquote>
+
+
+
+<a name="597319127"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597319127" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597319127">(May 23 2026 at 16:01)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#discussion_r3293070740">PR review comment</a>:</p>
+<blockquote>
+<p>Rather than making a dedicated method for this, could the construction and initialization happen in the constructor for this type?</p>
+</blockquote>
+
+
+
+<a name="597319128"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597319128" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597319128">(May 23 2026 at 16:01)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#discussion_r3293066838">PR review comment</a>:</p>
+<blockquote>
+<p>Can this loop explicitly handle errors rather than discarding them with <code>.flatten()</code>? For example if the branch-hinting section is corrupt then the entire section should be discarded.</p>
+</blockquote>
+
+
+
+<a name="597360210"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597360210" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597360210">(May 24 2026 at 01:31)</a>:</h4>
+<p>gfx converted <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459 Implement the branch-hinting proposal (parse + Cranelift cold blocks)</a> to a draft</p>
+
+
+
+<a name="597379977"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597379977" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597379977">(May 24 2026 at 07:40)</a>:</h4>
+<p>gfx updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="597385844"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597385844" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597385844">(May 24 2026 at 09:26)</a>:</h4>
+<p>github-actions[bot] added the label <code>fuzzing</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="597385882"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597385882" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597385882">(May 24 2026 at 09:26)</a>:</h4>
+<p>github-actions[bot] <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#issuecomment-4527965443">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>:</p>
+<blockquote>
+<h4>Subscribe to Label Action</h4>
+<p>cc @fitzgen</p>
+<p>&lt;details&gt;<br>
+This issue or pull request has been labeled: "fuzzing", "wasmtime:api", "wasmtime:c-api", "wasmtime:config", "wasmtime:docs"</p>
+<p>Thus the following users have been cc'd because of the following labels:</p>
+<ul>
+<li>fitzgen: fuzzing</li>
+</ul>
+<p>To subscribe or unsubscribe from this label, edit the &lt;code&gt;.github/subscribe-to-label.json&lt;/code&gt; configuration file.</p>
+<p><a href="https://github.com/bytecodealliance/subscribe-to-label-action">Learn more.</a><br>
+&lt;/details&gt;</p>
+</blockquote>
+
+
+
+<a name="597407975"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597407975" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597407975">(May 24 2026 at 15:30)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#pullrequestreview-4353036337">PR review</a>:</p>
+<blockquote>
+<p>Thanks! This all looks good to me. I've got one possible touch-up with <code>peekable</code> below, but otherwise with a <code>cargo fmt</code> this seems reasonable to land</p>
+</blockquote>
+
+
+
+<a name="597407976"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/597407976" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#597407976">(May 24 2026 at 15:30)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#discussion_r3294879924">PR review comment</a>:</p>
+<blockquote>
+<p>One option here would be to use the <a href="https://doc.rust-lang.org/stable/std/iter/trait.Iterator.html#method.peekable"><code>Iterator::peekable</code> method</a> in the standard library to avoid the <code>peeked_hint</code> field and make it a bit easier to use <code>branch_hints</code> perhaps?</p>
+</blockquote>
+
+
+
+<a name="598253644"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/598253644" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#598253644">(May 28 2026 at 07:06)</a>:</h4>
+<p>gfx updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="598256261"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/598256261" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#598256261">(May 28 2026 at 07:20)</a>:</h4>
+<p>gfx updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="598274113"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/598274113" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#598274113">(May 28 2026 at 08:47)</a>:</h4>
+<p>gfx has marked <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a> as ready for review.</p>
+
+
+
+<a name="598274117"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/598274117" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#598274117">(May 28 2026 at 08:47)</a>:</h4>
+<p>gfx requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-fuzz-reviewers">wasmtime-fuzz-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="598274723"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/598274723" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#598274723">(May 28 2026 at 08:50)</a>:</h4>
+<p>gfx <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#issuecomment-4562289356">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>:</p>
+<blockquote>
+<p>Rebased onto main (conflicts from #13487 and #13354 resolved), all review comments addressed, and cold-block layout is now covered across the x86-64, aarch64, and Pulley backends. CI is green. I think this is ready to merge!</p>
+</blockquote>
+
+
+
+<a name="598308022"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/598308022" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#598308022">(May 28 2026 at 11:42)</a>:</h4>
+<p>gfx edited <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>:</p>
+<blockquote>
+<p>Refs #9463. Supersedes #12483 (closed); this reworks that attempt to address<br>
+the review there.</p>
+<h2>What this does</h2>
+<p>Parses the <code>metadata.code.branch_hint</code> custom section and uses the hints to mark<br>
+cold blocks during Cranelift compilation, behind a new opt-in knob:</p>
+<ul>
+<li>
+<p><code>Config::wasm_branch_hinting(bool)</code> — <strong>off by default</strong>. Also <code>-W branch-hinting</code><br>
+  (CLI) and <code>wasmtime_config_wasm_branch_hinting_set</code> (C API).</p>
+</li>
+<li>
+<p>Applies to both <code>br_if</code> and <code>if</code> (the proposal hints both). For a hinted<br>
+  branch, the unlikely successor is marked cold via <code>FunctionBuilder::set_cold_block</code>.</p>
+</li>
+<li>
+<p>Hints are advisory: when the knob is off the section is ignored exactly as<br>
+  today, and when on it never changes execution semantics.</p>
+</li>
+</ul>
+<h2>Addressing the #12483 review</h2>
+<ul>
+<li>
+<p><strong>O(n), no per-offset map</strong> (cfallin/alexcrichton): the proposal lists hints in<br>
+  ascending PC order, so they are consumed with a forward cursor as translation<br>
+  visits increasing offsets (<code>FuncEnvironment::take_branch_hint</code>) — O(1)<br>
+  amortized, O(n) per function, no <code>HashMap&lt;offset, _&gt;</code>. We rely on the spec's<br>
+  ordering rather than re-sorting (validating malformed sections is left to a<br>
+  follow-up, see below).</p>
+</li>
+<li>
+<p><strong>Config knob, default off</strong> (fitzgen): there is no <code>WasmFeatures</code> bit for<br>
+  branch hinting (it is a pure custom section with nothing to validate in<br>
+<code>wasmparser</code>), so the knob lives in <code>Tunables</code> and is read by both the parser<br>
+  (<code>ModuleEnvironment</code>) and the compiler (<code>FuncEnvironment</code>). Per the proposal<br>
+  stability rules it stays off until fuzzed.</p>
+</li>
+<li>
+<p><strong><code>if</code> is handled</strong> (a gap in #12483, which only did <code>br_if</code>): all hints in<br>
+<code>tests/spec_testsuite/custom/branch_hint.wast</code> are on <code>if</code>. The <code>if</code> case<br>
+  includes the subtlety that the <code>else</code> block is sometimes allocated lazily<br>
+  (when <code>params == results</code>); a likely-taken hint there is deferred via<br>
+<code>ControlStackFrame::If { else_is_cold }</code> and applied when <code>Operator::Else</code><br>
+  creates the block.</p>
+</li>
+</ul>
+<p>The hint offset uses <code>builder.srcloc().bits()</code> (module-relative) minus the<br>
+function body's start (<code>body.get_binary_reader().original_position()</code>), matching<br>
+<code>wasmparser::BranchHint.func_offset</code>.</p>
+<p><code>Config::wasm_branch_hinting</code> only affects cold-block layout, so it is excluded<br>
+from the compiled-artifact compatibility check in <code>engine/serialization.rs</code><br>
+(an artifact loads into an engine configured either way).</p>
+<h2>Codegen evidence</h2>
+<p>In-tree, <code>tests/disas/branch-hinting-aarch64.wat</code> checks <code>$if_unlikely</code> with the<br>
+knob on: the unlikely then-block is hoisted out of line past <code>ret</code>, so the hot<br>
+path falls through. <code>tests/disas/branch-hinting-disabled.wat</code> is the same module<br>
+without the flag and asserts that nothing is marked cold.</p>
+<p>The off-vs-on contrast is clearest on a hot loop — from the objdump A/B in the<br>
+dogfood experiment linked below, per iteration the hot path goes from two taken<br>
+branches to one:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">off</span><span class="w"> </span><span class="err">—</span><span class="w"> </span><span class="n">cold</span><span class="w"> </span><span class="n">inline</span><span class="p">,</span><span class="w"> </span><span class="n">hot</span><span class="w"> </span><span class="n">path</span><span class="w"> </span><span class="n">branches</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">it</span><span class="w"> </span><span class="n">every</span><span class="w"> </span><span class="n">iteration</span><span class="p">:</span>
+<span class="w">    </span><span class="nc">cbnz</span><span class="w"> </span><span class="n">x0</span><span class="p">,</span><span class="w"> </span><span class="o">&lt;</span><span class="n">cold</span><span class="o">&gt;</span><span class="w">    </span><span class="p">;</span><span class="w"> </span><span class="o">~</span><span class="n">always</span><span class="w"> </span><span class="n">taken</span><span class="p">,</span><span class="w"> </span><span class="n">skip</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">inline</span><span class="w"> </span><span class="n">cold</span><span class="w"> </span><span class="n">body</span>
+<span class="w">    </span><span class="o">&lt;</span><span class="n">cold</span><span class="w"> </span><span class="n">body</span><span class="o">&gt;</span><span class="w">        </span><span class="p">;</span><span class="w"> </span><span class="n">wedged</span><span class="w"> </span><span class="n">between</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">hot</span><span class="w"> </span><span class="n">body</span><span class="w"> </span><span class="n">and</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="k">loop</span><span class="w"> </span><span class="n">back</span><span class="o">-</span><span class="n">edge</span>
+<span class="w">    </span><span class="n">add</span><span class="w">  </span><span class="n">x3</span><span class="p">,</span><span class="w"> </span><span class="p">#</span><span class="mi">1</span>
+<span class="w">    </span><span class="n">b</span><span class="w">    </span><span class="o">&lt;</span><span class="k">loop</span><span class="o">&gt;</span>
+
+<span class="n">on</span><span class="w"> </span><span class="err">—</span><span class="w"> </span><span class="n">cold</span><span class="w"> </span><span class="n">hoisted</span><span class="w"> </span><span class="n">past</span><span class="w"> </span><span class="err">`</span><span class="n">ret</span><span class="err">`</span><span class="p">,</span><span class="w"> </span><span class="n">hot</span><span class="w"> </span><span class="n">path</span><span class="w"> </span><span class="n">falls</span><span class="w"> </span><span class="n">through</span><span class="p">:</span>
+<span class="w">    </span><span class="nc">cbz</span><span class="w">  </span><span class="n">x0</span><span class="p">,</span><span class="w"> </span><span class="o">&lt;</span><span class="n">cold</span><span class="o">&gt;</span><span class="w">    </span><span class="p">;</span><span class="w"> </span><span class="o">~</span><span class="n">never</span><span class="w"> </span><span class="n">taken</span>
+<span class="w">    </span><span class="n">add</span><span class="w">  </span><span class="n">x3</span><span class="p">,</span><span class="w"> </span><span class="p">#</span><span class="mi">1</span>
+<span class="w">    </span><span class="n">b</span><span class="w">    </span><span class="o">&lt;</span><span class="k">loop</span><span class="o">&gt;</span>
+<span class="w">    </span><span class="n">ret</span>
+<span class="w">    </span><span class="o">&lt;</span><span class="n">cold</span><span class="w"> </span><span class="n">body</span><span class="o">&gt;</span><span class="w">        </span><span class="p">;</span><span class="w"> </span><span class="n">out</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">line</span>
+</code></pre></div>
+<h2>Performance</h2>
+<p>The transformation is the expected one (hot path tightened, cold path moved out<br>
+of line), but I'm not claiming a microbenchmark number here: on a tight loop on<br>
+Apple Silicon the wall-time delta is within noise — the eliminated forward<br>
+branch is perfectly predicted and the loop fits in L1i, so layout barely<br>
+matters. Branch hints pay off under i-cache pressure / large hot code, so the<br>
+credible place for a number is <code>/bench_x64</code> on a representative workload rather<br>
+than a microbenchmark. There is no runtime overhead either way: hints only<br>
+affect compile-time block layout, and with the knob off codegen is unchanged.</p>
+<p>This was dogfooded end-to-end against <a href="https://github.com/wado-lang/wado">Wado</a><br>
+output (a language that emits <code>metadata.code.branch_hint</code>): an objdump A/B on a<br>
+real Wado component shows the hints take effect. The harness and numbers are<br>
+published as a reproducible experiment:<br>
+&lt;<a href="https://github.com/wado-lang/wado/pull/1152">https://github.com/wado-lang/wado/pull/1152</a>&gt;.</p>
+<h2>Scope and follow-ups</h2>
+<p>This is intentionally the codegen + knob slice. Tracked as follow-ups before<br>
+flipping the default on:</p>
+<ul>
+<li>
+<p>Validate the section and reject bad hints (the spec restricts hints to <code>br_if</code><br>
+  and <code>if</code> only). <code>branch_hint.wast</code> exercises both <code>assert_malformed_custom</code><br>
+  (duplicate hint, hint outside a function) and <code>assert_invalid_custom</code> (hint<br>
+  whose offset points at a non-branch instruction). Phase 1 ignores misplaced<br>
+  hints rather than rejecting them; making these pass needs the validation plus<br>
+<code>assert_{malformed,invalid}_custom</code> support in the wast runner, then ungating<br>
+  the test (currently skipped in <code>crates/test-util/src/wast.rs</code>).</p>
+</li>
+<li>
+<p><code>wasm-smith</code> branch-hint emission + fuzzing soak, then enable by default and<br>
+  update <code>module_generation_uses_expected_proposals</code>.</p>
+</li>
+</ul>
+<p>The stability matrix is updated accordingly (Tier 3, API/C-API done, Tests/Fuzzed<br>
+pending, off by default).<br>
+</p>
+</blockquote>
+
+
+
+<a name="598311266"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/598311266" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#598311266">(May 28 2026 at 11:58)</a>:</h4>
+<p>gfx updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="598325715"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/598325715" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#598325715">(May 28 2026 at 13:03)</a>:</h4>
+<p>gfx updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="598337629"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/598337629" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#598337629">(May 28 2026 at 13:49)</a>:</h4>
+<p>gfx requested <a href="https://github.com/apps/copilot-pull-request-reviewer">Copilot</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="598347268"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/598347268" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#598347268">(May 28 2026 at 14:24)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13459#pullrequestreview-4381814982">PR review</a>:</p>
+<blockquote>
+<p>Thanks!</p>
+</blockquote>
+
+
+
+<a name="598347299"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/598347299" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#598347299">(May 28 2026 at 14:25)</a>:</h4>
+<p>alexcrichton added <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459 Implement the branch-hinting proposal (parse + Cranelift cold blocks)</a> to the merge queue</p>
+
+
+
+<a name="598353779"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/598353779" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#598353779">(May 28 2026 at 14:49)</a>:</h4>
+<p><span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span> alexcrichton merged <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459</a>.</p>
+
+
+
+<a name="598353788"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313459%20Implement%20the%20branch-hinting%20proposa.../near/598353788" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313459.20Implement.20the.20branch-hinting.20proposa.2E.2E.2E.html#598353788">(May 28 2026 at 14:49)</a>:</h4>
+<p>alexcrichton removed <a href="https://github.com/bytecodealliance/wasmtime/pull/13459">PR #13459 Implement the branch-hinting proposal (parse + Cranelift cold blocks)</a> from the merge queue</p>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

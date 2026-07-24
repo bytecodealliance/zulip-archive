@@ -1,0 +1,456 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #13783 x64: report an error instead of pani... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html">wasmtime / PR #13783 x64: report an error instead of pani...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="607509099"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607509099" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607509099">(Jul 01 2026 at 02:13)</a>:</h4>
+<p>soumik15630m requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-s390x-reviewers">wasmtime-compiler-s390x-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>.</p>
+
+
+
+<a name="607509100"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607509100" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607509100">(Jul 01 2026 at 02:13)</a>:</h4>
+<p>soumik15630m opened <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a> from <code>soumik15630m:fix-x64-frame-size-overflow</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p>x64 codegen panics with <code>TryFromIntError</code> when a function's stack frame<br>
+is large enough that offsets relative to it no longer fit in a 32-bit<br>
+immediate. This affects three places: the inline stack-probe loop<br>
+(<code>guard_size * probe_count</code>), clobber save/restore (RSP-relative<br>
+offsets), and incoming-argument access (RBP-relative offsets via<br>
+<code>SyntheticAmode::IncomingArg::finalize</code>).</p>
+<p>This was reported downstream in<br>
+<a href="https://github.com/rust-lang/rustc_codegen_cranelift/issues/1656">rust-lang/rustc_codegen_cranelift#1656</a>, where a ~2GB stack allocation<br>
+(<code>[0; 536870787_usize]</code>, a <code>[i32; N]</code> array) triggers an ICE:<br>
+thread 'optimize module ...' panicked at cranelift/codegen/src/isa/x64/inst/emit.rs:373:18:<br>
+guard_size * probe_count is too large to fit in a 32-bit immediate: TryFromIntError(PosOverflow)</p>
+<h2>What this does</h2>
+<p>Adds <code>ABIMachineSpec::validate_frame_layout</code>, a new trait method with a<br>
+no-op default, overridden for x64. It's called from <code>VCode::emit</code> right<br>
+after <code>compute_frame_layout</code>, before any offset encoding takes place,<br>
+and checks:</p>
+<p>On overflow, this returns <code>CodegenError::Unsupported</code> instead of<br>
+panicking. Only x64 overrides the new trait method; other backends are<br>
+unaffected (<code>aarch64</code>/<code>riscv64</code>/<code>s390x</code>/<code>pulley</code> needed a one-line <code>?</code><br>
+each to propagate <code>emit</code>'s now-fallible return type, no behavior<br>
+change).</p>
+<h2>Testing</h2>
+<ul>
+<li>Added unit tests in <code>isa/x64/abi.rs</code> covering: a normal frame<br>
+  (accepted), an oversized <code>fixed_frame_storage_size</code> (rejected), an<br>
+  oversized <code>tail_args_size</code> via the RBP-relative path (rejected), and<br>
+  a frame that's under <code>i32::MAX</code> on its own but pushed over by the<br>
+  guard-page rounding margin (rejected) — this last case specifically<br>
+  reproduces the original bug.</li>
+</ul>
+<h2>Known follow-up (not included here)</h2>
+<p><code>bjorn3</code>'s comment mentions "all stack load/store instruction<br>
+lowerings" more broadly. I traced and covered the two offset-encoding<br>
+paths that are actually reachable from the repro (<code>gen_clobber_save</code>/<br>
+<code>gen_clobber_restore</code> and <code>SyntheticAmode::IncomingArg::finalize</code>), but<br>
+I have not exhaustively audited every stack-relative offset computation<br>
+in the x64 backend for the same class of narrowing. Happy to widen this<br>
+if there's a specific path you'd like checked.</p>
+<p>Separately, <code>rustc_codegen_cranelift</code> currently panics when it receives<br>
+<em>any</em> <code>Err</code> from <code>Context::compile</code> at<br>
+<a href="https://github.com/rust-lang/rustc_codegen_cranelift/blob/main/src/base.rs#L224"><code>src/base.rs:224</code></a><br>
+rather than converting it to a rustc diagnostic. I plan to open a<br>
+follow-up PR there to handle <code>CodegenError::Unsupported</code> the same way<br>
+the existing <code>CodegenError::Verifier</code> arm already does.</p>
+</blockquote>
+
+
+
+<a name="607509102"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607509102" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607509102">(Jul 01 2026 at 02:13)</a>:</h4>
+<p>soumik15630m requested <a href="https://github.com/alexcrichton">alexcrichton</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>.</p>
+
+
+
+<a name="607509103"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607509103" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607509103">(Jul 01 2026 at 02:13)</a>:</h4>
+<p>soumik15630m requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>.</p>
+
+
+
+<a name="607510014"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607510014" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607510014">(Jul 01 2026 at 02:25)</a>:</h4>
+<p>soumik15630m edited <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p>x64 codegen panics with <code>TryFromIntError</code> when a function's stack frame<br>
+is large enough that offsets relative to it no longer fit in a 32-bit<br>
+immediate. This affects three places: the inline stack-probe loop<br>
+(<code>guard_size * probe_count</code>), clobber save/restore (RSP-relative<br>
+offsets), and incoming-argument access (RBP-relative offsets via<br>
+<code>SyntheticAmode::IncomingArg::finalize</code>).</p>
+<p>This was reported downstream in<br>
+<a href="https://github.com/rust-lang/rustc_codegen_cranelift/issues/1656">rust-lang/rustc_codegen_cranelift#1656</a>, where a ~2GB stack allocation<br>
+(<code>[0; 536870787_usize]</code>, a <code>[i32; N]</code> array) triggers an ICE:<br>
+thread 'optimize module ...' panicked at cranelift/codegen/src/isa/x64/inst/emit.rs:373:18:<br>
+guard_size * probe_count is too large to fit in a 32-bit immediate: TryFromIntError(PosOverflow)</p>
+<h2>What this does</h2>
+<p>Adds <code>ABIMachineSpec::validate_frame_layout</code>, a new trait method with a<br>
+no-op default, overridden for x64. It's called from <code>VCode::emit</code> right<br>
+after <code>compute_frame_layout</code>, before any offset encoding takes place,<br>
+and checks:</p>
+<p>On overflow, this returns <code>CodegenError::Unsupported</code> instead of<br>
+panicking. Only x64 overrides the new trait method; other backends are<br>
+unaffected (<code>aarch64</code>/<code>riscv64</code>/<code>s390x</code>/<code>pulley</code> needed a one-line <code>?</code><br>
+each to propagate <code>emit</code>'s now-fallible return type, no behavior<br>
+change).</p>
+<h2>Testing</h2>
+<ul>
+<li>Added unit tests in <code>isa/x64/abi.rs</code> covering: a normal frame<br>
+  (accepted), an oversized <code>fixed_frame_storage_size</code> (rejected), an<br>
+  oversized <code>tail_args_size</code> via the RBP-relative path (rejected), and<br>
+  a frame that's under <code>i32::MAX</code> on its own but pushed over by the<br>
+  guard-page rounding margin (rejected) — this last case specifically<br>
+  reproduces the original bug.</li>
+</ul>
+<h2>Known follow-up (not included here)</h2>
+<p><code>bjorn3</code>'s comment mentions "all stack load/store instruction<br>
+lowerings" more broadly. I traced and covered the two offset-encoding<br>
+paths that are actually reachable from the repro (<code>gen_clobber_save</code>/<br>
+<code>gen_clobber_restore</code> and <code>SyntheticAmode::IncomingArg::finalize</code>), but<br>
+I have not exhaustively audited every stack-relative offset computation<br>
+in the x64 backend for the same class of narrowing. Happy to widen this<br>
+if there's a specific path you'd like checked.</p>
+<p>Separately, <code>rustc_codegen_cranelift</code> currently panics when it receives<br>
+<em>any</em> <code>Err</code> from <code>Context::compile</code> at<br>
+<a href="https://github.com/rust-lang/rustc_codegen_cranelift/blob/main/src/base.rs#L224"><code>src/base.rs:224</code></a><br>
+rather than converting it to a rustc diagnostic. I have open a  PR rust-lang/rustc_codegen_cranelift/pull/1669 there to handle <code>CodegenError::Unsupported</code> the same way<br>
+the existing <code>CodegenError::Verifier</code> arm already does.</p>
+</blockquote>
+
+
+
+<a name="607519328"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607519328" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607519328">(Jul 01 2026 at 04:03)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>.</p>
+
+
+
+<a name="607519329"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607519329" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607519329">(Jul 01 2026 at 04:03)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift:area:machinst</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>.</p>
+
+
+
+<a name="607519330"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607519330" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607519330">(Jul 01 2026 at 04:03)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift:area:x64</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>.</p>
+
+
+
+<a name="607519331"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607519331" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607519331">(Jul 01 2026 at 04:03)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift:area:aarch64</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>.</p>
+
+
+
+<a name="607531154"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607531154" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607531154">(Jul 01 2026 at 06:09)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> bjorn3 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#pullrequestreview-4606195427">PR review</a>.</p>
+
+
+
+<a name="607531155"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607531155" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607531155">(Jul 01 2026 at 06:09)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> bjorn3 created <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#discussion_r3503628998">PR review comment</a>:</p>
+<blockquote>
+<p>Should probably use ImplLimitExceeded instead.</p>
+</blockquote>
+
+
+
+<a name="607554670"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607554670" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607554670">(Jul 01 2026 at 08:31)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> bjorn3 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#pullrequestreview-4607128594">PR review</a>.</p>
+
+
+
+<a name="607554671"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607554671" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607554671">(Jul 01 2026 at 08:31)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> bjorn3 created <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#discussion_r3504382824">PR review comment</a>:</p>
+<blockquote>
+<p>This validation should probably be done in generic code (maybe the caller of <code>compute_frame_layout</code>?). The <code>FrameLayout</code> type uses 32bit ints, so the 4GB stack frame size applies to all targets.</p>
+</blockquote>
+
+
+
+<a name="607594908"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607594908" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607594908">(Jul 01 2026 at 12:02)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> soumik15630m submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#pullrequestreview-4608715377">PR review</a>.</p>
+
+
+
+<a name="607594909"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607594909" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607594909">(Jul 01 2026 at 12:02)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> soumik15630m created <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#discussion_r3505689094">PR review comment</a>:</p>
+<blockquote>
+<p>Good call, thanks. <code>ImplLimitExceeded</code> doesn't carry a message though ...so is it okay?Happy to switch either way; want to make sure I'm not throwing away information you'd want to keep.</p>
+</blockquote>
+
+
+
+<a name="607595120"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607595120" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607595120">(Jul 01 2026 at 12:03)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> soumik15630m submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#pullrequestreview-4608723222">PR review</a>.</p>
+
+
+
+<a name="607595122"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607595122" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607595122">(Jul 01 2026 at 12:03)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> soumik15630m created <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#discussion_r3505695644">PR review comment</a>:</p>
+<blockquote>
+<p>Sure ... will push a commit soon</p>
+</blockquote>
+
+
+
+<a name="607599327"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607599327" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607599327">(Jul 01 2026 at 12:24)</a>:</h4>
+<p>soumik15630m updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>.</p>
+
+
+
+<a name="607600141"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607600141" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607600141">(Jul 01 2026 at 12:28)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> soumik15630m submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#pullrequestreview-4608920365">PR review</a>.</p>
+
+
+
+<a name="607600142"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607600142" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607600142">(Jul 01 2026 at 12:28)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> soumik15630m created <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#discussion_r3505862676">PR review comment</a>:</p>
+<blockquote>
+<p>Pushed a commit adding a generic check in <code>compute_frame_layout</code>.</p>
+<p>I kept the x64-specific <code>validate_frame_layout</code> check as well, since it's<br>
+catching a different, tighter condition: x64 encodes these offsets as<br>
+<em>signed</em> 32-bit immediates (<code>i32::MAX</code>, not <code>u32::MAX</code>), and the inline<br>
+probestack loop rounds the frame size up to the next guard-page boundary<br>
+before encoding it - so a frame just under <code>i32::MAX</code> can get pushed<br>
+over it by that rounding. The original repro (~2.147GB) is under<br>
+<code>u32::MAX</code> (~4.295GB), so the generic check alone doesn't catch it -<br>
+only the x64-specific one does.</p>
+<p>Happy to remove the x64-specific check if you'd rather keep this simpler<br>
+and generic-only, but wanted to flag that it currently exists to catch<br>
+a real case the generic check can't - unless other backends share x64's<br>
+signed-immediate constraint, in which case maybe it'd make sense to<br>
+generalize the tighter check too rather than keep it x64-only. Let me<br>
+know which direction you'd prefer.</p>
+</blockquote>
+
+
+
+<a name="607600669"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607600669" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607600669">(Jul 01 2026 at 12:31)</a>:</h4>
+<p>soumik15630m updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>.</p>
+
+
+
+<a name="607600772"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607600772" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607600772">(Jul 01 2026 at 12:31)</a>:</h4>
+<p>soumik15630m requested <a href="https://github.com/bjorn3">bjorn3</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>.</p>
+
+
+
+<a name="607683546"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607683546" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607683546">(Jul 01 2026 at 18:55)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#issuecomment-4859113254">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>:</p>
+<blockquote>
+<p>Thanks for the PR, but personally I'm pretty wary of adding a parallel path that calculates information about a frame that duplicates what's already in each backend. Frame handling/layout is pretty precise and requires extremely careful handling, and I wouldn't be confident that it could be accurately mirrored elsewhere in the system.</p>
+<p>What I think should happen here is either (a) to propagate a result upwards at the time of a <code>try_into</code> or a <code>checked_add</code> happens (e.g. the <code>try_into</code> in this case, or (b) the case in question is updated. Given the line number it looks like this is failing to generate a stack probe, but we  could enhance that logic to better support the stack probe loop with larger frame sizes.</p>
+</blockquote>
+
+
+
+<a name="607731277"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607731277" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607731277">(Jul 02 2026 at 00:52)</a>:</h4>
+<p>soumik15630m <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#issuecomment-4861233709">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>:</p>
+<blockquote>
+<p>@alexcrichton <br>
+Dug into this in detail. There are actually two different kinds of<br>
+32-bit narrowing happening here, and I think they need different<br>
+treatment:</p>
+<p><strong>1. RSP arithmetic</strong> (the <code>subq_mi</code>/<code>addq_mi</code> adjustments in the probe<br>
+loop and clobber save/restore) - this is genuinely fixable by widening.<br>
+r11/r15 are already reserved as scratch registers in this ABI, and<br>
+<code>movabsq_oi</code> already exists to materialize a 64-bit value into one. So<br>
+for these sites, we could fall back to "materialize into a scratch reg,<br>
+then register-to-register add/sub" when the value doesn't fit in i32.</p>
+<p><strong>2. Stack-relative memory addressing</strong> (<code>Amode::imm_reg(offset, rsp)</code>,<br>
+used for touching probe pages, clobber load/store, incoming-arg access)</p>
+<ul>
+<li>this hits an actual x86-64 ISA limit, not a Cranelift shortcut: the<br>
+addressing mode's displacement field is a hard 32-bit signed value at<br>
+the instruction-encoding level. The fix is computing the absolute<br>
+effective address into a register first, then addressing off that with<br>
+a zero displacement.</li>
+</ul>
+<p>One thing worth flagging on option (a): <code>MachInstEmit::emit</code> returns<br>
+<code>()</code> for all 5 backends, with no error path anywhere in <code>MachBuffer</code>.<br>
+So propagating a <code>Result</code> from the actual <code>try_from</code>/<code>.expect()</code> sites<br>
+in <code>emit.rs</code> would mean changing that trait's signature - which is<br>
+called once per instruction, everywhere, across every backend. That's<br>
+a much bigger surface than I first thought, and probably bigger than<br>
+(b), which stays contained to x64 frame setup/teardown.</p>
+<p>Given that, (b) seems like the more proportionate direction, and I'm<br>
+happy to take it on. Let me know if that matches your thinking or if<br>
+I'm missing a narrower way to do (a).</p>
+</blockquote>
+
+
+
+<a name="607731433"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607731433" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607731433">(Jul 02 2026 at 00:54)</a>:</h4>
+<p>soumik15630m edited a <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#issuecomment-4861233709">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>:</p>
+<blockquote>
+<p>@alexcrichton <br>
+Thanks for the detailed feedback.<br>
+Dug into this in detail. There are actually two different kinds of<br>
+32-bit narrowing happening here, and I think they need different<br>
+treatment:</p>
+<p><strong>1. RSP arithmetic</strong> (the <code>subq_mi</code>/<code>addq_mi</code> adjustments in the probe<br>
+loop and clobber save/restore) - this is genuinely fixable by widening.<br>
+r11/r15 are already reserved as scratch registers in this ABI, and<br>
+<code>movabsq_oi</code> already exists to materialize a 64-bit value into one. So<br>
+for these sites, we could fall back to "materialize into a scratch reg,<br>
+then register-to-register add/sub" when the value doesn't fit in i32.</p>
+<p><strong>2. Stack-relative memory addressing</strong> (<code>Amode::imm_reg(offset, rsp)</code>,<br>
+used for touching probe pages, clobber load/store, incoming-arg access)</p>
+<ul>
+<li>this hits an actual x86-64 ISA limit, not a Cranelift shortcut: the<br>
+addressing mode's displacement field is a hard 32-bit signed value at<br>
+the instruction-encoding level. The fix is computing the absolute<br>
+effective address into a register first, then addressing off that with<br>
+a zero displacement.</li>
+</ul>
+<p>One thing worth flagging on option (a): <code>MachInstEmit::emit</code> returns<br>
+<code>()</code> for all 5 backends, with no error path anywhere in <code>MachBuffer</code>.<br>
+So propagating a <code>Result</code> from the actual <code>try_from</code>/<code>.expect()</code> sites<br>
+in <code>emit.rs</code> would mean changing that trait's signature - which is<br>
+called once per instruction, everywhere, across every backend. That's<br>
+a much bigger surface than I first thought, and probably bigger than<br>
+(b), which stays contained to x64 frame setup/teardown.</p>
+<p>Given that, (b) seems like the more proportionate direction, and I'm<br>
+happy to take it on. Let me know if that matches your thinking or if<br>
+I'm missing a narrower way to do (a).</p>
+</blockquote>
+
+
+
+<a name="607924121"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607924121" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607924121">(Jul 02 2026 at 19:41)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#issuecomment-4869844537">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>:</p>
+<blockquote>
+<p>I'd like to confirm that you're aware of the Bytecode Alliance's <a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">AI tool usage policy</a> and would ask that if you haven't seen that that you read over it.</p>
+<p>My main concern here is still that I would want to make sure that there's not duplication in calculating or interpreting frame layout. I believe there should be a "mostly central" location that each backend handles all this and ideally a limit, if any, would fall out of that. It's true that returning an error during emission would require changing signatures and it would also affect other situations such as stack offsets.</p>
+<p>I'll bring this up at next week's Cranelift meeting because I'm not sure how best to handle this. One option would be to just say "all backends must support up to N byte stack frames" and return a hard error for anything over N for all backends. That would notably be a Cranelift/cross-platform limitation rather than just the x64 backend. Alternatively if N is high enough (e.g. 4GiB) then it would require changes to the x64 backend (and possibly others). I think it'd be good to loop in others on this discussion though.</p>
+</blockquote>
+
+
+
+<a name="607925515"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607925515" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607925515">(Jul 02 2026 at 19:50)</a>:</h4>
+<p>soumik15630m <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#issuecomment-4869906526">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>:</p>
+<blockquote>
+<p>Sure I will go through the ai tool usuage policy ... </p>
+<p>and yeah this issue needs a deeper discussion cause to me both the approach looks equally reasonable ..so i'm happy to wait for that discussion, or start on whichever direction comes out of it. Let me know how I can help move it forward.</p>
+</blockquote>
+
+
+
+<a name="607926452"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/607926452" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#607926452">(Jul 02 2026 at 19:56)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#issuecomment-4869950247">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>:</p>
+<blockquote>
+<p>(Ghost-of-cfallin popping in from PTO briefly to offer thoughts as original-person-who-inflicted-this-ABI-code-upon-us)</p>
+<p>I think that while this is a real issue that should indeed be surfaced into <code>ImplLimitExceeded</code>, I agree with Alex that there is too much backend-specific logic here. Actually the whole thing seems overly complex. I'd prefer a <code>maximum_frame_size</code> trait method per backend, then validate that once in the platform-independent code. And we should set it to something reasonable like 1GiB rather than try to reason carefully about 2GiB-minus-epsilon and squeeze every little bit out of the layout; the latter is error-prone and brittle.</p>
+</blockquote>
+
+
+
+<a name="608098470"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/608098470" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#608098470">(Jul 03 2026 at 16:07)</a>:</h4>
+<p>soumik15630m <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#issuecomment-4877906096">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>:</p>
+<blockquote>
+<p>Sure , this idea looks much practical ...keeping the best of both worlds</p>
+<p>I will wait though for the next internal discussion - before pushing another commit with this method <br>
+fixing the size needs the discussion right ?..but yeah 1gb seems reasonable </p>
+<p>Thanks...</p>
+</blockquote>
+
+
+
+<a name="608347494"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/608347494" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#608347494">(Jul 06 2026 at 03:01)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#issuecomment-4888722097">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>:</p>
+<blockquote>
+<p>FWIW I've added this to <a href="https://github.com/bytecodealliance/meetings/blob/main/cranelift/2026/cranelift-07-08.md">Cranelift's next meeting agenda</a>, this coming Wednesday, although I suspect the consensus there will be a 1G max across backends is also fine. If you want to have that ready to go I can review/approve afterwards</p>
+</blockquote>
+
+
+
+<a name="608814923"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/608814923" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#608814923">(Jul 07 2026 at 18:55)</a>:</h4>
+<p>soumik15630m <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#issuecomment-4907387413">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>:</p>
+<blockquote>
+<p>Sure , will push a commit ..... </p>
+</blockquote>
+
+
+
+<a name="609419322"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/609419322" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#609419322">(Jul 10 2026 at 10:06)</a>:</h4>
+<p>soumik15630m updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>.</p>
+
+
+
+<a name="609529489"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/609529489" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#609529489">(Jul 10 2026 at 19:30)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#pullrequestreview-4674421308">PR review</a>:</p>
+<blockquote>
+<p>Thanks! I suspect this won't be too controversial so I'm going to go ahead and land this, and when we discuss this in a meeting if there's any follow-ups I'm happy to handle them</p>
+</blockquote>
+
+
+
+<a name="609529499"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/609529499" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#609529499">(Jul 10 2026 at 19:30)</a>:</h4>
+<p>alexcrichton added <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783 x64: report an error instead of panicking on stack frames larger than i32::MAX</a> to the merge queue.</p>
+
+
+
+<a name="609533309"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/609533309" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#609533309">(Jul 10 2026 at 19:56)</a>:</h4>
+<p><span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span> alexcrichton merged <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>.</p>
+
+
+
+<a name="609533311"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/609533311" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#609533311">(Jul 10 2026 at 19:56)</a>:</h4>
+<p>alexcrichton removed <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783 x64: report an error instead of panicking on stack frames larger than i32::MAX</a> from the merge queue.</p>
+
+
+
+<a name="609622196"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313783%20x64%3A%20report%20an%20error%20instead%20of%20pani.../near/609622196" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313783.20x64.3A.20report.20an.20error.20instead.20of.20pani.2E.2E.2E.html#609622196">(Jul 11 2026 at 17:09)</a>:</h4>
+<p>soumik15630m <a href="https://github.com/bytecodealliance/wasmtime/pull/13783#issuecomment-4947961221">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13783">PR #13783</a>:</p>
+<blockquote>
+<p>Sure ...Thanks!!<br>
+</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

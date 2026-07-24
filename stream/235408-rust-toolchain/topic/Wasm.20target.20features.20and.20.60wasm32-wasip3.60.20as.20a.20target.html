@@ -1,0 +1,118 @@
+<html>
+<head><meta charset="utf-8"><title>Wasm target features and `wasm32-wasip3` as a target · rust-toolchain · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/235408-rust-toolchain/index.html">rust-toolchain</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/235408-rust-toolchain/topic/Wasm.20target.20features.20and.20.60wasm32-wasip3.60.20as.20a.20target.html">Wasm target features and `wasm32-wasip3` as a target</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="612593445"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/235408-rust-toolchain/topic/Wasm%20target%20features%20and%20%60wasm32-wasip3%60%20as%20a%20target/near/612593445" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/235408-rust-toolchain/topic/Wasm.20target.20features.20and.20.60wasm32-wasip3.60.20as.20a.20target.html#612593445">(Jul 24 2026 at 14:42)</a>:</h4>
+<p>I was talking with <span class="user-mention silent" data-user-id="234973">Till Schneidereit</span> yesterday and one thing we were considering is how Wasmtime has a number of wasm features implementation which WASI targets generally do not take advantage of. The main examples are:</p>
+<ul>
+<li><code>simd</code></li>
+<li><code>tail-call</code></li>
+<li><code>relaxed-simd</code></li>
+<li><code>exceptions</code></li>
+</ul>
+<p>The first three here pretty directly lead to performance benefits. A quick test on the Sightglass <code>regex</code> benchmark locally shows a ~10% performance improvement just from enabling simd/tail-call and recompiling. The <code>exceptions</code> target feature is an expressivity gap where panics on wasm currently abort (on all Rust wasm targets by default) meaning that you can't catch panics. This notably affects unit testing in Rust + wasm where the first failure takes down the whole process.</p>
+<p>In talking though we realized that <code>wasm32-wasip3</code> is perhaps a good time to raise the baseline. The target already more-or-less requires JSPI on the web which means that baseline of all browsers already includes <code>simd</code>/<code>tail-call</code> for example. Given that I wanted to raise two questions here:</p>
+<h3>Any objections to enabling these features on <code>wasm32-wasip3</code>?</h3>
+<p>Specifically I'd want to enable at least <code>simd</code>, <code>tail-call</code>, and <code>relaxed-simd</code>. My plan would be to enable this in LLVM itself (for <code>wasm32-wasip3</code> specifically) which would get inherited by wasi-sdk/rust/etc. I'll note that for <code>relaxed-simd</code> it just flags the feature as enabled, LLVM won't actually generate usage by default (libraries still have to opt-in).</p>
+<p>For <code>exceptions</code> that's a bit different...</p>
+<h3>Thoughts on <code>exceptions</code>-on-by-default</h3>
+<p>Technically <code>exceptions</code> and <code>-Cpanic=unwind</code> are orthogonal, but I'm going to conflate them here as there's not much use enabling <code>exceptions</code> while using <code>-Cpanic=abort</code>. The benefits of having <code>wasm32-wasip3</code> be <code>-Cpanic=unwind</code> by default:</p>
+<ul>
+<li>More like every other Rust target</li>
+<li>Testing works by default</li>
+<li>Program output looks more like native by default (except backtraces, more on that next...)</li>
+</ul>
+<p>There are also, however, downsides to enabling <code>-Cpanic=unwind</code>:</p>
+<ul>
+<li>I've measured up to a 10% performance regression in Sightglass benchmarks when the same source is recompiled with <code>-Cpanic=unwind</code>. Specifically <code>pulldown-cmark</code> got 9% slower, with a number of other benchmarks regressing in the 5% range.</li>
+<li><code>RUST_BACKTRACE=1</code> does nothing on wasm. Right now if your Rust code panics you get a nice backtrace printed by Wasmtime due to <code>unreachable</code> at the panic site. With <code>-Cpanic=unwind</code> Rust can't print a backtrace itself and then the eventual trap, if any, happens much lower down in the stack when Rust realizes that there's nothing to catch the exception. An example is <code>fn main() { ... }</code> panicking just exits with a nonzero code, no backtrace is printed.</li>
+</ul>
+<p>Hence that's why I'm opening this topic to discuss further. To me <code>-Cpanic=unwind</code> is a pretty fundamental decision in the toolchain/target because it affects how libstd works. NOT having <code>-Cpanic=unwind</code> means that this Rust target is forever "just that much more different" than other targets which is a source of friction (e.g. <code>cargo test --target ...</code> not working as expected). These downsides are also pretty fundamental though. Performance I believe is due to the fact that <code>try_call</code> preserves no registers, and printing a backtrace would require a WASI API of some sorts to reflect a backtrace. The performance downside can be relatively easily mitigated by compiling with <code>-Cpanic=abort</code>, but the backtrace downside basically can't be mitigated.</p>
+<hr>
+<p>With no obvious direction here to me I wanted to raise the topic here and see if others have thoughts. I don't think this is quite ready to bring to discussion to rust-lang/rust just yet and it'd be best to discuss here first.</p>
+
+
+
+<a name="612596703"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/235408-rust-toolchain/topic/Wasm%20target%20features%20and%20%60wasm32-wasip3%60%20as%20a%20target/near/612596703" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/235408-rust-toolchain/topic/Wasm.20target.20features.20and.20.60wasm32-wasip3.60.20as.20a.20target.html#612596703">(Jul 24 2026 at 14:57)</a>:</h4>
+<p>Interesting question; +1 on the first three, now for exceptions:</p>
+<ul>
+<li>
+<p>We could address the perf downside the direct (+ not easy) way by changing the ABI. We took our current approach to avoid having to unwind through all frames with clobber-restores (the restored register state is the overlapped composition of clobbers through the whole stack; one frame may save r12, another r15, another r12 again, ...), and to avoid having to save all registers in the entry trampoline to have a backstop for that unwind. But we <em>could</em> do it. There's a performance dimension to that as well such that it's not totally upside: the save-all-regs-in-trampolines would regress our host-to-Wasm call performance (potentially significantly on archs with more regs, like aarch64 -- it's basically a fiber-switch cost).</p>
+</li>
+<li>
+<p>It would <em>also</em> be possible to address the lack-of-backtrace by attaching a backtrace to an exception when it bubbles out to the host (uncaught exception). I forget why we don't do this now (probably just performance?) but in principle we should be able to get the same info that the trap-unwind gets and print it similarly.</p>
+</li>
+</ul>
+<p>All of that said, the above considers rust-lang + Wasmtime specifically as a unit together, with a joint tradeoff space; are we concerned about Rust on other Wasm platforms? Three dimensions there -- perf, ergonomics, compat. I don't know how <code>try_call</code> performs on browser Wasm for example. Firefox's ordinary calling convention is all-caller-saves (all-clobbers) anyway, so that doesn't change, I guess. I don't know anything about V8 or JSC on this question. Ergonomics -- do uncaught exceptions flowing out of Wasm get a backtrace like JS exceptions do? Compat -- exceptions are on by default everywhere p3 would run today (browsers via jco); but are we worried about excluding other platforms that might implement+adopt it if we push exceptions closer to "expected to be present everywhere"?</p>
+
+
+
+<a name="612602399"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/235408-rust-toolchain/topic/Wasm%20target%20features%20and%20%60wasm32-wasip3%60%20as%20a%20target/near/612602399" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/235408-rust-toolchain/topic/Wasm.20target.20features.20and.20.60wasm32-wasip3.60.20as.20a.20target.html#612602399">(Jul 24 2026 at 15:22)</a>:</h4>
+<p>For perf one way to mitigate the hostcall impact is that we already have a separate libcall for "do the actual unwind" (and just one of those) so we could put a shim in front of that which clobbers all registers. Basically leave almost all hostcalls exactly as-is except for the one which clobbers everything, and then line things up such that we don't spill/restore/etc on the fast path, only on the "I'm actually throwing an exception path".</p>
+<p>For the backtrace the issue is actually that Rust does catch the unwind, not that it's an uncaught exception. For example all <code>fn main</code> invocations have an implicit <code>catch_unwind</code> around them. Additionally all threads have an implicit <code>catch_unwind</code> around the body. The problem is that Rust catches the exception and Rust's own backtrace-printing machinery can't activate (lacking a <code>wasi:backtrace</code> interface).</p>
+<p>I agree though on the Wasmtime-specific bits, and I've no idea how the perf pans out in browsers. I'm not too worried about the ergonomics side of things where it's basically the same as Wasmtime AFAIK (uncaught wasm exceptions look like a "host language exception" -- <code>Error</code>in Rust an exception in JS). JS exceptions have a backtrace at the point of origin (like Rust), and the problem is still if Rust catches the exception unconditionally and signals failure through other means. (e.g. exit code, or nothing in the case of a thread). Compat is "I believe yes" for wasip3, for other unknown platforms I'm not sure.</p>
+
+
+
+<a name="612603986"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/235408-rust-toolchain/topic/Wasm%20target%20features%20and%20%60wasm32-wasip3%60%20as%20a%20target/near/612603986" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/235408-rust-toolchain/topic/Wasm.20target.20features.20and.20.60wasm32-wasip3.60.20as.20a.20target.html#612603986">(Jul 24 2026 at 15:29)</a>:</h4>
+<p>Ah, right, snapshot-at-exit then walk backwards; I guess in the case that we walk all the way and find no handler, we can reconstruct the state that ultimately returns into the calling Rust by composing all our clobber-restores, no need for a snapshot at entry. (I vaguely recall talking about this ~1.5 years ago; thanks for the refresh...)</p>
+<p>The backtrace bit seems to be the biggest downside -- panics/assertion failures/whatever are not at all uncommon in the Wasm guest and if we no longer get backtraces, that is a <em>huge</em> gap wrt native.</p>
+<p>Path-wise, if we did define <code>wasi:backtrace</code>, could a future release of Rust migrate its <code>wasm32-wasip3</code> to depend on it and on exceptions, and switch the default to use exceptions-based unwind, or is it set in stone once released?</p>
+
+
+
+<a name="612604321"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/235408-rust-toolchain/topic/Wasm%20target%20features%20and%20%60wasm32-wasip3%60%20as%20a%20target/near/612604321" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/235408-rust-toolchain/topic/Wasm.20target.20features.20and.20.60wasm32-wasip3.60.20as.20a.20target.html#612604321">(Jul 24 2026 at 15:31)</a>:</h4>
+<p>Also to be clear I'd expect that changing the ABI of exceptions to not clobber everything on <code>try_call</code> would be a significant investment of energy on our part. While I'm sure it's possible it's probably quite hard...</p>
+
+
+
+<a name="612604541"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/235408-rust-toolchain/topic/Wasm%20target%20features%20and%20%60wasm32-wasip3%60%20as%20a%20target/near/612604541" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/235408-rust-toolchain/topic/Wasm.20target.20features.20and.20.60wasm32-wasip3.60.20as.20a.20target.html#612604541">(Jul 24 2026 at 15:32)</a>:</h4>
+<p>My hope for a hypothetical <code>wasi:backtrace</code> is we'd (a) get component model optional imports, (b) stabilize <code>wasi:backtrace</code>, and then (c) Rust would optionally import it and work with. Versioning-wise everything's still sort of being settled with WASI in terms of how aggressively should toolchains pick things up, but IMO the rule-of-thumb of "lag 6 months behind WASI" or some fixed distance like that is what to shoot for</p>
+
+
+
+<a name="612605011"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/235408-rust-toolchain/topic/Wasm%20target%20features%20and%20%60wasm32-wasip3%60%20as%20a%20target/near/612605011" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/235408-rust-toolchain/topic/Wasm.20target.20features.20and.20.60wasm32-wasip3.60.20as.20a.20target.html#612605011">(Jul 24 2026 at 15:34)</a>:</h4>
+<p>It sounds like there's no "now or never" pressure then, just a desire to push things onto the most common path (real unwind) eventually... my preference at least would then be to not regress developer ergonomics in the meantime, and remain panic=abort so we get full backtraces for now</p>
+
+
+
+<a name="612605352"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/235408-rust-toolchain/topic/Wasm%20target%20features%20and%20%60wasm32-wasip3%60%20as%20a%20target/near/612605352" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/235408-rust-toolchain/topic/Wasm.20target.20features.20and.20.60wasm32-wasip3.60.20as.20a.20target.html#612605352">(Jul 24 2026 at 15:36)</a>:</h4>
+<p>I'd personally be willing to paper over the perf difference, but yeah I don't think we can compromise on "you don't get a backtrace by default"</p>
+
+
+
+<a name="612621131"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/235408-rust-toolchain/topic/Wasm%20target%20features%20and%20%60wasm32-wasip3%60%20as%20a%20target/near/612621131" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Till Schneidereit <a href="https://bytecodealliance.github.io/zulip-archive/stream/235408-rust-toolchain/topic/Wasm.20target.20features.20and.20.60wasm32-wasip3.60.20as.20a.20target.html#612621131">(Jul 24 2026 at 17:06)</a>:</h4>
+<p>based on the discussion here, I think I'm even more convinced than I was yesterday that it's too early to enable unwinding by default, but that we should enable the other three features by default for p3. I think the 10% perf improvement are likely to be the floor, too: I'm not sure if you recompiled everything (from wasi-libc on), but even if, we could invest more into SIMD optimizations in libc. (But also, 10% are nothing to sneeze at in any case!)</p>
+
+
+
+<a name="612621580"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/235408-rust-toolchain/topic/Wasm%20target%20features%20and%20%60wasm32-wasip3%60%20as%20a%20target/near/612621580" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/235408-rust-toolchain/topic/Wasm.20target.20features.20and.20.60wasm32-wasip3.60.20as.20a.20target.html#612621580">(Jul 24 2026 at 17:09)</a>:</h4>
+<p>TIL there's also a history to trying to add backtraces to WASI, so I don't expect that will be a quick feature by any means</p>
+
+
+
+<a name="612621668"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/235408-rust-toolchain/topic/Wasm%20target%20features%20and%20%60wasm32-wasip3%60%20as%20a%20target/near/612621668" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/235408-rust-toolchain/topic/Wasm.20target.20features.20and.20.60wasm32-wasip3.60.20as.20a.20target.html#612621668">(Jul 24 2026 at 17:09)</a>:</h4>
+<p>(<a href="https://github.com/WebAssembly/WASI/issues/159">this issue</a> and <a href="https://github.com/WebAssembly/meetings/pull/1425">this PR</a>)</p>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

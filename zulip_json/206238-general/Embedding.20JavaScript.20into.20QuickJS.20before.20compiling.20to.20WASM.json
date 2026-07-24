@@ -1,0 +1,236 @@
+[
+    {
+        "content": "<p>I've been playing around with JavaScript to WASM. There's a few different libraries; Javy, jco, js2wasm, to the extent applicable AssemblyScript.</p>\n<p>In trying to include the <code>qjs-wasi.wasm</code> build in a benchmark I have that includes various languages compiled to WASM I went ahead and just hardcoded some JavaScript into <code>qjs.c</code> before compilation to WASM with WASI-SDK.</p>\n<p>I'm wondering what is the most practical way to accept STDIN and/or point to a file for the embedding part before compilation?</p>\n<p>The relevant part of <code>qjs.c</code>, after commenting a lot of unused code that won't be used because I dropped parsing options and interactive mode <a href=\"https://github.com/quickjs-ng/quickjs/blob/master/qjs.c#L638-L645\">https://github.com/quickjs-ng/quickjs/blob/master/qjs.c#L638-L645</a></p>\n<div class=\"codehilite\" data-code-language=\"C\"><pre><span></span><code><span class=\"k\">const</span><span class=\"w\"> </span><span class=\"kt\">char</span><span class=\"w\"> </span><span class=\"o\">*</span><span class=\"n\">str</span><span class=\"w\"> </span><span class=\"o\">=</span>\n<span class=\"w\">                </span><span class=\"s\">\"import * as bjson from 'qjs:bjson';</span><span class=\"se\">\\n</span><span class=\"s\">\"</span>\n<span class=\"w\">                </span><span class=\"s\">\"import * as std from 'qjs:std';</span><span class=\"se\">\\n</span><span class=\"s\">\"</span>\n<span class=\"w\">                </span><span class=\"s\">\"import * as os from 'qjs:os';</span><span class=\"se\">\\n</span><span class=\"s\">\"</span>\n<span class=\"w\">                </span><span class=\"s\">\"globalThis.bjson = bjson;</span><span class=\"se\">\\n</span><span class=\"s\">\"</span>\n<span class=\"w\">                </span><span class=\"s\">\"globalThis.std = std;</span><span class=\"se\">\\n</span><span class=\"s\">\"</span>\n<span class=\"w\">                </span><span class=\"s\">\"globalThis.os = os;</span><span class=\"se\">\\n</span><span class=\"s\">\"</span>\n<span class=\"w\">                </span><span class=\"s\">\"print('hello world');</span><span class=\"se\">\\n</span><span class=\"s\">\"</span>\n<span class=\"w\">                </span><span class=\"s\">\"const output = new Uint8Array([97]);</span><span class=\"se\">\\n</span><span class=\"s\">\"</span>\n<span class=\"w\">                </span><span class=\"s\">\"std.out.write(output.buffer, 0, output.length);</span><span class=\"se\">\\n</span><span class=\"s\">\"</span>\n<span class=\"w\">                </span><span class=\"s\">\"std.out.flush();\"</span><span class=\"p\">;</span>\n<span class=\"w\">            </span><span class=\"n\">eval_buf</span><span class=\"p\">(</span><span class=\"n\">ctx</span><span class=\"p\">,</span><span class=\"w\"> </span><span class=\"n\">str</span><span class=\"p\">,</span><span class=\"w\"> </span><span class=\"n\">strlen</span><span class=\"p\">(</span><span class=\"n\">str</span><span class=\"p\">),</span><span class=\"w\"> </span><span class=\"s\">\"&lt;input&gt;\"</span><span class=\"p\">,</span><span class=\"w\"> </span><span class=\"n\">JS_EVAL_TYPE_MODULE</span><span class=\"p\">);</span>\n</code></pre></div>\n<p>That was the test. What I did after that was minify the JavaScript input with <code>bun build --minify</code> then threw it in there.</p>",
+        "id": 601439904,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781013631
+    },
+    {
+        "content": "<p>I'm thinking I can do something similar with Bellard's MicroQuickJS, which after <code>strip</code> is around a little over 200 KiB.</p>",
+        "id": 601447772,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781015275
+    },
+    {
+        "content": "<p>You'd probably have the best luck asking on quickjs-ng about their project and ways to use it.</p>\n<p>FWIW you're missing a major JS-on-Wasm runtime, StarlingMonkey (a BA project); fwiw, StarlingMonkey does natively support snapshotting with JS source read from a file or stdin. (See the docs for more.)</p>",
+        "id": 601451492,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1781016046
+    },
+    {
+        "content": "<p>There's no STDIN reading and STDOUT writing in StarlingMonkey. I tried. Back when it was redfire? I might even have an outstanding issue over there. </p>\n<p>This is how I came to this <a href=\"https://github.com/quickjs-ng/quickjs/issues/1527\">https://github.com/quickjs-ng/quickjs/issues/1527</a>.</p>\n<p>I understand there's no I/O in ECMA-262 - which is a serious omission / handicap. I have to jump through RegExp hoops to read STDIN in SpiderMonkey proper .</p>\n<p><a href=\"https://github.com/guest271314/native-messaging-spidermonkey-shell/blob/main/nm_spidermonkey.js#L10-L30\">https://github.com/guest271314/native-messaging-spidermonkey-shell/blob/main/nm_spidermonkey.js#L10-L30</a></p>\n<div class=\"codehilite\" data-code-language=\"javascriptfunction\"><pre><span></span><code>  // Call readline() N times to catch `\\r\\n\\r\\n\"` from 2d port.postMessage()\n  let stdin;\n  while (true) {\n    stdin = readline();\n    if (stdin !== null) {\n      break;\n    }\n  }\n  let data = `${stdin}`.replace(/[\\r\\n]+|\\\\x([0-9A-Fa-f]{2,4})/gu, \"\")\n    .replace(/[^A-Za-z0-9\\s\\[,\\]\\{\\}:_\"]+/igu, \"\")\n    .replace(/^\"rnrn/gu, \"\")\n    .replace(/^[#\\r\\n\\}_]+(?=\\[)/gu, \"\")\n    .replace(/^\"(?=[\"\\{]+)|^\"(?!\"$)/gu, \"\")\n    .replace(/^\\[(?=\\[(?!.*\\]{2}$))/gu, \"\")\n    .replace(/^\\{(?!\\}|.+\\}$)/gu, \"\")\n    .replace(/^[0-9A-Z]+(?=[\\[\\{\"])/igu, \"\")\n    .replace(/^[\\]\\}](?=\\[)/i, \"\")\n    .trimStart().trim();\n  return encodeMessage(data);\n}\n</code></pre></div>\n<p>V8's <code>d8</code> is worse. Basically impossible. So I use <code>head</code> and <code>dd</code>.</p>",
+        "id": 601454140,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781016597
+    },
+    {
+        "content": "<blockquote>\n<p>fwiw, StarlingMonkey does natively support snapshotting with JS source read from a file or stdin. (See the docs for more.)</p>\n</blockquote>\n<p>Yeah, I'd like to see a direct reference for that capability. I havn't seen it.</p>",
+        "id": 601455618,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781016887
+    },
+    {
+        "content": "<blockquote>\n<p>Back when it was redfire?</p>\n</blockquote>\n<p>I have no idea what redfire is, sorry, but AFAIK StarlingMonkey has never been \"redfire\".</p>\n<blockquote>\n<p>Yeah, I'd like to see a direct reference</p>\n</blockquote>\n<p><a href=\"https://github.com/bytecodealliance/StarlingMonkey/blob/main/README.md\">https://github.com/bytecodealliance/StarlingMonkey/blob/main/README.md</a></p>\n<p>\"./componentize.sh index.js -o index.wasm\"</p>",
+        "id": 601455876,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1781016938
+    },
+    {
+        "content": "<p>it appears I was mistaken about a mode to read source from stdin (maybe that was the old Fastly SDK this evolved from). In any case that has nothing to do with stdin/stdout access from the guest itself, it's just the plumbing to get JS into the snapshot</p>",
+        "id": 601456194,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1781016998
+    },
+    {
+        "content": "<p>Didn't that start out as SpiderFire? </p>\n<p>I mean actual <code>read</code> and <code>write</code> in the runtime. Like we can do in QuickJS. I'll have to dig through my issues. </p>\n<p>With all due respect, the component thing is just a bunch more code for no reason, in my opinion. But I'll try out what you're suggesting, later, and post back here the results.</p>",
+        "id": 601456831,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781017128
+    },
+    {
+        "content": "<p>It appears that SpiderFire is a completely separate runtime. StarlingMonkey is a Bytecode Alliance-hosted project built on SpiderMonkey that was evolved from earlier serverless/FaaS-focused SDK work we had been doing. No lineage to other runtimes.</p>\n<blockquote>\n<p>With all due respect, the component thing is just a bunch more code for no reason, in my opinion.</p>\n</blockquote>\n<p>FWIW, you're of course welcome to your opinion, but pointing this out in this way comes off as antagonistic. I'm trying to help you find runtimes that can snapshot JS, that's all. Good day and best of luck!</p>",
+        "id": 601458272,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1781017403
+    },
+    {
+        "content": "<p>I am not sure I fully follow the conversation, but regarding compiling JS to Wasm AOT that's something achievable, for example, with Javy: <a href=\"https://github.com/bytecodealliance/javy/blob/main/docs/docs-using-dynamic-linking.md\">https://github.com/bytecodealliance/javy/blob/main/docs/docs-using-dynamic-linking.md</a></p>",
+        "id": 601484419,
+        "sender_full_name": "andreaTP",
+        "timestamp": 1781023307
+    },
+    {
+        "content": "<p>Yes, StarlingMonkey as well -- there are two BA projects that achieve this</p>",
+        "id": 601484652,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1781023369
+    },
+    {
+        "content": "<blockquote>\n<p>There's no STDIN reading and STDOUT writing in StarlingMonkey</p>\n</blockquote>\n<p>StarlingMonkey does support <code>stdin</code> reading and <code>stdout</code> writing through wasi. For example you can use <code>ComponentizeJS</code> or <code>jco</code> (both uses StarlingMonkey) that will turn your <code>wit</code> world import into js modules that you can import and that is true for <code>wasi:cli/stdin</code> / <code>wasi:cli/stdout</code>.</p>",
+        "id": 601499951,
+        "sender_full_name": "Tomasz Andrzejak",
+        "timestamp": 1781026604
+    },
+    {
+        "content": "<p>I had a similar issue in the past. I ended up providing a tool that would compile my code which then calls include_str() at a location and sticks it in a static. </p>\n<p>They are probably so much better ways though</p>",
+        "id": 601522257,
+        "sender_full_name": "Ashanti Mutinta",
+        "timestamp": 1781031362
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"254389\">Chris Fallin</span> <a href=\"#narrow/channel/206238-general/topic/Embedding.20JavaScript.20into.20QuickJS.20before.20compiling.20to.20WASM/near/601458272\">said</a>:</p>\n<blockquote>\n<p>It appears that SpiderFire is a completely separate runtime. StarlingMonkey is a Bytecode Alliance-hosted project built on SpiderMonkey that was evolved from earlier serverless/FaaS-focused SDK work we had been doing. No lineage to other runtimes.</p>\n<blockquote>\n<p>With all due respect, the component thing is just a bunch more code for no reason, in my opinion.</p>\n</blockquote>\n<p>FWIW, you're of course welcome to your opinion, but pointing this out in this way comes off as antagonistic. I'm trying to help you find runtimes that can snapshot JS, that's all. Good day and best of luck!</p>\n</blockquote>\n<p>That's just my opinion. I look at WIT and am like that's a whole different language to learn. Thanks.</p>",
+        "id": 601535934,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781034333
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"1066333\">andreaTP</span> <a href=\"#narrow/channel/206238-general/topic/Embedding.20JavaScript.20into.20QuickJS.20before.20compiling.20to.20WASM/near/601484419\">said</a>:</p>\n<blockquote>\n<p>I am not sure I fully follow the conversation, but regarding compiling JS to Wasm AOT that's something achievable, for example, with Javy: <a href=\"https://github.com/bytecodealliance/javy/blob/main/docs/docs-using-dynamic-linking.md\">https://github.com/bytecodealliance/javy/blob/main/docs/docs-using-dynamic-linking.md</a></p>\n</blockquote>\n<p>Yeah, I've done this using Javy, js2wasm, Facebook's Static Hermes.</p>\n<p>Hit a roadblock when it came to defining WIT. Though I was able to do tge wasm-tools to component thing on AssemblyScript and Javy. Didnt add anything observable to me.</p>\n<p>A generic WIT definition for stdin and stdout would be useful. Seems like theres a lot of flux and everybody doez it diffefently, like WASI implementations in general.</p>",
+        "id": 601537134,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781034591
+    },
+    {
+        "content": "<p>bw, ive tried with jco, starlingmonkey, componentizejs, componentize qjs. ill try again later today</p>",
+        "id": 601542036,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781035620
+    },
+    {
+        "content": "<blockquote>\n<p>A generic WIT definition for stdin and stdout would be useful.</p>\n</blockquote>\n<p>That's <code>wasi:cli/stdin</code> and <code>wasi:cli/stdout</code>, as <a href=\"#narrow/channel/206238-general/topic/Embedding.20JavaScript.20into.20QuickJS.20before.20compiling.20to.20WASM/near/601499951\">pointed out to you above</a>. You shouldn't need to write any new WIT for this.</p>",
+        "id": 601559915,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1781039924
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"254389\">Chris Fallin</span> <a href=\"#narrow/channel/206238-general/topic/Embedding.20JavaScript.20into.20QuickJS.20before.20compiling.20to.20WASM/near/601559915\">said</a>:</p>\n<blockquote>\n<blockquote>\n<p>A generic WIT definition for stdin and stdout would be useful.</p>\n</blockquote>\n<p>That's <code>wasi:cli/stdin</code> and <code>wasi:cli/stdout</code>, as <a href=\"#narrow/channel/206238-general/topic/Embedding.20JavaScript.20into.20QuickJS.20before.20compiling.20to.20WASM/near/601499951\">pointed out to you above</a>. You shouldn't need to write any new WIT for this.</p>\n</blockquote>\n<p>To be clear, I'm not trying to _find_ JavaScript to WASM compilers, I'm testing, vetting, and comparing them.</p>\n<p>I've got about 30 different versions of the same algorithm - several already using JavaScript to WASM compilation targets, from Rust to C, Zig to QuickJS, and around 7 or 8 compiled to WASM; see <a href=\"https://github.com/guest271314/native-messaging-webassembly/blob/main/install_hosts.js#L39-L114\">https://github.com/guest271314/native-messaging-webassembly/blob/main/install_hosts.js#L39-L114</a> and <a href=\"https://guest271314.github.io/native-messaging-webassembly/\">https://guest271314.github.io/native-messaging-webassembly/</a>.</p>\n<p>What I'm doing now is attempting to do a JavaScript to WASM only comparison. I'm not looking for a single solution. I'm seeing which ones do what, which ones don't do what. </p>\n<p>Back outta the field. I'll see what happens with <br>\nStarlingMonkey and STDIN.</p>\n<p>Ahh, this is what the roadblock in StarlingMonkey world was last time I looked</p>\n<blockquote>\n<p>This mode currently only supports the creation of HTTP server components, which means that the <code>index.js</code> file must register a <code>fetch</code> event handler. For example, your <code>index.js</code> could contain the following code:</p>\n</blockquote>\n<p>There's not networking involved in my code.</p>",
+        "id": 601602314,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781051337
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"763150\">Tomasz Andrzejak</span> <a href=\"#narrow/channel/206238-general/topic/Embedding.20JavaScript.20into.20QuickJS.20before.20compiling.20to.20WASM/near/601499951\">said</a>:</p>\n<blockquote>\n<blockquote>\n<p>There's no STDIN reading and STDOUT writing in StarlingMonkey</p>\n</blockquote>\n<p>StarlingMonkey does support <code>stdin</code> reading and <code>stdout</code> writing through wasi. For example you can use <code>ComponentizeJS</code> or <code>jco</code> (both uses StarlingMonkey) that will turn your <code>wit</code> world import into js modules that you can import and that is true for <code>wasi:cli/stdin</code> / <code>wasi:cli/stdout</code>.</p>\n</blockquote>\n<p>I don't have a WIT world. I just have working JavaScript code. Same algorithm implemented for <code>node</code>, <code>deno</code>, <code>bun</code>, <code>tjs</code>, <code>qjs</code>, <code>llrt</code>, <code>js</code> (SpiderMonkey), <code>d8</code> (V8), <code>shermes</code>. In WASM only world, using <code>javy</code>, <code>js2wasm</code> (<a href=\"https://github.com/guest271314/js2\">https://github.com/guest271314/js2</a>); see <a href=\"https://github.com/guest271314/NativeMessagingHosts\">https://github.com/guest271314/NativeMessagingHosts</a>.</p>\n<p>So, if I'm reading you folks correctly the only WIT I need to do the Component Model thing with <code>ComponentizeJS</code> or <code>jco</code> is this basic WIT, that <code>js2wasm</code> output, right?</p>\n<div class=\"codehilite\" data-code-language=\"wit\"><pre><span></span><code>package js2wasm:nm-js2wasm;\n\nworld module {\n  /// Core import: wasi_snapshot_preview1.fd_write\n  import fd-write: func(fd: s32, iovs: s32, iovs-len: s32, nwritten: s32) -&gt; s32;\n  /// Core import: wasi_snapshot_preview1.fd_read\n  import fd-read: func(fd: s32, iovs: s32, iovs-len: s32, nread: s32) -&gt; s32;\n}\n</code></pre></div>",
+        "id": 601604090,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781051985
+    },
+    {
+        "content": "<p><span class=\"user-mention\" data-user-id=\"254389\">@Chris Fallin</span> <span class=\"user-mention\" data-user-id=\"763150\">@Tomasz Andrzejak</span> </p>\n<p>Here's a JavaScript runtime agnostic Native Messaging host <a href=\"https://github.com/guest271314/NativeMessagingHosts/blob/main/nm_host.js\">https://github.com/guest271314/NativeMessagingHosts/blob/main/nm_host.js</a>. The same code works using <code>node</code>, <code>deno</code>, <code>bun</code>, and <code>tjs</code> (txiki.js).</p>\n<p>In theory all I need is this WIT</p>\n<div class=\"codehilite\" data-code-language=\"wit\"><pre><span></span><code>world module {\n  /// Core import: wasi_snapshot_preview1.fd_write\n  import fd-write: func(fd: s32, iovs: s32, iovs-len: s32, nwritten: s32) -&gt; s32;\n  /// Core import: wasi_snapshot_preview1.fd_read\n  import fd-read: func(fd: s32, iovs: s32, iovs-len: s32, nread: s32) -&gt; s32;\n}\n</code></pre></div>\n<p>and the code should be compilable to WASM with <code>jco</code> or <code>@bytecodealliance/componentize-js</code> or <code>componentize.sh</code>, right?</p>",
+        "id": 601607762,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781053335
+    },
+    {
+        "content": "<p>(deleted)</p>",
+        "id": 601607830,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781053362
+    },
+    {
+        "content": "<p>I went ahead and filed this issue in ComponentizeJS. <a href=\"https://github.com/bytecodealliance/ComponentizeJS/issues/342\">https://github.com/bytecodealliance/ComponentizeJS/issues/342</a>.</p>\n<p>I was really just asking how you folks would go about emdedding JavaScript source into QuickJS's <code>qjs.c</code> before compilation to <code>qjs-wasi.wasm</code> with WASI-SDK. </p>\n<p>But since ther are suggestions to use Bytecode Alliance gear, sure, I can add Bytecode Alliance gear to my test. I look forward to clarification about reading STDIN, writing to STDOUT, and the minimal WIT for the Component Model thingy. Thanks.</p>",
+        "id": 601612770,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781055119
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"1066333\">andreaTP</span> <a href=\"#narrow/channel/206238-general/topic/Embedding.20JavaScript.20into.20QuickJS.20before.20compiling.20to.20WASM/near/601484419\">said</a>:</p>\n<blockquote>\n<p>I am not sure I fully follow the conversation, but regarding compiling JS to Wasm AOT that's something achievable, for example, with Javy: <a href=\"https://github.com/bytecodealliance/javy/blob/main/docs/docs-using-dynamic-linking.md\">https://github.com/bytecodealliance/javy/blob/main/docs/docs-using-dynamic-linking.md</a></p>\n</blockquote>\n<p>AFAICT there's no AOT compilation going on at all in Bytecode Alliance's Javy, nor the <code>qjs-wasi.wasm</code> example I originally asked about. </p>\n<p>The QuickJS engine is embedded and the JavaScript is dynamically evaluated. If that were not the case there'd be no need to embed rquicks into Javy, and the resulting WASM <code>plug.wasm</code> file wouldn't almost idenitically match the size of <code>qjs</code>. </p>\n<p><code>js2wasm</code> <a href=\"https://github.com/loopdive/js2\">https://github.com/loopdive/js2</a> _does_ do the AOT thing in WASM GC, that works with <code>wasmtime</code> 45+, where WASM GC is still being worked on, the last I checked a couple days ago.</p>\n<p>Nonetheless, yes, I'm familiar with Javy. I created a version of the Node.js example that runs in the browser <a href=\"https://github.com/guest271314/javy-browser-host\">https://github.com/guest271314/javy-browser-host</a>.</p>",
+        "id": 601626358,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781059653
+    },
+    {
+        "content": "<p>Just for the record, here's the Facebook (Meta) Static Hermes style of JavaScript compilation to WASM with WASI-SDK, in pertinanet part <a href=\"https://gist.github.com/guest271314/b10eac16be88350ffcd19387e22ad4d5#emit-c-from-javascript-source-with-shermes-compile-to-wasm-with-wasi-sdk-clang-and-clang\">https://gist.github.com/guest271314/b10eac16be88350ffcd19387e22ad4d5#emit-c-from-javascript-source-with-shermes-compile-to-wasm-with-wasi-sdk-clang-and-clang</a>. </p>\n<p>And one way to read STDIN in using <code>shermes</code> <a href=\"https://gist.github.com/guest271314/fec412134903e50521c12370edc88ef3\">https://gist.github.com/guest271314/fec412134903e50521c12370edc88ef3</a>. It wasn't/ain't a simple matter over there, either...</p>",
+        "id": 601630873,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781061283
+    },
+    {
+        "content": "<blockquote>\n<p>WASM GC, that works with <code>wasmtime</code> 45+, where WASM GC is still being worked on, the last I checked a couple days ago.</p>\n</blockquote>\n<p>That's an inaccurate characterization. Wasm GC is in fact a tier 1 feature now and on by default, and has been essentially stable and usable for quite some time now. <a href=\"https://docs.wasmtime.dev/stability-wasm-proposals.html\">doc link</a></p>\n<blockquote>\n<p>I was really just asking how you folks would go about emdedding JavaScript source into QuickJS's <code>qjs.c</code> before compilation to <code>qjs-wasi.wasm</code> with WASI-SDK.</p>\n</blockquote>\n<p>And as mentioned above, QuickJS is not a Bytecode Alliance project, so this is the wrong place to ask. I'd encourage you to ask the maintainers of that code how to use it. Best of luck!</p>",
+        "id": 601633917,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1781062366
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"254389\">Chris Fallin</span> <a href=\"#narrow/channel/206238-general/topic/Embedding.20JavaScript.20into.20QuickJS.20before.20compiling.20to.20WASM/near/601633917\">said</a>:</p>\n<blockquote>\n<blockquote>\n<p>WASM GC, that works with <code>wasmtime</code> 45+, where WASM GC is still being worked on, the last I checked a couple days ago.</p>\n</blockquote>\n<p>That's an inaccurate characterization. Wasm GC is in fact a tier 1 feature now and on by default, and has been essentially stable and usable for quite some time now. <a href=\"https://docs.wasmtime.dev/stability-wasm-proposals.html\">doc link</a></p>\n<blockquote>\n<p>I was really just asking how you folks would go about emdedding JavaScript source into QuickJS's <code>qjs.c</code> before compilation to <code>qjs-wasi.wasm</code> with WASI-SDK.</p>\n</blockquote>\n<p>And as mentioned above, QuickJS is not a Bytecode Alliance project, so this is the wrong place to ask. I'd encourage you to ask the maintainers of that code how to use it. Best of luck!</p>\n</blockquote>\n<p>See <a href=\"https://github.com/bytecodealliance/wasmtime/issues/13386#issuecomment-4635521910\">https://github.com/bytecodealliance/wasmtime/issues/13386#issuecomment-4635521910</a> re everything working just great in WASM GC  </p>\n<blockquote>\n<p>Ah yeah <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13382\">#13382</a> definitely didn't fix this issue, this issue was spawned from discussion on that PR.</p>\n</blockquote>\n<p>and <a href=\"https://github.com/bytecodealliance/wasmtime/issues/13216#issuecomment-4637655407\">https://github.com/bytecodealliance/wasmtime/issues/13216#issuecomment-4637655407</a></p>\n<blockquote>\n<p>Regarding this repo, in first benchmarks I stumbled over the <code>array.copy</code> performance gap tracked in <a href=\"https://github.com/bytecodealliance/wasmtime/issues/13279\">#13279</a> and that a fix is expected to ship in the next release.</p>\n</blockquote>\n<p>Guess who was testing <code>js2waasm</code> using <code>wasmtime</code> 44 and encountered what is described and relayed that to the maintainer - who relayed that feedback upstream?</p>\n<p>Anyway, I was thinking it's all about spreading the knowledge, domain and range of WebAssembly here - not just BCA. Guess I am terribly mistaken. </p>\n<p>In any event I have filed issues in ComponentizeJS and StalingMonkey - both Bytecode Alliance projects, respectfully asking exacly how the I/O works and how to cobble together the new WIT thing the CM expects. No QuickJS involved. Just comparisons to working code - including Javy, another BCA offspring. If StarlingMoney and ComponentizeJS can do, kindly illuminate the path to achieving implementing the Native Messaging protocol using those BCA projects. </p>\n<p>Again, thank for your time and effort. Have a great day.</p>",
+        "id": 601769190,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781094117
+    },
+    {
+        "content": "<p>A little update. <span class=\"user-mention\" data-user-id=\"763150\">@Tomasz Andrzejak</span> Has been very helpful over here <a href=\"https://github.com/andreiltd/componentize-qjs/issues/2\">https://github.com/andreiltd/componentize-qjs/issues/2</a>. Got a Native Messaging host working using componentize-qjs, using WASI P2. Along the way found out <code>wasmtime</code> is apparently buffering writes to STDOUT when P3 is used. Ironically, when the P2 version got to working they disclosed they are using library-specific read and write methods!If the point of WIT is a comprehensive template for all of the things, across different languages, as soon as that gets going people create custom methods outside of the template. Thus these issues. </p>\n<p>I think when <code>streams.methodOutputStreamBlockingWriteAndFlush(output, data.subarray(off, off + WRITE_CHUNK))</code> and <code>const r = streams.methodInputStreamBlockingRead(input, n - off)</code>are replaced with the P2 versions found in <code>wasi:io/streams@0.2.6</code> I should be able to use the same code with at least <code>componentize-js</code> and <code>jco</code> - as long as those respective libraries have not also created custom interfaces.</p>",
+        "id": 602911255,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781385664
+    },
+    {
+        "content": "<p>Finally got this working using <code>jco</code>. Very different code and import expectations cf. <code>componentize-qjs</code>. </p>\n<div class=\"codehilite\" data-code-language=\"Bash\"><pre><span></span><code>bun<span class=\"w\"> </span>x<span class=\"w\"> </span>jco<span class=\"w\"> </span>componentize<span class=\"w\"> </span>nm_jco_p2.js<span class=\"w\"> </span><span class=\"se\">\\</span>\n--wit<span class=\"w\"> </span>native-messaging-p2<span class=\"w\"> </span><span class=\"se\">\\</span>\n--world-name<span class=\"w\"> </span>native-messaging-p2<span class=\"w\"> </span><span class=\"se\">\\</span>\n-d<span class=\"w\"> </span>http<span class=\"w\"> </span>-d<span class=\"w\"> </span>fetch-event<span class=\"w\"> </span><span class=\"se\">\\</span>\n--out<span class=\"w\"> </span>nm_jco_p2.wasm\nOK<span class=\"w\"> </span>Successfully<span class=\"w\"> </span>written<span class=\"w\"> </span>nm_jco_p2.wasm.\n</code></pre></div>\n<p>HTTP included by default is a bit pushy downstream from StarlingMonkey... </p>\n<p>AssemblyScript compiled to WASI P1 and then \"adapted\" into Component Model by <code>wasm-tools</code> is 31.3 KiB.</p>\n<p><code>nm_jco_p2.wasm</code> is 12.1 MiB. Insane... I'll reproduce the build a couple more times from scratch then close out the issues I filed with steps to reproduce. Definitely a learning experience...</p>",
+        "id": 602934935,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781394704
+    },
+    {
+        "content": "<p>Here you go, componentize-qjs and ComponentizeJS/jco Component Model based WASI P2 Native Messaging hosts, respectively </p>\n<ul>\n<li><a href=\"https://github.com/guest271314/native-messaging-componentize-qjs\">https://github.com/guest271314/native-messaging-componentize-qjs</a></li>\n<li><a href=\"https://github.com/guest271314/native-messaging-componentize-js\">https://github.com/guest271314/native-messaging-componentize-js</a></li>\n</ul>\n<p>I still havn't been able to do the <a href=\"http://componentize.sh\">componentize.sh</a> thing in StarlingMonkey proper. </p>\n<div class=\"codehilite\" data-code-language=\"Bash\"><pre><span></span><code>/media/user/x/StarlingMonkey/cmake-build-release/componentize.sh<span class=\"w\"> </span>nm_componentize_js.js<span class=\"w\"> </span>-o<span class=\"w\"> </span>sm.wasm\nComponentizing<span class=\"w\"> </span>nm_componentize_js.js<span class=\"w\"> </span>into<span class=\"w\"> </span>sm.wasm\nError:<span class=\"w\"> </span>failed<span class=\"w\"> </span>to<span class=\"w\"> </span>run<span class=\"w\"> </span>main<span class=\"w\"> </span>module<span class=\"w\"> </span><span class=\"sb\">`</span>/media/user/x/StarlingMonkey/cmake-build-release/starling-raw.wasm<span class=\"sb\">`</span>\n\nCaused<span class=\"w\"> </span>by:\n<span class=\"w\">    </span>no<span class=\"w\"> </span>func<span class=\"w\"> </span><span class=\"nb\">export</span><span class=\"w\"> </span>named<span class=\"w\"> </span><span class=\"sb\">`</span>wizer-initialize<span class=\"sb\">`</span><span class=\"w\"> </span>found\n\nerror:<span class=\"w\"> </span>failed<span class=\"w\"> </span>to<span class=\"w\"> </span><span class=\"nb\">read</span><span class=\"w\"> </span>from<span class=\"w\"> </span><span class=\"sb\">`</span>sm.wasm<span class=\"sb\">`</span>\n\nCaused<span class=\"w\"> </span>by:\n<span class=\"w\">    </span><span class=\"m\">0</span>:<span class=\"w\"> </span>No<span class=\"w\"> </span>such<span class=\"w\"> </span>file<span class=\"w\"> </span>or<span class=\"w\"> </span>directory<span class=\"w\"> </span><span class=\"o\">(</span>os<span class=\"w\"> </span>error<span class=\"w\"> </span><span class=\"m\">2</span><span class=\"o\">)</span>\n</code></pre></div>\n<p>I'm pretty sure downstream ComponentizeJS/jco output has stuff in there that ain't being used, even after <code>--disable http --disable fetch-event</code>.</p>\n<p>The WASM using WASI P2 (couldn't get <code>wasmtime</code> 45 to run the WASI P3 stuff without inserting newlines, which compromises integrity of roundtrip/echo) output by ComponentizeJS/jco is a whopping 13.4 MiB for a Native Messaging host. The WAT output by wasm-tools print is 170 MiB. Insane...</p>",
+        "id": 603093780,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781455099
+    },
+    {
+        "content": "<p><span class=\"user-mention\" data-user-id=\"983221\">@guest271314</span> same as in the other two places where I just sent you messages: please be mindful of your tone. You've made your feelings on all kinds of things we're working on well known by now, and we're not in need of more information about them. We, the Bytecode Alliance's TSC, will start removing your messages or prevent you from sending additional ones if you don't tone it down</p>",
+        "id": 603328540,
+        "sender_full_name": "Till Schneidereit",
+        "timestamp": 1781523192
+    },
+    {
+        "content": "<blockquote>\n<p>@guest271314 same as in the other two places where I just sent you messages: please be mindful of your tone. You've made your feelings on all kinds of things we're working on well known by now, and we're not in need of more information about them. We, the Bytecode Alliance's TSC, will start removing your messages or prevent you from sending additional ones if you don't tone it down</p>\n</blockquote>\n<p>Do what you do. </p>\n<p>I don't take well to threats of reprisals for posting my opinion on technical matters.</p>",
+        "id": 603351049,
+        "sender_full_name": "guest271314",
+        "timestamp": 1781527528
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"983221\">guest271314</span> <a href=\"#narrow/channel/206238-general/topic/Embedding.20JavaScript.20into.20QuickJS.20before.20compiling.20to.20WASM/near/603351049\">said</a>:</p>\n<blockquote>\n<p>I don't take well to threats of reprisals for posting my opinion on technical matters.</p>\n</blockquote>\n<p>dude. you are barging into someone's house uninvited and telling them you don't like the interior decor. you might even have good points, but that doesn't mean that the way you're making them is acceptable.</p>",
+        "id": 603434101,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1781542256
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"253990\">fitzgen (he/him)</span> <a href=\"#narrow/channel/206238-general/topic/Embedding.20JavaScript.20into.20QuickJS.20before.20compiling.20to.20WASM/near/603434101\">said</a>:</p>\n<blockquote>\n<p><span class=\"user-mention silent\" data-user-id=\"983221\">guest271314</span> <a href=\"#narrow/channel/206238-general/topic/Embedding.20JavaScript.20into.20QuickJS.20before.20compiling.20to.20WASM/near/603351049\">said</a>:</p>\n<blockquote>\n<p>I don't take well to threats of reprisals for posting my opinion on technical matters.</p>\n</blockquote>\n<p>dude. you are barging into someone's house uninvited and telling them you don't like the interior decor. you might even have good points, but that doesn't mean that the way you're making them is acceptable.</p>\n</blockquote>\n<p>I don't entertain likes and dislikes. I deal with technical facts. Maybe other folks might not like the terseness and pedantic inpependent observations that they can reproduce? </p>\n<p>Some raw data to chew on. The Component Model WASM output by <code>componentize-js</code>/<code>jco</code> is around 8 times slower to execute by <code>wasmtime</code> than the next slowest to execute by <code>wasmtime</code>, Go source code compiled with <code>go</code>, not to be confused with the same source code compiled with <code>tinygo</code>. All I can say is, wow...</p>\n<div class=\"codehilite\" data-code-language=\"Text only\"><pre><span></span><code>0   'nm_zig'    0.09759999999900659\n1   'nm_go' 0.10093333333482345\n2   'nm_lua'    0.10776666666318972\n3   'nm_zig_wasi'   0.10803333333134651\n4   'nm_shermes'    0.12583333333333332\n5   'nm_assemblyscript' 0.13146666667113702\n6   'nm_qjs'    0.14363333333283665\n7   'nm_rust'   0.1475\n8   'nm_c_wasi' 0.152\n9   'nm_cpp'    0.15306666666517654\n10  'nm_c'  0.15910000000149013\n11  'nm_warpo'  0.1645\n12  'nm_componentize_qjs'   0.1686000000014901\n13  'nm_tjs'    0.16963333333283662\n14  'nm_javy'   0.1742666666681568\n15  'nm_qjs_wasi'   0.1772000000004967\n16  'nm_rust_wasi'  0.1772000000004967\n17  'nm_tinygo_wasi'    0.1963666666696469\n18  'nm_deno'   0.22149999999751646\n19  'nm_nodejs' 0.2383333333333333\n20  'nm_bun'    0.2388999999985099\n21  'nm_cpp_wasi'   0.24506666666766008\n22  'nm_typescript' 0.2626333333328366\n23  'nm_ruby'   0.26753333333383006\n24  'nm_bash'   0.2878666666671634\n25  'nm_python' 0.3299000000009934\n26  'nm_spidermonkey'   0.3761000000014901\n27  'nm_d8' 0.4375000000024835\n28  'nm_javy_node_wasi' 0.4617000000029803\n29  'nm_llrt'   0.8525666666676601\n30  'nm_go_wasi'    1.3399666666686534\n31  'nm_componentize_js'    8.171066666670145\n</code></pre></div>",
+        "id": 605737408,
+        "sender_full_name": "guest271314",
+        "timestamp": 1782137798
+    },
+    {
+        "content": "<p>One more run, just to make sure the previous was not an anomoly. Same algorithm. 10 runs, averages. Yep, the <code>componentize-js</code>/<code>jco</code> result even gets smoked by Bash!</p>\n<div class=\"codehilite\" data-code-language=\"Text only\"><pre><span></span><code>0   'nm_rust'   0.11625999999940395\n1   'nm_zig'    0.11707999999895691\n2   'nm_shermes'    0.11987999999970197\n3   'nm_lua'    0.12004999999999999\n4   'nm_go' 0.12407999999895691\n5   'nm_zig_wasi'   0.13098000000044702\n6   'nm_c'  0.13629999999925493\n7   'nm_cpp'    0.13901999999880793\n8   'nm_qjs'    0.14403999999985098\n9   'nm_tjs'    0.144689999999851\n10  'nm_warpo'  0.1599100000008941\n11  'nm_c_wasi' 0.16444000000059605\n12  'nm_assemblyscript' 0.16951999999955297\n13  'nm_qjs_wasi'   0.171380000000447\n14  'nm_componentize_qjs'   0.17316999999955296\n15  'nm_javy'   0.17483000000193716\n16  'nm_rust_wasi'  0.17595\n17  'nm_deno'   0.19719999999850987\n18  'nm_bun'    0.214310000000149\n19  'nm_nodejs' 0.222270000000298\n20  'nm_tinygo_wasi'    0.2259699999988079\n21  'nm_js2wasm'    0.2277000000014901\n22  'nm_typescript' 0.23329999999999998\n23  'nm_cpp_wasi'   0.267280000000447\n24  'nm_ruby'   0.27748999999985097\n25  'nm_go_wasi'    0.29124999999850987\n26  'nm_python' 0.292139999999851\n27  'nm_spidermonkey'   0.293410000000894\n28  'nm_bash'   0.295620000000298\n29  'nm_javy_node_wasi' 0.38675000000000004\n30  'nm_d8' 0.3936500000014901\n31  'nm_componentize_js'    0.666629999999702\n32  'nm_llrt'   0.7768699999980628\n</code></pre></div>",
+        "id": 605747333,
+        "sender_full_name": "guest271314",
+        "timestamp": 1782139546
+    },
+    {
+        "content": "<blockquote>\n<p>I don't entertain likes and dislikes. I deal with technical facts. Maybe other folks might not like the terseness and pedantic inpependent observations that they can reproduce?</p>\n</blockquote>\n<p>This is the last message I'll send on this topic, but to reemphasize: you don't get to make the rules in our spaces. I know that you disagree with the rules we made, but nevertheless: you can choose to abide by them and be welcome, or you can choose not to, and not be welcome.</p>\n<p>And regarding the numbers you shared: neither these numbers nor anything else I've seen you share here give us any new information. If at any point you'd come in with an open mind and asked questions about what you're seeing instead of calling things \"insane\", I might be up for explaining to you why what you're seeing isn't ideal, but also not unexpected. But since you've given me, and others here, absolutely no reason to engage with you, I'll use my time in better ways instead.</p>",
+        "id": 605799967,
+        "sender_full_name": "Till Schneidereit",
+        "timestamp": 1782149032
+    },
+    {
+        "content": "<blockquote>\n<p>And regarding the numbers you shared: neither these numbers nor anything else I've seen you share here give us any new information. If at any point you'd come in with an open mind and asked questions about what you're seeing instead of calling things \"insane\", I might be up for explaining to you why what you're seeing isn't ideal,</p>\n</blockquote>\n<p>Oh. That's what struck a nerve. Don't take that as a personal or organizational affront. It's a term of art, a human expression; the same as \"WTH\", \"I was shocked to find out\", \"Wow\". But you expect a question:</p>\n<p>Given the art in the sector that co-existed, VM Ware Labs WASM Workers Server, WasmEdge, Workerd - why didn't the team instead statically analyze the JavaScript source code, and pull ONLY what was NEEDED by the source code from SpiderMonkey source code to complete the instruction?</p>",
+        "id": 605891431,
+        "sender_full_name": "guest271314",
+        "timestamp": 1782177292
+    },
+    {
+        "content": "<p>The first two systems you name use QuickJS-based JS runtimes within Wasm, and workerd (I am assuming Cloudflare's project by that name) is native V8, which can run JS in the usual host-JIT'd fashion.</p>\n<p>None of these \"statically analyze the JavaScript source code and pull only what was needed\". Static analysis of JavaScript is an enormously deep and difficult subject, and not something that one \"just does\" as if it's obvious. SpiderMonkey is large because it's a browser-targeted JavaScript engine.</p>\n<p>To echo Till, I am extremely tired of your mode of engagement here. Ranging from the snide and dismissive \"[insane] is a term of art, a human expression\" (as if we need this to be explained) to the misinformed (why doesn't one just simply statically analyze JS?) to the enormously entitled (your shit sucks, why haven't you solved it yet).</p>\n<p>If you're interested in helping, then help. Asking questions is not helping. We are all hardworking folks trying to solve real problems with real constraints, and there is no grand conspiracy to screw that up in just such a way to annoy you. These are just hard problems and we're pushing the state of the art in new niches. If you think you can do better, then go and do better, rather than talking to others as if we owe you this.</p>\n<p>In summary: you're coming off extremely poorly and creating a toxic environment here. (It is probably no coincidence, if I take the matching username as a true match, that you are also <a href=\"https://www.reddit.com/user/guest271314/\">banned on Reddit</a> and <a href=\"https://politics.meta.stackexchange.com/questions/3504/what-is-the-rationale-for-the-question-ban-for-user-guest271314\">on StackOverflow</a>.) As far as I am concerned, the TSC needs to take further action. Good day and good luck.</p>",
+        "id": 605901617,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1782185204
+    },
+    {
+        "content": "<blockquote>\n<p>None of these \"statically analyze the JavaScript source code and pull only what was needed\". Static analysis of JavaScript is an enormously deep and difficult subject, and not something that one \"just does\" as if it's obvious.</p>\n<p>If you're interested in helping, then help.</p>\n</blockquote>\n<p>See <a href=\"https://github.com/loopdive/js2\">https://github.com/loopdive/js2</a></p>\n<blockquote>\n<p>(It is probably no coincidence, if I take the matching username as a true match, that you are also <a href=\"https://www.reddit.com/user/guest271314/\">banned on Reddit</a> and <a href=\"https://politics.meta.stackexchange.com/questions/3504/what-is-the-rationale-for-the-question-ban-for-user-guest271314\">on StackOverflow</a>.) As far as I am concerned, the TSC needs to take further action. Good day and good luck.</p>\n</blockquote>\n<p>Yep, that's me. And around 3 dozen more <a href=\"https://guest271314.com\">https://guest271314.com</a>.</p>\n<p>This is just constructive feedback. Some nudges. Y'all are the experts. No ill will. I'm on the front-end testing your gear, and comparing your gear to other art in the sector right now. </p>\n<p>I'm not the only programmer in the field that has noticed starting a 13 MiB WASM file is expensive. That's what science is about. Not getting mad because somebody says, that ain't the buisness, based on the evidence. Other than that, great work!</p>\n<p>von Braun wasn't recruited under Operation Paperclip because he wasn't gonna test, and testing without regard for the how the evidence would turn on this or that fragility or excess was needed to get the U.S. to the moon.</p>\n<blockquote>\n<p>von Braun believed in testing. I cannot emphasize that term enough – test, test, test. Test to the point it breaks.</p>\n</blockquote>\n<ul>\n<li>Ed Buckbee, NASA Public Affairs Officer, Chasing the Moon</li>\n</ul>",
+        "id": 605911107,
+        "sender_full_name": "guest271314",
+        "timestamp": 1782191417
+    },
+    {
+        "content": "<p><span class=\"user-mention\" data-user-id=\"983221\">@guest271314</span> as I said before, whether your behavior is welcome here or not is not a matter of discussion. You've been given a substantial amount of constructive feedback by a number of people, and chose to react with arguments instead of acknowledging the simple fact that if you want to be welcome here, you need to accept that you need to adjust your behavior to align with our expectations.</p>\n<p>Since you've made it entirely clear that you have no intention of doing so, I'm deactivating your account here and banning you from engaging in our GitHub repos going forward.</p>",
+        "id": 605933233,
+        "sender_full_name": "Till Schneidereit",
+        "timestamp": 1782201287
+    }
+]

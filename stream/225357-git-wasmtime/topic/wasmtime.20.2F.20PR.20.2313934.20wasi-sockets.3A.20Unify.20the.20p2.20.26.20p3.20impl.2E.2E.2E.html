@@ -1,0 +1,235 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #13934 wasi-sockets: Unify the p2 &amp; p3 impl... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html">wasmtime / PR #13934 wasi-sockets: Unify the p2 &amp; p3 impl...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="612151231"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612151231" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612151231">(Jul 22 2026 at 14:38)</a>:</h4>
+<p>badeend opened <a href="https://github.com/bytecodealliance/wasmtime/pull/13934">PR #13934</a> from <code>badeend:addr-checks</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>Currently, the shared socket code (<code>crates/wasi/src/sockets/*</code>) is modeled after the<br>
+p2 interface, with p3 bindings papering over the differences. Some<br>
+functionality is duplicated between the <code>p2/*</code> and <code>p3/*</code> implementations. This has<br>
+already <a href="https://github.com/bytecodealliance/wasmtime/pull/13631">caused bugs in the past</a>.</p>
+<p>Since the p3 interface is strictly a superset of p2, I think it makes more sense to invert that relationship. This PR updates the shared code to become the canonical (p3-shaped)<br>
+implementation with the p3's bindings now a thin wrapper around it. All<br>
+p2-only behavior &amp; state is moved into the p2 bindings layer. Think of: artificial restrictions like disallowing implicit<br>
+binds, and the start/finish async bookkeeping.</p>
+<p>Other notable changes:</p>
+<ul>
+<li>
+<p>Each socket now stores its own copy of the <code>WasiCtx</code>'s<br>
+<code>socket_addr_check</code> at creation time, allowing all permission checks to live in<br>
+  the shared socket code instead of being split across p2/p3. The p2<br>
+<code>Network</code> resource is now just an unforgeable capability token (its<br>
+  permission-checking responsibilities are gone).</p>
+</li>
+<li>
+<p>Removed the <code>Bound</code> state; whether a socket is bound is now determined<br>
+  lazily via <code>getsockname</code>/<code>local_addr</code> instead of tracked explicitly.<br>
+  This simplifies the implementation of <code>UdpSocket::send</code>, allowing it to return a future that can run to completion independently, without needing to rendezvous back with the socket to update its state.</p>
+</li>
+<li>
+<p>Updated <code>SocketAddrUse</code>:<br>
+    - added <code>TcpListen</code>, <code>TcpAccept</code>, <code>UdpReceive</code> checks.<br>
+    - replaced <code>UdpConnect</code> with calls to <code>UdpSend</code> and <code>UdpReceive</code>. On UDP sockets, "connecting" is just a local operation that sets the default remote address for future sends and receives. It does not actually do any I/O on its own.<br>
+    - <strong>Note to reviewer:</strong> this is a breaking change.</p>
+</li>
+<li>
+<p><code>Tcp&amp;UdpSocket::connect</code> now also issue a permission<br>
+  check for the implicit bind that the OS performs when connecting an<br>
+  unbound socket, matching the check already done for explicit binds. Following through the changes of <a href="https://github.com/bytecodealliance/wasmtime/pull/13677">https://github.com/bytecodealliance/wasmtime/pull/13677</a></p>
+</li>
+<li>
+<p>Removed the <code>StdView</code> type introduced in <a href="https://github.com/bytecodealliance/wasmtime/pull/13872">https://github.com/bytecodealliance/wasmtime/pull/13872</a> infavour of direct usage of <code>BorrowedFd</code></p>
+</li>
+</ul>
+<p>Added test coverage for previously-untested behavior:</p>
+<ul>
+<li>
+<p><code>test_udp_disconnect_local_address</code> (p2 &amp; p3): disconnecting a UDP<br>
+  socket should keep it bound. Exercises the removal of the explicit <code>Bound</code><br>
+  state in favor of lazily-derived bound status.</p>
+</li>
+<li>
+<p><code>test_udp_send_receive_multiple</code> (p2): a single <code>send</code>/<code>receive</code> call<br>
+  can carry multiple datagrams at once (bulk send/receive over a<br>
+  connected <code>stream()</code>).</p>
+</li>
+<li>
+<p><code>test_udp_receive_after_connect</code> (p2): datagrams from different peers<br>
+  queued before a socket is connected are correctly filtered so that<br>
+<code>stream(Some(addr))</code> only returns datagrams from the provided address.</p>
+</li>
+</ul>
+<hr>
+<p>All-in-all, the goal of this PR is to consolidate the socket code (even further) into a single place and make it less error-prone to maintain. I realize there's quite a bit of unannounced code movement here, so let me know what you think.</p>
+</blockquote>
+
+
+
+<a name="612151233"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612151233" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612151233">(Jul 22 2026 at 14:38)</a>:</h4>
+<p>badeend requested <a href="https://github.com/pchickey">pchickey</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13934">PR #13934</a>.</p>
+
+
+
+<a name="612151234"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612151234" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612151234">(Jul 22 2026 at 14:38)</a>:</h4>
+<p>badeend requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-wasi-reviewers">wasmtime-wasi-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13934">PR #13934</a>.</p>
+
+
+
+<a name="612151238"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612151238" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612151238">(Jul 22 2026 at 14:38)</a>:</h4>
+<p>badeend requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13934">PR #13934</a>.</p>
+
+
+
+<a name="612184769"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612184769" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612184769">(Jul 22 2026 at 17:05)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasi</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13934">PR #13934</a>.</p>
+
+
+
+<a name="612194431"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612194431" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612194431">(Jul 22 2026 at 17:46)</a>:</h4>
+<p>alexcrichton unassigned pchickey from <a href="https://github.com/bytecodealliance/wasmtime/pull/13934">PR #13934 wasi-sockets: Unify the p2 &amp; p3 implementations</a>.</p>
+
+
+
+<a name="612194433"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612194433" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612194433">(Jul 22 2026 at 17:46)</a>:</h4>
+<p>alexcrichton requested <a href="https://github.com/alexcrichton">alexcrichton</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13934">PR #13934</a>.</p>
+
+
+
+<a name="612196335"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612196335" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612196335">(Jul 22 2026 at 17:55)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13934#pullrequestreview-4757192591">PR review</a>:</p>
+<blockquote>
+<p>Thanks so much for this! This all sounds great to me and I think the refactoring's a good idea. Do you think long-term it would be possible to fold the <code>utils.rs</code> module into the tcp/udp modules directly? That seems a vestige of a time where it was a home of common functionality between p2/p3, but nowadays that should just be <code>{Tcp,Udp}Socket</code>. (Fine to happen in a follow-up PR of course)</p>
+</blockquote>
+
+
+
+<a name="612196336"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612196336" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612196336">(Jul 22 2026 at 17:55)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/13934#discussion_r3632544239">PR review comment</a>:</p>
+<blockquote>
+<p>For this the handling of <code>finish</code> is a bit subtle, but the basic idea is that this continues to do everything below and then instead of returning <code>Pending</code> at the last second it returns <code>Cancelled</code> instead. That gives sort of a "final chance" to get everything completed</p>
+</blockquote>
+
+
+
+<a name="612196337"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612196337" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612196337">(Jul 22 2026 at 17:55)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/13934#discussion_r3632549995">PR review comment</a>:</p>
+<blockquote>
+<p>Similar comment to below on <code>finish</code> here</p>
+</blockquote>
+
+
+
+<a name="612196338"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612196338" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612196338">(Jul 22 2026 at 17:55)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/13934#discussion_r3632547921">PR review comment</a>:</p>
+<blockquote>
+<p>Similar comment to below on <code>finish</code> here</p>
+</blockquote>
+
+
+
+<a name="612222504"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612222504" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612222504">(Jul 22 2026 at 20:26)</a>:</h4>
+<p>badeend updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13934">PR #13934</a>.</p>
+
+
+
+<a name="612223756"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612223756" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612223756">(Jul 22 2026 at 20:34)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> badeend submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13934#pullrequestreview-4758536190">PR review</a>.</p>
+
+
+
+<a name="612223757"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612223757" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612223757">(Jul 22 2026 at 20:34)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> badeend created <a href="https://github.com/bytecodealliance/wasmtime/pull/13934#discussion_r3633611772">PR review comment</a>:</p>
+<blockquote>
+<p>My reasoning was that; if the guest cancels the read/write, there's no point in us to querying the OS again for something the guest isn't interested in anymore. Which is why I had the early return.</p>
+<p>But I'm fine with giving it one last poll. See latest commit.</p>
+</blockquote>
+
+
+
+<a name="612225216"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612225216" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612225216">(Jul 22 2026 at 20:44)</a>:</h4>
+<p>badeend <a href="https://github.com/bytecodealliance/wasmtime/pull/13934#issuecomment-5051286442">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13934">PR #13934</a>:</p>
+<blockquote>
+<blockquote>
+<p>Do you think long-term it would be possible to fold the <a href="http://utils.rs">utils.rs</a> module into the tcp/udp modules directly?</p>
+</blockquote>
+<p>For the things that are explicitly marked as <code>tcp_*</code> &amp; <code>udp_*</code>; Yes, that should be possible.</p>
+<p>There are also a bunch of functions that are shared between tcp &amp; udp, like:</p>
+<ul>
+<li>is_valid_address_family</li>
+<li>normalize_get_buffer_size</li>
+<li>get_ip_ttl</li>
+<li>unspecified_addr</li>
+<li>..</li>
+</ul>
+<p>For those , I think the best we can do is move them into <a href="http://mod.rs">mod.rs</a>. </p>
+</blockquote>
+
+
+
+<a name="612230397"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612230397" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612230397">(Jul 22 2026 at 21:20)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13934#pullrequestreview-4758872611">PR review</a>.</p>
+
+
+
+<a name="612230399"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612230399" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612230399">(Jul 22 2026 at 21:21)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/13934#discussion_r3633892475">PR review comment</a>:</p>
+<blockquote>
+<p>Yeah the intent of the guest is a bit ambiguous because it could mean "I still want to try to finish, but clear out otherwise" vs "I'm totally uninterested in the result just clean up" which is conflated right now</p>
+</blockquote>
+
+
+
+<a name="612230428"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612230428" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612230428">(Jul 22 2026 at 21:21)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/13934#issuecomment-5051700556">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13934">PR #13934</a>:</p>
+<blockquote>
+<p>Makes sense yeah, not something worth proactively doing necessarily, just curious!</p>
+</blockquote>
+
+
+
+<a name="612230435"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612230435" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612230435">(Jul 22 2026 at 21:21)</a>:</h4>
+<p>alexcrichton added <a href="https://github.com/bytecodealliance/wasmtime/pull/13934">PR #13934 wasi-sockets: Unify the p2 &amp; p3 implementations</a> to the merge queue.</p>
+
+
+
+<a name="612234058"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612234058" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612234058">(Jul 22 2026 at 21:53)</a>:</h4>
+<p><span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span> alexcrichton merged <a href="https://github.com/bytecodealliance/wasmtime/pull/13934">PR #13934</a>.</p>
+
+
+
+<a name="612234059"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313934%20wasi-sockets%3A%20Unify%20the%20p2%20%26%20p3%20impl.../near/612234059" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313934.20wasi-sockets.3A.20Unify.20the.20p2.20.26.20p3.20impl.2E.2E.2E.html#612234059">(Jul 22 2026 at 21:53)</a>:</h4>
+<p>alexcrichton removed <a href="https://github.com/bytecodealliance/wasmtime/pull/13934">PR #13934 wasi-sockets: Unify the p2 &amp; p3 implementations</a> from the merge queue.</p>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

@@ -1,0 +1,237 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13133 Per-function compilation diagnost... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313133.20Per-function.20compilation.20diagnost.2E.2E.2E.html">wasmtime / issue #13133 Per-function compilation diagnost...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="586200973"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313133%20Per-function%20compilation%20diagnost.../near/586200973" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313133.20Per-function.20compilation.20diagnost.2E.2E.2E.html#586200973">(Apr 17 2026 at 19:24)</a>:</h4>
+<p>jspaith opened <a href="https://github.com/bytecodealliance/wasmtime/issues/13133">issue #13133</a>:</p>
+<blockquote>
+<p>I'll call out that I used AI to assist me with the analysis below.  The desire to move us from trace=&gt;debug from my experiences as a human.  I validated that all the functions below are real and at <code>debug</code>.  #NoAiSlop</p>
+<h2>Summary</h2>
+<p>Several modules in <code>cranelift_codegen</code> and <code>wasmtime_internal_cranelift</code> emit per-function compilation statistics at <code>log::debug!</code> level. For any application that embeds wasmtime and sets <code>RUST_LOG=debug</code> to debug their own code, these messages completely drown out all other output. I'd like to suggest downgrading these per-function messages from <code>debug!</code> to <code>trace!</code>.</p>
+<h2>Impact</h2>
+<p>I ran a workload that loaded 3 WASM modules. My actual application logic is small — the largest module has only 11 exported functions — but because WASM binaries include their full transitive dependency tree, cranelift ends up compiling ~4,100 functions total (most are from <code>core</code>, <code>alloc</code>, <code>regex</code>, <code>serde_json</code>, etc. linked into the binary). This is normal and expected for Rust-compiled WASM.</p>
+<p>The resulting log file had <strong>137,000 lines</strong>, of which <strong>136,480 (99.6%) were cranelift per-function compilation diagnostics</strong>. My actual application produced only 520 lines (0.4%).</p>
+<p>Breakdown by module:</p>
+<table>
+<thead>
+<tr>
+<th>Module</th>
+<th style="text-align: right;">Lines</th>
+<th style="text-align: center;">% of total</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cranelift_codegen::timing::enabled</code></td>
+<td style="text-align: right;">96,495</td>
+<td style="text-align: center;">70.4%</td>
+</tr>
+<tr>
+<td><code>cranelift_codegen::machinst::compile</code></td>
+<td style="text-align: right;">16,528</td>
+<td style="text-align: center;">12.1%</td>
+</tr>
+<tr>
+<td><code>cranelift_codegen::context</code></td>
+<td style="text-align: right;">12,396</td>
+<td style="text-align: center;">9.0%</td>
+</tr>
+<tr>
+<td><code>wasmtime_internal_cranelift::compiler</code></td>
+<td style="text-align: right;">6,929</td>
+<td style="text-align: center;">5.1%</td>
+</tr>
+<tr>
+<td><code>cranelift_codegen::remove_constant_phis</code></td>
+<td style="text-align: right;">4,132</td>
+<td style="text-align: center;">3.0%</td>
+</tr>
+<tr>
+<td><strong>All cranelift</strong></td>
+<td style="text-align: right;"><strong>136,480</strong></td>
+<td style="text-align: center;"><strong>99.6%</strong></td>
+</tr>
+<tr>
+<td>Application logs</td>
+<td style="text-align: right;">520</td>
+<td style="text-align: center;">0.4%</td>
+</tr>
+</tbody>
+</table>
+<p>That works out to ~33 debug log lines per compiled function. The only workaround today is to add per-module overrides like <code>RUST_LOG=debug,cranelift_codegen=info,wasmtime_cranelift=info,...</code> which is fragile and hard to discover.</p>
+<h2>Affected source locations</h2>
+<p>These are the <code>log::debug!</code> calls that emit per-function messages:</p>
+<p><strong><code>cranelift/codegen/src/timing.rs</code></strong> (70% of volume — 2 lines × ~12 passes × every function):</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="c1">// line 265</span>
+<span class="n">log</span><span class="p">::</span><span class="n">debug</span><span class="o">!</span><span class="p">(</span><span class="s">"   {pass}, (during {prev})"</span><span class="p">);</span>
+<span class="c1">// line 295</span>
+<span class="n">log</span><span class="p">::</span><span class="n">debug</span><span class="o">!</span><span class="p">(</span><span class="s">"timing: Ending {}: {}ms"</span><span class="p">,</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">pass</span><span class="p">,</span><span class="w"> </span><span class="n">duration</span><span class="p">.</span><span class="n">as_millis</span><span class="p">());</span>
+</code></pre></div>
+<p><strong><code>cranelift/codegen/src/context.rs</code></strong> (9% — CLIF instruction/block counts and egraph stats per function):</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="c1">// lines 156-160</span>
+<span class="n">log</span><span class="p">::</span><span class="n">debug</span><span class="o">!</span><span class="p">(</span><span class="s">"Number of CLIF instructions to optimize: {}"</span><span class="p">,</span><span class="w"> </span><span class="o">..</span><span class="p">.);</span>
+<span class="n">log</span><span class="p">::</span><span class="n">debug</span><span class="o">!</span><span class="p">(</span><span class="s">"Number of CLIF blocks to optimize: {}"</span><span class="p">,</span><span class="w"> </span><span class="o">..</span><span class="p">.);</span>
+<span class="c1">// line 387</span>
+<span class="n">log</span><span class="p">::</span><span class="n">debug</span><span class="o">!</span><span class="p">(</span><span class="s">"egraph stats: {:?}"</span><span class="p">,</span><span class="w"> </span><span class="n">pass</span><span class="p">.</span><span class="n">stats</span><span class="p">);</span>
+</code></pre></div>
+<p><strong><code>cranelift/codegen/src/machinst/compile.rs</code></strong> (12% — 4 messages per function):</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">log</span><span class="p">::</span><span class="n">debug</span><span class="o">!</span><span class="p">(</span><span class="s">"Number of CLIF instructions to lower: {}"</span><span class="p">,</span><span class="w"> </span><span class="o">..</span><span class="p">.);</span>
+<span class="n">log</span><span class="p">::</span><span class="n">debug</span><span class="o">!</span><span class="p">(</span><span class="s">"Number of CLIF blocks to lower: {}"</span><span class="p">,</span><span class="w"> </span><span class="o">..</span><span class="p">.);</span>
+<span class="n">log</span><span class="p">::</span><span class="n">debug</span><span class="o">!</span><span class="p">(</span><span class="s">"Number of lowered vcode instructions: {}"</span><span class="p">,</span><span class="w"> </span><span class="o">..</span><span class="p">.);</span>
+<span class="n">log</span><span class="p">::</span><span class="n">debug</span><span class="o">!</span><span class="p">(</span><span class="s">"Number of lowered vcode blocks: {}"</span><span class="p">,</span><span class="w"> </span><span class="o">..</span><span class="p">.);</span>
+</code></pre></div>
+<p><strong><code>cranelift/codegen/src/remove_constant_phis.rs</code></strong> (3% — 1 message per function):</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">log</span><span class="p">::</span><span class="n">debug</span><span class="o">!</span><span class="p">(</span><span class="s">"do_remove_constant_phis: done, {} iters. ..."</span><span class="p">,</span><span class="w"> </span><span class="o">..</span><span class="p">.);</span>
+</code></pre></div>
+<p><strong><code>crates/cranelift/src/compiler.rs</code></strong> (5% — 2 messages per function):</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">log</span><span class="p">::</span><span class="n">debug</span><span class="o">!</span><span class="p">(</span><span class="s">"`{symbol}` translated to CLIF in {:?}"</span><span class="p">,</span><span class="w"> </span><span class="n">timing</span><span class="p">.</span><span class="n">total</span><span class="p">());</span>
+<span class="n">log</span><span class="p">::</span><span class="n">debug</span><span class="o">!</span><span class="p">(</span><span class="s">"`{symbol}` compiled in {:?}"</span><span class="p">,</span><span class="w"> </span><span class="n">timing</span><span class="p">.</span><span class="n">total</span><span class="p">());</span>
+</code></pre></div>
+<h2>Suggested change</h2>
+<p>Change these per-function <code>log::debug!</code> calls to <code>log::trace!</code>. This would:</p>
+<ul>
+<li>Let embedders use <code>RUST_LOG=debug</code> without being flooded</li>
+<li>Keep the diagnostics fully available via <code>RUST_LOG=trace</code> for anyone who specifically wants them</li>
+<li>Align with the convention that <code>debug</code> is for occasional diagnostics and <code>trace</code> is for high-volume per-operation output</li>
+</ul>
+<p>If the maintainers agree with this direction, I'd be glad to help with a PR. Thank you for all the great work on cranelift and wasmtime!<br>
+</p>
+</blockquote>
+
+
+
+<a name="586204322"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313133%20Per-function%20compilation%20diagnost.../near/586204322" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313133.20Per-function.20compilation.20diagnost.2E.2E.2E.html#586204322">(Apr 17 2026 at 19:48)</a>:</h4>
+<p>bjorn3 <a href="https://github.com/bytecodealliance/wasmtime/issues/13133#issuecomment-4270820476">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13133">issue #13133</a>:</p>
+<blockquote>
+<p>Both env_logger and tracing-subscriber allow filtering log messages based on the crate/module they come from using <code>RUST_LOG=my_crate</code> or <code>RUST_LOG=my_crate::some_module=debug</code>. You could also do something like <code>RUST_LOG=debug,cranelift-codegen=info</code> to get debug logs, but restrict cranelift-codegen to info logs.</p>
+</blockquote>
+
+
+
+<a name="586204494"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313133%20Per-function%20compilation%20diagnost.../near/586204494" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313133.20Per-function.20compilation.20diagnost.2E.2E.2E.html#586204494">(Apr 17 2026 at 19:50)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/13133#issuecomment-4270828375">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13133">issue #13133</a>:</p>
+<blockquote>
+<p>In addition to bjorn3's note (your writeup describes crate-level filtering as "fragile" but it's a pretty standard use of logging infra) I'll note that whether info should be <code>trace</code> or <code>debug</code> is kind of a fuzzy line in my head at least; we use <code>debug!</code> for some "higher-level" info (from the point of view of us, the compiler authors!), the distinction has been useful to us at times, and I'm not aware of a standard for when libraries should or shouldn't use debug or trace. (If there is a reference to idioms here, I'd be interested to read it and learn what others do!).</p>
+<p>To be clear I'm open to this if consensus is that a library really shouldn't do this; but on its own, a desire for <code>debug</code> to be application-level only seems a bit too far to me.</p>
+</blockquote>
+
+
+
+<a name="586209657"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313133%20Per-function%20compilation%20diagnost.../near/586209657" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313133.20Per-function.20compilation.20diagnost.2E.2E.2E.html#586209657">(Apr 17 2026 at 20:29)</a>:</h4>
+<p>jspaith <a href="https://github.com/bytecodealliance/wasmtime/issues/13133#issuecomment-4271055970">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13133">issue #13133</a>:</p>
+<blockquote>
+<p>Thanks for super fast responses @bjorn3 &amp; @cfallin .  </p>
+<p>We will workaround this at our level by turning the defaults down to <code>info</code> going forward so we won't be impacted on this, but to my eye at least these still feel like trace.  I won't push back further on this.  But...</p>
+<p>RE the reference, <a href="https://docs.rs/log/latest/log/enum.Level.html">https://docs.rs/log/latest/log/enum.Level.html</a> from Rust itself</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">Debug</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span>
+<span class="n">The</span><span class="w"> </span><span class="err">“</span><span class="n">debug</span><span class="err">”</span><span class="w"> </span><span class="n">level</span><span class="p">.</span>
+
+<span class="n">Designates</span><span class="w"> </span><span class="n">lower</span><span class="w"> </span><span class="n">priority</span><span class="w"> </span><span class="n">information</span><span class="p">.</span>
+
+<span class="n">Trace</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">5</span>
+<span class="n">The</span><span class="w"> </span><span class="err">“</span><span class="n">trace</span><span class="err">”</span><span class="w"> </span><span class="n">level</span><span class="p">.</span>
+
+<span class="n">Designates</span><span class="w"> </span><span class="n">very</span><span class="w"> </span><span class="n">low</span><span class="w"> </span><span class="n">priority</span><span class="p">,</span><span class="w"> </span><span class="n">often</span><span class="w"> </span><span class="n">extremely</span><span class="w"> </span><span class="n">verbose</span><span class="p">,</span><span class="w"> </span><span class="n">information</span><span class="p">.</span>
+</code></pre></div>
+<p>I'm obviously not a compiler guy (God bless by the way, I'm an OS developer in my day and compilers were/still magic) but from my level at app these seem to fit into extremely verbose if only based on line count versus % my app and all the other crates it loads vs wasm.</p>
+<p>More in depth I found <a href="https://sematext.com/blog/logging-levels/">https://sematext.com/blog/logging-levels/</a> which suggest something similar.</p>
+</blockquote>
+
+
+
+<a name="586210252"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313133%20Per-function%20compilation%20diagnost.../near/586210252" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313133.20Per-function.20compilation.20diagnost.2E.2E.2E.html#586210252">(Apr 17 2026 at 20:33)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/13133#issuecomment-4271079850">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13133">issue #13133</a>:</p>
+<blockquote>
+<p>Thanks -- yep, I guess I'm curious more how libraries generally approach this. I guess verbosity is relative to the context, too -- typically when we develop/debug/optimize Cranelift we're compiling one or a few functions at most, so the tracelog is <em>very</em> verbose and covers every IR query/manipulation more or less, while the debug-level output contains a few summary stats.</p>
+<p>What I think might make sense is to build a macro analogous to our <a href="https://github.com/bytecodealliance/wasmtime/blob/495df131b40d81f76f41e6fcf2a157dedad3477b/cranelift/codegen/src/lib.rs#L113"><code>trace! macro</code></a> and then use this <code>debug!</code> rather than <code>log::debug!</code> throughout; so in release builds, you won't get this output. Does that seem reasonable?</p>
+</blockquote>
+
+
+
+<a name="586210929"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313133%20Per-function%20compilation%20diagnost.../near/586210929" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313133.20Per-function.20compilation.20diagnost.2E.2E.2E.html#586210929">(Apr 17 2026 at 20:39)</a>:</h4>
+<p>jspaith <a href="https://github.com/bytecodealliance/wasmtime/issues/13133#issuecomment-4271108113">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13133">issue #13133</a>:</p>
+<blockquote>
+<p>Yes - what you propose sounds good.</p>
+<p>For a bit more background on my component - we're a protocol gateway that primarily hosts MQTT and Kafka clients, does transforms on WASM (which is cool, again thank you all).  These other crates on <code>debug</code> don't output that frequetnly, and their various dependencies (however rust wraps sockets, all the auth logic, background timers, ...) also output pretty infrequently.  I wouldn't leave <code>debug</code> on in production as its too much but for standard day-to-day dev as well as our gate runs debug is manageable.</p>
+<p>Thanks again</p>
+</blockquote>
+
+
+
+<a name="586212264"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313133%20Per-function%20compilation%20diagnost.../near/586212264" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313133.20Per-function.20compilation.20diagnost.2E.2E.2E.html#586212264">(Apr 17 2026 at 20:50)</a>:</h4>
+<p>vadim-kovalyov <a href="https://github.com/bytecodealliance/wasmtime/issues/13133#issuecomment-4271161496">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13133">issue #13133</a>:</p>
+<blockquote>
+<p>Just my 2c: As an application-level developer, I'm always frustrated when I enable RUST_LOG=debug and the output is overwhelmed by library internals I don't understand or care about. For that reason, when I write internal libraries, I exclusively use trace! for logs. If someone needs to debug my library within their app, they can explicitly enable trace for my crate. Otherwise, it's just noise.</p>
+<p>That said, I'd push back against stripping these logs from release builds entirely. If I do need to debug a lib in a release binary, I want the ability to flip on trace logs for that crate. Downgrading to <code>trace!</code> is the right call IMO: it keeps the data available without<br>
+polluting everyone's default debug output.</p>
+</blockquote>
+
+
+
+<a name="586214024"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313133%20Per-function%20compilation%20diagnost.../near/586214024" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313133.20Per-function.20compilation.20diagnost.2E.2E.2E.html#586214024">(Apr 17 2026 at 21:04)</a>:</h4>
+<p>bjorn3 <a href="https://github.com/bytecodealliance/wasmtime/issues/13133#issuecomment-4271254826">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13133">issue #13133</a>:</p>
+<blockquote>
+<p>Doesn't trace generally get disabled in release builds?</p>
+</blockquote>
+
+
+
+<a name="586214773"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313133%20Per-function%20compilation%20diagnost.../near/586214773" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313133.20Per-function.20compilation.20diagnost.2E.2E.2E.html#586214773">(Apr 17 2026 at 21:11)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/13133#issuecomment-4271305855">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13133">issue #13133</a>:</p>
+<blockquote>
+<p>Our <code>trace!</code> does, yes, because we found observable performance impact to leaving it in with the conditional checks. I'm also not so sure I like the idea of some output always going out with the trace level, and other output conditionally going out with the trace level. And I'll note that the output that we currently have at trace level is really horrendously detailed compilation output -- nothing that anyone reasonable would want to see from production, IMHO. Things like "I am now visiting this basic block and this SSA value is ..." It's absolutely the right call to exclude that from release builds. I think the "leave it in in case you need to debug in production" viewpoint is very valid for a lot of logic, but IMHO is too abstract and generic to really be useful here.</p>
+<p>I think that I'd be happy to take a PR that makes our debug-level output gated on debug build or tracing feature, as our trace-level output is now. (And anyone who wants to retain the option to see it dynamically can enable the feature.) @jspaith happy to review if you want to send one!</p>
+</blockquote>
+
+
+
+<a name="587816482"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313133%20Per-function%20compilation%20diagnost.../near/587816482" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313133.20Per-function.20compilation.20diagnost.2E.2E.2E.html#587816482">(Apr 20 2026 at 16:56)</a>:</h4>
+<p>jspaith <a href="https://github.com/bytecodealliance/wasmtime/issues/13133#issuecomment-4282727229">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13133">issue #13133</a>:</p>
+<blockquote>
+<p>Thank you -- I see two ways to solve this.  I think OptionA below is better, but you're the maintainers so if you want OptionB it solves my problems too so I'll happily do a PR for whichever you prefer.</p>
+<h2>Background</h2>
+<p>To step back on requirements here:<br>
+Pri1:</p>
+<ul>
+<li>Req1.A Make this so maintainers can continue to maintain WASM time with logs they need to make all this happen.</li>
+<li>Req1.B Remove the overwhelming debug! by default for app devs (initial issue here)</li>
+</ul>
+<p>Pri2:</p>
+<ul>
+<li>Req2.A Make it so if a customer hits an issue in field, they can easily flip on extra logging to give maintainers an issue with existing rust log vocabulary and not needing to get into debug builds, feature flags, etc.  Even if feature flags are easy on a dev box, if I have a customer hitting issues that I'd need to get logs back to wasm devs for root analysis I (and most app devs on observable systems) can give them log updates to change but having them to feature flag changes isn't always practical.</li>
+</ul>
+<p>So possible fixes:</p>
+<h2>OptionA</h2>
+<p>Option A -- we move <code>log::debug!</code> macros to <code>log::trace!</code>.  In the hot paths above, and probably everywhere in components that reference them.  (I'd tend to leave stuff like fuzzing and all alone as it doesn't seem hot path?)  That alone solves Req1.B, Req2.A.  But... it makes it a pain for you guys when you want to not get overwhelmed with logs; you had these at trace and debug for a reason.</p>
+<p>So proposal here is to add a target field to all these things (see <a href="https://docs.rs/tracing/latest/tracing/#configuring-attributes">https://docs.rs/tracing/latest/tracing/#configuring-attributes</a>), so this becomes something like</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">log</span><span class="p">::</span><span class="n">trace</span><span class="o">!</span><span class="p">(</span><span class="n">target</span><span class="p">:</span><span class="w"> </span><span class="nc">SOME_NAME_WE_AGREE_ON</span><span class="p">,</span><span class="w"> </span><span class="s">"Number of CLIF instructions to optimize: {}"</span><span class="p">,</span><span class="w"> </span><span class="o">..</span><span class="p">.);</span>
+</code></pre></div>
+<p>This maybe(?) gives us Req1.A, since you can specify <code>RUST_LOG=crate_lift_wasm_env_whatever:SOME_NAME_WE_AGREE_ON=trace;</code> and get the more "interesting" traces, but all the log::trace I'm leaving alone would not be picked up by this.</p>
+<h2>Option B</h2>
+<p>OptionB would be as proposed above, with a <code>macro rules!debug</code> that would be added where this would be compiled out.  You get Req1.A and Req1.B but lose Req2.A.  </p>
+<p>There are already many <code>log::trace!</code> without the macros in the code - though I can't speak to their use on hot paths.  So I worry a bit demoting these <code>debug</code> all the way out of the product without a feature flag. </p>
+<p>But... ultimately you as maintainers are only ones who can balance Req2.A versus how much anything I imagine complicates Req1.A.<br>
+</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

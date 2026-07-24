@@ -1,0 +1,538 @@
+<html>
+<head><meta charset="utf-8"><title>call_indirect optimization · cranelift · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/index.html">cranelift</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html">call_indirect optimization</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="592632141"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592632141" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592632141">(May 04 2026 at 04:44)</a>:</h4>
+<p>Hi! I've been benchmarking wasmtime's interpreter against WAMR's interpreter on Apple M4, iPhone XS, and Apple Watch 6/SE2 with some homegrown benchmarks based on my real application that drove me away from WasmEdge interpreter. I see that there's been a few unresolved issues and pull requests discussing this area, but I'm not sure if I should dive into those existing threads of make a new one.</p>
+
+
+
+<a name="592632685"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592632685" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592632685">(May 04 2026 at 04:50)</a>:</h4>
+<p>While I was able to get WasmEdge purely on e-cores (saving battery life) with a bunch of local optimziations, the CPU usage is still relatively high -- especially when playing music sequencer type workloads: SNES SPC player, MOD/S3M player, etc. Even when optimizing with simd128 (sometimes doing the opcodes by hand), to reduce the opcode execution and stack operation pressure, WasmEdge was still using ~25% CPU and that's not acceptable for battery life.</p>
+
+
+
+<a name="592632696"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592632696" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592632696">(May 04 2026 at 04:51)</a>:</h4>
+<p><strong>iPhone XS (A12)</strong> — Pulley wins: matmul SIMD (+90%), matmul FMA (only Pulley supports relaxed-simd), tail-call (+52%), convolution (+9%). WAMR wins: bulk_memory (2.2×), call_indirect (2×), audio_dsp (+28%), sieve (+26%).<br>
+<strong>Apple Watch SE2 (S8)</strong> — Pulley wins: matmul SIMD (2.4×), tail-call (+57%), sieve (+23%), fib (+25%). WAMR wins: bulk_memory (2×), call_indirect (+58%), audio_dsp (+39%).</p>
+<p>Key shifts from M4 host:</p>
+<ul>
+<li><strong>fib and sieve flip on weaker cores</strong> — Pulley's tighter dispatch loop wins on smaller D-cache.</li>
+<li><strong>matmul SIMD widens</strong> on SE2 (+90% iPhone → 2.4× on watch). Pulley's vector lowering scales down well.</li>
+<li><strong>call_indirect gap shrinks on SE2</strong> (2× → +58%) — fixed per-dispatch cost gets amortized when the function body is slower.</li>
+<li><strong>audio_dsp widens on SE2</strong> (+28% → +39%) — the motivating workload, 410ms gap per 1000-frame block.</li>
+</ul>
+
+
+
+<a name="592632941"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592632941" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592632941">(May 04 2026 at 04:54)</a>:</h4>
+<p>so, while wasmtime interpreter generally wins, it seems like call_indirect is what would have the most uplift in the "audio_dsp" workload that represents the SNES SPC player. I'm up for contributing the optimization that would help with the weak(er) branch prediction on the target device's CPUs, but would love some guidance on the history and approach you'd prefer I take.</p>
+
+
+
+<a name="592748714"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592748714" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592748714">(May 04 2026 at 13:56)</a>:</h4>
+<blockquote>
+<p>I'm up for contributing the optimization</p>
+</blockquote>
+<p>which optimizations do you have in mind?</p>
+<p>FWIW the implementation of Wasm <code>call_indirect</code> isn't super-fast because it has to do CFI (control-flow integrity) things -- table bounds-check, target signature check, null check. That carries over from Wasm semantics, it's not Pulley-specific. Indeed branch predictor quality will matter too.</p>
+<p>There aren't really systematic optimizations we could do easily that would address BP accuracy, though, that I'm aware of -- <code>call_indirect</code> fundamentally has a runtime choice, so unless we can fully devirtualize with heavyweight AOT analysis (turn into a direct call with one provable target), there always has to be some branch... happy to hear what you have in mind of course.</p>
+
+
+
+<a name="592754724"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592754724" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> bjorn3 <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592754724">(May 04 2026 at 14:20)</a>:</h4>
+<p>Does arm have a way to hint that a branch is almost always taken/not taken? If so that would be possible to use for checks.</p>
+
+
+
+<a name="592757279"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592757279" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592757279">(May 04 2026 at 14:29)</a>:</h4>
+<p>I'm not aware of branch-hint instructions on aarch64 (and quick searching doesn't find any; someone correct me if wrong). That said the "default" on most modern BPUs is that the branch is invisible until taken once -- the branch won't be inserted into the relevant CPU frontend tables until a taken-mispredict forces a correction and insertion. So with our branch-to-cold-path-on-failure we're already best-case for our conditionals. I suspect the one making the difference between uarches is the indirect...</p>
+
+
+
+<a name="592757797"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592757797" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592757797">(May 04 2026 at 14:31)</a>:</h4>
+<p>One thing we haven't done is a sort of "macro call_indirect" pulley instruction which might help here quite a bit, basically slurp up a bunch of pulley opcodes into a single opcode to do the call_indirect logic, effectively taking fewer turns of the interpreter loop which can often be a nice win</p>
+
+
+
+<a name="592758543"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592758543" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> fitzgen (he/him) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592758543">(May 04 2026 at 14:34)</a>:</h4>
+<p>there's a bunch of stuff we could theorize, but its hard to consider anything without concrete benchmarks in hand that we can run ourselves</p>
+
+
+
+<a name="592813774"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592813774" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592813774">(May 04 2026 at 18:35)</a>:</h4>
+<p>thanks for the quick responses! I'm coming at this from the perspective of pulley/interpreter on a constrained platform, so while I'm considerate of the ripple effects to JIT, I'm focused on how to get reasonably fast Time To First Instruction without causing a ton of heap fragmentation. </p>
+<p>Based on my profiling (and filtering that through professional experience), I think that doing something akin to what WAMR and Luau pre-resolves indirect-call targets at preprocessing time; Pulley dispatches through the function table per call. I don't <em>think</em> this amounts to requiring full devirtualization (an optimization I helped contribute to GCC back in ~2010), but making passes generalized so they can layer with future passes is obviously Very Nice To Have.</p>
+
+
+
+<a name="592813936"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592813936" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592813936">(May 04 2026 at 18:36)</a>:</h4>
+<p>it sounds like I should prototype a thesis, benchmark the daylights out of it, and give something more tangible for you all to react to?</p>
+
+
+
+<a name="592814722"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592814722" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592814722">(May 04 2026 at 18:39)</a>:</h4>
+<p><span class="user-mention" data-user-id="1076290">@Matt Hargett</span> yes, absolutely, a prototype showing speedups would be really valuable! (And ideally any speedups you see on the little cores would transfer at least partially to the big cores in our development machines so we could evaluate too, but we'll take your word on the impact on real hardware)</p>
+<p>I'd be interested to read more about how WAMR pre-resolves targets -- I haven't looked into this before. If the source is still a function pointer (ie an index into the funcref table) I think we still need all checks, unless one can see that e.g. all table entries are non-null and all signatures match (latter is unlikely for all address-taken funcs in a real program). But curious to see what you come up with</p>
+
+
+
+<a name="592815242"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592815242" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592815242">(May 04 2026 at 18:42)</a>:</h4>
+<p>would you say that your cfallin/experiment-fast-calls branch is a good leaping off point? or is there something you learned in that branch you want to avoid, or do better/differently?</p>
+
+
+
+<a name="592815461"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592815461" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592815461">(May 04 2026 at 18:44)</a>:</h4>
+<p>ah, yes, I was playing with caching the last target; this was in the context of JS compiled to Wasm where almost every bytecode became an inline cache (indirect funcref call). I removed it because I didn't actually see any speedups</p>
+
+
+
+<a name="592815574"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592815574" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592815574">(May 04 2026 at 18:44)</a>:</h4>
+<p>If you want to rebuild a 1-entry resolved-function-pointer cache and if it shows speedups, I think we'd be happy to put it back in though. (There's a version I actually landed in tree, then deleted a few months later, if you want to find that)</p>
+
+
+
+<a name="592815587"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592815587" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592815587">(May 04 2026 at 18:44)</a>:</h4>
+<p>yea, I'm testing on Apple Watch SE2, iPhone XS, iPhone 12, iPhone 16, and M4 to try and make sure things remain a win in a reasonably diversified way. I have x64 Windows machines I can test on, but frankly I need to keep scope in mind since I have other paid projects going on :)</p>
+
+
+
+<a name="592816273"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592816273" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592816273">(May 04 2026 at 18:47)</a>:</h4>
+<p>it looked like your branch didn't do polymorphic ICs, cross tiers, and seems to leave invalidation to a generation-counter scheme. is that right? also, what hardware did you benchmark/profile on?</p>
+
+
+
+<a name="592817099"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592817099" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592817099">(May 04 2026 at 18:51)</a>:</h4>
+<ul>
+<li>Polymorphic: nope, just one target</li>
+<li>Cross tiers: we only run in one tier (Cranelift or Winch selected in config, and either true AOT or "AOT" into memory at module load -- no deferred function compilation)</li>
+<li>Invalidation: ah, I might have experimented with different schemes, that optimization sprint is a blur honestly; but the version I landed was a very simple opt that only applied when the table was constant (no opcodes <code>table.set</code>/... existed that could mutate it, and table not exported), so the cache remained valid for rest of execution</li>
+</ul>
+
+
+
+<a name="592817164"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592817164" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592817164">(May 04 2026 at 18:52)</a>:</h4>
+<p>Benchmarking was on both a generic desktop AMD x86 and Apple hardware (M1 and M2) at the time</p>
+
+
+
+<a name="592817748"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592817748" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592817748">(May 04 2026 at 18:55)</a>:</h4>
+<p>I'm guessing on any x64 (or Apple M-series) CPU from the last ~7 years , the great branch predictors (and huge BTB) means the bounds check, signature check,  and indirect call gets pipelined and predicted within 10 cycles thanks once the fast path is warmed up. if you looked at hardcore CPU counters (branch misses, L1 cache misses, etc) you'd probably see movement but not e2e movement until you paired that optimization with something else. on even newer iPhone and M2 efficiency cores, you'd probably get a wall clock difference (depending on the benchmark)</p>
+
+
+
+<a name="592817887"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592817887" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592817887">(May 04 2026 at 18:56)</a>:</h4>
+<p>anyway, I'll come up with a prototype and some numbers in a PR in my fork for you all to react to. I'll try to solve for the multi-dimensional constraints as best I can :D</p>
+
+
+
+<a name="592818231"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592818231" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592818231">(May 04 2026 at 18:58)</a>:</h4>
+<p>lmk if you have any guidance/concerns/preferences in the meantime!</p>
+
+
+
+<a name="592822828"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592822828" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592822828">(May 04 2026 at 19:20)</a>:</h4>
+<p>sounds good -- no further thoughts other than that if the 1-entry cache is neutral for big cores but helps on small cores, that'd be a great outcome. looking forward to knowing either way!</p>
+
+
+
+<a name="592824250"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592824250" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> fitzgen (he/him) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592824250">(May 04 2026 at 19:26)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="1076290">Matt Hargett</span> <a href="#narrow/channel/217117-cranelift/topic/call_indirect.20optimization/near/592813774">said</a>:</p>
+<blockquote>
+<p>I'm focused on how to get reasonably fast Time To First Instruction</p>
+</blockquote>
+<p>not sure if you've seen these docs, but you'll want to make sure you are pre-compiling Wasm to pulley bytecode before sending it to your device: <a href="https://docs.wasmtime.dev/examples-pre-compiling-wasm.html">https://docs.wasmtime.dev/examples-pre-compiling-wasm.html</a></p>
+
+
+
+<a name="592830439"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592830439" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592830439">(May 04 2026 at 20:00)</a>:</h4>
+<p>I need to the p2p module transfer to be wasm standard Because Reasons(tm), so I'm okay with absorbing some first-launch cold-start time where the device will cache the IR/pcode for later launches. For reasonably fast, I'm thinking 10kb (module size)/sec and staying under 100MB memory usage. versus hardcore AOT (like in .NET Native) which is 2+GB and sometimes tens of minutes</p>
+
+
+
+<a name="592846144"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592846144" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592846144">(May 04 2026 at 21:35)</a>:</h4>
+<p>That's fine (and definitely more network-efficient; .wasms are much smaller than the corresponding AOT-compiled artifacts), just be aware that we don't necessarily <em>guarantee</em> fast compilation, and Pulley still uses Cranelift (to target the Pulley virtual CPU) so you're still exposed to potential compilation-resource-exhaustion DoS vectors if you don't trust the .wasm. Of course we still try our best to avoid those. And if your compilation speed target is 10kB of Wasm bytecode per sec then you should be fine by one or two orders of magnitude for non-pathological inputs...</p>
+
+
+
+<a name="592850072"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592850072" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592850072">(May 04 2026 at 22:03)</a>:</h4>
+<p><span class="user-mention" data-user-id="254389">@Chris Fallin</span> what was the JS compiled to WASM example you used for your benchmark? how was it compiled?</p>
+
+
+
+<a name="592850164"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592850164" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592850164">(May 04 2026 at 22:04)</a>:</h4>
+<p>Ah, that is now all upstream in StarlingMonkey; build any interesting JS benchmark with <code>--enable-aot</code> and you'll get a .wasm full of indirect calls (I don't have one ready-made for you at the moment, sorry!)</p>
+
+
+
+<a name="592850217"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592850217" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592850217">(May 04 2026 at 22:04)</a>:</h4>
+<p>(<a href="https://github.com/bytecodealliance/StarlingMonkey/">https://github.com/bytecodealliance/StarlingMonkey/</a> for reference)</p>
+
+
+
+<a name="592850320"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592850320" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592850320">(May 04 2026 at 22:05)</a>:</h4>
+<p>for testing you could write something as simple as a five-line iterative Fibonacci computation or something; the important part is having an inner loop with JS operators that have ICs (which is ~all of them, e.g. <code>+</code>)</p>
+
+
+
+<a name="592850661"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592850661" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592850661">(May 04 2026 at 22:07)</a>:</h4>
+<p>besides my Rust SPC and S3M player workload, I"ll use a JS workload that I used to drive interpreter optimizations in Luau (when I was at Roblox), JSC  and hermes (when I was at PlayStation): graphql . I'll cross-check with microbenchmarks as well,  but I'm more interested in integration-case outcomes devs/users will "feel" :D</p>
+
+
+
+<a name="592850880"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/592850880" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#592850880">(May 04 2026 at 22:09)</a>:</h4>
+<p>Sounds good! Note that if you do it in stock StarlingMonkey you'll get a wasi-http component out of the end of the compilation pipeline, so you'll need to put the benchmark inside a GET handler for <code>/</code> or whatever, then run with <code>wasmtime serve</code> and hit it with curl; a bit elaborate but that's what it was built for. There's a way to build the bare JS shell in a way that can directly be compiled with weval that I used for development, but that's way unnecessary for your purposes probably</p>
+
+
+
+<a name="593073357"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/593073357" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Till Schneidereit <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#593073357">(May 05 2026 at 18:08)</a>:</h4>
+<p>(you can also <a href="https://github.com/bytecodealliance/StarlingMonkey/#using-starlingmonkey-with-dynamically-loaded-js-code">run</a> StarlingMonkey as a CLI tool with dynamically loaded JS)</p>
+
+
+
+<a name="593073416"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/593073416" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Till Schneidereit <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#593073416">(May 05 2026 at 18:09)</a>:</h4>
+<p>oh, except that doesn't work with AOT compilation, of course</p>
+
+
+
+<a name="593204867"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/593204867" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#593204867">(May 06 2026 at 09:23)</a>:</h4>
+<p>I opted to not use StarlingMonkey, but to try direct JS to WASM compilers: AssemblyScript and Porffor. I frankly never understood the scripting VM inside a VM think like Uno (mono on WASM), and that overhead would kill my WASM interpreter-on-watch target. I extracted a subset of graphql-js's validation workload to test both AssemblyScript and Porffor, and it's pretty neat that their unique approaches pushed me to generalize things further.</p>
+
+
+
+<a name="593204928"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/593204928" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#593204928">(May 06 2026 at 09:23)</a>:</h4>
+<p>I have a draft commit stack PR up at: <a href="https://github.com/rebeckerspecialties/wasmtime/pull/2">https://github.com/rebeckerspecialties/wasmtime/pull/2</a></p>
+
+
+
+<a name="593205791"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/593205791" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#593205791">(May 06 2026 at 09:26)</a>:</h4>
+<p>this was a bit tedious, but very interesting. with each commit starting at commit 2, we optimize at each CPU pipeline stage and move the "pileup" further down until we get stuck at the branch predictor. The next logical step is a fusion operation, but there's enough hard-won info here to get feedback/guidance/flames on what to do different/next.</p>
+
+
+
+<a name="593206358"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/593206358" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Sam Parker <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#593206358">(May 06 2026 at 09:29)</a>:</h4>
+<p>Just to note, if you weren't aware, that binaryen has a 'Directize' pass that tries to convert indirect to direct calls.</p>
+
+
+
+<a name="593206527"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/593206527" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#593206527">(May 06 2026 at 09:29)</a>:</h4>
+<p>I wasn't aware, thanks for the tip! :D</p>
+
+
+
+<a name="593206648"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/593206648" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#593206648">(May 06 2026 at 09:30)</a>:</h4>
+<p>I can see why <span class="user-mention" data-user-id="254389">@Chris Fallin</span> hit a wall in his branch and reverted the previous optimization PR for this area. it's pretty tricky to balance everything so that you get a user-visible, end-to-end uplift across many real-world sample programs. I think it's solvable with enough time and a dedicated benchmarking setup to cross-check assumptions.</p>
+
+
+
+<a name="593228569"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/593228569" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Till Schneidereit <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#593228569">(May 06 2026 at 11:19)</a>:</h4>
+<blockquote>
+<p>I frankly never understood the scripting VM inside a VM think like Uno (mono on WASM), and that overhead would kill my WASM interpreter-on-watch target.</p>
+</blockquote>
+<p>The motivation is very straight-forward: compatibility. Neither AssemblyScript nor Porffor are anywhere close to being able to run most existing applications, and lots of us have that as a strong requirement. If someone gave me an AOT compiler from JS to Wasm that solves that issue, I'd drop work on StarlingMonkey immediately. In the meantime, we have <a href="https://github.com/bytecodealliance/weval">weval</a> giving us 3x-5x speedups for most code running in StarlingMonkey. Still not comparable to optimizing JITs, but very much sufficient for a lot of real-world use cases</p>
+
+
+
+<a name="593275967"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/593275967" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#593275967">(May 06 2026 at 14:31)</a>:</h4>
+<blockquote>
+<p>I opted to not use StarlingMonkey, but to try direct JS to WASM compilers: AssemblyScript and Porffor.</p>
+</blockquote>
+<p>FWIW, that's missing the original motivation for the benchmark then: wevaled-StarlingMonkey code has a whole bunch of indirect call sites, but to my knowledge neither AS nor Porffor use ICs/emit many indirect calls. You might as well drop the benchmark then (but if the others provide the coverage you want / still represent your real use-case then that's fine).</p>
+<hr>
+<p>Interesting results, thanks. Extremely verbose (I would expect nothing less from our new clanker friends? -- no judgment, they're great for exploration) but interesting.</p>
+<p>I'll note it seems that your branch doesn't do the one main optimization I had put in / experimented with before: a 1-entry target cache. Basically if we know the table is immutable, we can statically cache in the vmtctx that (say) the last call at this <code>call_indirect</code> site took index 23, and that resolved to funcptr 0x1234. Unless you cache callee vmctx you'll want to gate on caller vmctx == callee vmtx (intra-instance call) as well. At least at one point in time during weval/SpiderMonkey's co-evolution, that gave a few percent speedup, but as noted above the speedup eventually disappeared with other optimizations.</p>
+<hr>
+<p>Also, overall, I agree with Alex above that merging Pulley ops into macro-ops is going to be by far the biggest win here, IMHO -- interpreter dispatch overhead dominates everything else.</p>
+
+
+
+<a name="593342149"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/593342149" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#593342149">(May 06 2026 at 19:27)</a>:</h4>
+<p>they actually all have indirect call sites, I pulled in sqlite benchmark out of curiosity and to make sure I don't apply the optimizations when the table is mutable (which it is in sqlite due to the export)</p>
+
+
+
+<a name="593342171"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/593342171" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#593342171">(May 06 2026 at 19:27)</a>:</h4>
+<table>
+<thead>
+<tr>
+<th>workload</th>
+<th>source</th>
+<th style="text-align: right;">call_indirect sites</th>
+<th>table</th>
+<th>dispatch shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>call_indirect.wasm</code></td>
+<td>hand-written Rust</td>
+<td style="text-align: right;">22</td>
+<td><code>(table 17 17)</code>, internal</td>
+<td>tight monomorphic loop, 200 K dispatches/iter</td>
+</tr>
+<tr>
+<td><code>graphql-validation-as.wasm</code></td>
+<td>AssemblyScript port</td>
+<td style="text-align: right;">13</td>
+<td><code>(table 107 107)</code>, slot 0 null</td>
+<td>optimizer-friendly baseline; predicate doesn't fire</td>
+</tr>
+<tr>
+<td><code>graphql-validation-porf.wasm</code></td>
+<td>Porffor port (JS→wasm)</td>
+<td style="text-align: right;">131</td>
+<td><code>(table 46 46)</code>, internal</td>
+<td>megamorphic JS dispatch</td>
+</tr>
+<tr>
+<td><code>xmrsplayer.wasm</code></td>
+<td>xmrsplayer 0.11.0 + <code>unreal.s3m</code> music file</td>
+<td style="text-align: right;">27</td>
+<td><code>(table 10 10)</code>, internal</td>
+<td>real-world tracker-player dispatch through 12 <code>dyn</code>-trait sites in the per-tick effect pipeline. Each call renders one CoreAudio-shaped buffer (1024 stereo frames ≈ 23 ms of audio); player state is persistent across calls and the song loops indefinitely (<code>max_loop_count = 0</code>), so <code>pick_iters</code> lands on a real iter distribution rather than collapsing to a single 15 s shot</td>
+</tr>
+<tr>
+<td><code>sqlite3.wasm</code></td>
+<td>sightglass</td>
+<td style="text-align: right;">595</td>
+<td><code>(table 620)</code>, <strong>exported</strong> as <code>__indirect_function_table</code></td>
+<td>host-mutable; predicate correctly OFF</td>
+</tr>
+</tbody>
+</table>
+
+
+
+<a name="593343139"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/593343139" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#593343139">(May 06 2026 at 19:32)</a>:</h4>
+<p>happy to add StarlingMonkey into the mix here if it's something people are deploying to production today in the server context to make sure it's all balancing out.</p>
+
+
+
+<a name="593344927"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/593344927" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#593344927">(May 06 2026 at 19:40)</a>:</h4>
+<p>the need for fused-ops/macro-ops/superinstructions is the logical outcome of my measurements as well and it's at the end of the fork PR's description. I'd love some feedback on the approach and ordering: xband_brif_eq_zero first, funcref_load_dispatch second, and then the peephole pass to leverage them both to greatest effect. being able to fuse them correctly/efficiently depends on the mutability knowledge/guarantee, so it would be an add-on. let me know in what order (and size) you'd want the contributions broken up into for easy review and incremental merging.</p>
+
+
+
+<a name="593345544"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/593345544" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#593345544">(May 06 2026 at 19:43)</a>:</h4>
+<p>I did look at your cache in both your branch and the PR that was merged and reverted. I thought it would be better to tee that (runtime optimziations) up better with static guarantees at bytecode loading/lowering/transforming time, but also so megamorphic chains (IC A -&gt; IC B -&gt; IC D) that appear common could be tackled as an incremental step with the same machinery. So, not really a different of opinion on the approach -- they aren't mutually exclusive by any means :D</p>
+
+
+
+<a name="593346088"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/593346088" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#593346088">(May 06 2026 at 19:46)</a>:</h4>
+<p>again, sorry for the wall of text. in the PR, I wanted to present all the facts and information as I ran into them so there was a clear trail of breadcrumbs in case I made a mistake or assumption at some step along way. Verbosity is a general problem I have, but also when it comes to performance/optimization I try to be very rigorous and data-driven when proving/disproving my theory/approach.</p>
+
+
+
+<a name="593683402"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/593683402" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#593683402">(May 08 2026 at 04:43)</a>:</h4>
+<p>ok, I've done some more integration and testing of the indirect cache. there's a couple of reasons why it's break-even or slightly regressing and bizarrely it's <em>worse</em> on M4 than on A12 due to quirks in the differences between the two microarchitectures when there is either an indirect cache Hit or a Miss. I just did a little experiment and I can get a consistent win if we make the indirect cache 2-way associative, and store it alongside the opcode, so that they're both in the L1 cache line. This would mean that the Pulley bytecode pages would need to be writable so that the indirect cache can be updated during execution.</p>
+<p><strong>question: can I make pulley bytecode memory pages writeable as a whole? or should I try and poke "holes" of writeable pages? or is this not a good idea because &lt;Very Good Reason(tm)&gt;?</strong></p>
+
+
+
+<a name="593683851"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/593683851" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#593683851">(May 08 2026 at 04:45)</a>:</h4>
+<p>note that this colocation of the IC is something done by the VM team at Roblox in response to some of my app teams' benchmarking and performane improvement requets. that runtime also had to deal with UGC and be resilient to fuzzing as well, but I don't know how much more sensitive to potetial attack surface you all are :)</p>
+
+
+
+<a name="593684741"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/593684741" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#593684741">(May 08 2026 at 04:52)</a>:</h4>
+<p>Hmm, we definitely don't want to make bytecode memory writable. The most immediate reason is that it's shared among multiple instances, so that's a data race (and hence undefined behavior) if you have more than one instance going.</p>
+<p>I'm somewhat skeptical that you need to put the data alongside the opcode for good cache behavior though -- most or all of the opcodes around the call-indirect opcode will also actually be used (so that cache line is not "wasted" in terms of cache occupancy vs byte-level working set size) and you can separately pack all the cache slots together in another array (classical struct-of-arrays). As long as a given workload fits in L1, the L1D doesn't care how you permute the data. Also if you put adjacent call-indirects' caches next to each other and you're streaming through code, it'll be a fairly prefetchable streaming sequence.</p>
+
+
+
+<a name="595173981"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/595173981" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#595173981">(May 14 2026 at 21:34)</a>:</h4>
+<p>ok, I definitely hit a wall across multiple platforms trying the indirect_call cache angle. TL;DR the losses in the branch predictors on lower-power cores (including Pentium Gold x64) across multiple compiler/transpiler outputs (C++ vtable from StarlingMonkey, GraphQL schema validation conversion from AssemblyScript, etc). This was super educational, thanks for giving me the feedback.</p>
+
+
+
+<a name="595179039"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/595179039" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#595179039">(May 14 2026 at 22:12)</a>:</h4>
+<p>that said, the table mutability analysis and the opcode elision I think are defensibly useful. I'll submit that as a self-contained PR and start trying the fused op / superinstruction approach that gets WAMR its clearer wins. I'll keep it incremental, but if you want to combine the two halves together and land them at the same time, that's fine with me. I'll report back when I have undeniable gains with wall clock and CPU trace bottleneck evidence</p>
+
+
+
+<a name="595380294"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/595380294" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#595380294">(May 15 2026 at 19:19)</a>:</h4>
+<p>I finally found a pretty great end-to-end outcome in the benchmarks, including the new ones I added derived from Starlight. I'd be curious for people to reproduce the benchmarks where that were flat before.</p>
+<p><a href="https://github.com/rebeckerspecialties/wasmtime/pull/4">https://github.com/rebeckerspecialties/wasmtime/pull/4</a></p>
+<p>and I pushed up the sample app I've been using to drive the on-device measurements. I' happy to donate/transfer this repo if that's useful.<br>
+<a href="https://github.com/rebeckerspecialties/wasm-benchmark">https://github.com/rebeckerspecialties/wasm-benchmark</a></p>
+
+
+
+<a name="595380556"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/595380556" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#595380556">(May 15 2026 at 19:20)</a>:</h4>
+<p>the win is more obvious, even if it doesn't generalize all the way back to iPhone XS's efficiency cores. I don't think the "phase 5" makes sense since it starts to break the design/structure of wasmtime to date, but I'm interested in other people's opinions.</p>
+
+
+
+<a name="595380854"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/595380854" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#595380854">(May 15 2026 at 19:22)</a>:</h4>
+<p>Let me know if there's other workloads you'd like me to benchmark on (or devices, assuming I have them). if there's no major objections/requests, I'll do another fuzzing pass and then submit the PRs  to the upstream repo (table mutation analysis and the fused opcode).</p>
+
+
+
+<a name="595380970"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/595380970" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#595380970">(May 15 2026 at 19:23)</a>:</h4>
+<p><span class="user-mention" data-user-id="254389">@Chris Fallin</span> lmk if there's any other rigor or constraints that I missed</p>
+
+
+
+<a name="595390624"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/595390624" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Till Schneidereit <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#595390624">(May 15 2026 at 20:19)</a>:</h4>
+<p><span class="user-mention" data-user-id="1076290">@Matt Hargett</span> please note our <a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">policy on AI tool use</a>. At the very least, we ask that AI tools aren't noted as co-authors, and that instead the human contributor takes full responsibly for the entirety of the changes.</p>
+<p>Note that that doesn't necessarily mean that anything needs to change about the code itself—I don't have the domain expertise to assess that, nor do our policies forbid substantial use of LLMs. In addition to requesting removal of the by-line I mainly wanted to give a heads-up to please be prepared to fully engage in conversations about these changes yourself, and feel fully confident that they're right, instead of letting reviewers be the first line of assessment of the LLM's output. For all I know you're already in that position, so please don't take this as criticism!</p>
+
+
+
+<a name="595391064"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/595391064" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Till Schneidereit <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#595391064">(May 15 2026 at 20:22)</a>:</h4>
+<p>oh, and since I hadn't seen it before: we also request that contributors not use automated AI review tools. The idea is that when a PR is opened, the contributor is confident that review by humans is the right next step, with any automated reviewing already done</p>
+
+
+
+<a name="595436103"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/595436103" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#595436103">(May 16 2026 at 02:20)</a>:</h4>
+<p><span class="user-mention" data-user-id="234973">@Till Schneidereit</span> sure thing, I can clean those things up before I submit the PR into the bytecodealliance repo. right now, I'm staging in my fork to make sure CI passes there. I have codex reviewing all PRs in my org to cross-check anything I didn't think of, same as the remote CI pass. I review all diffs and run style checksers and unit tests before commits are pushed, and in this case I also do multi-device benchmarks. </p>
+<p>Like not submitting a PR in your org for the indirect-call cache because I couldn't get the clear wins across CPU architectures (despite the approach working well in Luau when I was a Principal at Roblox). That said, I may ask for guidance when it's not clear what will be accepted, and I try to provde as much data as a I can so people can follow the chain of logic (and point out exactly where I went wrong). This is how I've often worked in OSS (like my first  merged Linux TCP/IP patch I emailed to Linus in 1994), even before coding agents :)</p>
+
+
+
+<a name="595436358"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/595436358" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#595436358">(May 16 2026 at 02:24)</a>:</h4>
+<p>btw, if you're asking me to disable codex reviews on forks in my own org, I suppose I can do that, but the policy doesn't make it clear that automated bot responses are banned from contributors' orgs and repos outside of the bytecodealliance org.</p>
+
+
+
+<a name="595439441"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/595439441" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#595439441">(May 16 2026 at 03:04)</a>:</h4>
+<p>I believe our policy applies only to interactions within the BA org. I suppose the line could be a bit fuzzy wrt what is "in BA" (e.g. linking large AI-generated walls of text here is <em>a little bit</em> against the spirit of "no extractive labor", but at the same time it's your fork). I would say, in any interaction where we are directly engaging e.g. a PR review, I would expect careful human review before the PR is posted, and I'd expect a coherent, human-written or at least human-edited <em>not-wall-of-text</em> PR description</p>
+
+
+
+<a name="595439575"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/595439575" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#595439575">(May 16 2026 at 03:06)</a>:</h4>
+<p>re: your linked PR above, I will say it's an enormous wall of text, my time is fairly limited, so for best engagement I'd usually appreciate something like a paragraph summary ("I tried A, B, C; A and B worked well; I found the call-indirect cache fell down because most callsites are actually polymorphic / the loads miss the cache / ..."). What you have there looks more like the detailed play-by-play of a long experiment session</p>
+
+
+
+<a name="595526215"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/595526215" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#595526215">(May 16 2026 at 20:35)</a>:</h4>
+<p>thanks for your time and patience, I'll try to not lay out _all_ the evidence like I usually do from now on. </p>
+<p>TL;DR: with the fused op similar to what WAMR does, there's consistent wins of 4-8% across the benchmarks for iPhone 12 e-cores, M4 e-cores, and Apple Watch 6/SE2. the wins are there on iPhone XS, but not as consistent. branch prediction pressure is the thing that makes optimizing in this area hard to translate across microarchitectures. this demonstrably helps close the benchmark gap with WAMR on Apple Watch, which was the original motivator.</p>
+
+
+
+<a name="595526843"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/595526843" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#595526843">(May 16 2026 at 20:43)</a>:</h4>
+<p>if that doesn't sound too incredible, you can skip the gory details in the PR description. the diff looks to me like it fits within the structure and style (and why I didn't implement/propose phase 5), so that's what I was looking to get feedback on. if you'd prefer that I hold off on asking for feedback until I've deployed the change to users, that is a fine barrier to set. (that used to be my default for OSS contribution when I was working within large companies to lend more credibility to the contribution.)</p>
+
+
+
+<a name="595875688"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/595875688" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> fitzgen (he/him) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#595875688">(May 18 2026 at 16:38)</a>:</h4>
+<p>4-8% wins is pretty good, and if it doesn't regress anything else significantly, then that definitely seems like something we would be interested in (complexity and maintenance being the other thing that we would need to consider, but that can be done in a PR so we can see the diff, IMO)</p>
+
+
+
+<a name="595886553"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/595886553" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Chris Fallin <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#595886553">(May 18 2026 at 17:28)</a>:</h4>
+<p>+1 -- happy to take a look at a PR for the opcode fusing</p>
+
+
+
+<a name="596118921"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/596118921" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Till Schneidereit <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#596118921">(May 19 2026 at 10:05)</a>:</h4>
+<p><span class="user-mention" data-user-id="1076290">@Matt Hargett</span> my apologies, I clearly didn't look closely enough and missed the fact that the PR isn't to upstream <span aria-label="confused" class="emoji emoji-1f615" role="img" title="confused">:confused:</span> Certainly our policies don't apply to what you're doing in your own repos!</p>
+<p>As for laying out evidence, it's always a fine line to walk: we certainly do want evidence on whether changes are worthwhile, in particular if they're complex and have subtle implications, as is the case here. At the same time, it's very easy for maintainers to get overwhelmed by too much information, and sometimes hard to know which parts to really dig into and which to skim.</p>
+<p>One way to try to thread that needle is to structure what you're sharing in a way that puts the top-level takeaways at, well, the top, mention in which order which details will follow, and then have sections for each aspect of details, so reviewers can dig into the aspects they find most critical to engage with more deeply</p>
+
+
+
+<a name="596196506"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/596196506" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> fitzgen (he/him) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#596196506">(May 19 2026 at 15:04)</a>:</h4>
+<p>Also the <code>&lt;details&gt;</code> tag is a godsend</p>
+
+
+
+<a name="596893266"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/596893266" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#596893266">(May 22 2026 at 02:46)</a>:</h4>
+<p>ok, I split it into two PRs for easier review, one can be merged before the other.<br>
+<a href="https://github.com/bytecodealliance/wasmtime/pull/13445">https://github.com/bytecodealliance/wasmtime/pull/13445</a><br>
+<a href="https://github.com/bytecodealliance/wasmtime/pull/13446">https://github.com/bytecodealliance/wasmtime/pull/13446</a></p>
+
+
+
+<a name="599710738"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/599710738" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#599710738">(Jun 03 2026 at 07:17)</a>:</h4>
+<p>I didn't forget about this, but have been traveling and dealing with other OSS coordination. I'll have an even thinner slice PR based on the feedback on #13445 in the next few days.</p>
+
+
+
+<a name="612261895"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217117-cranelift/topic/call_indirect%20optimization/near/612261895" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Matt Hargett <a href="https://bytecodealliance.github.io/zulip-archive/stream/217117-cranelift/topic/call_indirect.20optimization.html#612261895">(Jul 23 2026 at 02:49)</a>:</h4>
+<p><span class="user-mention" data-user-id="254389">@Chris Fallin</span> I updated the PR description to try and make it clearer what the first PR does, and link to the other PRs in the chain. let me know if this helps make the intent clearer.</p>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

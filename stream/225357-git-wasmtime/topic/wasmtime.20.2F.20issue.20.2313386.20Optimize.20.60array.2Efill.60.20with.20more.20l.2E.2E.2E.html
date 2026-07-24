@@ -1,0 +1,209 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13386 Optimize `array.fill` with more l... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313386.20Optimize.20.60array.2Efill.60.20with.20more.20l.2E.2E.2E.html">wasmtime / issue #13386 Optimize `array.fill` with more l...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="595353083"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313386%20Optimize%20%60array.fill%60%20with%20more%20l.../near/595353083" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313386.20Optimize.20.60array.2Efill.60.20with.20more.20l.2E.2E.2E.html#595353083">(May 15 2026 at 16:58)</a>:</h4>
+<p>alexcrichton edited <a href="https://github.com/bytecodealliance/wasmtime/issues/13386">issue #13386</a>:</p>
+<blockquote>
+<p>In <a href="https://github.com/bytecodealliance/wasmtime/pull/13382">https://github.com/bytecodealliance/wasmtime/pull/13382</a> I'm applying an optimization where <code>array.fill</code> for <code>i8</code>-element arrays to be optimized to a <code>memset</code> on the host. This is relatively easy to do because <code>memory.fill</code> already has the infrastructure for this on the host and <code>array.fill</code> is just reusing it. The intended benefit of this is that we get to use the host's vectorized routines for <code>array.fill</code> as opposed to a per-byte-loop within CLIF. This benefit, however, is also theoretically applicable for elements of other sizes (e.g. all the way up to 128-bits). Implementing this, however, would require new libcalls on the host, for example <code>memory.fill{16,32,64,128}</code>. </p>
+<p>This is doable without too too much effort, but this was left out of #13382 because it's not clear whether this is worth it. It'd likely be useful to investigate sibling peer compilers to see what they do in the face of <code>array.fill</code> or similar for larger-than-8-bit-types.</p>
+</blockquote>
+
+
+
+<a name="595353377"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313386%20Optimize%20%60array.fill%60%20with%20more%20l.../near/595353377" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313386.20Optimize.20.60array.2Efill.60.20with.20more.20l.2E.2E.2E.html#595353377">(May 15 2026 at 16:59)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/13386#issuecomment-4461686892">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13386">issue #13386</a>:</p>
+<blockquote>
+<p>I ended up doing a bit more work on <a href="https://github.com/bytecodealliance/wasmtime/pull/13382">https://github.com/bytecodealliance/wasmtime/pull/13382</a> for some more optimizations here. Specifically during <code>array.fill</code>, and <code>array.new_default</code> which uses the same internals, in addition to handling <code>i8</code> arrays there's a check to see if the initialization value is a constant, and if that constant is a memset-able constant. For example <code>i64.const 0</code> is a memset-able constant, as well as <code>i64.const -1</code>, but <code>i64.const 1</code> is not. That enables more usage of <code>memset</code>, notably with <code>array.new_default</code>, which I think is going to be important.</p>
+<p>What this does not handle, however, is a few situations:</p>
+<ul>
+<li>We should still vectorize initialization of <code>i64.const 1</code> in theory, the original premise of this issue</li>
+<li>Due to codegen initializing <code>ref.i31 (i32.const -1)</code>, which has the bit-pattern <code>i32.const -1</code> in CLIF, is not recognized and is not optimized to <code>memset</code>. I think that's due to the fact that the shape at codegen-time is not a constant initialization value but probably instead either the result if an <code>iadd</code> or <code>bor</code> instruction. This is later const-prop'd to a constant, so the final IR looks like it should be <code>memset</code>, but the order of operations didn't go well.</li>
+<li>While unrelated to <code>array.fill</code>, the implementation of <code>array.copy</code> does not use the <code>memory.copy</code> libcall for <code>VMGcRef</code>-based types. This can be used, however, when a GC implementation doesn't have read/write barriers (e.g. the null/copying collectors). In this situation we should ideally make a dynamic deduction based on the collector at compile time and use <code>memory.copy</code>'s libcall unconditionally for all types if barriers aren't needed.</li>
+</ul>
+</blockquote>
+
+
+
+<a name="600596804"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313386%20Optimize%20%60array.fill%60%20with%20more%20l.../near/600596804" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313386.20Optimize.20.60array.2Efill.60.20with.20more.20l.2E.2E.2E.html#600596804">(Jun 05 2026 at 07:07)</a>:</h4>
+<p>ttraenkler <a href="https://github.com/bytecodealliance/wasmtime/issues/13386#issuecomment-4629056988">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13386">issue #13386</a>:</p>
+<blockquote>
+<p>I hit the <code>array.copy</code> slow path on v45.0.0 and found this issue as a follow-up to #13382 (which optimized <code>array.fill</code>, i8 → <code>memset</code>). Did the fill optimization also cover the <code>array.copy</code> path, or is that the part still tracked here? A measured data point:</p>
+<p>On the <strong>default (drc) collector</strong>, i8 <code>array.copy</code> is <strong>~4,100× slower</strong> than linear <code>memory.copy</code>, and <strong>~47× slower</strong> than even a hand-written element loop. Throughput on a 16 MiB i8 array (<code>array.new_default</code> ×2, copy <code>dst[0..] ← src[0..]</code>):</p>
+<table>
+<thead>
+<tr>
+<th>copy</th>
+<th style="text-align: right;">wasmtime 45.0.0</th>
+<th style="text-align: right;">Node/V8 (25.x)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>array.copy</code> (i8 GC)</td>
+<td style="text-align: right;"><strong>9 MiB/s</strong></td>
+<td style="text-align: right;">26,464 MiB/s</td>
+</tr>
+<tr>
+<td>manual element loop (<code>array.get_u</code>/<code>array.set</code>)</td>
+<td style="text-align: right;">421 MiB/s</td>
+<td style="text-align: right;">1,256 MiB/s</td>
+</tr>
+<tr>
+<td>linear <code>memory.copy</code></td>
+<td style="text-align: right;">37,035 MiB/s</td>
+<td style="text-align: right;">36,452 MiB/s</td>
+</tr>
+</tbody>
+</table>
+<p>In comparison V8's <code>array.copy</code> runs at <strong>26,464 MiB/s</strong>, ~<strong>2,900× faster</strong> than wasmtime's <strong>9 MiB/s</strong>, and within ~<strong>1.4×</strong> of its own <code>memory.copy</code> (<strong>36,452 MiB/s</strong>). I am aware V8 has more resources so I only provide this as a reference point for orientation. The element-loop vs <code>array.copy</code> inversion is the surprising part: it makes the native bulk op a pessimization, so I currently work around it by hand-rolling the copy. That linear <code>memory.copy</code> is fast in wasmtime too suggests this is specific to the GC <code>array.copy</code> lowering rather than bulk-copy in general — consistent with the "optimize <code>array.copy</code> for more collectors" in the title.</p>
+<p><strong>Setup:</strong> aarch64; default (drc) collector. wasmtime <code>45.0.0</code> (<code>377cd917a</code>); Node <code>25.x</code> (V8 WasmGC). N = 16 MiB.</p>
+<p><strong>Method:</strong> each <code>run_*</code> export does <code>alloc</code> + R rounds in one call. For the wasmtime numbers I time the process and difference two round counts (so fixed startup/compile/alloc overhead cancels), except <code>memory.copy</code> which I measure absolutely (it's too fast for the difference to be stable). Node times the per-op loop directly with <code>performance.now()</code>. The element-loop and <code>array.copy</code> figures jitter by ~±20% run-to-run, but the ordering <code>array.copy</code> ≪ element-loop ≪ <code>memory.copy</code> is invariant. The module below is the exact one I measured — it assembles cleanly and reproduces these numbers.</p>
+<p>Minimal self-contained repro (drive with <code>wasmtime run -W gc=y,function-references=y --invoke run_arraycopy module.wasm 16777216 &lt;rounds&gt;</code>, and likewise <code>run_elemloop</code> / <code>run_memcopy</code>):</p>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">type</span> <span class="nv">$bytes</span> <span class="p">(</span><span class="err">array</span> <span class="p">(</span><span class="k">mut</span> <span class="err">i</span><span class="mi">8</span><span class="p">)))</span>
+  <span class="p">(</span><span class="k">memory</span> <span class="mf">1024</span><span class="p">)</span>
+  <span class="p">(</span><span class="k">global</span> <span class="nv">$src</span> <span class="p">(</span><span class="k">mut</span> <span class="p">(</span><span class="err">ref</span> <span class="err">null</span> <span class="nv">$bytes</span><span class="p">))</span> <span class="p">(</span><span class="err">ref.null</span> <span class="nv">$bytes</span><span class="p">))</span>
+  <span class="p">(</span><span class="k">global</span> <span class="nv">$dst</span> <span class="p">(</span><span class="k">mut</span> <span class="p">(</span><span class="err">ref</span> <span class="err">null</span> <span class="nv">$bytes</span><span class="p">))</span> <span class="p">(</span><span class="err">ref.null</span> <span class="nv">$bytes</span><span class="p">))</span>
+  <span class="p">(</span><span class="k">global</span> <span class="nv">$n</span> <span class="p">(</span><span class="k">mut</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">0</span><span class="p">))</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$alloc</span> <span class="p">(</span><span class="k">param</span> <span class="nv">$sz</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="p">(</span><span class="nb">global.set</span> <span class="nv">$n</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$sz</span><span class="p">))</span>
+    <span class="p">(</span><span class="nb">global.set</span> <span class="nv">$src</span> <span class="p">(</span><span class="err">array.new_default</span> <span class="nv">$bytes</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$sz</span><span class="p">)))</span>
+    <span class="p">(</span><span class="nb">global.set</span> <span class="nv">$dst</span> <span class="p">(</span><span class="err">array.new_default</span> <span class="nv">$bytes</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$sz</span><span class="p">))))</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$arraycopy</span> <span class="p">(</span><span class="k">param</span> <span class="nv">$r</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="p">(</span><span class="k">loop</span> <span class="nv">$l</span>
+      <span class="p">(</span><span class="err">array.copy</span> <span class="nv">$bytes</span> <span class="nv">$bytes</span> <span class="p">(</span><span class="err">ref.as_non_null</span> <span class="p">(</span><span class="nb">global.get</span> <span class="nv">$dst</span><span class="p">))</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">0</span><span class="p">)</span>
+                                <span class="p">(</span><span class="err">ref.as_non_null</span> <span class="p">(</span><span class="nb">global.get</span> <span class="nv">$src</span><span class="p">))</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">global.get</span> <span class="nv">$n</span><span class="p">))</span>
+      <span class="p">(</span><span class="nb">local.set</span> <span class="nv">$r</span> <span class="p">(</span><span class="nb">i32.sub</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$r</span><span class="p">)</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">1</span><span class="p">)))</span> <span class="p">(</span><span class="nb">br_if</span> <span class="nv">$l</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$r</span><span class="p">))))</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$elemloop</span> <span class="p">(</span><span class="k">param</span> <span class="nv">$r</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="k">local</span> <span class="nv">$i</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="p">(</span><span class="k">loop</span> <span class="nv">$l</span> <span class="p">(</span><span class="nb">local.set</span> <span class="nv">$i</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">0</span><span class="p">))</span>
+      <span class="p">(</span><span class="k">block</span> <span class="nv">$d</span> <span class="p">(</span><span class="k">loop</span> <span class="nv">$c</span> <span class="p">(</span><span class="nb">br_if</span> <span class="nv">$d</span> <span class="p">(</span><span class="nb">i32.ge_u</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$i</span><span class="p">)</span> <span class="p">(</span><span class="nb">global.get</span> <span class="nv">$n</span><span class="p">)))</span>
+        <span class="p">(</span><span class="err">array.set</span> <span class="nv">$bytes</span> <span class="p">(</span><span class="err">ref.as_non_null</span> <span class="p">(</span><span class="nb">global.get</span> <span class="nv">$dst</span><span class="p">))</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$i</span><span class="p">)</span>
+          <span class="p">(</span><span class="err">array.get_u</span> <span class="nv">$bytes</span> <span class="p">(</span><span class="err">ref.as_non_null</span> <span class="p">(</span><span class="nb">global.get</span> <span class="nv">$src</span><span class="p">))</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$i</span><span class="p">)))</span>
+        <span class="p">(</span><span class="nb">local.set</span> <span class="nv">$i</span> <span class="p">(</span><span class="nb">i32.add</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$i</span><span class="p">)</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">1</span><span class="p">)))</span> <span class="p">(</span><span class="nb">br</span> <span class="nv">$c</span><span class="p">)))</span>
+      <span class="p">(</span><span class="nb">local.set</span> <span class="nv">$r</span> <span class="p">(</span><span class="nb">i32.sub</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$r</span><span class="p">)</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">1</span><span class="p">)))</span> <span class="p">(</span><span class="nb">br_if</span> <span class="nv">$l</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$r</span><span class="p">))))</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$memcopy</span> <span class="p">(</span><span class="k">param</span> <span class="nv">$r</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="p">(</span><span class="k">loop</span> <span class="nv">$l</span> <span class="p">(</span><span class="err">memory.copy</span> <span class="p">(</span><span class="nb">global.get</span> <span class="nv">$n</span><span class="p">)</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="nb">global.get</span> <span class="nv">$n</span><span class="p">))</span>
+      <span class="p">(</span><span class="nb">local.set</span> <span class="nv">$r</span> <span class="p">(</span><span class="nb">i32.sub</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$r</span><span class="p">)</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">1</span><span class="p">)))</span> <span class="p">(</span><span class="nb">br_if</span> <span class="nv">$l</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$r</span><span class="p">))))</span>
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"run_arraycopy"</span><span class="p">)</span> <span class="p">(</span><span class="k">param</span> <span class="nv">$sz</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="k">param</span> <span class="nv">$r</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="nb">call</span> <span class="nv">$alloc</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$sz</span><span class="p">))</span> <span class="p">(</span><span class="nb">call</span> <span class="nv">$arraycopy</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$r</span><span class="p">)))</span>
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"run_elemloop"</span><span class="p">)</span>  <span class="p">(</span><span class="k">param</span> <span class="nv">$sz</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="k">param</span> <span class="nv">$r</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="nb">call</span> <span class="nv">$alloc</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$sz</span><span class="p">))</span> <span class="p">(</span><span class="nb">call</span> <span class="nv">$elemloop</span>  <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$r</span><span class="p">)))</span>
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"run_memcopy"</span><span class="p">)</span>   <span class="p">(</span><span class="k">param</span> <span class="nv">$sz</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="k">param</span> <span class="nv">$r</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="nb">call</span> <span class="nv">$alloc</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$sz</span><span class="p">))</span> <span class="p">(</span><span class="nb">call</span> <span class="nv">$memcopy</span>   <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$r</span><span class="p">))))</span>
+</code></pre></div>
+<p>(N ≤ 32 MiB keeps <code>src</code>+<code>dst</code> within the module's 64 MiB linear memory. Happy to provide more numbers, test other collectors, or try a patch if that helps.)<br>
+</p>
+</blockquote>
+
+
+
+<a name="600732810"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313386%20Optimize%20%60array.fill%60%20with%20more%20l.../near/600732810" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313386.20Optimize.20.60array.2Efill.60.20with.20more.20l.2E.2E.2E.html#600732810">(Jun 05 2026 at 17:27)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/13386#issuecomment-4633904234">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13386">issue #13386</a>:</p>
+<blockquote>
+<p>@ttraenkler all the optimizations and work on various bulk-transfer instructions will first be released with Wasmtime 46.0.0, so Wasmtime 45.0.0 is expected to have performance issues. This specific issue is about the follow-up to <code>array.fill</code> where <code>memset</code> can't be used but we could still do something more vectorized on the host.</p>
+<p>The <code>array.copy</code> path is as optimal as known to be at this point (more-or-less). There's no further tracking issues there. You'll need to test something more recent than Wasmtime 45, however, to see that.</p>
+<p>You have a question about <code>array.copy</code>, but did you have questions about anything else? I don't have a whole lot more to offer here other than "try main" unfortunately</p>
+</blockquote>
+
+
+
+<a name="600764752"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313386%20Optimize%20%60array.fill%60%20with%20more%20l.../near/600764752" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313386.20Optimize.20.60array.2Efill.60.20with.20more.20l.2E.2E.2E.html#600764752">(Jun 05 2026 at 20:52)</a>:</h4>
+<p>ttraenkler <a href="https://github.com/bytecodealliance/wasmtime/issues/13386#issuecomment-4635437481">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13386">issue #13386</a>:</p>
+<blockquote>
+<blockquote>
+<p><a href="https://github.com/ttraenkler">@ttraenkler</a> all the optimizations and work on various bulk-transfer instructions will first be released with Wasmtime 46.0.0, so Wasmtime 45.0.0 is expected to have performance issues. This specific issue is about the follow-up to <code>array.fill</code> where <code>memset</code> can't be used but we could still do something more vectorized on the host.</p>
+<p>The <code>array.copy</code> path is as optimal as known to be at this point (more-or-less). There's no further tracking issues there. You'll need to test something more recent than Wasmtime 45, however, to see that.</p>
+<p>You have a question about <code>array.copy</code>, but did you have questions about anything else? I don't have a whole lot more to offer here other than "try main" unfortunately</p>
+</blockquote>
+<p>@alexcrichton Thanks, will confirm on main if it can be reproduced. Just wasn't sure if #13382 entailed this fix. </p>
+<p>If you're asking in general, as an author of a compiler prototype depending on Wasm GC the signal I read from #13216 is that GC will soon be considered ready for production. Reading more into the V8 numbers of my benchmark I wonder GC ops can close the perf gap to linear and this is just a matter of more optimizations or if GC ops are at a disadvantage by design.</p>
+</blockquote>
+
+
+
+<a name="600764833"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313386%20Optimize%20%60array.fill%60%20with%20more%20l.../near/600764833" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313386.20Optimize.20.60array.2Efill.60.20with.20more.20l.2E.2E.2E.html#600764833">(Jun 05 2026 at 20:52)</a>:</h4>
+<p>ttraenkler edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/13386#issuecomment-4635437481">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13386">issue #13386</a>:</p>
+<blockquote>
+<blockquote>
+<p><a href="https://github.com/ttraenkler">@ttraenkler</a> all the optimizations and work on various bulk-transfer instructions will first be released with Wasmtime 46.0.0, so Wasmtime 45.0.0 is expected to have performance issues. This specific issue is about the follow-up to <code>array.fill</code> where <code>memset</code> can't be used but we could still do something more vectorized on the host.</p>
+<p>The <code>array.copy</code> path is as optimal as known to be at this point (more-or-less). There's no further tracking issues there. You'll need to test something more recent than Wasmtime 45, however, to see that.</p>
+<p>You have a question about <code>array.copy</code>, but did you have questions about anything else? I don't have a whole lot more to offer here other than "try main" unfortunately</p>
+</blockquote>
+<p>@alexcrichton Thanks, will confirm on main if it can be reproduced. Just wasn't sure if #13382 entailed this fix. </p>
+<p>If you're asking in general, as an author of a compiler prototype depending on Wasm GC the signal I read from #13216 is that GC will soon be considered ready for production. Reading more into the V8 numbers of my benchmark I wonder if GC ops can close the perf gap to linear and this is just a matter of more optimizations or if GC ops are at a disadvantage by design.</p>
+</blockquote>
+
+
+
+<a name="600766565"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313386%20Optimize%20%60array.fill%60%20with%20more%20l.../near/600766565" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313386.20Optimize.20.60array.2Efill.60.20with.20more.20l.2E.2E.2E.html#600766565">(Jun 05 2026 at 21:05)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/13386#issuecomment-4635521910">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13386">issue #13386</a>:</p>
+<blockquote>
+<p>Ah yeah #13382 definitely didn't fix this issue, this issue was spawned from discussion on that PR.</p>
+<p>For more generally turning GC on-by-default I'd recommend leaving any thoughts over on #13216 (or filing specific issues). My personal rule of thumb is that a 10x-or-more slowdown relative to other engines is likely a bug in Wasmtime, a 5x-10x slowdown is probably a bug but maybe more difficult to fix, and a 1x-5x slowdown is often "v8 has man-decades of GC effort and Wasmtime has man-months of GC effort" although sometimes these issues are just bugs in Wasmtime as well. Feel free to open issues for anything you find, and if they're reproducible we can help diagnose and classify what's up.</p>
+</blockquote>
+
+
+
+<a name="600770341"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313386%20Optimize%20%60array.fill%60%20with%20more%20l.../near/600770341" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313386.20Optimize.20.60array.2Efill.60.20with.20more.20l.2E.2E.2E.html#600770341">(Jun 05 2026 at 21:38)</a>:</h4>
+<p>ttraenkler <a href="https://github.com/bytecodealliance/wasmtime/issues/13386#issuecomment-4635723818">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13386">issue #13386</a>:</p>
+<blockquote>
+<p>Thanks, will do. My last point was not V8 vs. Wasmtime - but in general why even on V8 a significant gap remains between array.copy vs. memory.copy and if GC hits a theoretical limit. I will ask on the V8 repo and let you know if learn something worth sharing. </p>
+</blockquote>
+
+
+
+<a name="600825627"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313386%20Optimize%20%60array.fill%60%20with%20more%20l.../near/600825627" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313386.20Optimize.20.60array.2Efill.60.20with.20more.20l.2E.2E.2E.html#600825627">(Jun 06 2026 at 06:47)</a>:</h4>
+<p>ttraenkler <a href="https://github.com/bytecodealliance/wasmtime/issues/13386#issuecomment-4637720939">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13386">issue #13386</a>:</p>
+<blockquote>
+<p>The results from my test on main confirm this issue indeed is already fixed and doesn't need to be tracked here:</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">size</th>
+<th>copy</th>
+<th style="text-align: right;">wasmtime 45.0.0</th>
+<th style="text-align: right;">wasmtime main/dev</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">16 MiB</td>
+<td><code>array.copy</code></td>
+<td style="text-align: right;">10 MiB/s</td>
+<td style="text-align: right;">30,710 MiB/s</td>
+</tr>
+<tr>
+<td style="text-align: right;">16 MiB</td>
+<td>elem-loop</td>
+<td style="text-align: right;">435 MiB/s</td>
+<td style="text-align: right;">571 MiB/s</td>
+</tr>
+<tr>
+<td style="text-align: right;">16 MiB</td>
+<td><code>memory.copy</code></td>
+<td style="text-align: right;">47,059 MiB/s</td>
+<td style="text-align: right;">47,654 MiB/s</td>
+</tr>
+</tbody>
+</table>
+<p>Good to know this will land in 46!</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

@@ -1,0 +1,131 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13814 WASI incoming HTTP handler can ge... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313814.20WASI.20incoming.20HTTP.20handler.20can.20ge.2E.2E.2E.html">wasmtime / issue #13814 WASI incoming HTTP handler can ge...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="608063249"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313814%20WASI%20incoming%20HTTP%20handler%20can%20ge.../near/608063249" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313814.20WASI.20incoming.20HTTP.20handler.20can.20ge.2E.2E.2E.html#608063249">(Jul 03 2026 at 12:58)</a>:</h4>
+<p>ignatz opened <a href="https://github.com/bytecodealliance/wasmtime/issues/13814">issue #13814</a>:</p>
+<blockquote>
+<p>For a long time, I wanted to change the execution model of my wasmtime runtimes from being ephemeral and short-lived to being long-lived, i.e. reusing a store to interleave multiple HTTP requests  (instead of constructing and destroying requests per state).</p>
+<p>I actually had it rolled out at some point to then roll back because it worked for rust components but not for:</p>
+<ul>
+<li>JS components</li>
+<li>and only if the JS component calls a host interface.</li>
+</ul>
+<p>To be clear, besides having a shallow understanding of where it locks up, I don't understand what the issue is, e.g. it could be an issue with my host implementations (though it works for rust), it could be an issue with <code>jco</code> or seamonkey's js event loop, wasmtime itself, .... <span aria-label="woman shrugging" class="emoji emoji-1f937-200d-2640" role="img" title="woman shrugging">:woman_shrugging:</span>. Out of ignorance, I filed the issue here but happy to move it elsewhere <span aria-label="folded hands" class="emoji emoji-1f64f" role="img" title="folded hands">:folded_hands:</span> </p>
+<h3>Test Case</h3>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/trailbaseio/trailbase.git
+<span class="nb">cd</span><span class="w"> </span>trailbase
+git<span class="w"> </span>checkout<span class="w"> </span>wasm-share-state2
+<span class="nb">cd</span><span class="w"> </span>crates/wasm-runtime-axum
+
+<span class="c1"># Running with the "working" Rust component</span>
+cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>standalone<span class="w"> </span>--<span class="w"> </span>--path<span class="o">=</span>../../client/testfixture/wasm/wasm_guest_testfixture.wasm
+<span class="c1"># Will produce an error but the second run of curl won't block up the system.</span>
+curl<span class="w"> </span><span class="s2">"localhost:3000/addDeletePost"</span>
+curl<span class="w"> </span><span class="s2">"localhost:3000/addDeletePost"</span>
+
+<span class="c1"># Running with the "broken" JS component</span>
+cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>standalone<span class="w"> </span>--<span class="w"> </span>--path<span class="o">=</span>../../client/testfixture/wasm/wasm_ts_guest_testfixture.wasm
+curl<span class="w"> </span><span class="s2">"localhost:3000/addDeletePost"</span>
+curl<span class="w"> </span><span class="s2">"localhost:3000/addDeletePost"</span>
+</code></pre></div>
+<p>Note, the above is running pre-built, checked-in WASM components. Their respective HTTP handler implementations live here:</p>
+<ul>
+<li><a href="https://github.com/trailbaseio/trailbase/blob/wasm-share-state2/client/testfixture/guests/rust/src/lib.rs#L71">https://github.com/trailbaseio/trailbase/blob/wasm-share-state2/client/testfixture/guests/rust/src/lib.rs#L71</a></li>
+<li><a href="https://github.com/trailbaseio/trailbase/blob/wasm-share-state2/client/testfixture/guests/typescript/src/index.ts#L49">https://github.com/trailbaseio/trailbase/blob/wasm-share-state2/client/testfixture/guests/typescript/src/index.ts#L49</a></li>
+</ul>
+<p>When running curl the second time for the JS component, it's this call to <code>wasi_incoming_http_handler</code>: <a href="https://github.com/trailbaseio/trailbase/blob/57e912f042e44f313139f99f59bd54ec968fba3b/crates/wasm-runtime-host/src/lib.rs#L354">https://github.com/trailbaseio/trailbase/blob/57e912f042e44f313139f99f59bd54ec968fba3b/crates/wasm-runtime-host/src/lib.rs#L354</a> that gets stuck.</p>
+<p>A potential culprit is how I hacked the async host function, I.e. the component-side <code>query()</code> sends and outgoing http-request that is intercepted and handled here: <a href="https://github.com/trailbaseio/trailbase/blob/57e912f042e44f313139f99f59bd54ec968fba3b/crates/wasm-runtime-host/src/host.rs#L126-L130">https://github.com/trailbaseio/trailbase/blob/57e912f042e44f313139f99f59bd54ec968fba3b/crates/wasm-runtime-host/src/host.rs#L126-L130</a></p>
+<p>(The latter is one of the reasons why I've sat this out so long, I was hoping that WASIp3 may fix my issue, but it seems I keep running into obstacles <span aria-label="smiling face with tear" class="emoji emoji-1f972" role="img" title="smiling face with tear">:smiling_face_with_tear:</span> )</p>
+<h3>Expected Results</h3>
+<p>Ideally I would expect the JS component to behave like the Rust component. However, them behaving more consistently would already be an improvement.</p>
+<h3>Actual Results</h3>
+<p>Execution gets stuck.</p>
+<h3>Versions and Environment</h3>
+<p>Wasmtime version or commit: v46<br>
+Operating system: debian<br>
+Architecture: amd64</p>
+</blockquote>
+
+
+
+<a name="608063251"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313814%20WASI%20incoming%20HTTP%20handler%20can%20ge.../near/608063251" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313814.20WASI.20incoming.20HTTP.20handler.20can.20ge.2E.2E.2E.html#608063251">(Jul 03 2026 at 12:58)</a>:</h4>
+<p><a href="https://github.com/ignatz">ignatz</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13814">Issue #13814</a>.</p>
+
+
+
+<a name="608090125"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313814%20WASI%20incoming%20HTTP%20handler%20can%20ge.../near/608090125" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313814.20WASI.20incoming.20HTTP.20handler.20can.20ge.2E.2E.2E.html#608090125">(Jul 03 2026 at 15:15)</a>:</h4>
+<p>tschneidereit <a href="https://github.com/bytecodealliance/wasmtime/issues/13814#issuecomment-4877581876">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13814">issue #13814</a>:</p>
+<blockquote>
+<p>@ignatz you're most likely running into issues with the JS runtime (StarlingMonkey), which isn't set up to handle reuse of instances. See <a href="#narrow/channel/459697-StarlingMonkey/topic/Rust.20in.20StarlingMonkey.20path.20forward/near/607431980">this and the following messages</a>. I'm working in a replacement for that runtime which will support WASIp3 and full reuse, including handling multiple requests concurrently, not just serially. With P3, that is in general something we've switched to as the execution model, so hopefully your changes should mostly be absorbed by that</p>
+</blockquote>
+
+
+
+<a name="608093016"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313814%20WASI%20incoming%20HTTP%20handler%20can%20ge.../near/608093016" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313814.20WASI.20incoming.20HTTP.20handler.20can.20ge.2E.2E.2E.html#608093016">(Jul 03 2026 at 15:31)</a>:</h4>
+<p>ignatz <a href="https://github.com/bytecodealliance/wasmtime/issues/13814#issuecomment-4877685827">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13814">issue #13814</a>:</p>
+<blockquote>
+<p>Thanks for the quick reply. That sounds certainly very related. I haven't really tested true concurrency yet and will now keep my fingers off it. Can your hypothesis explain why subsequent requests block up in the presence of host calls eventhough the handler completes on first invocation. Feels like there may be something lingering <span aria-label="woman shrugging" class="emoji emoji-1f937-200d-2640" role="img" title="woman shrugging">:woman_shrugging:</span></p>
+</blockquote>
+
+
+
+<a name="608094152"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313814%20WASI%20incoming%20HTTP%20handler%20can%20ge.../near/608094152" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313814.20WASI.20incoming.20HTTP.20handler.20can.20ge.2E.2E.2E.html#608094152">(Jul 03 2026 at 15:38)</a>:</h4>
+<p>tschneidereit <a href="https://github.com/bytecodealliance/wasmtime/issues/13814#issuecomment-4877730977">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13814">issue #13814</a>:</p>
+<blockquote>
+<blockquote>
+<p>Can your hypothesis explain why subsequent requests block up in the presence of host calls eventhough the handler completes on first invocation. Feels like there may be something lingering <span aria-label="woman shrugging" class="emoji emoji-1f937-200d-2640" role="img" title="woman shrugging">:woman_shrugging:</span></p>
+</blockquote>
+<p>Yes: StarlingMonkey doesn't properly clean up after a request is done, so the next request hits weird inconsistent state. In debug builds that manifests as a failing assert, but I don't remember what the symptoms are in release builds.</p>
+</blockquote>
+
+
+
+<a name="608094588"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313814%20WASI%20incoming%20HTTP%20handler%20can%20ge.../near/608094588" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313814.20WASI.20incoming.20HTTP.20handler.20can.20ge.2E.2E.2E.html#608094588">(Jul 03 2026 at 15:41)</a>:</h4>
+<p>ignatz <a href="https://github.com/bytecodealliance/wasmtime/issues/13814#issuecomment-4877749837">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13814">issue #13814</a>:</p>
+<blockquote>
+<p>That would explain it. Thanks so much and thanks for being on top. I'll have to wait then. Is there an ETA? Can I help out as a canary? </p>
+</blockquote>
+
+
+
+<a name="608097500"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313814%20WASI%20incoming%20HTTP%20handler%20can%20ge.../near/608097500" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313814.20WASI.20incoming.20HTTP.20handler.20can.20ge.2E.2E.2E.html#608097500">(Jul 03 2026 at 16:01)</a>:</h4>
+<p>tschneidereit <a href="https://github.com/bytecodealliance/wasmtime/issues/13814#issuecomment-4877869039">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13814">issue #13814</a>:</p>
+<blockquote>
+<p>I unfortunately don't have a good ETA, sorry :( There's too much development work with wide error-margins on estimates still to be done for that. It's my highest priority though, and others are starting to chip in, so "this Summer" is realistic, I think.</p>
+<p>As for helping out, while I just mentioned that others are chipping in, I think it's too early to open that up more broadly. I'll share updates in the Zulip thread I linked to, though, so that's a good way to follow along</p>
+</blockquote>
+
+
+
+<a name="608347354"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313814%20WASI%20incoming%20HTTP%20handler%20can%20ge.../near/608347354" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313814.20WASI.20incoming.20HTTP.20handler.20can.20ge.2E.2E.2E.html#608347354">(Jul 06 2026 at 02:59)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/13814#issuecomment-4888716420">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13814">issue #13814</a>:</p>
+<blockquote>
+<p>@tschneidereit are you able to transfer this issue to StarlingMonkey?</p>
+</blockquote>
+
+
+
+<a name="608397147"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313814%20WASI%20incoming%20HTTP%20handler%20can%20ge.../near/608397147" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313814.20WASI.20incoming.20HTTP.20handler.20can.20ge.2E.2E.2E.html#608397147">(Jul 06 2026 at 09:13)</a>:</h4>
+<p>tschneidereit transferred <a href="https://github.com/bytecodealliance/wasmtime/issues/13814">issue #13814 WASI incoming HTTP handler can get stuck for JS componets when interleaving (Rust components work)</a> to <a href="https://github.com/bytecodealliance/StarlingMonkey/issues/321">bytecodealliance/StarlingMonkey/#321</a>.</p>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

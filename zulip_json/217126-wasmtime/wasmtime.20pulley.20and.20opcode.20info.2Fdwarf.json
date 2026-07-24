@@ -1,0 +1,278 @@
+[
+    {
+        "content": "<p>Hey! we're researching for wasm  interpreters which are easy to patch as part of our recording/debugging tools. Wasmtime has a permissive Apache2 License, and the <code>pulley</code> intrerpreter: many interpreters don't really propagate info about the original wasm binary offsets of the instructions to their internal IR/interpreter loops; <br>\nthis is a problem for us, as we want to match them with their DWARF info: does <code>pulley</code> propagate/preserve this?</p>",
+        "id": 511453402,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744301677
+    },
+    {
+        "content": "<p>Yes, it does, but the information is only useful for traps and debuginfo. Pulley internally follows basically the same compilation pipeline as when compiling for native architectures. It uses the same code to lower wasm to Cranelift IR, optimizes this using the regular Cranelift optimization passes (which can merge clif ir instructions from multiple wasm instructions together, losing information about which actual wasm instruction was executed) and only at the end compiles to Pulley bytecode rather than conventional machine code. If you only need it for debuginfo, this is obviously fine, but if you also want to manipulate execution or have a guaranteed 100% correct extraction of the full wasm-level state, this won't cut it.</p>",
+        "id": 511456378,
+        "sender_full_name": "bjorn3",
+        "timestamp": 1744302565
+    },
+    {
+        "content": "<p>DWARF isn't enabled for pulley because we haven't defined a DWARF register mapping. it also isn't clear to me what value it would provide since the DWARF is usually used by the system's native tools like <code>gdb</code> and <code>perf</code> but those don't apply to pulley.</p>\n<p>we do have address maps that we use internally to map trapping instructions to source locations:</p>\n<div class=\"codehilite\" data-code-language=\"Bash Session\"><pre><span></span><code><span class=\"gp\">$ </span>wasmtime<span class=\"w\"> </span>compile<span class=\"w\"> </span>-D<span class=\"w\"> </span>address-map<span class=\"o\">=</span>y<span class=\"w\"> </span>--target<span class=\"w\"> </span>pulley64<span class=\"w\"> </span>~/scratch/foo.wat<span class=\"w\"> </span>-o<span class=\"w\"> </span>~/scratch/foo.cwasm\n\n<span class=\"gp\">$ </span>wasmtime<span class=\"w\"> </span>objdump<span class=\"w\"> </span>--addrmap<span class=\"w\"> </span>~/scratch/foo.cwasm\n<span class=\"go\">wasm[0]::function[0]:</span>\n<span class=\"go\">            push_frame</span>\n<span class=\"go\">            ╰─╼ trap: StackOverflow</span>\n<span class=\"go\">            vconst128 v0, 32768</span>\n<span class=\"go\">            ╰─╼ addrmap: 0x28</span>\n<span class=\"go\">            call2 x0, x0, 0x9    // target = 0x1e</span>\n<span class=\"go\">            ╰─╼ addrmap: 0x3a</span>\n<span class=\"go\">            pop_frame</span>\n<span class=\"go\">            ╰─╼ addrmap: 0x3c</span>\n<span class=\"go\">            ret</span>\n\n<span class=\"go\">wasm[0]::function[1]:</span>\n<span class=\"go\">            push_frame</span>\n<span class=\"go\">            ╰─╼ trap: StackOverflow</span>\n<span class=\"go\">            vwidenlow8x16_s v5, v0</span>\n<span class=\"go\">            ╰─╼ addrmap: 0x41</span>\n<span class=\"go\">            vwidenhigh8x16_s v6, v0</span>\n<span class=\"go\">            vaddpairwisei16x8_s v0, v5, v6</span>\n<span class=\"go\">            pop_frame</span>\n<span class=\"go\">            ╰─╼ addrmap: 0x43</span>\n<span class=\"go\">            ret</span>\n</code></pre></div>\n<p>but this is really an internal implementation detail.</p>\n<p>can you share more about your goals here? patching pulley bytecode is not something that is supported. pulley is very low level, basically the same as an actual ISA like x86 or riscv64, so patching the bytecode will very easily lead to wild unsafety. any attempt to patch it under the covers is pretty scary. additionally, the bytecode is usually mapped read-only from disk, and so any attempt to write to it will trap.</p>",
+        "id": 511456604,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1744302625
+    },
+    {
+        "content": "<blockquote>\n<p>DWARF isn't enabled for pulley because we haven't defined a DWARF register mapping. it also isn't clear to me what value it would provide since the DWARF is usually used by the system's native tools like <code>gdb</code> and <code>perf</code> but those don't apply to pulley.</p>\n</blockquote>\n<p>The pulley interpreter could have a gdbstub to which you would attach gdb to as opposed to attaching gdb to the wasmtime process as a whole. The <a href=\"https://docs.rs/gdbstub/latest/gdbstub/\">gdbstub</a> crate allows implementing a gdbstub by implementing a bunch of traits.</p>",
+        "id": 511457185,
+        "sender_full_name": "bjorn3",
+        "timestamp": 1744302775
+    },
+    {
+        "content": "<p>interesting, TIL!</p>",
+        "id": 511457293,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1744302811
+    },
+    {
+        "content": "<p>This is also how for example qemu and valgrind allow debugging emulated cq instrumented code as if the original code was running rather than their jitted code.</p>",
+        "id": 511457583,
+        "sender_full_name": "bjorn3",
+        "timestamp": 1744302894
+    },
+    {
+        "content": "<p><span class=\"user-mention\" data-user-id=\"264278\">@bjorn3</span> thanks, this makes sense</p>",
+        "id": 511475253,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744307311
+    },
+    {
+        "content": "<p><span class=\"user-mention\" data-user-id=\"253990\">@fitzgen (he/him)</span> hey, you're one of the <code>gimli</code> guys!</p>",
+        "id": 511475524,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744307378
+    },
+    {
+        "content": "<p>yes: we don't want to patch the bytecode, but the interpreter itself</p>",
+        "id": 511475792,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744307429
+    },
+    {
+        "content": "<p>the goal is to produce full execution traces for some wasm-based programs for our CodeTracer environment</p>",
+        "id": 511476250,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744307469
+    },
+    {
+        "content": "<p>so that's where the DWARF info is useful: it lets us map the executed steps easily to high level code, and to know where certain local variables are, etc</p>",
+        "id": 511477218,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744307514
+    },
+    {
+        "content": "<p>currently, from the interpreter impls we've tried to look at, we've found mostly the wazero interpreter to propagate the original wasm binary instruction offsets to their final  representation, because they seem to use DWARF in limited cases</p>",
+        "id": 511477522,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744307611
+    },
+    {
+        "content": "<p>btw years ago, bjorn has been answering me a similar question for the rust/llvm call instrumentation hooks here in zulip, it really seems the debugging world is small</p>",
+        "id": 511478041,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744307765
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"898244\">Alexander Ivanov</span> <a href=\"#narrow/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf/near/511478041\">said</a>:</p>\n<blockquote>\n<p>btw years ago, bjorn has been answering me a similar question for the rust/llvm call instrumentation hooks here in zulip, it really seems the debugging world is small</p>\n</blockquote>\n<p>The way I got involved with rustc is through writing the rustc_codegen_cranelift rustc backend, which as the name says depends on Cranelift, just like Wasmtime does.</p>",
+        "id": 511480377,
+        "sender_full_name": "bjorn3",
+        "timestamp": 1744308559
+    },
+    {
+        "content": "<p><span class=\"user-mention\" data-user-id=\"898244\">@Alexander Ivanov</span> Assuming you are referring to <a href=\"https://github.com/metacraft-labs/codetracer\">https://github.com/metacraft-labs/codetracer</a>, once it supports loading rr traces, everything should work with native compilation rather than Pulley if you enable debuginfo generation in Wasmtime and you implement the gdb jit protocol in CodeTracer to get the DWARF debuginfo generated by Wasmtime out of the recorded trace.</p>\n<div class=\"message_embed\"><a class=\"message_embed_image\" href=\"https://github.com/metacraft-labs/codetracer\" style=\"background-image: url(&quot;https://uploads.zulipusercontent.net/10d0ded32c6e8ac0be06428d562e6354f42977fd/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f663264633433653236333639653231336138386266386135313235383661376565363031333333383833323432623630366264643030343132643835313363652f6d65746163726166742d6c6162732f636f6465747261636572&quot;)\"></a><div class=\"data-container\"><div class=\"message_embed_title\"><a href=\"https://github.com/metacraft-labs/codetracer\" title=\"GitHub - metacraft-labs/codetracer: CodeTracer is a user-friendly time-traveling debugger designed to support a wide range of programming languages.\">GitHub - metacraft-labs/codetracer: CodeTracer is a user-friendly time-traveling debugger designed to support a wide range of programming languages.</a></div><div class=\"message_embed_description\">CodeTracer is a user-friendly time-traveling debugger designed to support a wide range of programming languages. - metacraft-labs/codetracer</div></div></div>",
+        "id": 511481281,
+        "sender_full_name": "bjorn3",
+        "timestamp": 1744308903
+    },
+    {
+        "content": "<p>yes: the rr traces are somewhat supported internally,just in a proprietary separate backend; (and yes: this backend is not stable yet)</p>",
+        "id": 511484301,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744309936
+    },
+    {
+        "content": "<p>they do have some tradeoffs compared to the \"db-backend\"-based one-s, but the needs of some clients are related to producing specifically this kind of open source-based db trace mechanism</p>",
+        "id": 511484464,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744310003
+    },
+    {
+        "content": "<p>otherwise what you're saying is possible indeed</p>",
+        "id": 511484742,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744310091
+    },
+    {
+        "content": "<p>btw we tried a more weird approach for the db backend: just running the natively compiled wasm under lldb, and producing such a trace(however that's extremely slow indeed: but it's a valuable xp in assessing that kind of dwarf for natively compiled wasm indeed: it works well)</p>",
+        "id": 511484958,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744310164
+    },
+    {
+        "content": "<blockquote>\n<p>we do have address maps that we use internally to map trapping instructions to source locations:</p>\n</blockquote>",
+        "id": 511485636,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744310371
+    },
+    {
+        "content": "<p>ok, i have to look at the source i guess: I assume this might be sufficient, if they do indeed preserve the original offset/equivalent info at the final interpreter point</p>",
+        "id": 511485914,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744310469
+    },
+    {
+        "content": "<p>Note that we don't guarantee that every original Wasm opcode has a corresponding location in the final interpreter bytecode: Pulley's compilation is an optimizing one, which means that we may hoist code, GVN it, DCE it, etc. If you're looking to build a record/replay infrastructure on top of this at the Wasm virtual machine level, it's probably not what you want</p>",
+        "id": 511487976,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1744311015
+    },
+    {
+        "content": "<p>FWIW, we do have a roadmap in our debugging RFC (merged, but work hasn't really started yet) aiming at our own record/replay infrastructure, and the plan there is to use Winch, since it does preserve program-point-for-program-point</p>",
+        "id": 511488081,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1744311059
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"264278\">bjorn3</span> <a href=\"#narrow/channel/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf/near/511457185\">said</a>:</p>\n<blockquote>\n<p>The pulley interpreter could have a gdbstub to which you would attach gdb to as opposed to attaching gdb to the wasmtime process as a whole.</p>\n</blockquote>\n<p>I'll note that this still requires gdb to have an understanding of the \"native architecture\", and afaik gdb doesn't understand wasm and definitely doesn't understand pulley, so this would be of limited use I think.</p>\n<p><span class=\"user-mention silent\" data-user-id=\"898244\">Alexander Ivanov</span> <a href=\"#narrow/channel/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf/near/511477218\">said</a>:</p>\n<blockquote>\n<p>so that's where the DWARF info is useful: it lets us map the executed steps easily to high level code, and to know where certain local variables are, etc</p>\n</blockquote>\n<p>For this Wasmtime sort of and sort of doesn't have this info with Pulley. As others have mentioned this is the goal of the DWARF that Wasmtime emits. The wasm module itself has its own DWARF, which is wasm-relative, translated to native-relative DWARF. This has all the pitfalls Chris and Nick have mentioned of as an optimizing compiler we can't translate the wasm-dwarf 1:1 to native-dwarf.</p>\n<p>Additionally though there is no implementation of mapping wasm-dwarf to pulley-dwarf because pulley has no meaning in dwarf. It probably wouldn't be too too hard to add this though! That would enable you to read the pulley-dwarf and then couple that with pulley interpreter state to go back to the high-level program. With the understanding of course that this would be lossy in the same way that the wasm-to-native-dwarf translation is lossy.</p>",
+        "id": 511489366,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1744311561
+    },
+    {
+        "content": "<p>thank you! some level of optimizatation might be ok, if it preserves the original source for at least the final operands, even if some were left out</p>",
+        "id": 511499648,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744315786
+    },
+    {
+        "content": "<p>however i do assume it might not be done like that, if it wasn't specifically written with that in mind</p>",
+        "id": 511499772,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744315822
+    },
+    {
+        "content": "<p>Cranelift does have <code>-Oopt-level=0</code> which disables most optimizations. While that still doesn't preserve precise 1:1 mapping with wasm instructions it can work better than <code>-Oopt-level=2</code>,  the default</p>",
+        "id": 511499959,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1744315888
+    },
+    {
+        "content": "<p><span class=\"user-mention\" data-user-id=\"254389\">@Chris Fallin</span> interesting: it seems <code>winch</code> is a compilator, so do you plan to do something like <code>rr</code>? recording and replaying only the outside effects?</p>",
+        "id": 511500039,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744315921
+    },
+    {
+        "content": "<p>Yes, exactly, that's the plan</p>",
+        "id": 511500139,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1744315948
+    },
+    {
+        "content": "<p><span class=\"user-mention\" data-user-id=\"253994\">@Alex Crichton</span> i see, still going through that many layers does seem a bit harder to ensure that exact info gets mapped in the end; some interpreters directly implement/use a wasm reader and do simple transformations after that, maybe that's a bit closer to the specific usage</p>",
+        "id": 511500714,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744316185
+    },
+    {
+        "content": "<p><span class=\"user-mention\" data-user-id=\"254389\">@Chris Fallin</span> interesting, i'll search for it</p>",
+        "id": 511500739,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744316197
+    },
+    {
+        "content": "<p>Right, the main thing to understand about Pulley is that it is not what one would first expect when imagining a \"Wasm interpreter\": it does not interpret Wasm bytecode; it interprets the result of our usual compilation pipeline, to a new ISA we've invented; so all the usual pitfalls of that re: observability will apply</p>",
+        "id": 511500918,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1744316262
+    },
+    {
+        "content": "<p>our usecase is more specific currently, initially for certain kinds of wasm-based contracts: only by accident it seems it would be applicable to wasm programs overally , this wasn't entirely our initial focus</p>",
+        "id": 511500953,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744316275
+    },
+    {
+        "content": "<p><span class=\"user-mention\" data-user-id=\"254389\">@Chris Fallin</span> yes, makes sense, we're going through all kinds of runtimes to compare them in those aspects, learned a lot</p>",
+        "id": 511501151,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744316342
+    },
+    {
+        "content": "<p>I assume that's the record/replay &amp; debugging doc: <a href=\"https://github.com/bytecodealliance/rfcs/blob/main/accepted/wasmtime-debugging.md\">https://github.com/bytecodealliance/rfcs/blob/main/accepted/wasmtime-debugging.md</a></p>\n<div class=\"message_embed\"><a class=\"message_embed_image\" href=\"https://github.com/bytecodealliance/rfcs/blob/main/accepted/wasmtime-debugging.md\" style=\"background-image: url(&quot;https://uploads.zulipusercontent.net/d3e0527c125bdf510d70198a49c2adf9e114bcd4/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f663233623165666333333331663535333135393137663564643035616330323635626164613461303736346336613135333638386237343231663230316339632f62797465636f6465616c6c69616e63652f72666373&quot;)\"></a><div class=\"data-container\"><div class=\"message_embed_title\"><a href=\"https://github.com/bytecodealliance/rfcs/blob/main/accepted/wasmtime-debugging.md\" title=\"rfcs/accepted/wasmtime-debugging.md at main · bytecodealliance/rfcs\">rfcs/accepted/wasmtime-debugging.md at main · bytecodealliance/rfcs</a></div><div class=\"message_embed_description\">RFC process for Bytecode Alliance projects. Contribute to bytecodealliance/rfcs development by creating an account on GitHub.</div></div></div>",
+        "id": 511501451,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744316446
+    },
+    {
+        "content": "<p>Yep, that's the one</p>",
+        "id": 511501571,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1744316497
+    },
+    {
+        "content": "<p>interesting</p>",
+        "id": 511501711,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744316544
+    },
+    {
+        "content": "<p>a <code>re-execution</code> strategy works well with wasm indeed</p>",
+        "id": 511501781,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744316568
+    },
+    {
+        "content": "<p>in our current case we need to produce a different kind of record though, with different trade-offs, but it would be great to try with some real wasm programs</p>",
+        "id": 511502062,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744316682
+    },
+    {
+        "content": "<blockquote>\n<p>We will need to either maintain a mapping from locals to register/stack slot for all Wasm PC points that we might hit a breakpoint or watchpoint, or force winch to unconditionally spill locals to the stack. The latter would greatly simplify tracking local locations, while the former would greatly increase the amount of context we would need to pass into the utility function for inspecting the execution state.</p>\n</blockquote>",
+        "id": 511502202,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744316751
+    },
+    {
+        "content": "<p>that's a very good observation, haven't thought about this case enough: we assumed that DWARF contains correct info for locals location</p>",
+        "id": 511502325,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744316794
+    },
+    {
+        "content": "<p>but i assume what is meant here, is that certain implementations can obviously store them in a different way in optimized mode</p>",
+        "id": 511502424,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744316829
+    },
+    {
+        "content": "<p>our plan was to simply match the interpreter pc with the wasm binary offset and this with DWARF, and to produce a trace based on combination of interpreter state and the debuginfo</p>",
+        "id": 511502857,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744317012
+    },
+    {
+        "content": "<p>there are some things we'd need a bit later, for which an interpreter is a better fit than adapting a native binary/the compilation</p>",
+        "id": 511503145,
+        "sender_full_name": "Alexander Ivanov",
+        "timestamp": 1744317143
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"253994\">Alex Crichton</span> <a href=\"#narrow/stream/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf/near/511489366\">said</a>:</p>\n<blockquote>\n<p><span class=\"user-mention silent\" data-user-id=\"264278\">bjorn3</span> <a href=\"#narrow/channel/217126-wasmtime/topic/wasmtime.20pulley.20and.20opcode.20info.2Fdwarf/near/511457185\">said</a>:</p>\n<blockquote>\n<p>The pulley interpreter could have a gdbstub to which you would attach gdb to as opposed to attaching gdb to the wasmtime process as a whole.</p>\n</blockquote>\n<p>I'll note that this still requires gdb to have an understanding of the \"native architecture\", and afaik gdb doesn't understand wasm and definitely doesn't understand pulley, so this would be of limited use I think.</p>\n</blockquote>\n<p>If you do the same DWARF translation as for native you only need Pulley support. I guess you could pretend that the target arch is actually riscv and then map the pulley registers to riscv registers. Disassembling obviously won't work, you need to do the same remapping in the debuginfo and you will need to force usage of \"hardware\" breakpoints as opposed to software breakpoints (as the latter would try to insert riscv trap instructions at the breakpoint location), but everything else should work I think.</p>",
+        "id": 511505117,
+        "sender_full_name": "bjorn3",
+        "timestamp": 1744317954
+    },
+    {
+        "content": "<p>true!</p>",
+        "id": 511505226,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1744317992
+    }
+]

@@ -1,0 +1,143 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #13918 Fix current-thread leak on concurren... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313918.20Fix.20current-thread.20leak.20on.20concurren.2E.2E.2E.html">wasmtime / PR #13918 Fix current-thread leak on concurren...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="611791378"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313918%20Fix%20current-thread%20leak%20on%20concurren.../near/611791378" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313918.20Fix.20current-thread.20leak.20on.20concurren.2E.2E.2E.html#611791378">(Jul 21 2026 at 02:07)</a>:</h4>
+<p>SebTardif opened <a href="https://github.com/bytecodealliance/wasmtime/pull/13918">PR #13918</a> from <code>SebTardif:fix/restore-thread-on-lower-error</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p>Temporary <code>set_thread</code> switches used during concurrent component lowering (so guest <code>realloc</code> / callbacks see the correct thread) were not restored on error paths. An early <code>?</code> / <code>bail!</code> after <code>set_thread</code> left the store's current thread pointing at the temporary thread, so later concurrent operations could run with the wrong thread context.</p>
+<p>This adds <code>with_store_thread</code> / <code>restore_thread_after</code> that always restore the previous thread (preferring the original work error if restore also fails), and converts every temporary save/restore pair in this class.</p>
+<h2>Why this is needed</h2>
+<p><a href="https://github.com/bytecodealliance/wasmtime/pull/12736">#12736</a> correctly established that stream/future lowering can call guest <code>realloc</code> and therefore must set the current thread first. That PR also added restore on the success path. Error paths that return before the matching restore still leave the wrong thread installed.</p>
+<p>Concrete example in <code>futures_and_streams::lower</code> when <code>T::MAY_REQUIRE_REALLOC</code> is true:</p>
+<ol>
+<li><code>set_thread(caller_thread)</code> installs the caller.</li>
+<li>Alignment / bounds checks or <code>linear_store_list_to_memory</code> can fail with <code>?</code>.</li>
+<li>The matching <code>set_thread(old_thread)</code> never runs.</li>
+</ol>
+<p>The same pattern existed for guest↔guest future/stream <code>copy</code>, event delivery callbacks, stackless/stackful guest calls, async return adapters, host-task result lowering, and explicit thread start.</p>
+<h2>Fix</h2>
+<ul>
+<li><code>StoreOpaque::restore_thread_after</code> always restores after a work <code>Result</code>.</li>
+<li>Free function <code>with_store_thread</code> for the common scoped form.</li>
+<li><code>AsStoreOpaque</code> for <code>StoreContextMut</code> so the helper works at those call sites.</li>
+<li>Converted all temporary <code>set_thread</code> pairs found by grepping <code>crates/wasmtime/src/runtime/component</code>.</li>
+</ul>
+<p>Permanent thread transitions (enter/exit sync call, host task create, fiber resume bookkeeping) are unchanged.</p>
+<h2>Testing</h2>
+<p>Unit tests in <code>with_store_thread_tests</code>:</p>
+<ul>
+<li>Restores the previous current thread on success.</li>
+<li>Restores the previous current thread when work returns an error (red-green: skipping restore fails the assertion with <code>got None</code> after installing a host marker thread).</li>
+<li>Prefer work errors over restore errors.</li>
+</ul>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">cargo</span><span class="w"> </span><span class="n">test</span><span class="w"> </span><span class="o">-</span><span class="n">p</span><span class="w"> </span><span class="n">wasmtime</span><span class="w"> </span><span class="o">--</span><span class="n">features</span><span class="w"> </span><span class="n">component</span><span class="o">-</span><span class="n">model</span><span class="o">-</span><span class="k">async</span><span class="w"> </span><span class="o">--</span><span class="n">lib</span><span class="w"> </span><span class="n">with_store_thread</span>
+<span class="p">#</span><span class="w"> </span><span class="mi">3</span><span class="w"> </span><span class="n">passed</span>
+</code></pre></div>
+<p>Also ran other concurrent unit tests in the crate (<code>cargo test -p wasmtime --features component-model-async --lib concurrent</code>).</p>
+<h2>Related</h2>
+<ul>
+<li>Introduced with incomplete restore coverage in <a href="https://github.com/bytecodealliance/wasmtime/pull/12736">#12736</a> (merged 2026-03-11). Review discussion there already asked about restoring the previous thread after the temporary switch.</li>
+<li>Related current-thread API work: <a href="https://github.com/bytecodealliance/wasmtime/pull/13887">#13887</a>, <a href="https://github.com/bytecodealliance/wasmtime/pull/13759">#13759</a>.</li>
+</ul>
+</blockquote>
+
+
+
+<a name="611791380"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313918%20Fix%20current-thread%20leak%20on%20concurren.../near/611791380" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313918.20Fix.20current-thread.20leak.20on.20concurren.2E.2E.2E.html#611791380">(Jul 21 2026 at 02:07)</a>:</h4>
+<p>SebTardif requested <a href="https://github.com/pchickey">pchickey</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13918">PR #13918</a>.</p>
+
+
+
+<a name="611791381"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313918%20Fix%20current-thread%20leak%20on%20concurren.../near/611791381" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313918.20Fix.20current-thread.20leak.20on.20concurren.2E.2E.2E.html#611791381">(Jul 21 2026 at 02:07)</a>:</h4>
+<p>SebTardif requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13918">PR #13918</a>.</p>
+
+
+
+<a name="611800164"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313918%20Fix%20current-thread%20leak%20on%20concurren.../near/611800164" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313918.20Fix.20current-thread.20leak.20on.20concurren.2E.2E.2E.html#611800164">(Jul 21 2026 at 03:52)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13918">PR #13918</a>.</p>
+
+
+
+<a name="611946105"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313918%20Fix%20current-thread%20leak%20on%20concurren.../near/611946105" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313918.20Fix.20current-thread.20leak.20on.20concurren.2E.2E.2E.html#611946105">(Jul 21 2026 at 17:28)</a>:</h4>
+<p>pchickey unassigned pchickey from <a href="https://github.com/bytecodealliance/wasmtime/pull/13918">PR #13918 Fix current-thread leak on concurrent lower error paths</a>.</p>
+
+
+
+<a name="611946107"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313918%20Fix%20current-thread%20leak%20on%20concurren.../near/611946107" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313918.20Fix.20current-thread.20leak.20on.20concurren.2E.2E.2E.html#611946107">(Jul 21 2026 at 17:28)</a>:</h4>
+<p>pchickey requested <a href="https://github.com/alexcrichton">alexcrichton</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13918">PR #13918</a>.</p>
+
+
+
+<a name="611966483"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313918%20Fix%20current-thread%20leak%20on%20concurren.../near/611966483" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313918.20Fix.20current-thread.20leak.20on.20concurren.2E.2E.2E.html#611966483">(Jul 21 2026 at 19:03)</a>:</h4>
+<p><span aria-label="cross mark" class="emoji emoji-274c" role="img" title="cross mark">:cross_mark:</span> alexcrichton closed without merge <a href="https://github.com/bytecodealliance/wasmtime/pull/13918">PR #13918</a>.</p>
+
+
+
+<a name="611966484"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313918%20Fix%20current-thread%20leak%20on%20concurren.../near/611966484" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313918.20Fix.20current-thread.20leak.20on.20concurren.2E.2E.2E.html#611966484">(Jul 21 2026 at 19:03)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/13918#issuecomment-5037974492">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13918">PR #13918</a>:</p>
+<blockquote>
+<p>I'd advise against blindly following LLM advice when it comes to the deep internals of the runtime, especially an async runtime. It's intentional that error paths right now do not have the same degree of cleanup as successful paths because errors indicate traps after which a component is entirely locked down and unable to be used again.</p>
+<p>Are you able to write tests that misbehave using just wasm? Tests for the internal state aren't too interesting since they're not guaranteed to be exposed by the public API.</p>
+</blockquote>
+
+
+
+<a name="611966506"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313918%20Fix%20current-thread%20leak%20on%20concurren.../near/611966506" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313918.20Fix.20current-thread.20leak.20on.20concurren.2E.2E.2E.html#611966506">(Jul 21 2026 at 19:03)</a>:</h4>
+<p>alexcrichton reopened <a href="https://github.com/bytecodealliance/wasmtime/pull/13918">PR #13918</a> from <code>SebTardif:fix/restore-thread-on-lower-error</code> to <code>bytecodealliance:main</code>.</p>
+
+
+
+<a name="611966508"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313918%20Fix%20current-thread%20leak%20on%20concurren.../near/611966508" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313918.20Fix.20current-thread.20leak.20on.20concurren.2E.2E.2E.html#611966508">(Jul 21 2026 at 19:03)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/13918#issuecomment-5037975545">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13918">PR #13918</a>:</p>
+<blockquote>
+<p>er, sorry, didn't mean to close</p>
+</blockquote>
+
+
+
+<a name="611980834"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313918%20Fix%20current-thread%20leak%20on%20concurren.../near/611980834" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313918.20Fix.20current-thread.20leak.20on.20concurren.2E.2E.2E.html#611980834">(Jul 21 2026 at 20:24)</a>:</h4>
+<p>SebTardif <a href="https://github.com/bytecodealliance/wasmtime/pull/13918#issuecomment-5038689200">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13918">PR #13918</a>:</p>
+<blockquote>
+<p>@alexcrichton</p>
+<blockquote>
+<p>It's intentional that error paths right now do not have the same degree of cleanup as successful paths because errors indicate traps after which a component is entirely locked down and unable to be used again.</p>
+</blockquote>
+<p>Thanks for the context. That tracks: these host-side errors (alignment/bounds in <code>lower</code>, callback failures) propagate via <code>?</code> through <code>poll_until</code>, so the event loop exits before anything reads the stale thread state.</p>
+<blockquote>
+<p>Are you able to write tests that misbehave using just wasm?</p>
+</blockquote>
+<p>No. The event loop terminates on error before anything could observe the stale state.</p>
+<p>Closing this; the cleanup asymmetry is consistent with the design.<br>
+</p>
+</blockquote>
+
+
+
+<a name="611980850"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313918%20Fix%20current-thread%20leak%20on%20concurren.../near/611980850" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313918.20Fix.20current-thread.20leak.20on.20concurren.2E.2E.2E.html#611980850">(Jul 21 2026 at 20:24)</a>:</h4>
+<p><span aria-label="cross mark" class="emoji emoji-274c" role="img" title="cross mark">:cross_mark:</span> SebTardif closed without merge <a href="https://github.com/bytecodealliance/wasmtime/pull/13918">PR #13918</a>.</p>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

@@ -1,0 +1,67 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13344 GcRuntime::vmctx_gc_heap_data is ... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313344.20GcRuntime.3A.3Avmctx_gc_heap_data.20is.20.2E.2E.2E.html">wasmtime / issue #13344 GcRuntime::vmctx_gc_heap_data is ...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="594691593"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313344%20GcRuntime%3A%3Avmctx_gc_heap_data%20is%20.../near/594691593" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313344.20GcRuntime.3A.3Avmctx_gc_heap_data.20is.20.2E.2E.2E.html#594691593">(May 12 2026 at 22:12)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/issues/13344">issue #13344</a>:</p>
+<blockquote>
+<p>This is preexisting I think for other collectors, but there's 2 primary ways that this method is UB according to Miri:</p>
+<ol>
+<li>This is deriving a pointer from <code>&amp;self</code> which is later mutated through in compiled code. That's UB in Rust because by deriving the pointer from <code>&amp;self</code> you're saying that the contents can't be mutated. <a href="https://play.rust-lang.org/?version=nightly&amp;mode=debug&amp;edition=2024&amp;gist=dcdbe89919602deb507a3fad6bd7cfb5">This is a playground example</a> showing the UB (top right, Tools -&gt; Miri). The fix for this specific issue is to change this method to <code>&amp;mut self</code> and then have the implementation be <code>NonNull::from(&amp;mut self.vmctx_data).cast()</code></li>
+<li>The second problem is that this struture is stored inline with the <code>CopyingHeap</code>, which means that re-acquiring a mutable pointer to <code>CopyingHeap</code> will actually invalidate the previous pointer returned by this method. <a href="https://play.rust-lang.org/?version=nightly&amp;mode=debug&amp;edition=2024&amp;gist=92789a4df46d2b9acefcdc37125d2005">This is a playground example</a> of the UB here.</li>
+</ol>
+<p>Fixing the latter one is not going to be super easy. I can think a few possible ways:</p>
+<ul>
+<li>Every time we return back to wasm re-acquire the pointer and put it back in the <code>VMContext</code>. Probably too slow to work.</li>
+<li>Place the VM data behind an indirection (e.g. <code>Box&lt;VMCopyingHeapData&gt;</code> here). The goal is that by using <code>&amp;mut CopyingHeap</code> it doesn't auto-invaildate the vmctx data structures. This alone is <a href="https://play.rust-lang.org/?version=nightly&amp;mode=debug&amp;edition=2024&amp;gist=eb6538977fdf5e52ea963db7388e0c1b">not enough</a>, however. Another added fix necessary would be to create the raw pointer at creation of <code>CopyingHeap</code>, and then <code>CopyingHeap</code> itself only accesses the data through that pointer. The end result is <a href="https://play.rust-lang.org/?version=nightly&amp;mode=debug&amp;edition=2024&amp;gist=b18ae0d3c4b6f17193a4936ebbe06752">sort of like this</a> and models what we do with <code>vm::Instance</code> and its sibling <code>VMContext</code> storage data that comes after it.</li>
+</ul>
+<p>I haven't double-checked, but I believe this would all plague the drc/null collectors as well. If you'd like I think it'd be reasonable to fix them all in a subsequent PR.</p>
+<p>In terms of detecting all of this, in theory Miri should be able to capture everything here. I think that may mean we're not running much GC-compiled wasms through Miri, which might be a good addition to have?  For miri coverage <a href="https://github.com/bytecodealliance/wasmtime/blob/c73dda5b2bbac89ebcada7e7d8ce79e20ff443e6/.github/workflows/main.yml#L1264">copying this line</a> is probably the easiest. Along those lines <code>rustup run nightly ./ci/miri-wast.sh ./tests/spec_testsuite/struct.wast</code> locally shows a Miri violation which may be related to this, but it's always sort of hard to tell where exactly the miri error comes from due to the mix of pulley and lack of strict provenance...</p>
+<p>_Originally posted by @alexcrichton in <a href="https://github.com/bytecodealliance/wasmtime/pull/13323#discussion_r3209562532_">https://github.com/bytecodealliance/wasmtime/pull/13323#discussion_r3209562532_</a></p>
+</blockquote>
+
+
+
+<a name="594691597"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313344%20GcRuntime%3A%3Avmctx_gc_heap_data%20is%20.../near/594691597" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313344.20GcRuntime.3A.3Avmctx_gc_heap_data.20is.20.2E.2E.2E.html#594691597">(May 12 2026 at 22:12)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasm-proposal:gc label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13344">Issue #13344</a>.</p>
+
+
+
+<a name="594691607"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313344%20GcRuntime%3A%3Avmctx_gc_heap_data%20is%20.../near/594691607" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313344.20GcRuntime.3A.3Avmctx_gc_heap_data.20is.20.2E.2E.2E.html#594691607">(May 12 2026 at 22:12)</a>:</h4>
+<p>alexcrichton assigned fitzgen to <a href="https://github.com/bytecodealliance/wasmtime/issues/13344">issue #13344</a>.</p>
+
+
+
+<a name="596824734"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313344%20GcRuntime%3A%3Avmctx_gc_heap_data%20is%20.../near/596824734" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313344.20GcRuntime.3A.3Avmctx_gc_heap_data.20is.20.2E.2E.2E.html#596824734">(May 21 2026 at 18:50)</a>:</h4>
+<p>fitzgen closed <a href="https://github.com/bytecodealliance/wasmtime/issues/13344">issue #13344</a>:</p>
+<blockquote>
+<p>This is preexisting I think for other collectors, but there's 2 primary ways that this method is UB according to Miri:</p>
+<ol>
+<li>This is deriving a pointer from <code>&amp;self</code> which is later mutated through in compiled code. That's UB in Rust because by deriving the pointer from <code>&amp;self</code> you're saying that the contents can't be mutated. <a href="https://play.rust-lang.org/?version=nightly&amp;mode=debug&amp;edition=2024&amp;gist=dcdbe89919602deb507a3fad6bd7cfb5">This is a playground example</a> showing the UB (top right, Tools -&gt; Miri). The fix for this specific issue is to change this method to <code>&amp;mut self</code> and then have the implementation be <code>NonNull::from(&amp;mut self.vmctx_data).cast()</code></li>
+<li>The second problem is that this struture is stored inline with the <code>CopyingHeap</code>, which means that re-acquiring a mutable pointer to <code>CopyingHeap</code> will actually invalidate the previous pointer returned by this method. <a href="https://play.rust-lang.org/?version=nightly&amp;mode=debug&amp;edition=2024&amp;gist=92789a4df46d2b9acefcdc37125d2005">This is a playground example</a> of the UB here.</li>
+</ol>
+<p>Fixing the latter one is not going to be super easy. I can think a few possible ways:</p>
+<ul>
+<li>Every time we return back to wasm re-acquire the pointer and put it back in the <code>VMContext</code>. Probably too slow to work.</li>
+<li>Place the VM data behind an indirection (e.g. <code>Box&lt;VMCopyingHeapData&gt;</code> here). The goal is that by using <code>&amp;mut CopyingHeap</code> it doesn't auto-invaildate the vmctx data structures. This alone is <a href="https://play.rust-lang.org/?version=nightly&amp;mode=debug&amp;edition=2024&amp;gist=eb6538977fdf5e52ea963db7388e0c1b">not enough</a>, however. Another added fix necessary would be to create the raw pointer at creation of <code>CopyingHeap</code>, and then <code>CopyingHeap</code> itself only accesses the data through that pointer. The end result is <a href="https://play.rust-lang.org/?version=nightly&amp;mode=debug&amp;edition=2024&amp;gist=b18ae0d3c4b6f17193a4936ebbe06752">sort of like this</a> and models what we do with <code>vm::Instance</code> and its sibling <code>VMContext</code> storage data that comes after it.</li>
+</ul>
+<p>I haven't double-checked, but I believe this would all plague the drc/null collectors as well. If you'd like I think it'd be reasonable to fix them all in a subsequent PR.</p>
+<p>In terms of detecting all of this, in theory Miri should be able to capture everything here. I think that may mean we're not running much GC-compiled wasms through Miri, which might be a good addition to have?  For miri coverage <a href="https://github.com/bytecodealliance/wasmtime/blob/c73dda5b2bbac89ebcada7e7d8ce79e20ff443e6/.github/workflows/main.yml#L1264">copying this line</a> is probably the easiest. Along those lines <code>rustup run nightly ./ci/miri-wast.sh ./tests/spec_testsuite/struct.wast</code> locally shows a Miri violation which may be related to this, but it's always sort of hard to tell where exactly the miri error comes from due to the mix of pulley and lack of strict provenance...</p>
+<p>_Originally posted by @alexcrichton in <a href="https://github.com/bytecodealliance/wasmtime/pull/13323#discussion_r3209562532_">https://github.com/bytecodealliance/wasmtime/pull/13323#discussion_r3209562532_</a></p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

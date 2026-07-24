@@ -1,0 +1,140 @@
+<html>
+<head><meta charset="utf-8"><title>Creating a `stream` in a sync context · wasi · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/index.html">wasi</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Creating.20a.20.60stream.60.20in.20a.20sync.20context.html">Creating a `stream` in a sync context</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="609396520"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Creating%20a%20%60stream%60%20in%20a%20sync%20context/near/609396520" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> zslayton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Creating.20a.20.60stream.60.20in.20a.20sync.20context.html#609396520">(Jul 10 2026 at 08:06)</a>:</h4>
+<p>Hi! I'm trying to add WASI p3 support to <a href="http://github.com/bytecodealliance/WASI-Virt"><code>WASI-Virt</code></a>. As a jumping off point to get familiar with everything, I started writing a minimal example component that virtualizes <code>wasi:filesystem@0.3.0</code>. However, I've run into a problem that seems to be (at least for the time being?) impossible.</p>
+<p>Here's <a href="https://gist.github.com/zslayton/995f426e248ec110defac40f6a5020d5">a gist with the relevant bits of my code</a>.</p>
+<p><code>WASI-Virt</code> allows you to specify file names to be backed by a given byte array. I want to implement <code>Descriptor::read_via_stream</code> by either actually reading a file or by copying a static byte array into the stream as needed. However, I cannot find a way to actually copy a byte array into the stream.</p>
+<p><code>read-via-stream</code> is defined as a synchronous function in the WIT, and that cannot be overridden (for example, using the <code>async</code> setting in <code>wit-bindgen::generate</code>). Because another component would call into this method as its entry point, there's no async runtime set up in this component to process async tasks. That means I cannot use <code>wit_bindgen::spawn_local</code> or <code>wit_bindgen::block_on</code> to populate the stream. Doing so produces an async task that never gets polled, leading the reader to hang at runtime. A host application can use custom logic to work around this limitation, but that's not an option for <code>WASI-Virt</code>.</p>
+<p>There doesn't seem to be any way to meaningfully initialize a <code>stream</code> in a synchronous context. Am I missing something in the APIs? Are components not meant to be able to virtualize a synchronous method?</p>
+
+
+
+<a name="609452073"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Creating%20a%20%60stream%60%20in%20a%20sync%20context/near/609452073" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Christof Petig <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Creating.20a.20.60stream.60.20in.20a.20sync.20context.html#609452073">(Jul 10 2026 at 13:11)</a>:</h4>
+<p>At first glance this looks like you ran into the same problem I reported two days ago at <a href="#narrow/channel/219900-wasi/topic/.E2.9C.94.20Interval.20timer/near/608682442">https://bytecodealliance.zulipchat.com/#narrow/channel/219900-wasi/topic/.E2.9C.94.20Interval.20timer/near/608682442</a> . If so a fix is planned without a time frame or priority.</p>
+
+
+
+<a name="609454566"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Creating%20a%20%60stream%60%20in%20a%20sync%20context/near/609454566" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> zslayton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Creating.20a.20.60stream.60.20in.20a.20sync.20context.html#609454566">(Jul 10 2026 at 13:22)</a>:</h4>
+<p>Thanks, Christof! This does indeed sound quite similar. Regarding the fix, are you referring to what <span class="user-mention" data-user-id="509936">@Joel Dice</span> said?:</p>
+<blockquote>
+<p>Makes sense. I think the plan is to allow the sync lift ABI to use <code>task.return</code> (and thus allow post-return execution) as well, but that hasn't landed yet.</p>
+</blockquote>
+<p>If so, that does seem like it might address my problem. Joel, could you confirm that this fix would allow a synchronous function to call <code>spawn_local</code>? Is my understanding that <code>read-via-stream</code> cannot be adapted/lifted into an <code>async</code> function correct?</p>
+
+
+
+<a name="609464775"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Creating%20a%20%60stream%60%20in%20a%20sync%20context/near/609464775" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Creating.20a.20.60stream.60.20in.20a.20sync.20context.html#609464775">(Jul 10 2026 at 14:04)</a>:</h4>
+<p>The (somewhat confusing) thing to understand is that the term <code>async</code> is used two different ways in the component model:</p>
+<ul>
+<li>The <em>type</em> of a function can either be sync or async, and that determines whether it is allowed to wait for other async calls before returning (i.e. a sync function is not allowed to do that, but an async function is).  Note that either type is allowed to wait for async calls (or async stream reads and writes) <em>after</em> returning, though.</li>
+<li>The <em>lift</em> or <em>lower</em> ABI used to export or import a function, respectively, may either be sync or async, and that determines whether <code>task.return</code> is used to return a value vs. just a "normal" return via the call stack, among other things.</li>
+</ul>
+<p>The key insight here is that the lift/lower ABI used need not match the type: you can use the async lift ABI for a sync function or vice-versa.  The Rust <code>wit-bindgen</code> will <em>default</em> to matching the ABI to the type, but you can override that using the <code>async</code> option via the CLI or the <code>generate!</code> macro.  So in your case, you can lift <code>read-via-stream</code> using the async ABI even though the type is sync, and you can use <code>spawn_local</code> to write to the stream and future after returning them.</p>
+
+
+
+<a name="609585405"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Creating%20a%20%60stream%60%20in%20a%20sync%20context/near/609585405" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> zslayton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Creating.20a.20.60stream.60.20in.20a.20sync.20context.html#609585405">(Jul 11 2026 at 06:16)</a>:</h4>
+<p>Thanks, Joel. I've tried configuring <code>read-via-async</code> to be an <code>async fn</code> before in the call to <code>generate!</code>, like this:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="w">    </span><span class="k">async</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">        </span><span class="s">"export:wasi:filesystem/types@0.3.0#[method]descriptor.read-via-stream"</span><span class="p">,</span>
+<span class="w">    </span><span class="p">]</span>
+</code></pre></div>
+<p>(and the same in the importer with <code>import:wasi:...</code>) but at runtime I get this error:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="err">❯</span><span class="w"> </span><span class="o">/</span><span class="n">home</span><span class="o">/</span><span class="n">zslayton</span><span class="o">/</span><span class="p">.</span><span class="n">cargo</span><span class="o">/</span><span class="n">bin</span><span class="o">/</span><span class="n">wasmtime</span><span class="w"> </span><span class="o">--</span><span class="n">dir</span><span class="w"> </span><span class="p">.</span><span class="w"> </span><span class="n">composed</span><span class="p">.</span><span class="n">wasm</span>
+<span class="n">Error</span><span class="p">:</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">parse</span><span class="w"> </span><span class="n">WebAssembly</span><span class="w"> </span><span class="n">module</span>
+
+<span class="n">Caused</span><span class="w"> </span><span class="n">by</span><span class="p">:</span>
+<span class="w">    </span><span class="nc">the</span><span class="w"> </span><span class="err">`</span><span class="k">async</span><span class="err">`</span><span class="w"> </span><span class="n">canonical</span><span class="w"> </span><span class="n">option</span><span class="w"> </span><span class="n">requires</span><span class="w"> </span><span class="n">an</span><span class="w"> </span><span class="k">async</span><span class="w"> </span><span class="n">function</span><span class="w"> </span><span class="k">type</span>
+</code></pre></div>
+<p>which I interpreted to mean that I couldn't do that. I'm using:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">wasmtime</span><span class="w"> </span><span class="mf">48.0.0</span><span class="w"> </span><span class="p">(</span><span class="mi">66</span><span class="n">f269153</span><span class="w"> </span><span class="mi">2026</span><span class="o">-</span><span class="mi">07</span><span class="o">-</span><span class="mi">09</span><span class="p">)</span>
+<span class="n">wit</span><span class="o">-</span><span class="n">bindgen</span><span class="w"> </span><span class="mf">0.59.0</span>
+<span class="n">rustc</span><span class="w"> </span><span class="mf">1.98.0</span><span class="o">-</span><span class="n">nightly</span><span class="w"> </span><span class="p">(</span><span class="mi">4</span><span class="n">c9d2bfe4</span><span class="w"> </span><span class="mi">2026</span><span class="o">-</span><span class="mi">07</span><span class="o">-</span><span class="mi">01</span><span class="p">)</span>
+</code></pre></div>
+
+
+
+<a name="609587708"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Creating%20a%20%60stream%60%20in%20a%20sync%20context/near/609587708" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> zslayton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Creating.20a.20.60stream.60.20in.20a.20sync.20context.html#609587708">(Jul 11 2026 at 07:05)</a>:</h4>
+<p>Narrowing this down a bit further: when I include </p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">async</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="s">"export:wasi:filesystem/types@0.3.0#[method]descriptor.read-via-stream"</span><span class="p">,</span>
+<span class="p">]</span>
+</code></pre></div>
+<p>on the exporter side, the component it produces will not validate on its own with <code>wasm-tools</code>:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="err">❯</span><span class="w"> </span><span class="n">wasm</span><span class="o">-</span><span class="n">tools</span><span class="w"> </span><span class="n">component</span><span class="w"> </span><span class="n">wit</span><span class="w"> </span><span class="n">spike</span><span class="o">-</span><span class="n">virt</span><span class="o">/</span><span class="n">target</span><span class="o">/</span><span class="n">wasm32</span><span class="o">-</span><span class="n">wasip2</span><span class="o">/</span><span class="n">debug</span><span class="o">/</span><span class="n">spike_virt</span><span class="p">.</span><span class="n">wasm</span>
+<span class="n">error</span><span class="p">:</span><span class="w"> </span><span class="nc">the</span><span class="w"> </span><span class="err">`</span><span class="k">async</span><span class="err">`</span><span class="w"> </span><span class="n">canonical</span><span class="w"> </span><span class="n">option</span><span class="w"> </span><span class="n">requires</span><span class="w"> </span><span class="n">an</span><span class="w"> </span><span class="k">async</span><span class="w"> </span><span class="n">function</span><span class="w"> </span><span class="k">type</span><span class="w"> </span><span class="p">(</span><span class="n">at</span><span class="w"> </span><span class="n">offset</span><span class="w"> </span><span class="mh">0x57ae5c</span><span class="p">)</span>
+</code></pre></div>
+
+
+
+<a name="609588769"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Creating%20a%20%60stream%60%20in%20a%20sync%20context/near/609588769" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> zslayton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Creating.20a.20.60stream.60.20in.20a.20sync.20context.html#609588769">(Jul 11 2026 at 07:25)</a>:</h4>
+<p>In <a href="https://github.com/bytecodealliance/wit-bindgen/issues/1622">this <code>wit-bindgen</code> issue</a>, <span class="user-mention" data-user-id="253994">@Alex Crichton</span> seems to say that the <code>async</code> option isn't legal for functions that are sync in the WIT.</p>
+
+
+
+<a name="609608428"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Creating%20a%20%60stream%60%20in%20a%20sync%20context/near/609608428" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Creating.20a.20.60stream.60.20in.20a.20sync.20context.html#609608428">(Jul 11 2026 at 13:25)</a>:</h4>
+<p>Oof, yeah, I forgot about the implications of <a href="https://github.com/WebAssembly/component-model/pull/646">https://github.com/WebAssembly/component-model/pull/646</a>, a change that was made pretty late in the design process.  And I guess I didn't realize how it would affect this case.</p>
+<p><span class="user-mention" data-user-id="253998">@Luke Wagner</span> am I missing something, or is it effectively impossible to write to a stream returned by a sync function such as <code>read-via-stream</code> without guest superpowers?  If so, that's something we'll need to address.</p>
+
+
+
+<a name="609609149"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Creating%20a%20%60stream%60%20in%20a%20sync%20context/near/609609149" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Creating.20a.20.60stream.60.20in.20a.20sync.20context.html#609609149">(Jul 11 2026 at 13:40)</a>:</h4>
+<p><span class="user-mention" data-user-id="509936">@Joel Dice</span> That's right.  Both coop threads and the ABI changes (which would decouple the ability to call <code>task.return</code> from being <code>async</code>) will fix this, I believe</p>
+
+
+
+<a name="609611379"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Creating%20a%20%60stream%60%20in%20a%20sync%20context/near/609611379" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> zslayton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Creating.20a.20.60stream.60.20in.20a.20sync.20context.html#609611379">(Jul 11 2026 at 14:21)</a>:</h4>
+<p>Ok, cool. Are there relevant GitHub issues I could follow? Would the necessary changes be in <code>wasmtime</code>, or tied to a future WASI release?</p>
+
+
+
+<a name="609652226"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Creating%20a%20%60stream%60%20in%20a%20sync%20context/near/609652226" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Creating.20a.20.60stream.60.20in.20a.20sync.20context.html#609652226">(Jul 12 2026 at 00:29)</a>:</h4>
+<p>For cooperative threads, the plan is that it will go in WASI minor release (a 0.3.x) once the feature has been implemented and the WASI SG has a vote (it's already mostly implemented in <code>wasmtime</code> behind a flag, iiuc, but there's more producer toolchain work to do).  I'm not sure if there's an overall tracking issue for cooperative threads to follow... but maybe someone else does?</p>
+
+
+
+<a name="609768822"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Creating%20a%20%60stream%60%20in%20a%20sync%20context/near/609768822" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> zslayton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Creating.20a.20.60stream.60.20in.20a.20sync.20context.html#609768822">(Jul 13 2026 at 06:37)</a>:</h4>
+<blockquote>
+<p>Both coop threads and the ABI changes [...] will fix this, I believe</p>
+</blockquote>
+<p>Re-reading this, I wasn't sure if this meant that both features need to land for this or either one would suffice? What phrase could I use to research the ABI changes?</p>
+
+
+
+<a name="609918143"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Creating%20a%20%60stream%60%20in%20a%20sync%20context/near/609918143" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Creating.20a.20.60stream.60.20in.20a.20sync.20context.html#609918143">(Jul 13 2026 at 16:35)</a>:</h4>
+<p>Both features would <em>independently</em> address the issue, with cooperative threads being much closer to completion of the two.  In the CM spec repo, the cooperative thread additions are marked by the <span aria-label="thread" class="emoji emoji-1f9f5" role="img" title="thread">:thread:</span> character, and these are, i believe, all implemented in Wasmtime behind the flag <code>-W component-model-threading</code>.</p>
+<p>The "ABI changes" are not as clearly defined, but outlined in <a href="https://bytecodealliance.org/articles/the-road-to-component-model-1-0#1-abi-improvements">this BA blog post section</a>.  As part of these changes, I believe we can make <code>task.return</code>-vs-flat-results-and-<code>post-return</code> an ABI choice that is independent of whether the declared WIT function type is <code>async</code>.</p>
+
+
+
+<a name="611123756"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Creating%20a%20%60stream%60%20in%20a%20sync%20context/near/611123756" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Creating.20a.20.60stream.60.20in.20a.20sync.20context.html#611123756">(Jul 16 2026 at 17:19)</a>:</h4>
+<p>Oh, I realized there is a third solution that could work in 0.3.0:</p>
+<p>So iiuc, the goal here is for WASI-Virt to be able to virtualize <code>read-via-stream</code> in terms of data segments and the challenge is: during the synchronous <code>read-via-stream</code> call, we can call <code>stream.new</code>, we can initiate an <code>async</code> <code>stream.write</code> on the new writable end (passing a pointer to a linear memory region read from a data segment) which will always block (the caller hasn't had a chance to <code>stream.read</code> yet), and we can return the new readable end by returning from core wasm, but how do we now <code>waitable-set.wait</code> to find out when the <code>stream.write</code> completes so that we can release/reuse the memory buffer passed into it and call <code>stream.close-writable</code>?  I think a third solution would be: in the context of WASI-Virt, have the component that is virtualizing/exporting WASI add an extra <code>export init: async func()</code> that gets called by the top-level component (produced by WASI-virt that links the virtualizing component with the guest component) up-front.  <code>init</code> would immediately <code>task.return</code> and then return <code>WAIT</code> to its <code>callback</code> loop, waiting on a global <code>waitable-set</code> that <code>read-via-stream</code> appends its pending writable end to.  This callback loop could then free the memory and close the writable end (or, more generally, execute any async work).</p>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

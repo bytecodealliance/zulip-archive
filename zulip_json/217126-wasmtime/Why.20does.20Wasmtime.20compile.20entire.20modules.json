@@ -1,0 +1,98 @@
+[
+    {
+        "content": "<p>I'm trying to understand the history behind Wasmtime's development and why it <a href=\"https://www.fastly.com/blog/how-lucet-wasmtime-make-stronger-compiler-together\">adopted</a> Lucet's AOT model. I initially understood Wasmtime as a QEMU-style JIT but <a href=\"https://bytecodealliance.org/articles/inliner\">apparently</a> it compiles all module functions in parallel at the start.</p>\n<p>Some obvious reasons why compiling whole modules and using a static cache are:</p>\n<ul>\n<li>Instant start up after first compile</li>\n<li>Better performance after first compile</li>\n<li>Better security due to statically know code</li>\n<li>Easier debugging</li>\n</ul>\n<p>I want to understand were there any other reasons? Were there any public benchmarks that informed the decision.</p>",
+        "id": 576774751,
+        "sender_full_name": "Yage Hu",
+        "timestamp": 1772469730
+    },
+    {
+        "content": "<p><span class=\"user-mention\" data-user-id=\"254083\">@Dan Gohman</span> probably could answer best about early history and the actual path that decisions took, but a few additional considerations I can add are:</p>\n<ul>\n<li>Allows for complete separation of the compiler infrastructure from the runtime, even into a different physical location in a deployment (i.e., control plane vs. dataplane), and consequently allows the runtime to be much smaller and have fewer dependencies (e.g., to run in an embedded or embedded-like environment with tight latency/memory/overhead/... requirements) -- both of these are important for major embedders today</li>\n<li>It's simpler! No need for indirection via indirect calls, or dynamic code patching, or whatnot, to allow each function to be lazily compiled and slotted in</li>\n</ul>",
+        "id": 576776121,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1772470126
+    },
+    {
+        "content": "<p>Agreed on all the above points. Another reason is that unlike in native code, Wasm code never has any ambiguity about where the function boundaries are or what the code alignment is, never has any ambiguity about code vs jump tables vs constant pools or other things, and never has any dynamically modified code. So unlike native code translators, it doesn't need any knowledge from the runtime state of the application to determine which code to compile.</p>",
+        "id": 576795926,
+        "sender_full_name": "Dan Gohman",
+        "timestamp": 1772475747
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"381188\">Yage Hu</span> <a href=\"#narrow/channel/217126-wasmtime/topic/Why.20does.20Wasmtime.20compile.20entire.20modules/near/576774751\">said</a>:</p>\n<blockquote>\n<p>I'm trying to understand the history behind Wasmtime's development and why it <a href=\"https://www.fastly.com/blog/how-lucet-wasmtime-make-stronger-compiler-together\">adopted</a> Lucet's AOT model.</p>\n</blockquote>\n<p>I may be misremembering, but I am 98% sure that even before Wasmtime gained Lucet's features, it was still compiling all Wasm functions in a module eagerly, and it never waited until a function was called to compile the function.</p>",
+        "id": 576832529,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1772487642
+    },
+    {
+        "content": "<p>Yes, that's right, it's been that way at least since late 2019 when I started working on it</p>",
+        "id": 576840603,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1772490902
+    },
+    {
+        "content": "<p>Thanks for the info!</p>",
+        "id": 576992790,
+        "sender_full_name": "Yage Hu",
+        "timestamp": 1772548718
+    },
+    {
+        "content": "<p>There is experimental support for something somewhat related, FWIW: an <a href=\"https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/codegen/src/incremental_cache.rs\">incremental cache</a> that allows reusing compilation results for unchanged functions. I think it's been quite a while since anyone touched that though, so I'm not sure what the current state is</p>",
+        "id": 577000829,
+        "sender_full_name": "Till Schneidereit",
+        "timestamp": 1772550636
+    },
+    {
+        "content": "<p>IIRC it was in production at least at Embark; we never turned it on by default because of vague concerns transferred from the Rust incremental compilation trail of bugs, but this infra is designed much differently (uses types and struct nesting to separate state so there <em>can't</em> be cache invalidation bugs, more or less by construction) and honestly I think we should consider turning it on by default (we even have a pretty thorough <a href=\"https://github.com/bytecodealliance/wasmtime/blob/main/fuzz/fuzz_targets/cranelift-icache.rs\">fuzz target</a> for it)</p>",
+        "id": 577008357,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1772552239
+    },
+    {
+        "content": "<p>A follow-up question about this compiling-whole-module strategy is: how does Wasmtime address the startup latency for the first time when a Wasm module is executed, especially when the module contains many functions? It seems this compiling strategy differs from those adopted in JavaScript engines like V8 and SpiderMonkey.</p>",
+        "id": 577010108,
+        "sender_full_name": "Wenwen Wang",
+        "timestamp": 1772552629
+    },
+    {
+        "content": "<p>The short answer is that we don't: it's a different use-case. We aren't primarily targeting a Web-engine world where time to first frame / interaction / execution / ... is important; we're targeting use-cases where start-up time is ok (e.g., server-side modules that process requests can tolerate some latency in compiling and switching to a new version of a module, and then the module is resident while it processes many requests).</p>",
+        "id": 577013928,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1772553509
+    },
+    {
+        "content": "<p>I'll note that Cranelift's compile time is still ~10x faster than LLVM's, so things aren't as bad as one naively might expect from a \"compile the whole module\" workflow. We also have Winch as an alternative backend that is a few times faster still</p>",
+        "id": 577014151,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1772553556
+    },
+    {
+        "content": "<p>Thanks for the clarification. That makes sense. Another thing is that separating compilation from execution may also miss dynamic optimization opportunities, e.g., based on execution profiling, like tiered compilation/optimization in V8, allowing more optimized code to be generated.</p>",
+        "id": 577017752,
+        "sender_full_name": "Wenwen Wang",
+        "timestamp": 1772554377
+    },
+    {
+        "content": "<p>That's true, but keep in mind that there is much more opportunity for that in JS (for example) than in Wasm -- no dynamic types, no virtual dispatch, no hairy language semantics with happy paths you'd want to optimize, etc. I've heard that V8 uses ICs for some parts of Wasm GC but MVP-ish Wasm can get away without them entirely. Profiling info could inform inlining but for single modules that's marginal as well. Wasm really is more like a conventional binary for a conventional ISA than it is like JavaScript (for these purposes at least!), and (absent far-out research like the DynamoRIO stuff) \"JIT optimization for conventional binaries\" is not too much of a thing</p>",
+        "id": 577024307,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1772555818
+    },
+    {
+        "content": "<p>Said another way: tiering for Wasm in Web engines lets one trade off compile time and run-time by not optimizing some functions as much (or at all). We optimize all functions all the way, so we don't have any deficits in run-time from not tiering. We just take longer to compile.</p>",
+        "id": 577024680,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1772555918
+    },
+    {
+        "content": "<p>Thanks very much for the explanation. It is great to learn the design rationale behind Wasmtime. Indeed, Wasmtime is a great runtime system, giving us unprecedented opportunities to explore new design choices and to rethink conventional strategies in different usage scenarios. Again, thank you!</p>",
+        "id": 577027806,
+        "sender_full_name": "Wenwen Wang",
+        "timestamp": 1772556750
+    },
+    {
+        "content": "<p>Regarding start up latency, see:</p>\n<ul>\n<li><a href=\"https://docs.wasmtime.dev/examples-pre-compiling-wasm.html\">https://docs.wasmtime.dev/examples-pre-compiling-wasm.html</a></li>\n<li><a href=\"https://docs.wasmtime.dev/examples-fast-instantiation.html\">https://docs.wasmtime.dev/examples-fast-instantiation.html</a></li>\n<li><a href=\"https://github.com/bytecodealliance/wasmtime/tree/main/crates/wizer\">https://github.com/bytecodealliance/wasmtime/tree/main/crates/wizer</a></li>\n</ul>",
+        "id": 577132420,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1772600875
+    }
+]

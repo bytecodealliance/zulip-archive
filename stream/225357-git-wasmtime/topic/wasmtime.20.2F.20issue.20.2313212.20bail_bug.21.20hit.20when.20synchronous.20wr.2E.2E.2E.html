@@ -1,0 +1,446 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13212 bail_bug! hit when synchronous wr... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313212.20bail_bug.21.20hit.20when.20synchronous.20wr.2E.2E.2E.html">wasmtime / issue #13212 bail_bug! hit when synchronous wr...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="591219360"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313212%20bail_bug%21%20hit%20when%20synchronous%20wr.../near/591219360" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313212.20bail_bug.21.20hit.20when.20synchronous.20wr.2E.2E.2E.html#591219360">(Apr 27 2026 at 19:49)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/issues/13212">issue #13212</a>:</p>
+<blockquote>
+<p>This <code>*.wast</code> test:</p>
+<p>&lt;details&gt;</p>
+<div class="codehilite" data-code-language="wasm"><pre><span></span><code>;;! component_model_async = true
+;;! reference_types = true
+
+(component
+  (type $FT (future u8))
+  (core module $Memory (memory (export "mem") 1))
+
+  (component $C
+    (core instance $memory (instantiate $Memory))
+    (core module $CM
+      (import "" "mem" (memory 1))
+      (import "" "waitable.join" (func $waitable.join (param i32 i32)))
+      (import "" "waitable-set.new" (func $waitable-set.new (result i32)))
+      (import "" "waitable-set.wait" (func $waitable-set.wait (param i32 i32) (result i32)))
+      (import "" "future.new" (func $future.new (result i64)))
+      (import "" "future.write-sync" (func $future.write-sync (param i32 i32) (result i32)))
+
+      (global $writable-end (mut i32) (i32.const 0))
+      (global $ws (mut i32) (i32.const 0))
+
+      ;; create a new future, return the readable end to the caller
+      (func $start-future (export "start-future") (result i32)
+        (local $ret64 i64)
+        (global.set $ws (call $waitable-set.new))
+        (local.set $ret64 (call $future.new))
+        (global.set $writable-end (i32.wrap_i64 (i64.shr_u (local.get $ret64) (i64.const 32))))
+        (call $waitable.join (global.get $writable-end) (global.get $ws) )
+        (i32.wrap_i64 (local.get $ret64))
+      )
+      (func $future-write-sync (export "future-write-sync") (result i32)
+        ;; the caller will assert what they expect the return value to be
+        (i32.store (i32.const 16) (i32.const 42))
+        (call $future.write-sync (global.get $writable-end) (i32.const 16))
+      )
+      (func $acknowledge-future-write (export "acknowledge-future-write")
+        ;; confirm we got a FUTURE_WRITE $writable-end COMPLETED event
+        (local $ret i32)
+        (local.set $ret (call $waitable-set.wait (global.get $ws) (i32.const 0)))
+
+        ;; TODO: what should this actually be testing? Right now this hits a
+        ;; "BUG" in wasmtime...
+        (if (i32.ne (i32.const 5 (; FUTURE_WRITE ;)) (local.get $ret))
+          (then unreachable))
+        (if (i32.ne (global.get $writable-end) (i32.load (i32.const 0)))
+          (then unreachable))
+        (if (i32.ne (i32.const 0 (; COMPLETED ;)) (i32.load (i32.const 4)))
+          (then unreachable))
+      )
+    )
+    (canon waitable.join (core func $waitable.join))
+    (canon waitable-set.new (core func $waitable-set.new))
+    (canon waitable-set.wait (memory $memory "mem") (core func $waitable-set.wait))
+    (canon future.new $FT (core func $future.new))
+    (canon future.write $FT (memory $memory "mem") (core func $future.write-sync))
+    (core instance $cm (instantiate $CM (with "" (instance
+      (export "mem" (memory $memory "mem"))
+      (export "waitable.join" (func $waitable.join))
+      (export "waitable-set.new" (func $waitable-set.new))
+      (export "waitable-set.wait" (func $waitable-set.wait))
+      (export "future.new" (func $future.new))
+      (export "future.write-sync" (func $future.write-sync))
+    ))))
+    (func (export "start-future") (result (future u8)) (canon lift (core func $cm "start-future")))
+    (func (export "future-write-sync") async (result u32) (canon lift (core func $cm "future-write-sync")))
+    (func (export "acknowledge-future-write") async (canon lift (core func $cm "acknowledge-future-write")))
+  )
+
+  (component $D
+    (import "c" (instance $c
+      (export "start-future" (func (result (future u8))))
+      (export "future-write-sync" (func async (result u32)))
+      (export "acknowledge-future-write" (func async))
+    ))
+
+    (core instance $memory (instantiate $Memory))
+    (core module $Core
+      (import "" "mem" (memory 1))
+      (import "" "future.read" (func $future.read (param i32 i32) (result i32)))
+      (import "" "start-future" (func $start-future (result i32)))
+      (import "" "future-write-sync.async" (func $future-write-sync.async (param i32) (result i32)))
+      (import "" "acknowledge-future-write" (func $acknowledge-future-write))
+
+      (func $trap-after-future-async-write (export "trap-after-future-async-write")
+        (local $ret i32)
+        (local $fr i32)
+        (local $subtask i32)
+        (local.set $fr (call $start-future))
+
+        ;; calling future.write in $C should block
+        (local.set $ret (call $future-write-sync.async (i32.const 4)))
+        (if (i32.ne (i32.const 1 (; SUBTASK_STARTED ;)) (i32.and (local.get $ret) (i32.const 0xf)))
+          (then unreachable))
+
+        ;; our future.read should then succeed eagerly
+        (local.set $ret (call $future.read (local.get $fr) (i32.const 16)))
+        (if (i32.ne (i32.const 0 (; COMPLETED ;)) (local.get $ret))
+          (then unreachable))
+        (if (i32.ne (i32.const 42) (i32.load8_u (i32.const 16)))
+          (then unreachable))
+
+        ;; try to use a waitable-set to acquire an event...
+        (call $acknowledge-future-write)
+      )
+    )
+    (canon future.read $FT async (memory $memory "mem") (core func $future.read))
+    (canon lower (func $c "start-future") (core func $start-future'))
+    (canon lower (func $c "future-write-sync") async (memory $memory "mem") (core func $future-write-sync.async))
+    (canon lower (func $c "acknowledge-future-write") (core func $acknowledge-future-write'))
+    (core instance $core (instantiate $Core (with "" (instance
+      (export "mem" (memory $memory "mem"))
+      (export "future.read" (func $future.read))
+      (export "start-future" (func $start-future'))
+      (export "future-write-sync.async" (func $future-write-sync.async))
+      (export "acknowledge-future-write" (func $acknowledge-future-write'))
+    ))))
+    (func (export "trap-after-future-async-write") async (canon lift (core func $core "trap-after-future-async-write")))
+  )
+  (instance $c (instantiate $C))
+  (instance $d (instantiate $D (with "c" (instance $c))))
+  (func (export "trap-after-future-async-write") (alias export $d "trap-after-future-async-write"))
+)
+
+(assert_return (invoke "trap-after-future-async-write"))
+</code></pre></div>
+<p>&lt;/details&gt;</p>
+<p>currently fails with:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">cargo</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">W</span><span class="w"> </span><span class="n">component</span><span class="o">-</span><span class="n">model</span><span class="o">-</span><span class="k">async</span><span class="w"> </span><span class="n">foo</span><span class="p">.</span><span class="n">wast</span>
+<span class="w">    </span><span class="n">Finished</span><span class="w"> </span><span class="err">`</span><span class="n">dev</span><span class="err">`</span><span class="w"> </span><span class="n">profile</span><span class="w"> </span><span class="p">[</span><span class="n">unoptimized</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">debuginfo</span><span class="p">]</span><span class="w"> </span><span class="n">target</span><span class="p">(</span><span class="n">s</span><span class="p">)</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="mf">0.11</span><span class="n">s</span>
+<span class="w">     </span><span class="n">Running</span><span class="w"> </span><span class="err">`</span><span class="n">target</span><span class="o">/</span><span class="n">debug</span><span class="o">/</span><span class="n">wasmtime</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">W</span><span class="w"> </span><span class="n">component</span><span class="o">-</span><span class="n">model</span><span class="o">-</span><span class="k">async</span><span class="w"> </span><span class="n">foo</span><span class="p">.</span><span class="n">wast</span><span class="err">`</span>
+
+<span class="n">thread</span><span class="w"> </span><span class="o">'</span><span class="na">main</span><span class="o">'</span><span class="w"> </span><span class="p">(</span><span class="mi">3404937</span><span class="p">)</span><span class="w"> </span><span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">crates</span><span class="o">/</span><span class="n">wasmtime</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">runtime</span><span class="o">/</span><span class="n">bug</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">56</span><span class="p">:</span><span class="mi">13</span><span class="p">:</span>
+<span class="nc">BUG</span><span class="p">:</span><span class="w"> </span><span class="nc">event</span><span class="w"> </span><span class="n">expected</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">be</span><span class="w"> </span><span class="n">present</span>
+<span class="n">note</span><span class="p">:</span><span class="w"> </span><span class="nc">run</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="err">`</span><span class="n">RUST_BACKTRACE</span><span class="o">=</span><span class="mi">1</span><span class="err">`</span><span class="w"> </span><span class="n">environment</span><span class="w"> </span><span class="n">variable</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">display</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="n">backtrace</span>
+</code></pre></div>
+<p>The specific scenario here is:</p>
+<ul>
+<li>A subtask is blocked on a synchronous <code>future.write</code></li>
+<li>The writable-end of a future is in a waitable-set</li>
+<li>Then the future read is completed in another task. </li>
+<li>The waitable-set is blocked on</li>
+</ul>
+<p>My hunch is that we're accidentally delivering this event through the waitable set rather than exclusively sending it to the synchronous operation. No matter what we shouldn't be hitting a <code>bail_bug!</code> here. Once this specific issue is fixed, however, I think that this test should be expanded additionally to encompass other various interleavings. For example adding the future to a waitable set while the synchronous task hasn't yet returned but the event is "pending"  currently causes this test to pass, but that feels quite fishy to me since that might result in an event being delivered twice or the task never waking up.</p>
+<p>cc @lukewagner on this situation as well since this is a corner of the spec I'd like to double-check with you on. Basically when a task is blocked in a synchronous future/stream operation, it should be impossible for events related to that operation to get routed to a waitable set, right? Or should adding the future/stream to a waitable set at all during that blocking operation be a trap? Or something similar?</p>
+</blockquote>
+
+
+
+<a name="591219361"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313212%20bail_bug%21%20hit%20when%20synchronous%20wr.../near/591219361" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313212.20bail_bug.21.20hit.20when.20synchronous.20wr.2E.2E.2E.html#591219361">(Apr 27 2026 at 19:49)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasm-proposal:component-model-async label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13212">Issue #13212</a>.</p>
+
+
+
+<a name="591226431"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313212%20bail_bug%21%20hit%20when%20synchronous%20wr.../near/591226431" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313212.20bail_bug.21.20hit.20when.20synchronous.20wr.2E.2E.2E.html#591226431">(Apr 27 2026 at 20:29)</a>:</h4>
+<p>lukewagner <a href="https://github.com/bytecodealliance/wasmtime/issues/13212#issuecomment-4330237293">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13212">issue #13212</a>:</p>
+<blockquote>
+<p>Wow, that's definitely a hole in the spec; good points!</p>
+<p>So there's already a spec-level <code>SYNC_COPYING</code>-vs-<code>ASYNC_COPYING</code> state distinction on the readable/writable ends of streams/futures and this distinction is currently used to make <code>{stream,future}.cancel-{read,write}</code> trap if not <code>ASYNC_COPYING</code> (since otherwise cancellation would leave a sync read/write "dangling").  This situation with waitable sets "stealing" an event from a sync read/write seems analogous, so I think we could update the spec to say that when an end is <code>SYNC_COPYING</code>, events are never delivered to <code>waitable-set.{wait,poll}</code>.</p>
+<p>Considering the alternative of trapping if you try to add an end to a waitable set during a sync operation: we also have to trap in the case of adding the end to the waitable set and <em>then</em> starting the sync operation, and this seems like more trouble and potentially frustrating, so I think the first options is better?</p>
+</blockquote>
+
+
+
+<a name="591227021"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313212%20bail_bug%21%20hit%20when%20synchronous%20wr.../near/591227021" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313212.20bail_bug.21.20hit.20when.20synchronous.20wr.2E.2E.2E.html#591227021">(Apr 27 2026 at 20:32)</a>:</h4>
+<p>dicej <a href="https://github.com/bytecodealliance/wasmtime/issues/13212#issuecomment-4330253618">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13212">issue #13212</a>:</p>
+<blockquote>
+<p>FWIW, the Wasmtime implementation for sync reads or writes which block involve temporarily moving the waitable to an internal set, waiting on that set syncronously, then putting it back in the original (possibly null) set: <a href="https://github.com/bytecodealliance/wasmtime/blob/a0dd8b3a681146c35ef5bee8af941314f00e25c5/crates/wasmtime/src/runtime/component/concurrent.rs#L1922-L1935">https://github.com/bytecodealliance/wasmtime/blob/a0dd8b3a681146c35ef5bee8af941314f00e25c5/crates/wasmtime/src/runtime/component/concurrent.rs#L1922-L1935</a></p>
+</blockquote>
+
+
+
+<a name="591229905"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313212%20bail_bug%21%20hit%20when%20synchronous%20wr.../near/591229905" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313212.20bail_bug.21.20hit.20when.20synchronous.20wr.2E.2E.2E.html#591229905">(Apr 27 2026 at 20:48)</a>:</h4>
+<p>lukewagner <a href="https://github.com/bytecodealliance/wasmtime/issues/13212#issuecomment-4330348089">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13212">issue #13212</a>:</p>
+<blockquote>
+<p>Ah, interesting; does the current impl also do something (trap or... something fancier) if attempting to add a currently-sync-reading/writing end to a waitable-set?</p>
+</blockquote>
+
+
+
+<a name="591230530"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313212%20bail_bug%21%20hit%20when%20synchronous%20wr.../near/591230530" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313212.20bail_bug.21.20hit.20when.20synchronous.20wr.2E.2E.2E.html#591230530">(Apr 27 2026 at 20:52)</a>:</h4>
+<p>dicej <a href="https://github.com/bytecodealliance/wasmtime/issues/13212#issuecomment-4330369660">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13212">issue #13212</a>:</p>
+<blockquote>
+<blockquote>
+<p>Ah, interesting; does the current impl also do something (trap or... something fancier) if attempting to add a currently-sync-reading/writing end to a waitable-set?</p>
+</blockquote>
+<p>No, but it probably should.  I'll admit these scenarios hadn't occurred to me until now.</p>
+</blockquote>
+
+
+
+<a name="591231786"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313212%20bail_bug%21%20hit%20when%20synchronous%20wr.../near/591231786" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313212.20bail_bug.21.20hit.20when.20synchronous.20wr.2E.2E.2E.html#591231786">(Apr 27 2026 at 20:59)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/13212#issuecomment-4330411354">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13212">issue #13212</a>:</p>
+<blockquote>
+<p>Is this something where it might be reasonable, even at this late hour, to gate this from an 0.3.0 wasip3 release? I'm not aware of any guests requiring sync read/write intrinsics, so gating them behind a separate feature might be a feasible near-term change. Personally I'm basically perpetually worried about having all these sorts of interactions which seem reasonable on the surface but after digging a bit surprising combinations rise and give way to interesting and subtle questions. I'd effectively like to ensure that we are able to dedicate enough time to figuring these things out vs lumping everything together.</p>
+</blockquote>
+
+
+
+<a name="591233103"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313212%20bail_bug%21%20hit%20when%20synchronous%20wr.../near/591233103" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313212.20bail_bug.21.20hit.20when.20synchronous.20wr.2E.2E.2E.html#591233103">(Apr 27 2026 at 21:07)</a>:</h4>
+<p>lukewagner <a href="https://github.com/bytecodealliance/wasmtime/issues/13212#issuecomment-4330455058">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13212">issue #13212</a>:</p>
+<blockquote>
+<p>Yeah, if there's no users of the sync variants, that sounds reasonable.</p>
+</blockquote>
+
+
+
+<a name="591236905"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313212%20bail_bug%21%20hit%20when%20synchronous%20wr.../near/591236905" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313212.20bail_bug.21.20hit.20when.20synchronous.20wr.2E.2E.2E.html#591236905">(Apr 27 2026 at 21:36)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/13212#issuecomment-4330605129">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13212">issue #13212</a>:</p>
+<blockquote>
+<p>I've opened up <a href="https://github.com/WebAssembly/component-model/pull/641">https://github.com/WebAssembly/component-model/pull/641</a> at the spec level to explore gating this functionality by default.</p>
+</blockquote>
+
+
+
+<a name="591238483"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313212%20bail_bug%21%20hit%20when%20synchronous%20wr.../near/591238483" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313212.20bail_bug.21.20hit.20when.20synchronous.20wr.2E.2E.2E.html#591238483">(Apr 27 2026 at 21:48)</a>:</h4>
+<p>dicej <a href="https://github.com/bytecodealliance/wasmtime/issues/13212#issuecomment-4330663497">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13212">issue #13212</a>:</p>
+<blockquote>
+<p>Okay, I dug into this; the reason we're hitting the <code>bail_bug</code> is that the code I referenced above joins the waitable to its original set (after temporarily moving it to the internal set), which queues up an internal job to wake the task blocked on <code>waitable-set.wait</code>, _then_ takes the event from the waitable.  By the time the job runs to resume the <code>waitable-set.wait</code> task, the event has already been taken, and so the code is confused why it was woken up.</p>
+<p>I can change that code to take the event before joining the waitable to its original set, which will leave the task that's waiting on it to keep waiting (i.e. not queue a job to resume it), which seems consistent with what Luke described above.  Does that sound right?</p>
+</blockquote>
+
+
+
+<a name="591238597"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313212%20bail_bug%21%20hit%20when%20synchronous%20wr.../near/591238597" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313212.20bail_bug.21.20hit.20when.20synchronous.20wr.2E.2E.2E.html#591238597">(Apr 27 2026 at 21:49)</a>:</h4>
+<p>dicej edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/13212#issuecomment-4330663497">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13212">issue #13212</a>:</p>
+<blockquote>
+<p>Okay, I dug into this; the reason we're hitting the <code>bail_bug</code> is that the code I referenced above joins the waitable to its original set (after temporarily moving it to the internal set), which queues up an internal job to wake the task blocked on <code>waitable-set.wait</code>, and _then_ takes the event from the waitable.  By the time the job runs to resume the <code>waitable-set.wait</code> task, the event has already been taken, and so the code is confused why it was woken up.</p>
+<p>I can change that code to take the event before joining the waitable to its original set, which will leave the task that's waiting on it to keep waiting (i.e. not queue a job to resume it), which seems consistent with what Luke described above.  Does that sound right?</p>
+</blockquote>
+
+
+
+<a name="591241833"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313212%20bail_bug%21%20hit%20when%20synchronous%20wr.../near/591241833" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313212.20bail_bug.21.20hit.20when.20synchronous.20wr.2E.2E.2E.html#591241833">(Apr 27 2026 at 22:17)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/13212#issuecomment-4330798708">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13212">issue #13212</a>:</p>
+<blockquote>
+<p>I think in theory internally using a waitable set for sync operations means that it's basically broken if <code>waitable.join</code> is used while the blocking operation is in-flight? I also wouldn't be surprised if a cancelling a sync operation is allowed right now and processes as-if it were an async operation. </p>
+</blockquote>
+
+
+
+<a name="591249058"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313212%20bail_bug%21%20hit%20when%20synchronous%20wr.../near/591249058" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313212.20bail_bug.21.20hit.20when.20synchronous.20wr.2E.2E.2E.html#591249058">(Apr 27 2026 at 23:27)</a>:</h4>
+<p>dicej <a href="https://github.com/bytecodealliance/wasmtime/issues/13212#issuecomment-4331205200">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13212">issue #13212</a>:</p>
+<blockquote>
+<p>Yes, good point.  Seems that the first thing to do is clarify the spec to enumerate the various possible combinations of <code>waitable-set</code>s and sync ops and how they should behave, then we can update the implementation to match.</p>
+</blockquote>
+
+
+
+<a name="596273463"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313212%20bail_bug%21%20hit%20when%20synchronous%20wr.../near/596273463" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313212.20bail_bug.21.20hit.20when.20synchronous.20wr.2E.2E.2E.html#596273463">(May 19 2026 at 20:02)</a>:</h4>
+<p>dicej assigned dicej to <a href="https://github.com/bytecodealliance/wasmtime/issues/13212">issue #13212</a>.</p>
+
+
+
+<a name="596274503"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313212%20bail_bug%21%20hit%20when%20synchronous%20wr.../near/596274503" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313212.20bail_bug.21.20hit.20when.20synchronous.20wr.2E.2E.2E.html#596274503">(May 19 2026 at 20:07)</a>:</h4>
+<p>dicej <a href="https://github.com/bytecodealliance/wasmtime/issues/13212#issuecomment-4491596976">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13212">issue #13212</a>:</p>
+<blockquote>
+<p>I'm going to implement the spec changes made in <a href="https://github.com/WebAssembly/component-model/pull/647">https://github.com/WebAssembly/component-model/pull/647</a></p>
+</blockquote>
+
+
+
+<a name="597349038"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313212%20bail_bug%21%20hit%20when%20synchronous%20wr.../near/597349038" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313212.20bail_bug.21.20hit.20when.20synchronous.20wr.2E.2E.2E.html#597349038">(May 23 2026 at 23:12)</a>:</h4>
+<p>alexcrichton closed <a href="https://github.com/bytecodealliance/wasmtime/issues/13212">issue #13212</a>:</p>
+<blockquote>
+<p>This <code>*.wast</code> test:</p>
+<p>&lt;details&gt;</p>
+<div class="codehilite" data-code-language="wasm"><pre><span></span><code>;;! component_model_async = true
+;;! reference_types = true
+
+(component
+  (type $FT (future u8))
+  (core module $Memory (memory (export "mem") 1))
+
+  (component $C
+    (core instance $memory (instantiate $Memory))
+    (core module $CM
+      (import "" "mem" (memory 1))
+      (import "" "waitable.join" (func $waitable.join (param i32 i32)))
+      (import "" "waitable-set.new" (func $waitable-set.new (result i32)))
+      (import "" "waitable-set.wait" (func $waitable-set.wait (param i32 i32) (result i32)))
+      (import "" "future.new" (func $future.new (result i64)))
+      (import "" "future.write-sync" (func $future.write-sync (param i32 i32) (result i32)))
+
+      (global $writable-end (mut i32) (i32.const 0))
+      (global $ws (mut i32) (i32.const 0))
+
+      ;; create a new future, return the readable end to the caller
+      (func $start-future (export "start-future") (result i32)
+        (local $ret64 i64)
+        (global.set $ws (call $waitable-set.new))
+        (local.set $ret64 (call $future.new))
+        (global.set $writable-end (i32.wrap_i64 (i64.shr_u (local.get $ret64) (i64.const 32))))
+        (call $waitable.join (global.get $writable-end) (global.get $ws) )
+        (i32.wrap_i64 (local.get $ret64))
+      )
+      (func $future-write-sync (export "future-write-sync") (result i32)
+        ;; the caller will assert what they expect the return value to be
+        (i32.store (i32.const 16) (i32.const 42))
+        (call $future.write-sync (global.get $writable-end) (i32.const 16))
+      )
+      (func $acknowledge-future-write (export "acknowledge-future-write")
+        ;; confirm we got a FUTURE_WRITE $writable-end COMPLETED event
+        (local $ret i32)
+        (local.set $ret (call $waitable-set.wait (global.get $ws) (i32.const 0)))
+
+        ;; TODO: what should this actually be testing? Right now this hits a
+        ;; "BUG" in wasmtime...
+        (if (i32.ne (i32.const 5 (; FUTURE_WRITE ;)) (local.get $ret))
+          (then unreachable))
+        (if (i32.ne (global.get $writable-end) (i32.load (i32.const 0)))
+          (then unreachable))
+        (if (i32.ne (i32.const 0 (; COMPLETED ;)) (i32.load (i32.const 4)))
+          (then unreachable))
+      )
+    )
+    (canon waitable.join (core func $waitable.join))
+    (canon waitable-set.new (core func $waitable-set.new))
+    (canon waitable-set.wait (memory $memory "mem") (core func $waitable-set.wait))
+    (canon future.new $FT (core func $future.new))
+    (canon future.write $FT (memory $memory "mem") (core func $future.write-sync))
+    (core instance $cm (instantiate $CM (with "" (instance
+      (export "mem" (memory $memory "mem"))
+      (export "waitable.join" (func $waitable.join))
+      (export "waitable-set.new" (func $waitable-set.new))
+      (export "waitable-set.wait" (func $waitable-set.wait))
+      (export "future.new" (func $future.new))
+      (export "future.write-sync" (func $future.write-sync))
+    ))))
+    (func (export "start-future") (result (future u8)) (canon lift (core func $cm "start-future")))
+    (func (export "future-write-sync") async (result u32) (canon lift (core func $cm "future-write-sync")))
+    (func (export "acknowledge-future-write") async (canon lift (core func $cm "acknowledge-future-write")))
+  )
+
+  (component $D
+    (import "c" (instance $c
+      (export "start-future" (func (result (future u8))))
+      (export "future-write-sync" (func async (result u32)))
+      (export "acknowledge-future-write" (func async))
+    ))
+
+    (core instance $memory (instantiate $Memory))
+    (core module $Core
+      (import "" "mem" (memory 1))
+      (import "" "future.read" (func $future.read (param i32 i32) (result i32)))
+      (import "" "start-future" (func $start-future (result i32)))
+      (import "" "future-write-sync.async" (func $future-write-sync.async (param i32) (result i32)))
+      (import "" "acknowledge-future-write" (func $acknowledge-future-write))
+
+      (func $trap-after-future-async-write (export "trap-after-future-async-write")
+        (local $ret i32)
+        (local $fr i32)
+        (local $subtask i32)
+        (local.set $fr (call $start-future))
+
+        ;; calling future.write in $C should block
+        (local.set $ret (call $future-write-sync.async (i32.const 4)))
+        (if (i32.ne (i32.const 1 (; SUBTASK_STARTED ;)) (i32.and (local.get $ret) (i32.const 0xf)))
+          (then unreachable))
+
+        ;; our future.read should then succeed eagerly
+        (local.set $ret (call $future.read (local.get $fr) (i32.const 16)))
+        (if (i32.ne (i32.const 0 (; COMPLETED ;)) (local.get $ret))
+          (then unreachable))
+        (if (i32.ne (i32.const 42) (i32.load8_u (i32.const 16)))
+          (then unreachable))
+
+        ;; try to use a waitable-set to acquire an event...
+        (call $acknowledge-future-write)
+      )
+    )
+    (canon future.read $FT async (memory $memory "mem") (core func $future.read))
+    (canon lower (func $c "start-future") (core func $start-future'))
+    (canon lower (func $c "future-write-sync") async (memory $memory "mem") (core func $future-write-sync.async))
+    (canon lower (func $c "acknowledge-future-write") (core func $acknowledge-future-write'))
+    (core instance $core (instantiate $Core (with "" (instance
+      (export "mem" (memory $memory "mem"))
+      (export "future.read" (func $future.read))
+      (export "start-future" (func $start-future'))
+      (export "future-write-sync.async" (func $future-write-sync.async))
+      (export "acknowledge-future-write" (func $acknowledge-future-write'))
+    ))))
+    (func (export "trap-after-future-async-write") async (canon lift (core func $core "trap-after-future-async-write")))
+  )
+  (instance $c (instantiate $C))
+  (instance $d (instantiate $D (with "c" (instance $c))))
+  (func (export "trap-after-future-async-write") (alias export $d "trap-after-future-async-write"))
+)
+
+(assert_return (invoke "trap-after-future-async-write"))
+</code></pre></div>
+<p>&lt;/details&gt;</p>
+<p>currently fails with:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">cargo</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">W</span><span class="w"> </span><span class="n">component</span><span class="o">-</span><span class="n">model</span><span class="o">-</span><span class="k">async</span><span class="w"> </span><span class="n">foo</span><span class="p">.</span><span class="n">wast</span>
+<span class="w">    </span><span class="n">Finished</span><span class="w"> </span><span class="err">`</span><span class="n">dev</span><span class="err">`</span><span class="w"> </span><span class="n">profile</span><span class="w"> </span><span class="p">[</span><span class="n">unoptimized</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">debuginfo</span><span class="p">]</span><span class="w"> </span><span class="n">target</span><span class="p">(</span><span class="n">s</span><span class="p">)</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="mf">0.11</span><span class="n">s</span>
+<span class="w">     </span><span class="n">Running</span><span class="w"> </span><span class="err">`</span><span class="n">target</span><span class="o">/</span><span class="n">debug</span><span class="o">/</span><span class="n">wasmtime</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">W</span><span class="w"> </span><span class="n">component</span><span class="o">-</span><span class="n">model</span><span class="o">-</span><span class="k">async</span><span class="w"> </span><span class="n">foo</span><span class="p">.</span><span class="n">wast</span><span class="err">`</span>
+
+<span class="n">thread</span><span class="w"> </span><span class="o">'</span><span class="na">main</span><span class="o">'</span><span class="w"> </span><span class="p">(</span><span class="mi">3404937</span><span class="p">)</span><span class="w"> </span><span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">crates</span><span class="o">/</span><span class="n">wasmtime</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">runtime</span><span class="o">/</span><span class="n">bug</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">56</span><span class="p">:</span><span class="mi">13</span><span class="p">:</span>
+<span class="nc">BUG</span><span class="p">:</span><span class="w"> </span><span class="nc">event</span><span class="w"> </span><span class="n">expected</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">be</span><span class="w"> </span><span class="n">present</span>
+<span class="n">note</span><span class="p">:</span><span class="w"> </span><span class="nc">run</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="err">`</span><span class="n">RUST_BACKTRACE</span><span class="o">=</span><span class="mi">1</span><span class="err">`</span><span class="w"> </span><span class="n">environment</span><span class="w"> </span><span class="n">variable</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">display</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="n">backtrace</span>
+</code></pre></div>
+<p>The specific scenario here is:</p>
+<ul>
+<li>A subtask is blocked on a synchronous <code>future.write</code></li>
+<li>The writable-end of a future is in a waitable-set</li>
+<li>Then the future read is completed in another task. </li>
+<li>The waitable-set is blocked on</li>
+</ul>
+<p>My hunch is that we're accidentally delivering this event through the waitable set rather than exclusively sending it to the synchronous operation. No matter what we shouldn't be hitting a <code>bail_bug!</code> here. Once this specific issue is fixed, however, I think that this test should be expanded additionally to encompass other various interleavings. For example adding the future to a waitable set while the synchronous task hasn't yet returned but the event is "pending"  currently causes this test to pass, but that feels quite fishy to me since that might result in an event being delivered twice or the task never waking up.</p>
+<p>cc @lukewagner on this situation as well since this is a corner of the spec I'd like to double-check with you on. Basically when a task is blocked in a synchronous future/stream operation, it should be impossible for events related to that operation to get routed to a waitable set, right? Or should adding the future/stream to a waitable set at all during that blocking operation be a trap? Or something similar?</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

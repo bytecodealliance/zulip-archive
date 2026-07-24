@@ -1,0 +1,246 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13409 Cranelift: Potential soundness is... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313409.20Cranelift.3A.20Potential.20soundness.20is.2E.2E.2E.html">wasmtime / issue #13409 Cranelift: Potential soundness is...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="596169619"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313409%20Cranelift%3A%20Potential%20soundness%20is.../near/596169619" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313409.20Cranelift.3A.20Potential.20soundness.20is.2E.2E.2E.html#596169619">(May 19 2026 at 13:34)</a>:</h4>
+<p>varies-rust opened <a href="https://github.com/bytecodealliance/wasmtime/issues/13409">issue #13409</a>:</p>
+<blockquote>
+<p>Hello, and thank you for maintaining this crate.</p>
+<p>I found a sanitizer/Miri failure reachable through public crate APIs using safe Rust code. I may be missing crate-specific preconditions, but the behavior looks worth checking because safe callers should not be able to trigger undefined behavior.</p>
+<h2>Summary</h2>
+<ul>
+<li>Crate: <code>cranelift-egraph</code></li>
+<li>Version tested: <code>0.91.1</code></li>
+<li>API paths with similar failures observed:<ul>
+<li><code>BumpVec::push</code></li>
+<li><code>BumpVec::reserve</code></li>
+<li><code>BumpVec::truncate</code></li>
+<li><code>BumpArena::single</code></li>
+<li><code>BumpArena::vec_with_capacity</code></li>
+</ul>
+</li>
+</ul>
+<h2>Observed diagnostics</h2>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>MemorySanitizer use of uninitialized value: WARNING: MemorySanitizer: use-of-uninitialized-value
+Miri undefined behavior: error: Undefined Behavior: reading memory at alloc68512[0x0..0x8], but memory is uninitialized at [0x0..0x8], and this operation requires initialized memory
+</code></pre></div>
+<h2>Reproduction</h2>
+<p>The snippets below are minimal readable reproducers. Each PoC also includes the source location most relevant to the reported failure.</p>
+<h3>PoC 1: <code>test_cranelift_egraph109::generated_test_109</code></h3>
+<p>Relevant source location:</p>
+<ul>
+<li><code>src/bumpvec.rs:357</code>: <code>BumpVec::push</code> accepts an arbitrary <code>BumpArena&lt;T&gt;</code> argument.</li>
+<li><code>src/bumpvec.rs:304</code>: <code>as_slice</code> reads from the supplied arena using only stored <code>base</code> and <code>len</code>.</li>
+</ul>
+<p>Readable equivalent PoC:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">io</span><span class="p">::</span><span class="n">Sink</span><span class="p">;</span>
+
+<span class="cp">#[test]</span>
+<span class="k">fn</span><span class="w"> </span><span class="nf">poc</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">vec</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cranelift_egraph</span><span class="p">::</span><span class="n">BumpVec</span><span class="p">::</span><span class="o">&lt;&amp;</span><span class="n">Sink</span><span class="o">&gt;</span><span class="p">::</span><span class="n">default</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">arena_b</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cranelift_egraph</span><span class="p">::</span><span class="n">BumpArena</span><span class="p">::</span><span class="o">&lt;&amp;</span><span class="n">Sink</span><span class="o">&gt;</span><span class="p">::</span><span class="n">default</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">sink</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">io</span><span class="p">::</span><span class="n">sink</span><span class="p">();</span>
+
+<span class="w">    </span><span class="n">vec</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sink</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">arena_b</span><span class="p">);</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">arena_a</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cranelift_egraph</span><span class="p">::</span><span class="n">BumpArena</span><span class="p">::</span><span class="o">&lt;&amp;</span><span class="n">Sink</span><span class="o">&gt;</span><span class="p">::</span><span class="n">default</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">_</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">arena_a</span><span class="p">.</span><span class="n">vec_with_capacity</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">_</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">vec</span><span class="p">.</span><span class="n">as_slice</span><span class="p">(</span><span class="o">&amp;</span><span class="n">arena_a</span><span class="p">)[</span><span class="mi">0</span><span class="p">];</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Observed diagnostic:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>WARNING: MemorySanitizer: use-of-uninitialized-value
+</code></pre></div>
+<h3>PoC 2: <code>test_cranelift_egraph120::generated_test_120</code></h3>
+<p>Relevant source location:</p>
+<ul>
+<li><code>src/bumpvec.rs:334</code>: <code>reserve</code> also accepts an arbitrary arena argument.</li>
+<li><code>src/bumpvec.rs:357</code>: <code>push</code> can attach data through a different arena than later operations use.</li>
+</ul>
+<p>Readable equivalent PoC:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">io</span><span class="p">::</span><span class="n">Sink</span><span class="p">;</span>
+
+<span class="cp">#[test]</span>
+<span class="k">fn</span><span class="w"> </span><span class="nf">poc</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">vec</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cranelift_egraph</span><span class="p">::</span><span class="n">BumpVec</span><span class="p">::</span><span class="o">&lt;&amp;</span><span class="n">Sink</span><span class="o">&gt;</span><span class="p">::</span><span class="n">default</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">arena_b</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cranelift_egraph</span><span class="p">::</span><span class="n">BumpArena</span><span class="p">::</span><span class="o">&lt;&amp;</span><span class="n">Sink</span><span class="o">&gt;</span><span class="p">::</span><span class="n">default</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">sink</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">io</span><span class="p">::</span><span class="n">sink</span><span class="p">();</span>
+
+<span class="w">    </span><span class="n">vec</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sink</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">arena_b</span><span class="p">);</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">arena_a</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cranelift_egraph</span><span class="p">::</span><span class="n">BumpArena</span><span class="p">::</span><span class="o">&lt;&amp;</span><span class="n">Sink</span><span class="o">&gt;</span><span class="p">::</span><span class="n">default</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">_</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">arena_a</span><span class="p">.</span><span class="n">vec_with_capacity</span><span class="p">(</span><span class="mi">2</span><span class="p">);</span>
+<span class="w">    </span><span class="n">vec</span><span class="p">.</span><span class="n">reserve</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">arena_a</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Observed diagnostic:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>error: Undefined Behavior: reading memory at alloc68512[0x0..0x8], but memory is uninitialized at [0x0..0x8], and this operation requires initialized memory
+</code></pre></div>
+<h2>Source review and suggested fix</h2>
+<p>Brief reasoning:</p>
+<ul>
+<li><code>BumpVec</code> tracks only numeric indices, not the arena that actually owns the backing slots.</li>
+<li>A safe caller can push into one arena and later read or reallocate the same logical vector through another arena.</li>
+<li>That breaks the storage provenance the unsafe helpers rely on.</li>
+</ul>
+<p>Suggested fix:</p>
+<ul>
+<li>Tie the vector to the arena lifetime or store and check arena identity before using arena-backed storage.</li>
+</ul>
+<p>Thanks again for taking a look.<br>
+</p>
+</blockquote>
+
+
+
+<a name="596169621"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313409%20Cranelift%3A%20Potential%20soundness%20is.../near/596169621" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313409.20Cranelift.3A.20Potential.20soundness.20is.2E.2E.2E.html#596169621">(May 19 2026 at 13:35)</a>:</h4>
+<p><a href="https://github.com/varies-rust">varies-rust</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13409">Issue #13409</a>.</p>
+
+
+
+<a name="596169623"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313409%20Cranelift%3A%20Potential%20soundness%20is.../near/596169623" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313409.20Cranelift.3A.20Potential.20soundness.20is.2E.2E.2E.html#596169623">(May 19 2026 at 13:35)</a>:</h4>
+<p><a href="https://github.com/varies-rust">varies-rust</a> added the cranelift label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13409">Issue #13409</a>.</p>
+
+
+
+<a name="596244258"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313409%20Cranelift%3A%20Potential%20soundness%20is.../near/596244258" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313409.20Cranelift.3A.20Potential.20soundness.20is.2E.2E.2E.html#596244258">(May 19 2026 at 17:49)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/13409#issuecomment-4490483692">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13409">issue #13409</a>:</p>
+<blockquote>
+<p>Hi: <code>cranelift-egraph</code> is no longer maintained -- we merged the egraph implementation back into our existing <code>cranelift-codegen</code> crate long ago. The old crate version still on <a href="http://crates.io">crates.io</a> is an artifact of our project setup with multiple crates: when we delete a crate, we no longer publish new versions with new Cranelift/Wasmtime releases, so an old version remains forever on <a href="http://crates.io">crates.io</a>.</p>
+<p>Maybe we should change that (e.g. publish a "tombstone" version that is empty, or yank the crate). @fitzgen @alexcrichton what do you think?</p>
+</blockquote>
+
+
+
+<a name="596265467"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313409%20Cranelift%3A%20Potential%20soundness%20is.../near/596265467" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313409.20Cranelift.3A.20Potential.20soundness.20is.2E.2E.2E.html#596265467">(May 19 2026 at 19:25)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/13409#issuecomment-4491271451">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13409">issue #13409</a>:</p>
+<blockquote>
+<p>Either seems fine by me. Also doing nothing is probably also fine, since this is the first spurious report we've had in many years of that crate not being active.</p>
+</blockquote>
+
+
+
+<a name="596295700"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313409%20Cranelift%3A%20Potential%20soundness%20is.../near/596295700" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313409.20Cranelift.3A.20Potential.20soundness.20is.2E.2E.2E.html#596295700">(May 19 2026 at 21:59)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/13409#issuecomment-4492405539">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13409">issue #13409</a>:</p>
+<blockquote>
+<p>Personally I'd say we do nothing here, there's a fair number of <code>wasmtime-*</code> crates that are no longer maintained and I don't know the set that we'd have to go back and publish markers for.</p>
+</blockquote>
+
+
+
+<a name="596296504"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313409%20Cranelift%3A%20Potential%20soundness%20is.../near/596296504" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313409.20Cranelift.3A.20Potential.20soundness.20is.2E.2E.2E.html#596296504">(May 19 2026 at 22:04)</a>:</h4>
+<p>cfallin closed <a href="https://github.com/bytecodealliance/wasmtime/issues/13409">issue #13409</a>:</p>
+<blockquote>
+<p>Hello, and thank you for maintaining this crate.</p>
+<p>I found a sanitizer/Miri failure reachable through public crate APIs using safe Rust code. I may be missing crate-specific preconditions, but the behavior looks worth checking because safe callers should not be able to trigger undefined behavior.</p>
+<h2>Summary</h2>
+<ul>
+<li>Crate: <code>cranelift-egraph</code></li>
+<li>Version tested: <code>0.91.1</code></li>
+<li>API paths with similar failures observed:<ul>
+<li><code>BumpVec::push</code></li>
+<li><code>BumpVec::reserve</code></li>
+<li><code>BumpVec::truncate</code></li>
+<li><code>BumpArena::single</code></li>
+<li><code>BumpArena::vec_with_capacity</code></li>
+</ul>
+</li>
+</ul>
+<h2>Observed diagnostics</h2>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>MemorySanitizer use of uninitialized value: WARNING: MemorySanitizer: use-of-uninitialized-value
+Miri undefined behavior: error: Undefined Behavior: reading memory at alloc68512[0x0..0x8], but memory is uninitialized at [0x0..0x8], and this operation requires initialized memory
+</code></pre></div>
+<h2>Reproduction</h2>
+<p>The snippets below are minimal readable reproducers. Each PoC also includes the source location most relevant to the reported failure.</p>
+<h3>PoC 1: <code>test_cranelift_egraph109::generated_test_109</code></h3>
+<p>Relevant source location:</p>
+<ul>
+<li><code>src/bumpvec.rs:357</code>: <code>BumpVec::push</code> accepts an arbitrary <code>BumpArena&lt;T&gt;</code> argument.</li>
+<li><code>src/bumpvec.rs:304</code>: <code>as_slice</code> reads from the supplied arena using only stored <code>base</code> and <code>len</code>.</li>
+</ul>
+<p>Readable equivalent PoC:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">io</span><span class="p">::</span><span class="n">Sink</span><span class="p">;</span>
+
+<span class="cp">#[test]</span>
+<span class="k">fn</span><span class="w"> </span><span class="nf">poc</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">vec</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cranelift_egraph</span><span class="p">::</span><span class="n">BumpVec</span><span class="p">::</span><span class="o">&lt;&amp;</span><span class="n">Sink</span><span class="o">&gt;</span><span class="p">::</span><span class="n">default</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">arena_b</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cranelift_egraph</span><span class="p">::</span><span class="n">BumpArena</span><span class="p">::</span><span class="o">&lt;&amp;</span><span class="n">Sink</span><span class="o">&gt;</span><span class="p">::</span><span class="n">default</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">sink</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">io</span><span class="p">::</span><span class="n">sink</span><span class="p">();</span>
+
+<span class="w">    </span><span class="n">vec</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sink</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">arena_b</span><span class="p">);</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">arena_a</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cranelift_egraph</span><span class="p">::</span><span class="n">BumpArena</span><span class="p">::</span><span class="o">&lt;&amp;</span><span class="n">Sink</span><span class="o">&gt;</span><span class="p">::</span><span class="n">default</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">_</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">arena_a</span><span class="p">.</span><span class="n">vec_with_capacity</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">_</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">vec</span><span class="p">.</span><span class="n">as_slice</span><span class="p">(</span><span class="o">&amp;</span><span class="n">arena_a</span><span class="p">)[</span><span class="mi">0</span><span class="p">];</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Observed diagnostic:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>WARNING: MemorySanitizer: use-of-uninitialized-value
+</code></pre></div>
+<h3>PoC 2: <code>test_cranelift_egraph120::generated_test_120</code></h3>
+<p>Relevant source location:</p>
+<ul>
+<li><code>src/bumpvec.rs:334</code>: <code>reserve</code> also accepts an arbitrary arena argument.</li>
+<li><code>src/bumpvec.rs:357</code>: <code>push</code> can attach data through a different arena than later operations use.</li>
+</ul>
+<p>Readable equivalent PoC:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">io</span><span class="p">::</span><span class="n">Sink</span><span class="p">;</span>
+
+<span class="cp">#[test]</span>
+<span class="k">fn</span><span class="w"> </span><span class="nf">poc</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">vec</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cranelift_egraph</span><span class="p">::</span><span class="n">BumpVec</span><span class="p">::</span><span class="o">&lt;&amp;</span><span class="n">Sink</span><span class="o">&gt;</span><span class="p">::</span><span class="n">default</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">arena_b</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cranelift_egraph</span><span class="p">::</span><span class="n">BumpArena</span><span class="p">::</span><span class="o">&lt;&amp;</span><span class="n">Sink</span><span class="o">&gt;</span><span class="p">::</span><span class="n">default</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">sink</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">io</span><span class="p">::</span><span class="n">sink</span><span class="p">();</span>
+
+<span class="w">    </span><span class="n">vec</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sink</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">arena_b</span><span class="p">);</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">arena_a</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cranelift_egraph</span><span class="p">::</span><span class="n">BumpArena</span><span class="p">::</span><span class="o">&lt;&amp;</span><span class="n">Sink</span><span class="o">&gt;</span><span class="p">::</span><span class="n">default</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">_</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">arena_a</span><span class="p">.</span><span class="n">vec_with_capacity</span><span class="p">(</span><span class="mi">2</span><span class="p">);</span>
+<span class="w">    </span><span class="n">vec</span><span class="p">.</span><span class="n">reserve</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">arena_a</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Observed diagnostic:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>error: Undefined Behavior: reading memory at alloc68512[0x0..0x8], but memory is uninitialized at [0x0..0x8], and this operation requires initialized memory
+</code></pre></div>
+<h2>Source review and suggested fix</h2>
+<p>Brief reasoning:</p>
+<ul>
+<li><code>BumpVec</code> tracks only numeric indices, not the arena that actually owns the backing slots.</li>
+<li>A safe caller can push into one arena and later read or reallocate the same logical vector through another arena.</li>
+<li>That breaks the storage provenance the unsafe helpers rely on.</li>
+</ul>
+<p>Suggested fix:</p>
+<ul>
+<li>Tie the vector to the arena lifetime or store and check arena identity before using arena-backed storage.</li>
+</ul>
+<p>Thanks again for taking a look.<br>
+</p>
+</blockquote>
+
+
+
+<a name="596296505"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313409%20Cranelift%3A%20Potential%20soundness%20is.../near/596296505" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313409.20Cranelift.3A.20Potential.20soundness.20is.2E.2E.2E.html#596296505">(May 19 2026 at 22:04)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/13409#issuecomment-4492438058">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13409">issue #13409</a>:</p>
+<blockquote>
+<p>Cool, I will close the issue then, on the basis that the version of Wasmtime+Cranelift that that crate is associated with is far outside of our current support window. Thanks nevertheless for filing the issue!</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

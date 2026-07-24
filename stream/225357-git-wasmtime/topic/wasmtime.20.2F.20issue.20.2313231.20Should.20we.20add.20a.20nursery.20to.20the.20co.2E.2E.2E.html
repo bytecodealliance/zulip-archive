@@ -1,0 +1,85 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13231 Should we add a nursery to the co... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313231.20Should.20we.20add.20a.20nursery.20to.20the.20co.2E.2E.2E.html">wasmtime / issue #13231 Should we add a nursery to the co...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="591807301"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313231%20Should%20we%20add%20a%20nursery%20to%20the%20co.../near/591807301" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313231.20Should.20we.20add.20a.20nursery.20to.20the.20co.2E.2E.2E.html#591807301">(Apr 29 2026 at 14:06)</a>:</h4>
+<p>fitzgen opened <a href="https://github.com/bytecodealliance/wasmtime/issues/13231">issue #13231</a>:</p>
+<blockquote>
+<blockquote>
+<blockquote>
+<p>My rough assumption as well is that long-term we'll want nurseries as well, right? If that's the case would it make sense to document that in an issue as an open future work item?</p>
+</blockquote>
+<p>Not totally clear to me right now. A nursery probably isn't worth it for our typical short-running programs, since we can mostly just avoid collecting in those cases, and would only slow down wasm execution via the write barriers it would require. (Also, our amortized GC heap growth algorithm effectively means we have N nursery collections on the way to the full heap size, if you squint hard.)</p>
+<p>But someone with long-running wasm instance use cases may indeed want a nursery. But then we also wouldn't want to force a nursery on the short-running use cases that don't need it.</p>
+<p>Seems like the kind of bridge we can cross when we get to it. I wouldn't go so far as to say that we should expect it to happen with enough certainty that a tracking issue is required at this time.</p>
+</blockquote>
+<p>_Originally posted by @fitzgen in <a href="https://github.com/bytecodealliance/wasmtime/issues/13107#issuecomment-4254865035_">https://github.com/bytecodealliance/wasmtime/issues/13107#issuecomment-4254865035_</a></p>
+<hr>
+<p>Also, regarding my above comment, we could potentially introduce <em>another</em> collector that has a nursery and is tuned for longer-running Wasm instances, while keeping the copying collector as it is today without a nursery.</p>
+<p>Or somehow make it a cargo feature or something, but that seems pretty hairy.</p>
+<hr>
+<p>In addition to the above discussion, there is the question of how to implement the nursery, and in particular its remembered set, with O(1)-sized host data structures outside of the GC heap's memory.</p>
+<ul>
+<li>
+<p>The remembered set is the set of GC <em>edges</em> from the tenured heap into the nursery.</p>
+</li>
+<li>
+<p>A typical approach might be something like a chunk-list where we bump into each chunk until we run out of capacity and then allocate another chunk, and chunks form a linked list together. The problem is that this means that <code>GcStore::write_gc_ref</code> might need to allocate, which might need to grow the GC heap or trigger a collection, so it would need to become async and fallible, which means it needs to keep GC objects in a valid state for retry after GC, which is just a <em>huge</em> can of worms given that the remembered set is required to perform GC correctly.</p>
+</li>
+<li>
+<p>We could alternatively have an intrusive linked list in tenured objects' headers, and inclusion in this list means that one of your edges is in the remembered set. This is a big overapproximation of the remembered set, and if a very large array has one edge in the remembered set, then we will need to scan the whole array when collecting the nursery. But it does give use the O(1)-sized host data structures property.</p>
+<ul>
+<li>We could potentially alleviate the large-array issue by doing a variant of card marking, where we have a bitmap in the array with a bit for every N elements and we set an element's associated bit when it is inserted into the remembered set. This caps wasted tracing to <code>N - 1</code> at most but imposes size overhead and makes barriers more expensive.</li>
+</ul>
+</li>
+<li>
+<p>Some kind of hybrid set up where we use a chunk-list when possible but fall back to the intrusive linked list of tenured objects when allocating a new chunk fails and would require GC or heap growth? Does the fast thing when it can, falls back to the slower thing when it can't to avoid the fallibility/async/gc in the middle of a barrier question. Downsides are additional complexity, we would always pay for the size of the linked-list link in object headers, even when the remembered set fully fits in the chunk-list, and more-expensive barriers.</p>
+</li>
+</ul>
+<p>Certainly there are other ideas to explore here. I mostly just wanted to write this stuff down and get it out of my head while it is fresh. I don't actually expect us to make any moves here anytime soon.</p>
+</blockquote>
+
+
+
+<a name="591807335"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313231%20Should%20we%20add%20a%20nursery%20to%20the%20co.../near/591807335" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313231.20Should.20we.20add.20a.20nursery.20to.20the.20co.2E.2E.2E.html#591807335">(Apr 29 2026 at 14:06)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the wasm-proposal:gc label to <a href="https://github.com/bytecodealliance/wasmtime/issues/13231">Issue #13231</a>.</p>
+
+
+
+<a name="596204740"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313231%20Should%20we%20add%20a%20nursery%20to%20the%20co.../near/596204740" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313231.20Should.20we.20add.20a.20nursery.20to.20the.20co.2E.2E.2E.html#596204740">(May 19 2026 at 15:32)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/13231#issuecomment-4489373240">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13231">issue #13231</a>:</p>
+<blockquote>
+<p>Other implementation option I thought of the other day: try to allocate new chunks for the remembered set's chunk list when we can, but if it fails, then set a bit somewhere saying that everything in the nursery is conservatively considered referenced from the tenured heap, so we promote everything on next nursery GC. Note that this would only be required for the host implementations of the write barriers, not the JIT code's barriers, so is probably rare and acceptable.</p>
+</blockquote>
+
+
+
+<a name="596243142"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313231%20Should%20we%20add%20a%20nursery%20to%20the%20co.../near/596243142" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313231.20Should.20we.20add.20a.20nursery.20to.20the.20co.2E.2E.2E.html#596243142">(May 19 2026 at 17:44)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/issues/13231#issuecomment-4490445268">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13231">issue #13231</a>:</p>
+<blockquote>
+<p>There might also be other dimensions to limit space in: for example, per minimal-object-size chunk of the nursery, have 1 (or K) pointers-to-references-to-this-object-in-tenured-heap? E.g. for the 1 pointer case, and let's say min obj size 16 bytes so 25% space overhead (4 bytes per 16 bytes):</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">write_barrier</span><span class="p">(</span><span class="n">field_ptr</span><span class="p">,</span><span class="w"> </span><span class="n">pointee</span><span class="p">):</span>
+<span class="w">  </span><span class="nc">if</span><span class="w"> </span><span class="n">is_nursery</span><span class="p">(</span><span class="n">pointee</span><span class="p">):</span>
+<span class="w">    </span><span class="nc">if</span><span class="w"> </span><span class="n">shadow</span><span class="p">[</span><span class="n">pointee</span><span class="p">]</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">null</span><span class="p">:</span>
+<span class="w">      </span><span class="nc">slow</span><span class="w"> </span><span class="n">path</span><span class="w"> </span><span class="p">(</span><span class="n">push</span><span class="w"> </span><span class="n">into</span><span class="w"> </span><span class="n">linear</span><span class="w"> </span><span class="n">remembered</span><span class="o">-</span><span class="n">set</span><span class="w"> </span><span class="n">edge</span><span class="w"> </span><span class="n">list</span><span class="p">,</span><span class="w"> </span><span class="n">maybe</span><span class="w"> </span><span class="k">async</span><span class="w"> </span><span class="n">pause</span><span class="p">,</span><span class="w"> </span><span class="o">..</span><span class="p">.)</span>
+<span class="w">    </span><span class="k">else</span><span class="p">:</span>
+<span class="w">      </span><span class="nc">shadow</span><span class="p">[</span><span class="n">pointee</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">field_ptr</span>
+</code></pre></div>
+<p>This is optimizing on a hypothesis that most remembered nursery objects are going to be referenced by at most one edge into the nursery (common "allocate an object/object graph then root it by storing it into durable data structures" pattern). It does have a cliff when doing more than that of course. One could tune K upward, trading off complexity of the write barrier to move that cliff. It's also a not-too-steep cliff if the slow path is a push-into-remembered-list-chunk-with-space-available most of the time.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

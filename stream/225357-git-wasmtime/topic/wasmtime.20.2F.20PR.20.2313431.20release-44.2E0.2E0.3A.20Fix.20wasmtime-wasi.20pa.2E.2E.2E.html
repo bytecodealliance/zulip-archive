@@ -1,0 +1,196 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #13431 release-44.0.0: Fix wasmtime-wasi pa... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313431.20release-44.2E0.2E0.3A.20Fix.20wasmtime-wasi.20pa.2E.2E.2E.html">wasmtime / PR #13431 release-44.0.0: Fix wasmtime-wasi pa...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="596789866"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313431%20release-44.0.0%3A%20Fix%20wasmtime-wasi%20pa.../near/596789866" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313431.20release-44.2E0.2E0.3A.20Fix.20wasmtime-wasi.20pa.2E.2E.2E.html#596789866">(May 21 2026 at 16:34)</a>:</h4>
+<p>pchickey opened <a href="https://github.com/bytecodealliance/wasmtime/pull/13431">PR #13431</a> from <code>pchickey:fix_ghsa_2r75_release_44</code> to <code>bytecodealliance:release-44.0.0</code>:</p>
+<blockquote>
+<p>In <code>wasmtime-wasi</code>, when a filesystem preopen is given <code>DirPerms::all()</code> and <code>FilePerms::READ</code> without <code>FilePerms::WRITE</code>,  this wasmtime-wasi enforced access control mechanism can be bypassed by using the wasip2 <code>descriptor.open-at</code> or wasip1 <code>path_open</code> interfaces by opening a file with <code>OpenFlags::TRUNCATE</code> oflag only, for example:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">dir_descriptor</span><span class="p">.</span><span class="n">open_at</span><span class="p">(</span>
+<span class="w">   </span><span class="n">PathFlags</span><span class="p">::</span><span class="n">empty</span><span class="p">(),</span>
+<span class="w">   </span><span class="n">FILENAME</span><span class="p">,</span>
+<span class="w">   </span><span class="n">OpenFlags</span><span class="p">::</span><span class="n">TRUNCATE</span><span class="p">,</span>
+<span class="w">   </span><span class="n">DescriptorFlags</span><span class="p">::</span><span class="n">READ</span><span class="p">,</span>
+<span class="p">)</span>
+</code></pre></div>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">wasip1</span><span class="p">::</span><span class="n">path_open</span><span class="p">(</span>
+<span class="w">    </span><span class="n">dir_fd</span><span class="p">,</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="n">FILENAME</span><span class="p">,</span>
+<span class="w">    </span><span class="n">wasip1</span><span class="p">::</span><span class="n">OFLAGS_TRUNC</span><span class="p">,</span>
+<span class="w">    </span><span class="n">wasip1</span><span class="p">::</span><span class="n">RIGHTS_FD_READ</span><span class="p">,</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="mi">0</span>
+<span class="p">)</span>
+</code></pre></div>
+<p>The root cause is that the clause that considered <code>OpenFlags::TRUNCATE</code> did not set <code>open_mode |= OpenMode::WRITE;</code>, used later in that function for the access control check against <code>FilePerms</code> for whether opening that file is permitted. With the bug corrected, these calls to <code>open-at</code> and <code>path_open</code> fail with <code>error-code.not-permitted</code> and <code>ERRNO_PERM</code> respectively.</p>
+<p>The bug in <code>crates/wasi/src/filesystem.rs</code>, <code>Dir::open_at</code>, lines 967–969:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="n">oflags</span><span class="p">.</span><span class="n">contains</span><span class="p">(</span><span class="n">OpenFlags</span><span class="p">::</span><span class="n">TRUNCATE</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">opts</span><span class="p">.</span><span class="n">truncate</span><span class="p">(</span><span class="kc">true</span><span class="p">).</span><span class="n">write</span><span class="p">(</span><span class="kc">true</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>and the single line fix is:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="n">oflags</span><span class="p">.</span><span class="n">contains</span><span class="p">(</span><span class="n">OpenFlags</span><span class="p">::</span><span class="n">TRUNCATE</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">opts</span><span class="p">.</span><span class="n">truncate</span><span class="p">(</span><span class="kc">true</span><span class="p">).</span><span class="n">write</span><span class="p">(</span><span class="kc">true</span><span class="p">);</span>
+<span class="w">    </span><span class="n">open_mode</span><span class="w"> </span><span class="o">|=</span><span class="w"> </span><span class="n">OpenMode</span><span class="p">::</span><span class="n">WRITE</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Only wasmtime-wasi embeddings that use a combination of DirPerms::MUTATE with FilePerms::READ are affected by this bug, e.g. those that use in the <code>WasiCtxBuilder</code>:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">builder</span><span class="p">.</span><span class="n">preopened_dir</span><span class="p">(</span><span class="s">"readonly"</span><span class="p">,</span><span class="w"> </span><span class="s">"readonly"</span><span class="p">,</span><span class="w"> </span><span class="n">DirPerms</span><span class="p">::</span><span class="n">READ</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">DirPerms</span><span class="p">::</span><span class="n">MUTATE</span><span class="p">,</span><span class="w"> </span><span class="n">FilePerms</span><span class="p">::</span><span class="n">READ</span><span class="p">);</span>
+</code></pre></div>
+<p>In particular, the Wasmtime project's <code>wasmtime-cli</code>'s use of wasmtime-wasi is not affected, because it always sets <code>FilePerms::all()</code> for all preopens.</p>
+</blockquote>
+
+
+
+<a name="596789874"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313431%20release-44.0.0%3A%20Fix%20wasmtime-wasi%20pa.../near/596789874" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313431.20release-44.2E0.2E0.3A.20Fix.20wasmtime-wasi.20pa.2E.2E.2E.html#596789874">(May 21 2026 at 16:34)</a>:</h4>
+<p>pchickey requested <a href="https://github.com/dicej">dicej</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13431">PR #13431</a>.</p>
+
+
+
+<a name="596789876"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313431%20release-44.0.0%3A%20Fix%20wasmtime-wasi%20pa.../near/596789876" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313431.20release-44.2E0.2E0.3A.20Fix.20wasmtime-wasi.20pa.2E.2E.2E.html#596789876">(May 21 2026 at 16:34)</a>:</h4>
+<p>pchickey requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-wasi-reviewers">wasmtime-wasi-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13431">PR #13431</a>.</p>
+
+
+
+<a name="596789878"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313431%20release-44.0.0%3A%20Fix%20wasmtime-wasi%20pa.../near/596789878" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313431.20release-44.2E0.2E0.3A.20Fix.20wasmtime-wasi.20pa.2E.2E.2E.html#596789878">(May 21 2026 at 16:34)</a>:</h4>
+<p>pchickey requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13431">PR #13431</a>.</p>
+
+
+
+<a name="596789882"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313431%20release-44.0.0%3A%20Fix%20wasmtime-wasi%20pa.../near/596789882" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313431.20release-44.2E0.2E0.3A.20Fix.20wasmtime-wasi.20pa.2E.2E.2E.html#596789882">(May 21 2026 at 16:34)</a>:</h4>
+<p>pchickey requested <a href="https://github.com/fitzgen">fitzgen</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13431">PR #13431</a>.</p>
+
+
+
+<a name="596789883"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313431%20release-44.0.0%3A%20Fix%20wasmtime-wasi%20pa.../near/596789883" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313431.20release-44.2E0.2E0.3A.20Fix.20wasmtime-wasi.20pa.2E.2E.2E.html#596789883">(May 21 2026 at 16:34)</a>:</h4>
+<p>pchickey requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-default-reviewers">wasmtime-default-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/13431">PR #13431</a>.</p>
+
+
+
+<a name="596790963"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313431%20release-44.0.0%3A%20Fix%20wasmtime-wasi%20pa.../near/596790963" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313431.20release-44.2E0.2E0.3A.20Fix.20wasmtime-wasi.20pa.2E.2E.2E.html#596790963">(May 21 2026 at 16:39)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/13431#pullrequestreview-4338841187">PR review</a>.</p>
+
+
+
+<a name="596792469"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313431%20release-44.0.0%3A%20Fix%20wasmtime-wasi%20pa.../near/596792469" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313431.20release-44.2E0.2E0.3A.20Fix.20wasmtime-wasi.20pa.2E.2E.2E.html#596792469">(May 21 2026 at 16:46)</a>:</h4>
+<p>pchickey edited <a href="https://github.com/bytecodealliance/wasmtime/pull/13431">PR #13431</a>:</p>
+<blockquote>
+<p>This is a backport of #13429 to the 44.0.0 release branch.</p>
+<p>&lt;details&gt;</p>
+<p>In <code>wasmtime-wasi</code>, when a filesystem preopen is given <code>DirPerms::all()</code> and <code>FilePerms::READ</code> without <code>FilePerms::WRITE</code>,  this wasmtime-wasi enforced access control mechanism can be bypassed by using the wasip2 <code>descriptor.open-at</code> or wasip1 <code>path_open</code> interfaces by opening a file with <code>OpenFlags::TRUNCATE</code> oflag only, for example:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">dir_descriptor</span><span class="p">.</span><span class="n">open_at</span><span class="p">(</span>
+<span class="w">   </span><span class="n">PathFlags</span><span class="p">::</span><span class="n">empty</span><span class="p">(),</span>
+<span class="w">   </span><span class="n">FILENAME</span><span class="p">,</span>
+<span class="w">   </span><span class="n">OpenFlags</span><span class="p">::</span><span class="n">TRUNCATE</span><span class="p">,</span>
+<span class="w">   </span><span class="n">DescriptorFlags</span><span class="p">::</span><span class="n">READ</span><span class="p">,</span>
+<span class="p">)</span>
+</code></pre></div>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">wasip1</span><span class="p">::</span><span class="n">path_open</span><span class="p">(</span>
+<span class="w">    </span><span class="n">dir_fd</span><span class="p">,</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="n">FILENAME</span><span class="p">,</span>
+<span class="w">    </span><span class="n">wasip1</span><span class="p">::</span><span class="n">OFLAGS_TRUNC</span><span class="p">,</span>
+<span class="w">    </span><span class="n">wasip1</span><span class="p">::</span><span class="n">RIGHTS_FD_READ</span><span class="p">,</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="mi">0</span>
+<span class="p">)</span>
+</code></pre></div>
+<p>The root cause is that the clause that considered <code>OpenFlags::TRUNCATE</code> did not set <code>open_mode |= OpenMode::WRITE;</code>, used later in that function for the access control check against <code>FilePerms</code> for whether opening that file is permitted. With the bug corrected, these calls to <code>open-at</code> and <code>path_open</code> fail with <code>error-code.not-permitted</code> and <code>ERRNO_PERM</code> respectively.</p>
+<p>The bug in <code>crates/wasi/src/filesystem.rs</code>, <code>Dir::open_at</code>, lines 967–969:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="n">oflags</span><span class="p">.</span><span class="n">contains</span><span class="p">(</span><span class="n">OpenFlags</span><span class="p">::</span><span class="n">TRUNCATE</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">opts</span><span class="p">.</span><span class="n">truncate</span><span class="p">(</span><span class="kc">true</span><span class="p">).</span><span class="n">write</span><span class="p">(</span><span class="kc">true</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>and the single line fix is:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="n">oflags</span><span class="p">.</span><span class="n">contains</span><span class="p">(</span><span class="n">OpenFlags</span><span class="p">::</span><span class="n">TRUNCATE</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">opts</span><span class="p">.</span><span class="n">truncate</span><span class="p">(</span><span class="kc">true</span><span class="p">).</span><span class="n">write</span><span class="p">(</span><span class="kc">true</span><span class="p">);</span>
+<span class="w">    </span><span class="n">open_mode</span><span class="w"> </span><span class="o">|=</span><span class="w"> </span><span class="n">OpenMode</span><span class="p">::</span><span class="n">WRITE</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Only wasmtime-wasi embeddings that use a combination of DirPerms::MUTATE with FilePerms::READ are affected by this bug, e.g. those that use in the <code>WasiCtxBuilder</code>:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">builder</span><span class="p">.</span><span class="n">preopened_dir</span><span class="p">(</span><span class="s">"readonly"</span><span class="p">,</span><span class="w"> </span><span class="s">"readonly"</span><span class="p">,</span><span class="w"> </span><span class="n">DirPerms</span><span class="p">::</span><span class="n">READ</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">DirPerms</span><span class="p">::</span><span class="n">MUTATE</span><span class="p">,</span><span class="w"> </span><span class="n">FilePerms</span><span class="p">::</span><span class="n">READ</span><span class="p">);</span>
+</code></pre></div>
+<p>In particular, the Wasmtime project's <code>wasmtime-cli</code>'s use of wasmtime-wasi is not affected, because it always sets <code>FilePerms::all()</code> for all preopens.</p>
+<p>&lt;/details&gt;</p>
+</blockquote>
+
+
+
+<a name="596793773"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313431%20release-44.0.0%3A%20Fix%20wasmtime-wasi%20pa.../near/596793773" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313431.20release-44.2E0.2E0.3A.20Fix.20wasmtime-wasi.20pa.2E.2E.2E.html#596793773">(May 21 2026 at 16:52)</a>:</h4>
+<p>pchickey updated <a href="https://github.com/bytecodealliance/wasmtime/pull/13431">PR #13431</a>.</p>
+
+
+
+<a name="596793931"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313431%20release-44.0.0%3A%20Fix%20wasmtime-wasi%20pa.../near/596793931" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313431.20release-44.2E0.2E0.3A.20Fix.20wasmtime-wasi.20pa.2E.2E.2E.html#596793931">(May 21 2026 at 16:53)</a>:</h4>
+<p>pchickey has enabled auto merge for <a href="https://github.com/bytecodealliance/wasmtime/pull/13431">PR #13431</a>.</p>
+
+
+
+<a name="596801961"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313431%20release-44.0.0%3A%20Fix%20wasmtime-wasi%20pa.../near/596801961" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313431.20release-44.2E0.2E0.3A.20Fix.20wasmtime-wasi.20pa.2E.2E.2E.html#596801961">(May 21 2026 at 17:31)</a>:</h4>
+<p>pchickey has disabled auto merge for <a href="https://github.com/bytecodealliance/wasmtime/pull/13431">PR #13431</a>.</p>
+
+
+
+<a name="596801964"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313431%20release-44.0.0%3A%20Fix%20wasmtime-wasi%20pa.../near/596801964" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313431.20release-44.2E0.2E0.3A.20Fix.20wasmtime-wasi.20pa.2E.2E.2E.html#596801964">(May 21 2026 at 17:31)</a>:</h4>
+<p><span aria-label="cross mark" class="emoji emoji-274c" role="img" title="cross mark">:cross_mark:</span> pchickey closed without merge <a href="https://github.com/bytecodealliance/wasmtime/pull/13431">PR #13431</a>.</p>
+
+
+
+<a name="596801967"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313431%20release-44.0.0%3A%20Fix%20wasmtime-wasi%20pa.../near/596801967" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313431.20release-44.2E0.2E0.3A.20Fix.20wasmtime-wasi.20pa.2E.2E.2E.html#596801967">(May 21 2026 at 17:31)</a>:</h4>
+<p>pchickey <a href="https://github.com/bytecodealliance/wasmtime/pull/13431#issuecomment-4510872127">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13431">PR #13431</a>:</p>
+<blockquote>
+<p>One of the macos ci runners has hung, closing and reopening to hopefully get a fresh run?</p>
+</blockquote>
+
+
+
+<a name="596801980"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313431%20release-44.0.0%3A%20Fix%20wasmtime-wasi%20pa.../near/596801980" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313431.20release-44.2E0.2E0.3A.20Fix.20wasmtime-wasi.20pa.2E.2E.2E.html#596801980">(May 21 2026 at 17:31)</a>:</h4>
+<p>pchickey reopened <a href="https://github.com/bytecodealliance/wasmtime/pull/13431">PR #13431</a> from <code>pchickey:fix_ghsa_2r75_release_44</code> to <code>bytecodealliance:release-44.0.0</code>.</p>
+
+
+
+<a name="596802072"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313431%20release-44.0.0%3A%20Fix%20wasmtime-wasi%20pa.../near/596802072" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313431.20release-44.2E0.2E0.3A.20Fix.20wasmtime-wasi.20pa.2E.2E.2E.html#596802072">(May 21 2026 at 17:32)</a>:</h4>
+<p>pchickey edited a <a href="https://github.com/bytecodealliance/wasmtime/pull/13431#issuecomment-4510872127">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/13431">PR #13431</a>:</p>
+<blockquote>
+<p>One of the macos ci runners has hung and the cancel button isnt working, closing and reopening to hopefully get a fresh run?</p>
+</blockquote>
+
+
+
+<a name="596802722"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313431%20release-44.0.0%3A%20Fix%20wasmtime-wasi%20pa.../near/596802722" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313431.20release-44.2E0.2E0.3A.20Fix.20wasmtime-wasi.20pa.2E.2E.2E.html#596802722">(May 21 2026 at 17:35)</a>:</h4>
+<p>pchickey has enabled auto merge for <a href="https://github.com/bytecodealliance/wasmtime/pull/13431">PR #13431</a>.</p>
+
+
+
+<a name="596807968"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2313431%20release-44.0.0%3A%20Fix%20wasmtime-wasi%20pa.../near/596807968" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2313431.20release-44.2E0.2E0.3A.20Fix.20wasmtime-wasi.20pa.2E.2E.2E.html#596807968">(May 21 2026 at 17:57)</a>:</h4>
+<p><span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span> pchickey merged <a href="https://github.com/bytecodealliance/wasmtime/pull/13431">PR #13431</a>.</p>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>

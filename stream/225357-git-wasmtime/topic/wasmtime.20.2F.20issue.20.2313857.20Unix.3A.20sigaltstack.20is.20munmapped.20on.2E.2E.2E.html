@@ -1,0 +1,140 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #13857 Unix: sigaltstack is munmapped on... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313857.20Unix.3A.20sigaltstack.20is.20munmapped.20on.2E.2E.2E.html">wasmtime / issue #13857 Unix: sigaltstack is munmapped on...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="609354133"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313857%20Unix%3A%20sigaltstack%20is%20munmapped%20on.../near/609354133" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313857.20Unix.3A.20sigaltstack.20is.20munmapped.20on.2E.2E.2E.html#609354133">(Jul 10 2026 at 01:34)</a>:</h4>
+<p>tiandiwonder opened <a href="https://github.com/bytecodealliance/wasmtime/issues/13857">issue #13857</a>:</p>
+<blockquote>
+<h3>Summary</h3>
+<p>On Unix, <code>lazy_per_thread_init</code> (<code>crates/wasmtime/src/runtime/vm/sys/unix/signals.rs</code>) registers a custom alternate signal stack per thread. Its TLS destructor deallocates it like this:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">impl</span><span class="w"> </span><span class="nb">Drop</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">Stack</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">drop</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// Deallocate the stack memory.</span>
+<span class="w">            </span><span class="kd">let</span><span class="w"> </span><span class="n">r</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">rustix</span><span class="p">::</span><span class="n">mm</span><span class="p">::</span><span class="n">munmap</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">mmap_ptr</span><span class="p">,</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">mmap_size</span><span class="p">);</span>
+<span class="w">            </span><span class="fm">debug_assert!</span><span class="p">(</span><span class="n">r</span><span class="p">.</span><span class="n">is_ok</span><span class="p">(),</span><span class="w"> </span><span class="s">"munmap failed during thread shutdown"</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The stack is munmapped <strong>without first calling <code>sigaltstack</code> with <code>SS_DISABLE</code></strong> (or restoring the previous stack), so the kernel keeps the freed range registered as the thread's alternate signal stack for the remainder of thread teardown.</p>
+<h3>Consequences</h3>
+<ol>
+<li>
+<p>If any <code>SA_ONSTACK</code> signal is delivered to the thread after this destructor runs (other TLS destructors, sanitizer teardown, etc.), the kernel pushes the signal frame onto unmapped memory.</p>
+</li>
+<li>
+<p>Worse, for AddressSanitizer embedders: ASan's thread-destruction hook calls <code>UnsetAlternateSignalStack()</code> (<code>compiler-rt/lib/sanitizer_common/sanitizer_posix_libcdep.cpp</code>), which queries the <em>currently registered</em> altstack and unconditionally <code>UnmapOrDie(oldstack.ss_sp, oldstack.ss_size)</code>. With the dangling registration left by <code>Stack::drop</code>, ASan re-munmaps a 256 KiB range that was already freed — and possibly <strong>already reused by the allocator</strong> — silently destroying pages of live, unrelated heap allocations. The eventual crash appears at a random later point in whatever code owned the reused memory, which makes it extremely hard to attribute.</p>
+</li>
+</ol>
+<p>This looks like the actual mechanism behind the long-standing mystery documented in the comment at the top of <code>lazy_per_thread_init</code> (the ASan fuzzing crashes reproduced in <a href="https://gist.github.com/alexcrichton/6815a5d57a3c5ca94a8d816a9fcc91af">https://gist.github.com/alexcrichton/6815a5d57a3c5ca94a8d816a9fcc91af</a>): it is not TLS-destructor ordering corrupting ASan state — it is the dangling <code>sigaltstack</code> registration making ASan's <code>UnsetAlternateSignalStack</code> unmap a stale (reused) range. The existing <code>cfg!(asan)</code> guard only protects builds where the <em>Rust</em> code is compiled with <code>-Zsanitizer=address</code>; embedders that instrument only their C/C++ side with ASan and link wasmtime built without it (a common setup) still hit the bug.</p>
+<h3>Real-world impact</h3>
+<p>We (ClickHouse) chased sporadic ASan CI crashes for two months, where random large read buffers were found unmapped mid-use. Forensics of a core dump showed the faulted buffer was still registered as live in ASan's secondary allocator (never freed) and the destroyed page range measured exactly one wasmtime sigaltstack allocation (guard page + <code>MIN_STACK_SIZE</code> = 64×4096); a WASM module had executed on a pool thread minutes earlier, and the crash fired when that thread was reaped. Details: <a href="https://github.com/ClickHouse/ClickHouse/issues/104692">https://github.com/ClickHouse/ClickHouse/issues/104692</a>, fixed on our side by re-enabling <code>cfg(asan)</code> via <a href="https://github.com/ClickHouse/ClickHouse/pull/109950">https://github.com/ClickHouse/ClickHouse/pull/109950</a>.</p>
+<h3>Suggested fix</h3>
+<p>In <code>Stack::drop</code>, disable (or restore the previously registered) alternate signal stack before unmapping:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">impl</span><span class="w"> </span><span class="nb">Drop</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">Stack</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">drop</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="kd">let</span><span class="w"> </span><span class="n">disable</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">libc</span><span class="p">::</span><span class="n">stack_t</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="n">ss_sp</span><span class="p">:</span><span class="w"> </span><span class="nc">ptr</span><span class="p">::</span><span class="n">null_mut</span><span class="p">(),</span>
+<span class="w">                </span><span class="n">ss_flags</span><span class="p">:</span><span class="w"> </span><span class="nc">libc</span><span class="p">::</span><span class="n">SS_DISABLE</span><span class="p">,</span>
+<span class="w">                </span><span class="n">ss_size</span><span class="p">:</span><span class="w"> </span><span class="nc">MIN_STACK_SIZE</span><span class="p">,</span>
+<span class="w">            </span><span class="p">};</span>
+<span class="w">            </span><span class="kd">let</span><span class="w"> </span><span class="n">r</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">libc</span><span class="p">::</span><span class="n">sigaltstack</span><span class="p">(</span><span class="o">&amp;</span><span class="n">disable</span><span class="p">,</span><span class="w"> </span><span class="n">ptr</span><span class="p">::</span><span class="n">null_mut</span><span class="p">());</span>
+<span class="w">            </span><span class="fm">debug_assert_eq!</span><span class="p">(</span><span class="n">r</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="s">"sigaltstack(SS_DISABLE) failed during thread shutdown"</span><span class="p">);</span>
+<span class="w">            </span><span class="kd">let</span><span class="w"> </span><span class="n">r</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">rustix</span><span class="p">::</span><span class="n">mm</span><span class="p">::</span><span class="n">munmap</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">mmap_ptr</span><span class="p">,</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">mmap_size</span><span class="p">);</span>
+<span class="w">            </span><span class="fm">debug_assert!</span><span class="p">(</span><span class="n">r</span><span class="p">.</span><span class="n">is_ok</span><span class="p">(),</span><span class="w"> </span><span class="s">"munmap failed during thread shutdown"</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>With that in place the <code>cfg!(asan)</code> opt-out may even become unnecessary, since ASan's <code>UnsetAlternateSignalStack</code> would then see a disabled stack instead of a dangling one (worth verifying — <code>UnmapOrDie(NULL, ...)</code> on a disabled stack would fail loudly rather than corrupt, so ASan-instrumented-Rust builds may still want the guard).</p>
+</blockquote>
+
+
+
+<a name="609476493"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313857%20Unix%3A%20sigaltstack%20is%20munmapped%20on.../near/609476493" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313857.20Unix.3A.20sigaltstack.20is.20munmapped.20on.2E.2E.2E.html#609476493">(Jul 10 2026 at 14:53)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/13857#issuecomment-4936574805">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13857">issue #13857</a>:</p>
+<blockquote>
+<p>Thanks for the report! I'm not certain there's much we can do about this though other than recommending that asan builds indeed compile Rust with asan as well to disable the sigaltstack. This is a much better explanation to the current hand-wavy one of why we can't use a sigaltstack with asan, however.</p>
+<p>What I'd be worried about is that I basically don't think we're equipped to reset the thread's <code>sigaltstack</code> back to the original on drop. While we could preserve whatever was leftover there we still don't have any guarantee about the order of TLS destructors so we don't know if we'd reset the stack from Wasmtime's stack to the prior or if the stack has already been reset by something else. Additionally I don't think we can just unset the <code>sigaltstack</code> because historical versions of LLVM seem to always call <code>munmap</code> on the return value of <code>sigaltstack</code> when unsetting.</p>
+<p>Looking at LLVM tip-of-tree, however, <a href="https://github.com/llvm/llvm-project/blob/6211a71358a4d23d810a0bca526ea28f98e07996/compiler-rt/lib/sanitizer_common/sanitizer_posix_libcdep.cpp#L208-L217">it looks like this behavior has changed</a> and might mean that this is now compatible? I think that the tip-of-tree behavior would be compatible with Wasmtime as-is, and it'd also be compatible with unsetting the sigaltstack as well in the handler.</p>
+</blockquote>
+
+
+
+<a name="610055610"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313857%20Unix%3A%20sigaltstack%20is%20munmapped%20on.../near/610055610" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313857.20Unix.3A.20sigaltstack.20is.20munmapped.20on.2E.2E.2E.html#610055610">(Jul 14 2026 at 09:33)</a>:</h4>
+<p>tiandiwonder <a href="https://github.com/bytecodealliance/wasmtime/issues/13857#issuecomment-4967538958">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/13857">issue #13857</a>:</p>
+<blockquote>
+<p>Re the historical-LLVM concern: I checked the released compiler-rt implementations, and <code>UnmapOrDie</code> starts with <code>if (!addr || !size) return;</code> (<a href="https://github.com/llvm/llvm-project/blob/release/21.x/compiler-rt/lib/sanitizer_common/sanitizer_posix.cpp#L57-L58">sanitizer_posix.cpp</a>; it is the same at least as far back as the clang-21 runtime where we hit this). After <code>sigaltstack(SS_DISABLE)</code>, Linux reports <code>ss_sp = NULL, ss_size = 0</code> for the disabled stack, so a historical <code>UnsetAlternateSignalStack</code> running after the disable does <code>UnmapOrDie(NULL, 0)</code> — a harmless no-op rather than a <code>Die</code>. So plain <code>SS_DISABLE</code> in <code>Stack::drop</code> (no restoring of the previous stack, agreed that is not robust under TLS-destructor ordering) appears compatible with both historical and tip-of-tree runtimes. Darwin is worth double-checking, but per POSIX a disabled stack reports <code>SS_DISABLE</code> and sanitizers only act on the pointer.</p>
+<p>To be fair about coverage: <code>SS_DISABLE</code> does not help the opposite TLS-destructor ordering — if ASan's thread teardown runs <em>before</em> wasmtime's TLS destructor, a pre-<a href="https://github.com/llvm/llvm-project/pull/179000">llvm/llvm-project#179000</a> runtime still unmaps the then-live wasmtime stack. That side can only be fixed in the sanitizer runtime, and #179000 (merged 2026-05-11) ships in LLVM 23 at the earliest; every released LLVM (≤ 22) has the unconditional unmap.</p>
+<p>Still, <code>SS_DISABLE</code> in <code>Stack::drop</code> looks like a strict improvement with no downside on any runtime version: it fixes the dangling kernel registration for all embedders (consequence 1 — signal frames pushed onto unmapped memory during the rest of thread teardown), and it closes the ordering we actually hit in production (wasmtime destructor first, ASan teardown second). Keeping the <code>cfg!(asan)</code> guard on top for Rust-instrumented builds remains reasonable.<br>
+</p>
+</blockquote>
+
+
+
+<a name="611750945"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2313857%20Unix%3A%20sigaltstack%20is%20munmapped%20on.../near/611750945" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2313857.20Unix.3A.20sigaltstack.20is.20munmapped.20on.2E.2E.2E.html#611750945">(Jul 20 2026 at 19:57)</a>:</h4>
+<p>alexcrichton closed <a href="https://github.com/bytecodealliance/wasmtime/issues/13857">issue #13857</a>:</p>
+<blockquote>
+<h3>Summary</h3>
+<p>On Unix, <code>lazy_per_thread_init</code> (<code>crates/wasmtime/src/runtime/vm/sys/unix/signals.rs</code>) registers a custom alternate signal stack per thread. Its TLS destructor deallocates it like this:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">impl</span><span class="w"> </span><span class="nb">Drop</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">Stack</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">drop</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// Deallocate the stack memory.</span>
+<span class="w">            </span><span class="kd">let</span><span class="w"> </span><span class="n">r</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">rustix</span><span class="p">::</span><span class="n">mm</span><span class="p">::</span><span class="n">munmap</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">mmap_ptr</span><span class="p">,</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">mmap_size</span><span class="p">);</span>
+<span class="w">            </span><span class="fm">debug_assert!</span><span class="p">(</span><span class="n">r</span><span class="p">.</span><span class="n">is_ok</span><span class="p">(),</span><span class="w"> </span><span class="s">"munmap failed during thread shutdown"</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The stack is munmapped <strong>without first calling <code>sigaltstack</code> with <code>SS_DISABLE</code></strong> (or restoring the previous stack), so the kernel keeps the freed range registered as the thread's alternate signal stack for the remainder of thread teardown.</p>
+<h3>Consequences</h3>
+<ol>
+<li>
+<p>If any <code>SA_ONSTACK</code> signal is delivered to the thread after this destructor runs (other TLS destructors, sanitizer teardown, etc.), the kernel pushes the signal frame onto unmapped memory.</p>
+</li>
+<li>
+<p>Worse, for AddressSanitizer embedders: ASan's thread-destruction hook calls <code>UnsetAlternateSignalStack()</code> (<code>compiler-rt/lib/sanitizer_common/sanitizer_posix_libcdep.cpp</code>), which queries the <em>currently registered</em> altstack and unconditionally <code>UnmapOrDie(oldstack.ss_sp, oldstack.ss_size)</code>. With the dangling registration left by <code>Stack::drop</code>, ASan re-munmaps a 256 KiB range that was already freed — and possibly <strong>already reused by the allocator</strong> — silently destroying pages of live, unrelated heap allocations. The eventual crash appears at a random later point in whatever code owned the reused memory, which makes it extremely hard to attribute.</p>
+</li>
+</ol>
+<p>This looks like the actual mechanism behind the long-standing mystery documented in the comment at the top of <code>lazy_per_thread_init</code> (the ASan fuzzing crashes reproduced in <a href="https://gist.github.com/alexcrichton/6815a5d57a3c5ca94a8d816a9fcc91af">https://gist.github.com/alexcrichton/6815a5d57a3c5ca94a8d816a9fcc91af</a>): it is not TLS-destructor ordering corrupting ASan state — it is the dangling <code>sigaltstack</code> registration making ASan's <code>UnsetAlternateSignalStack</code> unmap a stale (reused) range. The existing <code>cfg!(asan)</code> guard only protects builds where the <em>Rust</em> code is compiled with <code>-Zsanitizer=address</code>; embedders that instrument only their C/C++ side with ASan and link wasmtime built without it (a common setup) still hit the bug.</p>
+<h3>Real-world impact</h3>
+<p>We (ClickHouse) chased sporadic ASan CI crashes for two months, where random large read buffers were found unmapped mid-use. Forensics of a core dump showed the faulted buffer was still registered as live in ASan's secondary allocator (never freed) and the destroyed page range measured exactly one wasmtime sigaltstack allocation (guard page + <code>MIN_STACK_SIZE</code> = 64×4096); a WASM module had executed on a pool thread minutes earlier, and the crash fired when that thread was reaped. Details: <a href="https://github.com/ClickHouse/ClickHouse/issues/104692">https://github.com/ClickHouse/ClickHouse/issues/104692</a>, fixed on our side by re-enabling <code>cfg(asan)</code> via <a href="https://github.com/ClickHouse/ClickHouse/pull/109950">https://github.com/ClickHouse/ClickHouse/pull/109950</a>.</p>
+<h3>Suggested fix</h3>
+<p>In <code>Stack::drop</code>, disable (or restore the previously registered) alternate signal stack before unmapping:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">impl</span><span class="w"> </span><span class="nb">Drop</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">Stack</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">drop</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="kd">let</span><span class="w"> </span><span class="n">disable</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">libc</span><span class="p">::</span><span class="n">stack_t</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="n">ss_sp</span><span class="p">:</span><span class="w"> </span><span class="nc">ptr</span><span class="p">::</span><span class="n">null_mut</span><span class="p">(),</span>
+<span class="w">                </span><span class="n">ss_flags</span><span class="p">:</span><span class="w"> </span><span class="nc">libc</span><span class="p">::</span><span class="n">SS_DISABLE</span><span class="p">,</span>
+<span class="w">                </span><span class="n">ss_size</span><span class="p">:</span><span class="w"> </span><span class="nc">MIN_STACK_SIZE</span><span class="p">,</span>
+<span class="w">            </span><span class="p">};</span>
+<span class="w">            </span><span class="kd">let</span><span class="w"> </span><span class="n">r</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">libc</span><span class="p">::</span><span class="n">sigaltstack</span><span class="p">(</span><span class="o">&amp;</span><span class="n">disable</span><span class="p">,</span><span class="w"> </span><span class="n">ptr</span><span class="p">::</span><span class="n">null_mut</span><span class="p">());</span>
+<span class="w">            </span><span class="fm">debug_assert_eq!</span><span class="p">(</span><span class="n">r</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="s">"sigaltstack(SS_DISABLE) failed during thread shutdown"</span><span class="p">);</span>
+<span class="w">            </span><span class="kd">let</span><span class="w"> </span><span class="n">r</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">rustix</span><span class="p">::</span><span class="n">mm</span><span class="p">::</span><span class="n">munmap</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">mmap_ptr</span><span class="p">,</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">mmap_size</span><span class="p">);</span>
+<span class="w">            </span><span class="fm">debug_assert!</span><span class="p">(</span><span class="n">r</span><span class="p">.</span><span class="n">is_ok</span><span class="p">(),</span><span class="w"> </span><span class="s">"munmap failed during thread shutdown"</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>With that in place the <code>cfg!(asan)</code> opt-out may even become unnecessary, since ASan's <code>UnsetAlternateSignalStack</code> would then see a disabled stack instead of a dangling one (worth verifying — <code>UnmapOrDie(NULL, ...)</code> on a disabled stack would fail loudly rather than corrupt, so ASan-instrumented-Rust builds may still want the guard).</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Jul 24 2026 at 22:24 UTC</p>
+</html>
