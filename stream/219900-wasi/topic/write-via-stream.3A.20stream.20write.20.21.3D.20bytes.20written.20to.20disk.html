@@ -1,0 +1,244 @@
+<html>
+<head><meta charset="utf-8"><title>write-via-stream: stream write != bytes written to disk · wasi · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/index.html">wasi</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html">write-via-stream: stream write != bytes written to disk</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="614352917"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614352917" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614352917">(Aug 03 2026 at 16:00)</a>:</h4>
+<p>tl;dr - <a href="https://github.com/WebAssembly/WASI/blob/6c290cec1c0ec972372548a897cb462177724ddb/proposals/filesystem/wit/types.wit#L347">write-via-stream</a> or some new API should probably return a stream of disk write acks, because stream write != disk write. </p>
+<p>Recently we ran into <a href="https://github.com/WebAssembly/wasi-testsuite/blob/main/tests/rust/wasm32-wasip3/src/bin/filesystem-io.rs#L108">a racy test</a> in the wasi-testsuite with regards to <a href="https://github.com/WebAssembly/WASI/blob/6c290cec1c0ec972372548a897cb462177724ddb/proposals/filesystem/wit/types.wit#L347">use of <code>write-via-stream</code></a>. </p>
+<p>To try to explain the race concisely:</p>
+<ol>
+<li><a href="https://github.com/WebAssembly/WASI/blob/6c290cec1c0ec972372548a897cb462177724ddb/proposals/filesystem/wit/types.wit#L363"><code>append-via-stream</code></a> is called with a stream <code>s1</code></li>
+<li>data is written to <code>s1</code></li>
+<li>After the <em>stream write</em> completes, <code>stat</code> is called, to check if the file reflects the written bytes</li>
+<li>Depending on the outcome of <code>stat</code> more bytes may be sent to <code>s1</code> (i.e. finishing a partial write)</li>
+</ol>
+<p>The issue here is between steps (2) and (3) -- bytes being written to the stream <em>does not mean those bytes hit disk</em>. In this case, the test mistakes those two things, and because <code>wasmtime</code> does host magic to make that the case, the test runs fine in <code>wasmtime</code>. The stream-write is <em>delayed until the disk-write completes</em>, so by the time <code>stat</code> gets called, we really do have a guarantee that the bytes are on disk and thus show up when <code>stat</code> executes. </p>
+<p>On the Jco side, however, we don't have this same host magic (though we can add it), and we actually end up blocking. Some context on why:</p>
+<ol>
+<li>Our fs <code>write</code> happens in a WebWorker (somewhat "far away")</li>
+<li>Our fs <code>stat</code> does not</li>
+<li>The event loop may not order these as we'd like</li>
+</ol>
+<p>This manifests as two problem scenarios on the Jco side:</p>
+<ol>
+<li>Even if <code>write</code> gets called before <code>stat</code> on the Jco side, the <code>stat</code> may actually happen <em>before</em> the <code>write</code></li>
+<li>In the case where the <code>write</code> is (properly) called first, we hang because while the partial write happens and we start waiting on the stream read for more bytes, but we'll never finish (amongst other issues the <code>stat</code> blows up because the writes did not yet land on disk, and thus the additional bytes/write-end closure will never happen)</li>
+</ol>
+<p>(2) is solvable with changes on the Jco side (essentially, allowing partial writes, an explicit work queue), and we'll make some of those, but this bug makes it clear the API might be a bit lacking.</p>
+<p><strong>AFAICT the core of the problem is the API for <code>write-via-stream</code> -- there needs to be some way to signal disk writes, not just stream writes, so that users that want to acknowledge partial writes explicitly may do so.</strong></p>
+<p>A new, more fine-grained fn would be perfectly fine IMO.</p>
+<p>As far as the test goes the test can/should be rewritten to be less racy, but this kind of code is easy for someone to write and is not super obviously wrong, it would be nice if we could make this behavior explicit, so people are a bit less likely to mistake stream writes for operation completion.</p>
+<p>It may be a good general rule of thumb that any API which takes a stream to allow for asynchronous operation should likely return a stream of asynchronous/batched acks unless it is explicitly meant to coalesce -- this is clearly something that would apply to any async operation that works in chunks.</p>
+
+
+
+<a name="614394948"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614394948" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614394948">(Aug 03 2026 at 19:25)</a>:</h4>
+<p>Isn't this what <a href="https://github.com/WebAssembly/WASI/blob/6c290cec1c0ec972372548a897cb462177724ddb/proposals/filesystem/wit/types.wit#L451"><code>descriptor.sync</code></a> is for?</p>
+
+
+
+<a name="614395169"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614395169" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Dave Bakker (badeend) <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614395169">(Aug 03 2026 at 19:27)</a>:</h4>
+<p>I'm not familiar with the internals of JCO, but it sounds like JCO reports the <code>stream.write</code> as completed even while it is still being processed on the background thread. If JCO can't finish the write immediately, it should report the write as in-progrss, so that the guest can wait for it to reach the kernel.<br>
+Additionally, even when you manage to implement it that way, you can't assume that written data will be immediately reflected in the info returned by <code>stat</code>, unless you use <code>fsync</code>/<code>O_SYNC</code>.</p>
+
+
+
+<a name="614401815"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614401815" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Dave Bakker (badeend) <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614401815">(Aug 03 2026 at 20:13)</a>:</h4>
+<blockquote>
+<p>there needs to be some way to signal disk writes (..) so that users that want to acknowledge partial writes explicitly may do so.</p>
+</blockquote>
+<p>wasi-filesystem is a relatively thin abstraction layer over the POSIX filesystem API. And in POSIX, all writes are _not_ synchronized by default. Only when you use <code>fsync</code>/<code>fdatasync</code>/<code>O_*SYNC</code>/.. do you get a stronger guarantee about the data's consistency.<br>
+One could interpret this as: wasi-filesystem already provides the semantics you're asking for. But as you also have already experienced the hard way; there is a difference between</p>
+<ul>
+<li>what POSIX technically allows, and</li>
+<li>what code out of the wild actually depends on. <span aria-label="slight smile" class="emoji emoji-1f642" role="img" title="slight smile">:slight_smile:</span></li>
+</ul>
+<p>Given that the test passes under wasmtime but not on JCO, I'd focus on the JCO / stream bindgen side of things first.</p>
+<hr>
+<p>Side note: you refer to "bytes hitting the disk". AFAIK, there's not a single mainstream OS that can actually reliably guarantee that. What <code>fstat</code> &amp; friends guarantee is a consistent view of the filesystem to across processes. Whether or not that also includes the data being durably written to disk depends on a whole lot of other factors, some of them beyond the kernel's control.</p>
+<p>Welcome to the wonderful world of filesystems <span aria-label="octopus" class="emoji emoji-1f419" role="img" title="octopus">:octopus:</span></p>
+
+
+
+<a name="614402329"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614402329" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614402329">(Aug 03 2026 at 20:17)</a>:</h4>
+<blockquote>
+<p>If JCO can't finish the write immediately, it should report the write as in-progrss</p>
+</blockquote>
+<p>I talked with Victor about this in DMs, but one problem with this, while I agree this is the correct semantics, is that there's no way to actually do this in a pure guest-to-guest situation today. We (some set of folks more than just me but I forget who) discussed this in the past and supporting this in guest-to-guest scenarios will require a new intrinsic on the read side at the very least. If JCO is implementing the host as-if it were guest-to-guest while this is the synchronization desired it's not actually possible with streams today</p>
+
+
+
+<a name="614402538"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614402538" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614402538">(Aug 03 2026 at 20:18)</a>:</h4>
+<p>but I would agree that this isn't about disk/etc, it's about "I sent bytes to the WASI API, then I read the size, and it should account for the thing I wrote"</p>
+
+
+
+<a name="614402653"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614402653" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Dave Bakker (badeend) <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614402653">(Aug 03 2026 at 20:19)</a>:</h4>
+<p>in guest-to-guest interactions, can 0-sized writes be used to check for readiness after a non-0-sized write?</p>
+
+
+
+<a name="614402863"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614402863" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614402863">(Aug 03 2026 at 20:21)</a>:</h4>
+<p>I believe so, yeah, you'd write bytes, do a 0-sized write, and then when the other side gets around to reading again you'd get woken up</p>
+
+
+
+<a name="614402898"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614402898" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614402898">(Aug 03 2026 at 20:21)</a>:</h4>
+<p>so that could be a wasi-libc-style workaround pehraps</p>
+
+
+
+<a name="614402920"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614402920" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614402920">(Aug 03 2026 at 20:21)</a>:</h4>
+<p>(or a fix for the test in wasi-testsuite that was changed)</p>
+
+
+
+<a name="614446450"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614446450" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614446450">(Aug 04 2026 at 03:05)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="480579">Lann Martin</span> <a href="#narrow/channel/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk/near/614394948">said</a>:</p>
+<blockquote>
+<p>Isn't this what <a href="https://github.com/WebAssembly/WASI/blob/6c290cec1c0ec972372548a897cb462177724ddb/proposals/filesystem/wit/types.wit#L451"><code>descriptor.sync</code></a> is for?</p>
+</blockquote>
+<p>So yes, this is certainly true, and fsync after every stream write would certainly write <em>some</em> bytes to disk, but we don't know <em>which</em> bytes have been accepted/written (e.g. fine grained ACKs out of <code>read-via-stream</code>). </p>
+<p>In the current world you could call <code>read-via-stream</code>, all bytes are read off the stream, and <em>no</em> bytes are written at the OS level, and <code>sync</code> (<code>fsync</code>) is called. Test would fail in the same way I think.</p>
+
+
+
+<a name="614446726"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614446726" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614446726">(Aug 04 2026 at 03:09)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="378155">Dave Bakker (badeend)</span> <a href="#narrow/channel/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk/near/614395169">said</a>:</p>
+<blockquote>
+<p>I'm not familiar with the internals of JCO, but it sounds like JCO reports the <code>stream.write</code> as completed even while it is still being processed on the background thread. If JCO can't finish the write immediately, it should report the write as in-progrss, so that the guest can wait for it to reach the kernel.<br>
+Additionally, even when you manage to implement it that way, you can't assume that written data will be immediately reflected in the info returned by <code>stat</code>, unless you use <code>fsync</code>/<code>O_SYNC</code>.</p>
+</blockquote>
+<p>Yep, that's it! The <code>stream.write</code> and the <code>fs.write</code> are distinct, and IMO should be separate, if the thing the consumer cares about is the operation happening on the bytes, then we should have a specific channel for that signal.</p>
+<p>Agree on the sync (fsync/fdatasync) -- this was Lann's suggestion, and wanted to point out that we have the same problem there -- you could call fsync but you don't know what has been purported to be written to the OS layer.</p>
+
+
+
+<a name="614447210"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614447210" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614447210">(Aug 04 2026 at 03:14)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="378155">Dave Bakker (badeend)</span> <a href="#narrow/channel/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk/near/614401815">said</a>:</p>
+<blockquote>
+<blockquote>
+<p>there needs to be some way to signal disk writes (..) so that users that want to acknowledge partial writes explicitly may do so.</p>
+</blockquote>
+<p>wasi-filesystem is a relatively thin abstraction layer over the POSIX filesystem API. And in POSIX, all writes are _not_ synchronized by default. Only when you use <code>fsync</code>/<code>fdatasync</code>/<code>O_*SYNC</code>/.. do you get a stronger guarantee about the data's consistency.<br>
+One could interpret this as: wasi-filesystem already provides the semantics you're asking for. But as you also have already experienced the hard way; there is a difference between</p>
+<ul>
+<li>what POSIX technically allows, and</li>
+<li>what code out of the wild actually depends on. <span aria-label="slight smile" class="emoji emoji-1f642" role="img" title="slight smile">:slight_smile:</span></li>
+</ul>
+<p>Given that the test passes under wasmtime but not on JCO, I'd focus on the JCO / stream bindgen side of things first.</p>
+<hr>
+<p>Side note: you refer to "bytes hitting the disk". AFAIK, there's not a single mainstream OS that can actually reliably guarantee that. What <code>fstat</code> &amp; friends guarantee is a consistent view of the filesystem to across processes. Whether or not that also includes the data being durably written to disk depends on a whole lot of other factors, some of them beyond the kernel's control.</p>
+<p>Welcome to the wonderful world of filesystems <span aria-label="octopus" class="emoji emoji-1f419" role="img" title="octopus">:octopus:</span></p>
+</blockquote>
+<p>Yes, I know this -- the point is that when you come back from a <code>read</code>, you know you've at least given the read to the OS (i.e. the layer that will make your <code>fsync</code>/<code>fdatasync</code> mean anything). We don't have that signal with the current API -- we only have "bytes were delivered to the operation that will maybe eventually give your writes to the system underneath".</p>
+<p>And sorry, I was using "bytes hitting the disk" as a shorthand for the guarantees at the OS level, I should have been more precise! The only way to guarantee is an fsync, and we're not even talking about that behavior, I'm literally only talking about a write &amp; stat.</p>
+<blockquote>
+<p>What <code>fstat</code> &amp; friends guarantee is a consistent view of the filesystem to across processes.</p>
+</blockquote>
+<p>One thing I did consider on the spectrum of solutions to this was trying to guarantee some sort of same-FD consistency of the read-your-writes flavor, and I thought better of that -- preferring to leave it to the OS (i.e. not guarantee anything the OS isn't). </p>
+<p>Even queueing the work isn't necessarily the best solution, I think -- I'd like to have whichever operation complete as fast as possible, but the problem is that the user has no way to wait for a "write" right now, they can only wait for "stream consumption".</p>
+
+
+
+<a name="614448502"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614448502" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614448502">(Aug 04 2026 at 03:27)</a>:</h4>
+<h3>So let me try to condense &amp; rephrase (thanks everyone for thoughts/poking at it <span aria-label="bow" class="emoji emoji-1f647" role="img" title="bow">:bow:</span> ):</h3>
+<p><code>write-via-stream</code> does not currently provide a way to know that the underlying write operation (whether it's a real OS or virtualized) has been completed/submitted. </p>
+<p>For most platforms some <code>fsync</code>-like operation (<code>descriptor.sync</code> in WASI) is the way to make sure the bytes hit the disk (as far as the platform can tell), but this problem is separate from that -- the <em>user cannot tell when the bytes written to the stream actually got submitted to the platform</em>, with the current API. You can only tell when the bytes you submitted to the stream got read. </p>
+<p>For the current system (and this example in particular) to work, hosts essentially <em>must</em> do magic to make bytes-operated-on equivalent to stream-writes-delivered, and outside of being non-virtualizable, I think that's a mixing of signals -- the two should be distinct.</p>
+<p>The current API certainly works very well for complete writes from a stream (i.e. every write on the stream lands, then <code>write-via-stream</code> delivers it's success in writing <em>all</em> the content with platform-specific meaning), but it does not work for partial writes of what was streamed.</p>
+<p>Of course, "just don't do that" is a valid option (i.e. all bytes to the stream will be written, wait for that instead)! But I think this kind of fine grained writing &amp; acking/probing disk presence is a usecase that should be supported.</p>
+
+
+
+<a name="614534901"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614534901" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614534901">(Aug 04 2026 at 13:12)</a>:</h4>
+<p>With the current design I think you have to treat a <code>write-via-stream</code> as a single write operation, at least for this purpose, so stat on the same descriptor wouldn't necessarily be updated until the call finishes.</p>
+
+
+
+<a name="614534960"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614534960" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614534960">(Aug 04 2026 at 13:13)</a>:</h4>
+<p>If <em>that</em> isn't already happening I'd consider it a bug.</p>
+
+
+
+<a name="614535275"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614535275" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614535275">(Aug 04 2026 at 13:14)</a>:</h4>
+<p>Re-reading your original message I'm not sure if "After the <em>stream write</em> completes" is referring to the CM stream write or the append-via-stream call.</p>
+
+
+
+<a name="614535370"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614535370" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614535370">(Aug 04 2026 at 13:15)</a>:</h4>
+<p>Ah it definitely <em>is</em> already happening, but the test is trying to do a partial write thing, which is the problem. </p>
+<p><code>write-via-stream</code> is fine for what it does, but the test made the mistake of thinking CM stream write confirmation was file write confirmation</p>
+
+
+
+<a name="614535416"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614535416" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614535416">(Aug 04 2026 at 13:15)</a>:</h4>
+<p>Ah sorry, when I say "stream write" I mean CM stream write</p>
+
+
+
+<a name="614535507"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614535507" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614535507">(Aug 04 2026 at 13:16)</a>:</h4>
+<p>Yeah I think that behavior is reasonable in the scope of wasi:filesystem trying to be posix-ish.</p>
+
+
+
+<a name="614535629"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614535629" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614535629">(Aug 04 2026 at 13:16)</a>:</h4>
+<p><code>write-via-stream</code> is working as intended, but it's kind of easy to misuse if what you're looking for is chunked write ACKs, so yeah I am happy with a new API for this, but wanted to call it out, as it's easy to misuse (if you want fine grained acks)</p>
+
+
+
+<a name="614535818"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614535818" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614535818">(Aug 04 2026 at 13:17)</a>:</h4>
+<p>A lot of the wasi mappings to posix-ish IO are easy to misuse, partly because there is a bit of an execution model mismatch and partly because posix is just easy to misuse. <span aria-label="sweat smile" class="emoji emoji-1f605" role="img" title="sweat smile">:sweat_smile:</span></p>
+
+
+
+<a name="614536491"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614536491" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614536491">(Aug 04 2026 at 13:21)</a>:</h4>
+<p>Yeah I think a new API could make this pretty explicit though, and help us get rid of non-virtualizable host magic.</p>
+<p>Again, <em>maybe</em> this use case is niche, but I think we kind of suggested/welcomed it when <code>write-via-stream</code> was introduced. If you write via a stream, it makes sense that sometimes you'd want to know when a specific individual chunk was written (and maybe fsync right then and there, then go do some other stuff, etc).</p>
+
+
+
+<a name="614538455"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614538455" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Lann Martin <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614538455">(Aug 04 2026 at 13:30)</a>:</h4>
+<p>You <em>could</em> break up a large write into multiple <code>write-via-stream</code> calls. That's what I would reach for if the data is already in memory at the same point that you want the write acknowledgements. It gets hairy if you're trying to do this for something middlewareish that wouldn't otherwise need to buffer the data. I think  <a href="https://github.com/WebAssembly/component-model/issues/658"><code>stream.forward</code></a> would serve that use case if/when implemented.</p>
+
+
+
+<a name="614552641"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/write-via-stream%3A%20stream%20write%20%21%3D%20bytes%20written%20to%20disk/near/614552641" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Victor Adossi <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/write-via-stream.3A.20stream.20write.20.21.3D.20bytes.20written.20to.20disk.html#614552641">(Aug 04 2026 at 14:33)</a>:</h4>
+<p>Yup I had that thought as well -- I thought it might be a bit inefficient having to create and pass in multiple streams and then to keep track of all of it would be pretty annoying to write out in the guest.</p>
+
+
+
+<hr><p>Last updated: Aug 08 2026 at 20:06 UTC</p>
+</html>

@@ -1,0 +1,130 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14075 Cost of stack probes not accounte... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314075.20Cost.20of.20stack.20probes.20not.20accounte.2E.2E.2E.html">wasmtime / issue #14075 Cost of stack probes not accounte...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="614411580"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314075%20Cost%20of%20stack%20probes%20not%20accounte.../near/614411580" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314075.20Cost.20of.20stack.20probes.20not.20accounte.2E.2E.2E.html#614411580">(Aug 03 2026 at 21:16)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14075">issue #14075</a>:</p>
+<blockquote>
+<p>Originally surfaced in <a href="https://github.com/bytecodealliance/wasmtime/pull/14042">https://github.com/bytecodealliance/wasmtime/pull/14042</a> the problem, or at least my own summary of it, is that Cranelift-generated stack probes are an unaccounted for cost when it comes to fuel consumption. Cranelift's stack probes are used for large stack frames and the probe is either unrolled or codegen'd as a loop depending on the size of the stack frame. This cost is not account for in fuel consumption insofar as it's possible for a malicious guest to craft modules where the time/resources taken to execute are constant in fuel consumption but variable in wall-clock time and stack consumption. </p>
+<p>One example from <a href="https://github.com/bytecodealliance/wasmtime/pull/14042">https://github.com/bytecodealliance/wasmtime/pull/14042</a> is a large function with thousands of locals which dynamically ends up doing nothing (e.g. early returns). In this situation if all these locals are live via a computation at the end, and if optimizations are disabled, then lots of locals are spilled to the stack. This causes a stack frame to be generated which is proportional to the number of locals but this function consumes a constant amount of fuel regardless of the number of locals.</p>
+<p>Another example of increasing stack space, however, is having a very large operand stack in wasm. For example wasm can repeatedly call a function to return a value, and then after generating N values add them all up. This is another example of a variable-sized wasm function incurring a variable-sized amount of runtime (due to differing stack frame sizes) while consuming a constant amount of fuel at runtime.</p>
+<p>The overall problem seems to be that the cost of the probe itself is unaccounted for meaning guests, in theory, given a fixed budget of fuel can consume an arbitrary amount of time. I'm not personally sure of the best fix for this since the size of the stack frame isn't known until the end of compilation. One nice property of fuel as well is that it's deterministic across targets within a Wasmtime version right now, but if the literal stack frame size were taken into account this would start to diverge across compiler options/targets/etc. On the other hand there are indicators of stack frame size, such as locals or operand-stack-depth, but I wouldn't be confident in saying these are the only variable sources of stack-frame-sizes. </p>
+<p>Hence, an issue!</p>
+</blockquote>
+
+
+
+<a name="614468643"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314075%20Cost%20of%20stack%20probes%20not%20accounte.../near/614468643" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314075.20Cost.20of.20stack.20probes.20not.20accounte.2E.2E.2E.html#614468643">(Aug 04 2026 at 06:40)</a>:</h4>
+<p>michael-weigelt <a href="https://github.com/bytecodealliance/wasmtime/issues/14075#issuecomment-5175504315">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14075">issue #14075</a>:</p>
+<blockquote>
+<p>I don't know the exact design goals of Wasmtime's fuel, but I can share an almost-use case: <a href="https://github.com/dfinity/ic/tree/master/rs/embedders/src">ICP</a> needs to suspend untrusted user code 1) deterministically and 2) at wall-time intervals that should be within some time, say half a second. In other words, we need a deterministic proxy for CPU time. <br>
+Since we run many embedders representing different user programs on the same host, limiting each programs' compute properly is a liveness issue for the platform, so it's very important. <br>
+ICP does <strong>not</strong> use Wasmtime's fuel, because we need more flexibility than it had at the time, in particular, we need to charge different amounts of fuel per operation, based on benchmarks, to represent true CPU time better. <br>
+Given our use case and the stakes, we approached the problem in this issue in the most "conservative" way: </p>
+<ul>
+<li>We charge for every local declared</li>
+<li>We charge an amount per local that is proportional to the maximum frame size it can cause (i.e., more for v128 typed locals than i32).<br>
+because anything else leaves us open to attacks which slow down the platform. <br>
+It's clear that this overcharges in some situations, but for ICP, this is the trade-off we need. </li>
+</ul>
+<p>Now IMO, this could point the way to an approach for Wasmtime's fuel as well: </p>
+<ul>
+<li>Charge for locals declared, BUT</li>
+<li>Make their cost configurable<br>
+should give fuel users the means to choose their own operation point in this trade-off between overcharging and safety. It feels a bit blunt, but it's better than forcing the user to either extreme (either can be a deal-breaker for some application).<br>
+And perhaps a similar approach could be found for the call depth issue, though I haven't thought about that yet. <br>
+</li>
+</ul>
+</blockquote>
+
+
+
+<a name="614468698"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314075%20Cost%20of%20stack%20probes%20not%20accounte.../near/614468698" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314075.20Cost.20of.20stack.20probes.20not.20accounte.2E.2E.2E.html#614468698">(Aug 04 2026 at 06:41)</a>:</h4>
+<p>michael-weigelt edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/14075#issuecomment-5175504315">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14075">issue #14075</a>:</p>
+<blockquote>
+<p>I don't know the exact design goals of Wasmtime's fuel, but I can share an almost-use case: <a href="https://github.com/dfinity/ic/tree/master/rs/embedders/src">ICP</a> needs to suspend untrusted user code 1) deterministically and 2) at wall-time intervals that should be within some time, say half a second. In other words, we need a deterministic proxy for CPU time. <br>
+Since we run many embedders representing different user programs on the same host, limiting each program's compute properly is a liveness issue for the platform, so it's very important. <br>
+ICP does <strong>not</strong> use Wasmtime's fuel, because we need more flexibility than it had at the time, in particular, we need to charge different amounts of fuel per operation, based on benchmarks, to represent true CPU time better. <br>
+Given our use case and the stakes, we approached the problem in this issue in the most "conservative" way: </p>
+<ul>
+<li>We charge for every local declared</li>
+<li>We charge an amount per local that is proportional to the maximum frame size it can cause (i.e., more for v128 typed locals than i32).<br>
+because anything else leaves us open to attacks which slow down the platform. <br>
+It's clear that this overcharges in some situations, but for ICP, this is the trade-off we need. </li>
+</ul>
+<p>Now IMO, this could point the way to an approach for Wasmtime's fuel as well: </p>
+<ul>
+<li>Charge for locals declared, BUT</li>
+<li>Make their cost configurable<br>
+should give fuel users the means to choose their own operation point in this trade-off between overcharging and safety. It feels a bit blunt, but it's better than forcing the user to either extreme (either can be a deal-breaker for some application).<br>
+And perhaps a similar approach could be found for the call depth issue, though I haven't thought about that yet. <br>
+</li>
+</ul>
+</blockquote>
+
+
+
+<a name="614468766"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314075%20Cost%20of%20stack%20probes%20not%20accounte.../near/614468766" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314075.20Cost.20of.20stack.20probes.20not.20accounte.2E.2E.2E.html#614468766">(Aug 04 2026 at 06:42)</a>:</h4>
+<p>michael-weigelt edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/14075#issuecomment-5175504315">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14075">issue #14075</a>:</p>
+<blockquote>
+<p>I don't know the exact design goals of Wasmtime's fuel, but I can share an almost-use case: <a href="https://github.com/dfinity/ic/tree/master/rs/embedders/src">ICP</a> needs to suspend untrusted user code 1) deterministically and 2) at wall-time intervals that should be within some time, say half a second. In other words, we need a deterministic proxy for CPU time. <br>
+Since we run many embedders representing different user programs on the same host, limiting each program's compute properly is a liveness issue for the platform, so it's very important. <br>
+ICP does <strong>not</strong> use Wasmtime's fuel, because we need more flexibility than it had at the time, in particular, we need to charge different amounts of fuel per operation, based on benchmarks, to represent true CPU time better. <br>
+Given our use case and the stakes, we approached the problem in this issue in the most "conservative" way: </p>
+<ul>
+<li>We charge for every local declared</li>
+<li>We charge an amount per local that is proportional to the maximum frame size it can cause (i.e., more for v128 typed locals than i32).</li>
+</ul>
+<p>because anything else leaves us open to attacks which slow down the platform. <br>
+It's clear that this overcharges in some situations, but for ICP, this is the trade-off we need. </p>
+<p>Now IMO, this could point the way to an approach for Wasmtime's fuel as well: </p>
+<ul>
+<li>Charge for locals declared, BUT</li>
+<li>Make their cost configurable</li>
+</ul>
+<p>should give fuel users the means to choose their own operation point in this trade-off between overcharging and safety. It feels a bit blunt, but it's better than forcing the user to either extreme (either can be a deal-breaker for some application).<br>
+And perhaps a similar approach could be found for the call depth issue, though I haven't thought about that yet. <br>
+</p>
+</blockquote>
+
+
+
+<a name="614469521"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314075%20Cost%20of%20stack%20probes%20not%20accounte.../near/614469521" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314075.20Cost.20of.20stack.20probes.20not.20accounte.2E.2E.2E.html#614469521">(Aug 04 2026 at 06:48)</a>:</h4>
+<p>michael-weigelt edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/14075#issuecomment-5175504315">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14075">issue #14075</a>:</p>
+<blockquote>
+<p>I don't know the exact design goals of Wasmtime's fuel, but I can share an almost-use case: <a href="https://github.com/dfinity/ic/tree/master/rs/embedders/src">ICP</a> needs to suspend untrusted user code 1) deterministically and 2) at wall-time intervals that should be within some time, say half a second. In other words, we need a deterministic proxy for CPU time. <br>
+Since we run many embedders representing different user programs on the same host, limiting each program's compute properly is a liveness issue for the platform, so it's very important. <br>
+ICP does <strong>not</strong> use Wasmtime's fuel, because we need more flexibility than it had at the time, in particular, we need to charge different amounts of fuel per operation, based on benchmarks, to represent true CPU time better. <br>
+Given our use case and the stakes, we approached the problem in this issue in the most "conservative" way: </p>
+<ul>
+<li>We charge for every local declared</li>
+<li>We charge an amount per local that is proportional to the maximum frame size it can cause (i.e., more for v128 typed locals than i32).</li>
+</ul>
+<p>because anything else leaves us open to attacks which slow down the platform. <br>
+It's clear that this overcharges in some situations, but for ICP, this is the trade-off we need. </p>
+<p>Now IMO, this could point the way to an approach for Wasmtime's fuel as well: </p>
+<ul>
+<li>Charging for locals declared, BUT</li>
+<li>Making their cost configurable</li>
+</ul>
+<p>should give fuel users the means to choose their own operation point in this trade-off between overcharging and safety. It feels a bit blunt, but it's better than forcing the user to either extreme (either can be a deal-breaker for some application).<br>
+And perhaps a similar approach could be found for the call depth issue, though I haven't thought about that yet. <br>
+</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Aug 08 2026 at 20:06 UTC</p>
+</html>
