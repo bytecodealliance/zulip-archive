@@ -1,0 +1,266 @@
+[
+    {
+        "content": "<p>I'm having some issues with cranelift's code generation being quite bad...</p>\n<p>IR and assembly: <a href=\"https://paste.sr.ht/~pitust/29f8e92da8a90f94336d4d7b648f3a514dd612b4\">https://paste.sr.ht/~pitust/29f8e92da8a90f94336d4d7b648f3a514dd612b4</a></p>\n<p>Note that at line 24 of the asssembly, cranelift decides to move a saved register into x1, dereference it, then overwrite x1 with something else. Is there something weird going on that I'm not aware of around regalloc in cranelift or something like that? Or maybe I'm missing some option (I set <code>opt_level</code> to <code>speed</code> and <code>regalloc_algorithm</code> to <code>backtracking</code>, but the behavior persists...)</p>",
+        "id": 556890251,
+        "sender_full_name": "pitust",
+        "timestamp": 1763400196
+    },
+    {
+        "content": "<p>The short answer is that regalloc (in general, not just ours) is full of heuristics and sometimes does the wrong thing because it's an NP-hard binpacking problem. Unfortunately I don't have time to look at specific cases at the moment, but if you're willing to, PRs welcome. (Sorry, I don't mean to sound dismissive with that, just trying to level-set -- we aren't at a level of staffing that can allow for fine-tuning at this level at the moment)</p>",
+        "id": 556891278,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763400465
+    },
+    {
+        "content": "<p>Yeah, I know it's an NP-hard problem and all, but this specific case is also not a very complex one (there are more available machine registers than values, and not all of the values even need a register of their own, and this definitely has the \"some heuristic broke\" vibe rather than the \"this is just a really hard problem to solve\" vibe), so I figured I'd ask anyway in case it's like a known bug or something.</p>",
+        "id": 556891827,
+        "sender_full_name": "pitust",
+        "timestamp": 1763400627
+    },
+    {
+        "content": "<p>It's a fair question to ask! If you decide to dig into this, I'm at least happy to point at relevant bits of code</p>",
+        "id": 556891923,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763400661
+    },
+    {
+        "content": "<p>Sure! I guess the first step is enabling logs from <code>log</code>?</p>",
+        "id": 556892002,
+        "sender_full_name": "pitust",
+        "timestamp": 1763400681
+    },
+    {
+        "content": "<p>yes, the <code>trace-log</code> feature in cranelift-codegen guards a bunch of logging to eliminate dynamic checks, so enable that, then <code>WASMTIME_LOG=trace</code> will give you gigabytes of stuff; probably also <code>RAYON_NUM_THREADS=1</code> so parallel compilation doesn't confuse you</p>",
+        "id": 556892161,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763400730
+    },
+    {
+        "content": "<p>Does cranelift create threads on its own? (since I'm writing a custom frontend)</p>",
+        "id": 556892402,
+        "sender_full_name": "pitust",
+        "timestamp": 1763400809
+    },
+    {
+        "content": "<p>ah, no, that's a Wasmtime thing</p>",
+        "id": 556892428,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763400818
+    },
+    {
+        "content": "<p>so <code>RUST_LOG=trace</code> (or whatever your logging frontend is in your embedding) too</p>",
+        "id": 556892476,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763400829
+    },
+    {
+        "content": "<p>Okay, sure. I have a whole lot of logs now. What should I look for?</p>",
+        "id": 556893203,
+        "sender_full_name": "pitust",
+        "timestamp": 1763401041
+    },
+    {
+        "content": "<p>I think I know what might be going wrong. It seems like cranelift tries really hard to keep the arguments in the same registers as they were passed in, even if that makes no sense...</p>",
+        "id": 556894702,
+        "sender_full_name": "pitust",
+        "timestamp": 1763401459
+    },
+    {
+        "content": "<p>Yeah, the bad codegen disappears if i set <code>opt_level</code> to <code>none</code> and mangle the pointer by running <code>let ctx = b.ins().band_imm(ctx, (!1u64) as i64);</code>...</p>",
+        "id": 556896667,
+        "sender_full_name": "pitust",
+        "timestamp": 1763402075
+    },
+    {
+        "content": "<p>With optimizations enabled, then the bitand gets rematerialized and the bad regalloc is back.</p>",
+        "id": 556896779,
+        "sender_full_name": "pitust",
+        "timestamp": 1763402107
+    },
+    {
+        "content": "<blockquote>\n<p>What should I look for?</p>\n</blockquote>\n<p>You aren't going to like the answer but unfortunately it's \"understand the regalloc's algorithms and see where they are doing something suboptimal\" :-/</p>",
+        "id": 556897521,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763402285
+    },
+    {
+        "content": "<blockquote>\n<p>cranelift tries really hard to keep the arguments in the same registers as they were passed in</p>\n</blockquote>\n<p>It's not exactly that, more that regalloc has constraints, the fixed-reg constraints apply to the args, and there are heuristics for when one wants to split liveranges</p>",
+        "id": 556897717,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763402347
+    },
+    {
+        "content": "<p>Yeah, I figured. What I <em>think</em> happens is that cranelift decides to not split the liverange but just spill, and then after unspilling it maintains the same register assignment (for whatever reason), and then later it decides to move it into a different register instead of spilling, and then move elision fails for whatever reason.</p>",
+        "id": 556898623,
+        "sender_full_name": "pitust",
+        "timestamp": 1763402610
+    },
+    {
+        "content": "<p>a few things just to help: (i) there aren't any spills here, just moves between registers (those are distinct); (ii) move elision will remove moves that are redundant, but it's not going to see that A was copied to B and we can use A directly instead of B</p>",
+        "id": 556899022,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763402742
+    },
+    {
+        "content": "<p>thanks</p>",
+        "id": 556899588,
+        "sender_full_name": "pitust",
+        "timestamp": 1763402943
+    },
+    {
+        "content": "<p>I think the issue is around <code>split_and_requeue_bundle</code>: when a bundle is split because one fixed register constraint contradicts another, then the register allocator should explicitly try to not use that fixed register when allocating, instead of having it be the <em>preferred</em> register...</p>",
+        "id": 556908308,
+        "sender_full_name": "pitust",
+        "timestamp": 1763405755
+    },
+    {
+        "content": "<p>when a split happens, the split-off portion has a preference but not a hard requirement anymore -- the requirements for each half are recomputed</p>",
+        "id": 556908765,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763405925
+    },
+    {
+        "content": "<p>Yeah, but the soft assignment is still problematic.</p>",
+        "id": 556908825,
+        "sender_full_name": "pitust",
+        "timestamp": 1763405945
+    },
+    {
+        "content": "<p>The ranges may have been split because that register <em>cannot</em> be used, in which case, the register is explicitly the one you <em>don't</em> want to use.</p>",
+        "id": 556909030,
+        "sender_full_name": "pitust",
+        "timestamp": 1763406006
+    },
+    {
+        "content": "<p>OK -- if there is a conflict, or if other liveranges have stronger preference, the weights should move the split-off half to another register instead</p>",
+        "id": 556909257,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763406077
+    },
+    {
+        "content": "<p>Yeah. I'll try implementing something like that.</p>",
+        "id": 556909321,
+        "sender_full_name": "pitust",
+        "timestamp": 1763406096
+    },
+    {
+        "content": "<p>No, I mean, that's how things already work</p>",
+        "id": 556909344,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763406104
+    },
+    {
+        "content": "<p>Oh?</p>",
+        "id": 556909352,
+        "sender_full_name": "pitust",
+        "timestamp": 1763406107
+    },
+    {
+        "content": "<p>That.. doesn't seem to be happening?</p>",
+        "id": 556909394,
+        "sender_full_name": "pitust",
+        "timestamp": 1763406119
+    },
+    {
+        "content": "<p>Well, it's all heuristics. There are use-weights and there are costs that are considered during assignment. A simplistic \"I would simply not use that register\" heuristic stacked on top isn't going to be the answer, because there is already a fairly complex cost machinery considering the tradeoffs</p>",
+        "id": 556909592,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763406186
+    },
+    {
+        "content": "<p>In the split off LR, the hint is checked as the first thing to be processed. It <em>can</em> work (because the thing stopping the register from being viable is between the two LRs), but it results in some extra shuffling (because to get the register from one LR to the other, some other register needs to be used).</p>",
+        "id": 556909609,
+        "sender_full_name": "pitust",
+        "timestamp": 1763406191
+    },
+    {
+        "content": "<p>This is the backtracking part of the allocator: when another use comes along that can make use of the register, it has the opportunity to undo that choice</p>",
+        "id": 556909784,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763406246
+    },
+    {
+        "content": "<p>if it doesn't, then the cost machinery could use tuning</p>",
+        "id": 556909807,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763406253
+    },
+    {
+        "content": "<p>Ah, wait, I didn't read the code carefully enough. Hmm.</p>",
+        "id": 556909830,
+        "sender_full_name": "pitust",
+        "timestamp": 1763406261
+    },
+    {
+        "content": "<p>I'd caution against simplistic answers here though: \"don't consider the hint\" is going to break a lot of other stuff</p>",
+        "id": 556909844,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763406266
+    },
+    {
+        "content": "<p>(or not \"break\" but \"make much less good\")</p>",
+        "id": 556909864,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763406275
+    },
+    {
+        "content": "<p>I'm confused by something. When cranelift splits the liverange into two parts, the log it prints  is<code>split bundle LiveBundleIndex(0) at progpoint4-pre and requeue with reg hint (for first part) PReg(hw = 0, class = Int, index = 0)</code>.</p>\n<p>But it uses the hint for both parts?</p>",
+        "id": 556912902,
+        "sender_full_name": "pitust",
+        "timestamp": 1763407408
+    },
+    {
+        "content": "<p>I believe the hint is just for the first part, but the code would be the definitive answer. Unfortunately I can't give much more time to this this morning, but best of luck (sorry!)</p>",
+        "id": 556914240,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763407902
+    },
+    {
+        "content": "<p>no worries</p>",
+        "id": 556914445,
+        "sender_full_name": "pitust",
+        "timestamp": 1763407982
+    },
+    {
+        "content": "<p>I looked into this: the root cause from regalloc2's choice to split bundles into 3 parts instead of 2. It moves the middle part of the live range between 2 conflicting uses directly to the spill bundle (which is then allocated to a register in the second chance allocation pass). This results in the unnecessary move because the middle and end bundles end up assigned different registers since regalloc2 doesn't know they are related.</p>",
+        "id": 556976961,
+        "sender_full_name": "Amanieu",
+        "timestamp": 1763440602
+    },
+    {
+        "content": "<p>I also tried the example code with regalloc3 (<a href=\"https://gist.github.com/Amanieu/54d5d89c119ca74409a4b458c4fa013b\">disassembly</a> since it has a completely different live range splitting algorithm. However it avoids the splitting in the first place by not putting a fixed-register constraint on the whole live range, instead only treating the constraint as a hint (which only applies to the first part of the live range if it is split).</p>\n<p>I also looked into why regalloc2 spills more than regalloc3 and it's because of regalloc2's randomization of the probe order. This will tend to spread bundles over all available registers instead of minimizing the number of registers used.</p>\n<div class=\"message_embed\"><a class=\"message_embed_image\" href=\"https://gist.github.com/Amanieu/54d5d89c119ca74409a4b458c4fa013b\" style=\"background-image: url(&quot;https://uploads.zulipusercontent.net/91f9baed8f4fc08c462d1a4de5a8c23942d45e97/68747470733a2f2f6769746875622e6769746875626173736574732e636f6d2f6173736574732f676973742d6f672d696d6167652d3534666437646330373133652e706e67&quot;)\"></a><div class=\"data-container\"><div class=\"message_embed_title\"><a href=\"https://gist.github.com/Amanieu/54d5d89c119ca74409a4b458c4fa013b\" title=\"gist:54d5d89c119ca74409a4b458c4fa013b\">gist:54d5d89c119ca74409a4b458c4fa013b</a></div><div class=\"message_embed_description\">GitHub Gist: instantly share code, notes, and snippets.</div></div></div>",
+        "id": 556977674,
+        "sender_full_name": "Amanieu",
+        "timestamp": 1763441051
+    },
+    {
+        "content": "<p>Yeah, the regaloc3 codegen looks much more reasonable. Out of curiousity, is it possible to use regalloc3 with cranelift? (I know it's not yet production-ready, but this isn't very security-critical code and I don't mind getting crashes).</p>",
+        "id": 557887229,
+        "sender_full_name": "pitust",
+        "timestamp": 1763460918
+    },
+    {
+        "content": "<p>We talked about that over the summer in Cranelift meetings; the conclusion was that we who use Wasmtime+Cranelift in security-critical contexts (i) would need to review regalloc3 but (ii) don't have the bandwidth to do so to the degree that we would understand the codebase and be able to fix it in an emergency or add features as needed. Basically, regalloc is too load-bearing to outsource</p>",
+        "id": 557998666,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763486564
+    },
+    {
+        "content": "<p>Ah, and I guess the burden of maintaining both concurrently is too great? That is understandable, then.</p>",
+        "id": 557999549,
+        "sender_full_name": "pitust",
+        "timestamp": 1763486789
+    },
+    {
+        "content": "<p>Unfortunately, yeah. If we had a large compiler team it would be an obvious choice to ramp up on it, but, sadly, that's not the case</p>",
+        "id": 558000265,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763486897
+    },
+    {
+        "content": "<p><span class=\"user-mention\" data-user-id=\"993027\">@pitust</span> If you really want to try it out then you can use my branch from <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11213\">https://github.com/bytecodealliance/wasmtime/pull/11213</a>. It may be slightly out of date though since the regalloc2 API has changed a bit since.</p>\n<div class=\"message_embed\"><a class=\"message_embed_image\" href=\"https://github.com/bytecodealliance/wasmtime/pull/11213\" style=\"background-image: url(&quot;https://uploads.zulipusercontent.net/761cb04fcad84e06390398d07a3aa0d8ee98fedb/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f623132363430613538386564633330646132326132306465646636386538626539323938393364306663316139633764396263613465653032343461306263302f62797465636f6465616c6c69616e63652f7761736d74696d652f70756c6c2f3131323133&quot;)\"></a><div class=\"data-container\"><div class=\"message_embed_title\"><a href=\"https://github.com/bytecodealliance/wasmtime/pull/11213\" title=\"Add option to use regalloc3 as the register allocator by Amanieu · Pull Request #11213 · bytecodealliance/wasmtime\">Add option to use regalloc3 as the register allocator by Amanieu · Pull Request #11213 · bytecodealliance/wasmtime</a></div><div class=\"message_embed_description\">This is based on bytecodealliance/regalloc2#230 which adds regalloc3 as a back-end to regalloc2.\nOnly one change had to be made to codegen: tail calls were reserving r11 as a scratch register by ma...</div></div></div>",
+        "id": 558004247,
+        "sender_full_name": "Amanieu",
+        "timestamp": 1763487895
+    }
+]
