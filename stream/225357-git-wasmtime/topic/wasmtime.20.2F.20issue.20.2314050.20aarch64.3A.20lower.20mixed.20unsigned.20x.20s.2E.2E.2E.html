@@ -1,0 +1,125 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14050 aarch64: lower mixed unsigned x s... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314050.20aarch64.3A.20lower.20mixed.20unsigned.20x.20s.2E.2E.2E.html">wasmtime / issue #14050 aarch64: lower mixed unsigned x s...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="613899397"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314050%20aarch64%3A%20lower%20mixed%20unsigned%20x%20s.../near/613899397" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314050.20aarch64.3A.20lower.20mixed.20unsigned.20x.20s.2E.2E.2E.html#613899397">(Jul 31 2026 at 16:44)</a>:</h4>
+<p>darmie opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14050">issue #14050</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p><code>aarch64</code> lowers the signed i8 dot-product tree to <code>SDOT</code> under <code>has_dotprod</code>, but there is no equivalent for the <strong>mixed unsigned x signed</strong> form, which FEAT_I8MM provides as <code>USDOT</code>. On an I8MM-capable part that tree currently falls back to <code>umull</code>/<code>smull</code> + <code>saddlp</code> widening even though a single instruction exists.</p>
+<p>For contrast, x64 already handles the mixed form: a <code>VectorDot</code>-shaped tree with an unsigned operand lowers to <code>VPDPBUSD</code> on a VNNI host. The aarch64 side has the signed case only.</p>
+<h2>Background</h2>
+<p>Quantized inference kernels are overwhelmingly <strong>unsigned activations x signed weights</strong> (u8 x i8) — that asymmetry is why <code>VPDPBUSD</code> and <code>USDOT</code> exist. So this is the shape that matters most for int8 inference, and it is the one currently left on the fallback path.</p>
+<p>I hit this lowering a quantized int8 dot kernel: on x86 with VNNI it reaches <code>vpdpbusd</code>, while the same kernel on aarch64 emits the widening sequence.</p>
+<h2>Proposal</h2>
+<p>Mirror the existing <code>SDOT</code> support:</p>
+<ol>
+<li>A <code>has_i8mm</code> setting in <code>meta/src/isa/arm64.rs</code> alongside <code>has_dotprod</code>, with matching host detection and a <code>use_i8mm</code> helper.</li>
+<li>The <code>USDOT</code> instruction in <code>isa/aarch64/inst.isle</code> + emit.</li>
+<li>A lowering rule beside the <code>SDOT</code> rule. The tree is identical except one operand widens unsigned:</li>
+</ol>
+<div class="codehilite" data-code-language="isle"><pre><span></span><code>(rule 8 (lower (and (use_i8mm)
+                    (has_type $I32X4
+                      (iadd _
+                        (iadd_pairwise _
+                          (iadd_pairwise _
+                            (swiden_low _ lo @ (imul _ (uwiden_low _ a) (swiden_low _ b)))
+                            (swiden_high _ lo))
+                          (iadd_pairwise _
+                            (swiden_low _ hi @ (imul _ (uwiden_high _ a) (swiden_high _ b)))
+                            (swiden_high _ hi)))
+                        c))))
+      (usdot c a b))
+</code></pre></div>
+<p>The <code>uwiden</code>/<code>swiden</code> pairing is what the mixed form actually produces — confirmed in disassembly (<code>uxtl</code> on the unsigned operand, <code>sxtl</code> on the signed one).</p>
+<h2>Why an issue and not a PR</h2>
+<p>I cannot verify correctness. The machine I have is an M1, where <code>hw.optional.arm.FEAT_I8MM = 0</code>, so <code>USDOT</code> will not execute — a filetest would only prove instruction selection, not that the result is right. Given a wrong dot-product rule is a silent miscompile, that seemed like the wrong thing to submit untested.</p>
+<p>Happy to prepare the patch if the approach looks right, and to write it against whatever the project prefers for validating I8MM lowerings (emulation, or CI hardware that has the feature).</p>
+<h2>Questions</h2>
+<ul>
+<li>Is the pattern above the right shape, or does the mid-end normalise the mixed tree differently than the signed one?</li>
+<li>Is there existing precedent for testing lowerings that need a feature the CI hosts lack?<br>
+</li>
+</ul>
+</blockquote>
+
+
+
+<a name="613904026"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314050%20aarch64%3A%20lower%20mixed%20unsigned%20x%20s.../near/613904026" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314050.20aarch64.3A.20lower.20mixed.20unsigned.20x.20s.2E.2E.2E.html#613904026">(Jul 31 2026 at 17:10)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/14050#issuecomment-5145547007">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14050">issue #14050</a>:</p>
+<blockquote>
+<p>Looking at a <a href="https://github.com/bytecodealliance/wasmtime/actions/runs/30647521128/job/91212577769">recent CI log</a> I see:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">Flags</span><span class="p">:</span><span class="w">                                   </span><span class="o">..</span><span class="p">.</span><span class="w"> </span><span class="n">i8mm</span><span class="w"> </span><span class="o">..</span><span class="p">.</span>
+</code></pre></div>
+<p>so I think that this runtest will actually run in CI. This is similar to many AVX-512 lowerings we have where most of us don't have that on local machines and CI often doesn't either. Here though it looks like it'll be better where CI is running things, so feel free to send a PR!</p>
+</blockquote>
+
+
+
+<a name="613904064"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314050%20aarch64%3A%20lower%20mixed%20unsigned%20x%20s.../near/613904064" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314050.20aarch64.3A.20lower.20mixed.20unsigned.20x.20s.2E.2E.2E.html#613904064">(Jul 31 2026 at 17:10)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the cranelift label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14050">Issue #14050</a>.</p>
+
+
+
+<a name="613904067"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314050%20aarch64%3A%20lower%20mixed%20unsigned%20x%20s.../near/613904067" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314050.20aarch64.3A.20lower.20mixed.20unsigned.20x.20s.2E.2E.2E.html#613904067">(Jul 31 2026 at 17:10)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the cranelift:area:aarch64 label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14050">Issue #14050</a>.</p>
+
+
+
+<a name="614052855"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314050%20aarch64%3A%20lower%20mixed%20unsigned%20x%20s.../near/614052855" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314050.20aarch64.3A.20lower.20mixed.20unsigned.20x.20s.2E.2E.2E.html#614052855">(Aug 01 2026 at 08:10)</a>:</h4>
+<p>darmie closed <a href="https://github.com/bytecodealliance/wasmtime/issues/14050">issue #14050</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p><code>aarch64</code> lowers the signed i8 dot-product tree to <code>SDOT</code> under <code>has_dotprod</code>, but there is no equivalent for the <strong>mixed unsigned x signed</strong> form, which FEAT_I8MM provides as <code>USDOT</code>. On an I8MM-capable part that tree currently falls back to <code>umull</code>/<code>smull</code> + <code>saddlp</code> widening even though a single instruction exists.</p>
+<p>For contrast, x64 already handles the mixed form: a <code>VectorDot</code>-shaped tree with an unsigned operand lowers to <code>VPDPBUSD</code> on a VNNI host. The aarch64 side has the signed case only.</p>
+<h2>Background</h2>
+<p>Quantized inference kernels are overwhelmingly <strong>unsigned activations x signed weights</strong> (u8 x i8) — that asymmetry is why <code>VPDPBUSD</code> and <code>USDOT</code> exist. So this is the shape that matters most for int8 inference, and it is the one currently left on the fallback path.</p>
+<p>I hit this lowering a quantized int8 dot kernel: on x86 with VNNI it reaches <code>vpdpbusd</code>, while the same kernel on aarch64 emits the widening sequence.</p>
+<h2>Proposal</h2>
+<p>Mirror the existing <code>SDOT</code> support:</p>
+<ol>
+<li>A <code>has_i8mm</code> setting in <code>meta/src/isa/arm64.rs</code> alongside <code>has_dotprod</code>, with matching host detection and a <code>use_i8mm</code> helper.</li>
+<li>The <code>USDOT</code> instruction in <code>isa/aarch64/inst.isle</code> + emit.</li>
+<li>A lowering rule beside the <code>SDOT</code> rule. The tree is identical except one operand widens unsigned:</li>
+</ol>
+<div class="codehilite" data-code-language="isle"><pre><span></span><code>(rule 8 (lower (and (use_i8mm)
+                    (has_type $I32X4
+                      (iadd _
+                        (iadd_pairwise _
+                          (iadd_pairwise _
+                            (swiden_low _ lo @ (imul _ (uwiden_low _ a) (swiden_low _ b)))
+                            (swiden_high _ lo))
+                          (iadd_pairwise _
+                            (swiden_low _ hi @ (imul _ (uwiden_high _ a) (swiden_high _ b)))
+                            (swiden_high _ hi)))
+                        c))))
+      (usdot c a b))
+</code></pre></div>
+<p>The <code>uwiden</code>/<code>swiden</code> pairing is what the mixed form actually produces — confirmed in disassembly (<code>uxtl</code> on the unsigned operand, <code>sxtl</code> on the signed one).</p>
+<h2>Why an issue and not a PR</h2>
+<p>I cannot verify correctness. The machine I have is an M1, where <code>hw.optional.arm.FEAT_I8MM = 0</code>, so <code>USDOT</code> will not execute — a filetest would only prove instruction selection, not that the result is right. Given a wrong dot-product rule is a silent miscompile, that seemed like the wrong thing to submit untested.</p>
+<p>Happy to prepare the patch if the approach looks right, and to write it against whatever the project prefers for validating I8MM lowerings (emulation, or CI hardware that has the feature).</p>
+<h2>Questions</h2>
+<ul>
+<li>Is the pattern above the right shape, or does the mid-end normalise the mixed tree differently than the signed one?</li>
+<li>Is there existing precedent for testing lowerings that need a feature the CI hosts lack?<br>
+</li>
+</ul>
+</blockquote>
+
+
+
+<hr><p>Last updated: Sep 05 2026 at 18:09 UTC</p>
+</html>

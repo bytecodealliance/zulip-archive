@@ -1,0 +1,295 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #14150 c-api: fix the component-model build... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html">wasmtime / PR #14150 c-api: fix the component-model build...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="617171426"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617171426" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617171426">(Aug 18 2026 at 11:33)</a>:</h4>
+<p>Lstarsky0 opened <a href="https://github.com/bytecodealliance/wasmtime/pull/14150">PR #14150</a> from <code>Lstarsky0:fix/c-api-declare-vecs-cfg</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p><code>cargo check -p wasmtime-c-api --no-default-features --features component-model</code> fails on main with 23 diagnostics, starting with:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">error</span><span class="p">[</span><span class="n">E0433</span><span class="p">]:</span><span class="w"> </span><span class="nc">cannot</span><span class="w"> </span><span class="n">find</span><span class="w"> </span><span class="err">`</span><span class="n">declare_vecs</span><span class="err">`</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="err">`</span><span class="k">crate</span><span class="err">`</span>
+<span class="n">error</span><span class="p">[</span><span class="n">E0425</span><span class="p">]:</span><span class="w"> </span><span class="nc">cannot</span><span class="w"> </span><span class="n">find</span><span class="w"> </span><span class="k">type</span><span class="w"> </span><span class="err">`</span><span class="n">wasmtime_component_vallist_t</span><span class="err">`</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">this</span><span class="w"> </span><span class="n">scope</span>
+<span class="o">..</span><span class="p">.</span>
+</code></pre></div>
+<h2>What is broken</h2>
+<p><code>crates/c-api/src/component/val.rs:11</code> calls <code>crate::declare_vecs!</code>. <code>declare_vecs</code> is a plain <code>macro_rules!</code>, so that path only resolves because of the re-export at the bottom of <code>vec.rs</code> — and the re-export is gated on the wrong feature:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#[cfg(feature = </span><span class="s">"async"</span><span class="cp">)]</span>
+<span class="k">pub</span><span class="p">(</span><span class="k">crate</span><span class="p">)</span><span class="w"> </span><span class="k">use</span><span class="w"> </span><span class="n">declare_vecs</span><span class="p">;</span>
+</code></pre></div>
+<p><code>component/val.rs</code> is behind <code>#[cfg(feature = "component-model")]</code> (<code>lib.rs:104</code>), and <code>component-model</code> does not imply <code>async</code>. Enable one without the other and the macro is not in scope, taking every vec type it declares with it.</p>
+<p><code>crate::declare_vecs!</code> has exactly one caller, <code>component/val.rs</code>. Nothing under <code>async</code> uses the path form.</p>
+<h2>How it got here</h2>
+<p><code>#10697</code> added the re-export for this consumer with no cfg at all:</p>
+<div class="codehilite" data-code-language="Diff"><pre><span></span><code><span class="gi">+pub(crate) use declare_vecs;</span>
+</code></pre></div>
+<p><code>4f2fa1541</code> ("Update nightly Rust used in CI") later added the <code>#[cfg(feature = "async")]</code> line — the shape of a fix for an unused-import warning from a newer lint, with the feature picked incorrectly.</p>
+<p>CI did not catch it because the <code>wasmtime-c-api</code> matrix entry covers <code>--no-default-features</code> and then <code>wat</code>, <code>wasi</code> and <code>gc</code>. <code>component-model</code> alone was never built.</p>
+<h2>The change</h2>
+<p>One line: the re-export is gated on <code>component-model</code>, matching its only consumer.</p>
+<h2>Testing</h2>
+<p>Feature matrix for <code>wasmtime-c-api-impl</code>, before and after:</p>
+<table>
+<thead>
+<tr>
+<th>features</th>
+<th>main</th>
+<th>with this PR</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>component-model</code></td>
+<td>24 errors</td>
+<td>ok</td>
+</tr>
+<tr>
+<td><code>component-model,async</code></td>
+<td>ok</td>
+<td>ok</td>
+</tr>
+<tr>
+<td><code>async</code></td>
+<td>ok</td>
+<td>ok</td>
+</tr>
+<tr>
+<td><code>component-model,cranelift</code></td>
+<td>24 errors</td>
+<td>ok</td>
+</tr>
+<tr>
+<td>none, <code>wat</code>, <code>wasi</code>, <code>gc</code></td>
+<td>ok</td>
+<td>ok</td>
+</tr>
+</tbody>
+</table>
+<p><code>-p wasmtime-c-api --no-default-features --features component-model</code> is added to the <code>wasmtime-c-api</code> checks. It fails on unpatched main with 23 diagnostics and passes here.</p>
+<p>Also clean, run twice: the four existing <code>wasmtime-c-api</code> checks, <code>-p wasmtime-c-api-impl --all-features</code>, <code>cargo clippy -p wasmtime-c-api-impl --no-default-features --features component-model</code>, <code>cargo test -p wasmtime-c-api-impl</code>, <code>cargo fmt --all -- --check</code>.</p>
+<p>One warning remains under <code>component-model</code> — <code>unused import: wasm_byte_vec_t</code> in <code>component/component.rs</code>. It is already there on main under <code>component-model,async</code>, so it is not from this change and I have left it alone.<br>
+</p>
+</blockquote>
+
+
+
+<a name="617171430"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617171430" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617171430">(Aug 18 2026 at 11:33)</a>:</h4>
+<p>Lstarsky0 requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14150">PR #14150</a>.</p>
+
+
+
+<a name="617171432"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617171432" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617171432">(Aug 18 2026 at 11:33)</a>:</h4>
+<p>Lstarsky0 requested <a href="https://github.com/pchickey">pchickey</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14150">PR #14150</a>.</p>
+
+
+
+<a name="617171433"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617171433" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617171433">(Aug 18 2026 at 11:33)</a>:</h4>
+<p>Lstarsky0 requested <a href="https://github.com/fitzgen">fitzgen</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14150">PR #14150</a>.</p>
+
+
+
+<a name="617171437"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617171437" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617171437">(Aug 18 2026 at 11:33)</a>:</h4>
+<p>Lstarsky0 requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-default-reviewers">wasmtime-default-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14150">PR #14150</a>.</p>
+
+
+
+<a name="617173766"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617173766" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617173766">(Aug 18 2026 at 11:47)</a>:</h4>
+<p>Lstarsky0 updated <a href="https://github.com/bytecodealliance/wasmtime/pull/14150">PR #14150</a>.</p>
+
+
+
+<a name="617174549"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617174549" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617174549">(Aug 18 2026 at 11:51)</a>:</h4>
+<p>Lstarsky0 edited <a href="https://github.com/bytecodealliance/wasmtime/pull/14150">PR #14150</a>:</p>
+<blockquote>
+<p><code>cargo check -p wasmtime-c-api --no-default-features --features component-model</code> fails on main with 23 diagnostics, starting with:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">error</span><span class="p">[</span><span class="n">E0433</span><span class="p">]:</span><span class="w"> </span><span class="nc">cannot</span><span class="w"> </span><span class="n">find</span><span class="w"> </span><span class="err">`</span><span class="n">declare_vecs</span><span class="err">`</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="err">`</span><span class="k">crate</span><span class="err">`</span>
+<span class="n">error</span><span class="p">[</span><span class="n">E0425</span><span class="p">]:</span><span class="w"> </span><span class="nc">cannot</span><span class="w"> </span><span class="n">find</span><span class="w"> </span><span class="k">type</span><span class="w"> </span><span class="err">`</span><span class="n">wasmtime_component_vallist_t</span><span class="err">`</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">this</span><span class="w"> </span><span class="n">scope</span>
+<span class="o">..</span><span class="p">.</span>
+</code></pre></div>
+<h2>What is broken</h2>
+<p><code>crates/c-api/src/component/val.rs:11</code> calls <code>crate::declare_vecs!</code>. <code>declare_vecs</code> is a plain <code>macro_rules!</code>, so that path only resolves because of the re-export at the bottom of <code>vec.rs</code> — and the re-export is gated on the wrong feature:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#[cfg(feature = </span><span class="s">"async"</span><span class="cp">)]</span>
+<span class="k">pub</span><span class="p">(</span><span class="k">crate</span><span class="p">)</span><span class="w"> </span><span class="k">use</span><span class="w"> </span><span class="n">declare_vecs</span><span class="p">;</span>
+</code></pre></div>
+<p><code>component/val.rs</code> is behind <code>#[cfg(feature = "component-model")]</code> (<code>lib.rs:104</code>), and <code>component-model</code> does not imply <code>async</code>. Enable one without the other and the macro is not in scope, taking every vec type it declares with it.</p>
+<p><code>crate::declare_vecs!</code> has exactly one caller, <code>component/val.rs</code>. Nothing under <code>async</code> uses the path form.</p>
+<h2>How it got here</h2>
+<p><code>#10697</code> added the re-export for this consumer with no cfg at all:</p>
+<div class="codehilite" data-code-language="Diff"><pre><span></span><code><span class="gi">+pub(crate) use declare_vecs;</span>
+</code></pre></div>
+<p><code>4f2fa1541</code> ("Update nightly Rust used in CI") later added the <code>#[cfg(feature = "async")]</code> line — the shape of a fix for an unused-import warning from a newer lint, with the feature picked incorrectly.</p>
+<p>CI did not catch it because the <code>wasmtime-c-api</code> matrix entry covers <code>--no-default-features</code> and then <code>wat</code>, <code>wasi</code> and <code>gc</code>. <code>component-model</code> alone was never built.</p>
+<h2>The change</h2>
+<p>One line: the re-export is gated on <code>component-model</code>, matching its only consumer.</p>
+<h2>Testing</h2>
+<p>Feature matrix for <code>wasmtime-c-api-impl</code>, before and after:</p>
+<table>
+<thead>
+<tr>
+<th>features</th>
+<th>main</th>
+<th>with this PR</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>component-model</code></td>
+<td>24 errors</td>
+<td>ok</td>
+</tr>
+<tr>
+<td><code>component-model,async</code></td>
+<td>ok</td>
+<td>ok</td>
+</tr>
+<tr>
+<td><code>async</code></td>
+<td>ok</td>
+<td>ok</td>
+</tr>
+<tr>
+<td><code>component-model,cranelift</code></td>
+<td>24 errors</td>
+<td>ok</td>
+</tr>
+<tr>
+<td>none, <code>wat</code>, <code>wasi</code>, <code>gc</code></td>
+<td>ok</td>
+<td>ok</td>
+</tr>
+</tbody>
+</table>
+<p><code>-p wasmtime-c-api --no-default-features --features component-model</code> is added to the <code>wasmtime-c-api</code> checks. It fails on unpatched main with 23 diagnostics and passes here.</p>
+<p>Also clean, run twice: the four existing <code>wasmtime-c-api</code> checks, <code>-p wasmtime-c-api-impl --all-features</code>, <code>cargo clippy -p wasmtime-c-api-impl --no-default-features --features component-model</code>, <code>cargo test -p wasmtime-c-api-impl</code>, <code>cargo fmt --all -- --check</code>.</p>
+<p>One more thing had to come with it. <code>component/component.rs</code> imports <code>wasm_byte_vec_t</code> unconditionally, but the only use is in <code>wasmtime_component_serialize</code>, which is gated on <code>cranelift</code> or <code>winch</code>. Under <code>component-model</code> alone the import is unused, and CI runs with <code>RUSTFLAGS=-D warnings</code>, so the new check fails on it. The import is now gated the same way as its use.</p>
+<p>The warning is not from this change — it is on main today under <code>component-model,async</code> as well. Nothing built either configuration, which is why it had never surfaced. I first pushed this without the import fix and CI caught it, which is the check doing its job.<br>
+</p>
+</blockquote>
+
+
+
+<a name="617216963"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617216963" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617216963">(Aug 18 2026 at 14:13)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14150#pullrequestreview-4962014945">PR review</a>.</p>
+
+
+
+<a name="617216966"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617216966" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617216966">(Aug 18 2026 at 14:13)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14150#discussion_r3804864629">PR review comment</a>:</p>
+<blockquote>
+<p>No need for comments here, the <code>#[cfg]</code> explains things.</p>
+</blockquote>
+
+
+
+<a name="617216969"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617216969" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617216969">(Aug 18 2026 at 14:13)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14150#discussion_r3804866954">PR review comment</a>:</p>
+<blockquote>
+<p>Should this be <code>any(feature = "async", feature = "component-model")</code>?</p>
+</blockquote>
+
+
+
+<a name="617217012"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617217012" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617217012">(Aug 18 2026 at 14:14)</a>:</h4>
+<p>alexcrichton unassigned pchickey from <a href="https://github.com/bytecodealliance/wasmtime/pull/14150">PR #14150 c-api: fix the component-model build without async</a>.</p>
+
+
+
+<a name="617217013"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617217013" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617217013">(Aug 18 2026 at 14:14)</a>:</h4>
+<p>alexcrichton requested <a href="https://github.com/alexcrichton">alexcrichton</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14150">PR #14150</a>.</p>
+
+
+
+<a name="617217015"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617217015" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617217015">(Aug 18 2026 at 14:14)</a>:</h4>
+<p>alexcrichton unassigned fitzgen from <a href="https://github.com/bytecodealliance/wasmtime/pull/14150">PR #14150 c-api: fix the component-model build without async</a>.</p>
+
+
+
+<a name="617217197"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617217197" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617217197">(Aug 18 2026 at 14:14)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/14150#issuecomment-5329436773">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14150">PR #14150</a>:</p>
+<blockquote>
+<p>Also, please be sure to review our <a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">AI tool usage policy</a></p>
+</blockquote>
+
+
+
+<a name="617233784"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617233784" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617233784">(Aug 18 2026 at 15:18)</a>:</h4>
+<p>Lstarsky0 updated <a href="https://github.com/bytecodealliance/wasmtime/pull/14150">PR #14150</a>.</p>
+
+
+
+<a name="617235896"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617235896" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617235896">(Aug 18 2026 at 15:28)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> Lstarsky0 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14150#pullrequestreview-4962814796">PR review</a>.</p>
+
+
+
+<a name="617235899"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617235899" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617235899">(Aug 18 2026 at 15:28)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> Lstarsky0 created <a href="https://github.com/bytecodealliance/wasmtime/pull/14150#discussion_r3805517889">PR review comment</a>:</p>
+<blockquote>
+<p>Dropped. The import order moves in the same commit: the comment was what kept rustfmt from sorting those two use lines, so cargo fmt --check fails once it is gone</p>
+</blockquote>
+
+
+
+<a name="617236000"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617236000" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617236000">(Aug 18 2026 at 15:28)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> Lstarsky0 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14150#pullrequestreview-4962819132">PR review</a>.</p>
+
+
+
+<a name="617236001"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617236001" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617236001">(Aug 18 2026 at 15:28)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> Lstarsky0 created <a href="https://github.com/bytecodealliance/wasmtime/pull/14150#discussion_r3805521530">PR review comment</a>:</p>
+<blockquote>
+<p>No, that breaks async on its own. crate::declare_vecs! has one caller, component/val.rs:11, and mod component is gated on component-model at lib.rs:104, so under --features async with no component-model nothing uses the path form and the re-export is unused. With -D warnings that is error: unused import: declare_vecs at vec.rs:152. That is the same warning the original #[cfg(feature = "async")] was silencing. It named the wrong feature, which is what let component-model alone break</p>
+</blockquote>
+
+
+
+<a name="617262759"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617262759" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617262759">(Aug 18 2026 at 17:22)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14150#pullrequestreview-4963872124">PR review</a>.</p>
+
+
+
+<a name="617262779"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617262779" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617262779">(Aug 18 2026 at 17:22)</a>:</h4>
+<p>alexcrichton added <a href="https://github.com/bytecodealliance/wasmtime/pull/14150">PR #14150 c-api: fix the component-model build without async</a> to the merge queue.</p>
+
+
+
+<a name="617269354"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617269354" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617269354">(Aug 18 2026 at 17:48)</a>:</h4>
+<p><span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span> alexcrichton merged <a href="https://github.com/bytecodealliance/wasmtime/pull/14150">PR #14150</a>.</p>
+
+
+
+<a name="617269356"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314150%20c-api%3A%20fix%20the%20component-model%20build.../near/617269356" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314150.20c-api.3A.20fix.20the.20component-model.20build.2E.2E.2E.html#617269356">(Aug 18 2026 at 17:48)</a>:</h4>
+<p>alexcrichton removed <a href="https://github.com/bytecodealliance/wasmtime/pull/14150">PR #14150 c-api: fix the component-model build without async</a> from the merge queue.</p>
+
+
+
+<hr><p>Last updated: Sep 05 2026 at 18:09 UTC</p>
+</html>

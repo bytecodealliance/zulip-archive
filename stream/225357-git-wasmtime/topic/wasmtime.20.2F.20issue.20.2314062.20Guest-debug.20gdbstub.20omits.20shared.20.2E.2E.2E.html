@@ -1,0 +1,71 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14062 Guest-debug gdbstub omits shared ... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314062.20Guest-debug.20gdbstub.20omits.20shared.20.2E.2E.2E.html">wasmtime / issue #14062 Guest-debug gdbstub omits shared ...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="614147624"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314062%20Guest-debug%20gdbstub%20omits%20shared%20.../near/614147624" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314062.20Guest-debug.20gdbstub.20omits.20shared.20.2E.2E.2E.html#614147624">(Aug 02 2026 at 07:55)</a>:</h4>
+<p>cpunion opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14062">issue #14062</a>:</p>
+<blockquote>
+<h3>Reproduction</h3>
+<p>Wasmtime's built-in guest-debug gdbstub does not expose a shared linear memory in its synthetic address space. This prevents LLDB from reading globals and runtime-backed values even though source breakpoints, Wasm locals, and backtraces work.</p>
+<p><code>main.wat</code>:</p>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">memory</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"memory"</span><span class="p">)</span> <span class="mf">1 1</span> <span class="err">shared</span><span class="p">)</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$entry</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"_start"</span><span class="p">)</span>
+    <span class="nb">i32.const</span> <span class="mi">0</span>
+    <span class="nb">i32.const</span> <span class="mi">42</span>
+    <span class="nb">i32.store</span>
+    <span class="nb">unreachable</span><span class="p">))</span>
+</code></pre></div>
+<p>Build and start guest debugging:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>wat2wasm<span class="w"> </span>--debug-names<span class="w"> </span>--enable-threads<span class="w"> </span>main.wat<span class="w"> </span>-o<span class="w"> </span>main.wasm
+wasmtime<span class="w"> </span>run<span class="w"> </span>-g<span class="w"> </span><span class="m">1234</span><span class="w"> </span>-W<span class="w"> </span><span class="nv">threads</span><span class="o">=</span>y,shared-memory<span class="o">=</span>y<span class="w"> </span>main.wasm
+</code></pre></div>
+<p>Using a Wasm-aware LLDB:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>(lldb) target create main.wasm
+(lldb) process connect --plugin wasm connect://127.0.0.1:1234
+(lldb) continue
+# stopped at the final `unreachable`, after storing 42
+(lldb) process plugin packet send qXfer:memory-map:read::0,ffff
+response: ...&lt;memory-map&gt;&lt;memory type="rom" start="0x4000000000000000" length="0x51"/&gt;&lt;/memory-map&gt;
+(lldb) memory read --size 4 --format decimal --count 1 0x0
+error: memory read failed for 0x0
+</code></pre></div>
+<p>The equivalent unshared memory is reported as a <code>ram</code> region at address 0 and can be read successfully.</p>
+<h3>Expected result</h3>
+<p>The shared memory should appear in the RSP memory map and support reads while the guest is stopped, just like an unshared memory. Guest source-language adapters need this to inspect globals and runtime values.</p>
+<h3>Likely cause</h3>
+<p><code>Instance::debug_memory</code> intentionally returns only unshared <code>Memory</code> and directs callers to <code>debug_shared_memory</code> for shared memory:</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/v47.0.3/crates/wasmtime/src/runtime/debug.rs#L202-L247">https://github.com/bytecodealliance/wasmtime/blob/v47.0.3/crates/wasmtime/src/runtime/debug.rs#L202-L247</a></p>
+<p>However, the debugger host API's <code>instance_get_memory</code> only calls <code>debug_memory</code>:</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/v47.0.3/crates/debugger/src/host/opaque.rs#L166-L173">https://github.com/bytecodealliance/wasmtime/blob/v47.0.3/crates/debugger/src/host/opaque.rs#L166-L173</a></p>
+<p>The gdbstub address-space implementation consequently has no shared-memory resource to enumerate:</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/v47.0.3/crates/gdbstub-component/src/addr.rs#L60-L78">https://github.com/bytecodealliance/wasmtime/blob/v47.0.3/crates/gdbstub-component/src/addr.rs#L60-L78</a></p>
+<p>It looks like the debugger resource abstraction needs to represent both <code>Memory</code> and <code>SharedMemory</code>, then implement size/read/write operations for both.</p>
+<h3>Environment</h3>
+<ul>
+<li>Wasmtime 47.0.3 (<code>5554cc1a6</code>, 2026-07-31); the same behavior was also observed with 44.0.0</li>
+<li>wasi-sdk 33 LLDB 22.1.0 with the Wasm process plugin</li>
+<li>macOS arm64</li>
+</ul>
+<p>This was found while implementing WASI source debugging for <a href="https://github.com/xgo-dev/llgo/issues/2164">xgo-dev/llgo#2164</a>, but the WAT reproduction is independent of LLGo.<br>
+</p>
+</blockquote>
+
+
+
+<a name="614182830"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314062%20Guest-debug%20gdbstub%20omits%20shared%20.../near/614182830" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314062.20Guest-debug.20gdbstub.20omits.20shared.20.2E.2E.2E.html#614182830">(Aug 02 2026 at 16:36)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasmtime:debugging label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14062">Issue #14062</a>.</p>
+
+
+
+<hr><p>Last updated: Sep 05 2026 at 18:09 UTC</p>
+</html>

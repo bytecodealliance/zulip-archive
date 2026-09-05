@@ -1,0 +1,371 @@
+<html>
+<head><meta charset="utf-8"><title>Optional imports and exports with wit-bindgen and wasmtime · wit-bindgen · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/index.html">wit-bindgen</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html">Optional imports and exports with wit-bindgen and wasmtime</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="616989067"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/616989067" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Eduard Smet (Celarye) <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#616989067">(Aug 17 2026 at 15:28)</a>:</h4>
+<p>I've been redoing the WIT design for a plugin system I have in one of my projects (<a href="https://github.com/wpbs-rs/wpbs/pull/29">https://github.com/wpbs-rs/wpbs/pull/29</a>). The plugin system has a dynamic list of "services" (provided as WIT dep worlds) which a plugin can optionally implement.</p>
+<p>Meaning that they ideally only implement the worlds they want to implement. But it seems like optional imports (<a href="https://github.com/WebAssembly/component-model/issues/555">https://github.com/WebAssembly/component-model/issues/555</a>) and optional exports (can not find any tracking issue for this) are still quite a way off.</p>
+<p>For now guests implement all worlds their export functions but just call <code>unimplemented!()</code> for the ones they do not want to implement. This works for now and it could get abstracted away behind a crate providing macros for this but in the future we would love to provide this at the WIT level instead.</p>
+<p>The usage of wit-bindgen is also strongly preferred for both the host and guest because of great developer experience and type safety it provides.</p>
+<p>So <span class="user-mention" data-user-id="697013">@circuitsacul</span> and I are looking into ways to support optional imports and exports with the current system (wit-bindgen and wasmtime). And we would like some feedback on the following idea:</p>
+<h2>WIT</h2>
+<p>You split each service into it's own world and do not compose them into a single <code>plugin</code> world.</p>
+<h2>Host</h2>
+<p>The main steps here are:</p>
+<ol>
+<li>Detect what worlds a WASM component implements (not sure how to tackle this at this moment).</li>
+<li>Add only those worlds to a linker (import validation).</li>
+<li>Pre-instantiate for only those worlds (export validation).</li>
+</ol>
+<h3>World detection</h3>
+<p>I could have a world with an export function which needs to list all "service" worlds the plugin implements but I rather just detect it before doing any instantiation if possible.</p>
+<h3>Linker</h3>
+<p>Added a specific "service" world to the linker in case a component has it implemented:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">ServiceOne</span><span class="p">::</span><span class="n">add_to_linker</span><span class="p">::</span><span class="o">&lt;</span><span class="n">InternalRuntime</span><span class="p">,</span><span class="w"> </span><span class="n">HasSelf</span><span class="o">&lt;</span><span class="n">InternalRuntime</span><span class="o">&gt;&gt;</span><span class="p">(</span>
+<span class="w">    </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">linker</span><span class="p">,</span>
+<span class="w">    </span><span class="o">|</span><span class="n">internal_runtime</span><span class="o">|</span><span class="w"> </span><span class="n">internal_runtime</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="p">.</span><span class="n">unwrap</span><span class="p">();</span>
+
+<span class="n">ServiceTwo</span><span class="p">::</span><span class="n">add_to_linker</span><span class="p">::</span><span class="o">&lt;</span><span class="n">InternalRuntime</span><span class="p">,</span><span class="w"> </span><span class="n">HasSelf</span><span class="o">&lt;</span><span class="n">InternalRuntime</span><span class="o">&gt;&gt;</span><span class="p">(</span>
+<span class="w">    </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">linker</span><span class="p">,</span>
+<span class="w">    </span><span class="o">|</span><span class="n">internal_runtime</span><span class="o">|</span><span class="w"> </span><span class="n">internal_runtime</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="p">.</span><span class="n">unwrap</span><span class="p">();</span>
+
+<span class="c1">// etc.</span>
+</code></pre></div>
+<p>This would mean that there would be a bunch of unique linkers for the used "service" combinations.</p>
+<h3>Pre Instantiation</h3>
+<p>Pre Instantiate with a specific "service" world in case a component has it implemented:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">struct</span><span class="w"> </span><span class="nc">PluginPre</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">service_one_pre</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">ServiceOnePre</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="w">    </span><span class="n">service_two_pre</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">ServiceTwoPre</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="w">    </span><span class="c1">// etc.</span>
+<span class="p">}</span>
+</code></pre></div>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">ServiceOnePre</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">instance_pre</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span>
+
+<span class="n">ServiceTwoPre</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">instance_pre</span><span class="p">).</span><span class="n">unwrap</span><span class="p">();</span>
+
+<span class="c1">// etc.</span>
+</code></pre></div>
+<p>The question here is what the cost if of many InstancePre's per plugin, how does it scale?</p>
+<h2>Guest</h2>
+<p>A guest can then implement the traits for the <code>service</code> worlds they want to a <code>Plugin</code> struct and then add:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="c1">// Clippy pedantic is not happy with wit-bindgen 0.60.0</span>
+<span class="cp">#[allow(clippy::same_length_and_capacity)]</span>
+<span class="k">mod</span><span class="w"> </span><span class="nn">bindgen</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">use</span><span class="w"> </span><span class="k">crate</span><span class="p">::</span><span class="n">Plugin</span><span class="p">;</span>
+
+<span class="w">    </span><span class="n">wit_bindgen</span><span class="p">::</span><span class="n">generate</span><span class="o">!</span><span class="p">({</span><span class="w"> </span><span class="n">path</span><span class="p">:</span><span class="w"> </span><span class="s">"../service-one"</span><span class="w"> </span><span class="p">});</span>
+<span class="w">    </span><span class="n">wit_bindgen</span><span class="p">::</span><span class="n">generate</span><span class="o">!</span><span class="p">({</span><span class="w"> </span><span class="n">path</span><span class="p">:</span><span class="w"> </span><span class="s">"../service-two"</span><span class="w"> </span><span class="p">});</span>
+<span class="w">    </span><span class="c1">// etc.</span>
+
+<span class="w">    </span><span class="n">export</span><span class="o">!</span><span class="p">(</span><span class="n">Plugin</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>So basically I would love to know:</p>
+<ol>
+<li>If anyone has experience with this.</li>
+<li>If this is even possible in reality (I have not gone ahead and actually implemented it yet because of the world detection issue and the work it will take).</li>
+<li>If it's worth in case it does work.</li>
+<li>If there is  tracking issue for optional exports.</li>
+</ol>
+
+
+
+<a name="616989772"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/616989772" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Eduard Smet (Celarye) <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#616989772">(Aug 17 2026 at 15:31)</a>:</h4>
+<p><span class="user-mention" data-user-id="1101301">@Ignatz</span> you might be interested in this.</p>
+
+
+
+<a name="617021993"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/617021993" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#617021993">(Aug 17 2026 at 18:18)</a>:</h4>
+<p>FWIW optional imports in the component model are seen as pretty high-priority and in theory going to get implemented in the next few months or so, but that's also still all a work-in-progress (e.g. no spec definition quite just yet). Otherwise though there's no plans for optional exports at this time -- that'd be more done with host side detection I think.</p>
+<p>As for the viability of what you're thinking, there's a lot of details glossed over I think but it seems reasonable-ish to me</p>
+
+
+
+<a name="617024965"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/617024965" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Eduard Smet (Celarye) <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#617024965">(Aug 17 2026 at 18:34)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="253994">Alex Crichton</span> <a href="#narrow/channel/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime/near/617021993">said</a>:</p>
+<blockquote>
+<p>FWIW optional imports in the component model are seen as pretty high-priority and in theory going to get implemented in the next few months or so, but that's also still all a work-in-progress (e.g. no spec definition quite just yet). Otherwise though there's no plans for optional exports at this time -- that'd be more done with host side detection I think.</p>
+<p>As for the viability of what you're thinking, there's a lot of details glossed over I think but it seems reasonable-ish to me</p>
+</blockquote>
+<p>Is there any specific way you see host side detection working, as that seems to be the biggest hurdle for the above proposed implementation?</p>
+<p>Iirc the WIT worlds a component implements can be checked through wasm-tools. But that’s not a library (maybe I can use the internal crate). And then I would need to parse that as well ofcourse.</p>
+<p>As optional exports are not planned at all I’ll probably have to try the above idea eventually if I want to keep the plugin developer experience as simple as possible.</p>
+
+
+
+<a name="617026396"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/617026396" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#617026396">(Aug 17 2026 at 18:43)</a>:</h4>
+<p>For host-side detection I'd imagine reflection over the <code>Component</code> type after it's loaded/compiled. That has information on imports/exports you'd be able to dispatch on</p>
+
+
+
+<a name="617026535"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/617026535" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#617026535">(Aug 17 2026 at 18:44)</a>:</h4>
+<p>For optional exports my impression is that an export is either there or not, optionality doesn't factor in to it. For imports it's different because you may be given the import or not, but optional exports seem like it'd be some sort of conditional decision based on what you were given at runtime and that's not planned AFAIK</p>
+
+
+
+<a name="617028934"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/617028934" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Till Schneidereit <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#617028934">(Aug 17 2026 at 19:00)</a>:</h4>
+<p>the Wasmtime CLI effectively already does this, fwiw: <code>wasmtime run</code> and <code>wasmtime serve</code> both support multiple different exports, and successfully run the component if at least one of them exists</p>
+
+
+
+<a name="617038972"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/617038972" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Eduard Smet (Celarye) <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#617038972">(Aug 17 2026 at 20:03)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="253994">Alex Crichton</span> <a href="#narrow/channel/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime/near/617026396">said</a>:</p>
+<blockquote>
+<p>For host-side detection I'd imagine reflection over the <code>Component</code> type after it's loaded/compiled. That has information on imports/exports you'd be able to dispatch on</p>
+</blockquote>
+<p>Ah yeah something like <code>Component::get_export_index()</code> or so could maybe do the job? What I would want was a clear list of the worlds a component implements.</p>
+
+
+
+<a name="617038997"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/617038997" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Eduard Smet (Celarye) <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#617038997">(Aug 17 2026 at 20:03)</a>:</h4>
+<p><span class="user-mention silent" data-user-id="253994">Alex Crichton</span> <a href="#narrow/channel/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime/near/617026396">said</a>:</p>
+<blockquote>
+<p>For host-side detection I'd imagine reflection over the <code>Component</code> type after it's loaded/compiled. That has information on imports/exports you'd be able to dispatch on</p>
+</blockquote>
+<p>Ah yeah something like <code>Component::get_export_index()</code> or so could maybe do the job? What I would want was a clear list of the worlds a component implements.</p>
+
+
+
+<a name="617039118"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/617039118" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Eduard Smet (Celarye) <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#617039118">(Aug 17 2026 at 20:04)</a>:</h4>
+<p>Not sure why it double send?</p>
+
+
+
+<a name="617039509"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/617039509" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Eduard Smet (Celarye) <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#617039509">(Aug 17 2026 at 20:07)</a>:</h4>
+<p>Just to clarify this is the current WIT structure which I have:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">wit</span>
+<span class="err">├──</span><span class="w"> </span><span class="n">deps</span>
+<span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">wpbs</span><span class="o">-</span><span class="n">services</span><span class="p">:</span><span class="nc">discord</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">types</span><span class="p">.</span><span class="n">wit</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="n">world</span><span class="p">.</span><span class="n">wit</span>
+<span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">wpbs</span><span class="o">-</span><span class="n">services</span><span class="p">:</span><span class="nc">job</span><span class="o">-</span><span class="n">scheduler</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">types</span><span class="p">.</span><span class="n">wit</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="n">world</span><span class="p">.</span><span class="n">wit</span>
+<span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">wpbs</span><span class="p">:</span><span class="nc">core</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">types</span><span class="p">.</span><span class="n">wit</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="n">world</span><span class="p">.</span><span class="n">wit</span>
+<span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">wpbs</span><span class="p">:</span><span class="nc">services</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="n">world</span><span class="p">.</span><span class="n">wit</span>
+<span class="err">│</span><span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="n">wpbs</span><span class="p">:</span><span class="nc">shared</span>
+<span class="err">│</span><span class="w">       </span><span class="err">└──</span><span class="w"> </span><span class="n">types</span><span class="p">.</span><span class="n">wit</span>
+<span class="err">└──</span><span class="w"> </span><span class="n">world</span><span class="p">.</span><span class="n">wit</span>
+</code></pre></div>
+<p>Here services like "discord" or "job-scheduler" provide worlds which a component may or may not implement.</p>
+
+
+
+<a name="617039630"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/617039630" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Eduard Smet (Celarye) <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#617039630">(Aug 17 2026 at 20:07)</a>:</h4>
+<p>So it's not an optional thing which may change ar runtime but gets decided at compile time of the component.</p>
+
+
+
+<a name="617039860"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/617039860" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#617039860">(Aug 17 2026 at 20:09)</a>:</h4>
+<p>Ok yeah sounds like you definitely want to reflect over the component type, so this wouldn't be a WIT feature really but rather a feature of your embedding. And yeah <code>get_export_index</code> is the way to go.</p>
+
+
+
+<a name="617040497"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/617040497" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Eduard Smet (Celarye) <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#617040497">(Aug 17 2026 at 20:13)</a>:</h4>
+<p>I think optional imports and exports was the wrong way to go about this. Rather these worlds are either implemented or not at compile time and I need to validate which are before pre-instantiating them.</p>
+<p>Should I combine <code>get_export_index</code> with the ideas I send above?</p>
+
+
+
+<a name="617047013"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/617047013" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#617047013">(Aug 17 2026 at 20:52)</a>:</h4>
+<p>That sounds reasonable to me yeah!</p>
+
+
+
+<a name="617050618"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/617050618" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Eduard Smet (Celarye) <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#617050618">(Aug 17 2026 at 21:18)</a>:</h4>
+<p>Could it be that the guest code snippet in my first message was wrong and that it would look like this instead?</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">mod</span><span class="w"> </span><span class="nn">bindgen</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">mod</span><span class="w"> </span><span class="nn">service_one</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">use</span><span class="w"> </span><span class="k">crate</span><span class="p">::</span><span class="n">Plugin</span><span class="p">;</span>
+
+<span class="w">        </span><span class="n">wit_bindgen</span><span class="p">::</span><span class="n">generate</span><span class="o">!</span><span class="p">({</span><span class="w"> </span><span class="n">path</span><span class="p">:</span><span class="w"> </span><span class="s">"../service-one"</span><span class="w"> </span><span class="p">});</span>
+<span class="w">        </span><span class="n">export</span><span class="o">!</span><span class="p">(</span><span class="n">Plugin</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="k">mod</span><span class="w"> </span><span class="nn">service_two</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">use</span><span class="w"> </span><span class="k">crate</span><span class="p">::</span><span class="n">Plugin</span><span class="p">;</span>
+
+<span class="w">        </span><span class="n">wit_bindgen</span><span class="p">::</span><span class="n">generate</span><span class="o">!</span><span class="p">({</span><span class="w"> </span><span class="n">path</span><span class="p">:</span><span class="w"> </span><span class="s">"../service-two"</span><span class="w"> </span><span class="p">});</span>
+<span class="w">        </span><span class="n">export</span><span class="o">!</span><span class="p">(</span><span class="n">Plugin</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+
+
+<a name="617965135"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/617965135" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Celarye <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#617965135">(Aug 21 2026 at 15:58)</a>:</h4>
+<p>I've gone ahead and split my separate worlds into their own subdirectories under <code>wit</code>. But I am not sure if this is the best way forward as I now need to duplicate the <code>deps</code> directory a bunch of times:</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>wit
+├──<span class="w"> </span>core
+│<span class="w">   </span>├──<span class="w"> </span>deps
+│<span class="w">   </span>│<span class="w">   </span>└──<span class="w"> </span>wpbs:shared
+│<span class="w">   </span>│<span class="w">       </span>└──<span class="w"> </span>types.wit
+│<span class="w">   </span>├──<span class="w"> </span>types.wit
+│<span class="w">   </span>└──<span class="w"> </span>world.wit
+├──<span class="w"> </span>services
+│<span class="w">   </span>├──<span class="w"> </span>discord
+│<span class="w">   </span>│<span class="w">   </span>├──<span class="w"> </span>deps
+│<span class="w">   </span>│<span class="w">   </span>│<span class="w">   </span>└──<span class="w"> </span>wpbs:shared
+│<span class="w">   </span>│<span class="w">   </span>│<span class="w">       </span>└──<span class="w"> </span>types.wit
+│<span class="w">   </span>│<span class="w">   </span>├──<span class="w"> </span>types.wit
+│<span class="w">   </span>│<span class="w">   </span>└──<span class="w"> </span>world.wit
+│<span class="w">   </span>└──<span class="w"> </span>job-scheduler
+│<span class="w">       </span>├──<span class="w"> </span>deps
+│<span class="w">       </span>│<span class="w">   </span>└──<span class="w"> </span>wpbs:shared
+│<span class="w">       </span>│<span class="w">       </span>└──<span class="w"> </span>types.wit
+│<span class="w">       </span>├──<span class="w"> </span>types.wit
+│<span class="w">       </span>└──<span class="w"> </span>world.wit
+└──<span class="w"> </span>shared
+<span class="w">    </span>└──<span class="w"> </span>types.wit
+</code></pre></div>
+<p>Are there any other ways I could solve this that improves upon this?</p>
+
+
+
+<a name="617970444"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/617970444" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Celarye <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#617970444">(Aug 21 2026 at 16:25)</a>:</h4>
+<p>I tried doing:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">mod</span><span class="w"> </span><span class="nn">bindings</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">mod</span><span class="w"> </span><span class="nn">shared</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// Had to create an empty world for this</span>
+<span class="w">        </span><span class="n">wasmtime</span><span class="p">::</span><span class="n">component</span><span class="p">::</span><span class="n">bindgen</span><span class="o">!</span><span class="p">({</span><span class="w"> </span><span class="n">path</span><span class="p">:</span><span class="w"> </span><span class="s">"./wit/shared/"</span><span class="w"> </span><span class="p">});</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">mod</span><span class="w"> </span><span class="nn">core</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">wasmtime</span><span class="p">::</span><span class="n">component</span><span class="p">::</span><span class="n">bindgen</span><span class="o">!</span><span class="p">({</span><span class="w"> </span><span class="n">path</span><span class="p">:</span><span class="w"> </span><span class="s">"./wit/core/"</span><span class="p">,</span><span class="w"> </span><span class="n">imports</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">default</span><span class="p">:</span><span class="w"> </span><span class="nc">async</span><span class="w"> </span><span class="p">},</span><span class="w"> </span><span class="n">exports</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">default</span><span class="p">:</span><span class="w"> </span><span class="nc">async</span><span class="w"> </span><span class="p">},</span><span class="w"> </span><span class="n">with</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="s">"wpbs::shared/shared-types@0.1.0-rc.1"</span><span class="p">:</span><span class="w"> </span><span class="nc">crate</span><span class="p">::</span><span class="n">runtime</span><span class="p">::</span><span class="n">plugins</span><span class="p">::</span><span class="n">bindings</span><span class="p">::</span><span class="n">shared</span><span class="p">::</span><span class="n">wpbs</span><span class="p">::</span><span class="n">shared</span><span class="p">::</span><span class="n">shared_types</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="p">});</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">//...</span>
+</code></pre></div>
+<p>But re-reading the reference I guess that's only for interfaces which I explicitly import into a world.</p>
+
+
+
+<a name="619507376"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/619507376" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Celarye <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#619507376">(Aug 27 2026 at 10:47)</a>:</h4>
+<p>For now I'll just keep duplicating the deps but maybe a configurable deps path in wit bindgen would be interesting to support?</p>
+
+
+
+<a name="619512803"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/619512803" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Celarye <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#619512803">(Aug 27 2026 at 11:15)</a>:</h4>
+<p>While implementing the above I came across an alternative solution on the host side:</p>
+<h2>Linker</h2>
+<p>Stick to a single <code>Linker</code> which implements all service worlds as it's okay for a <code>Linker</code> to implement more imports than a guest (if I understand this correctly).</p>
+<h2>Pre Instantiation</h2>
+<p>Instead of pre instantiating for every service world and storing a dynamic amount of <code>{world}Pre</code>, create a single generic <code>InstancePre</code> and <code>{world}Indices</code> (created by wit-bindgen as well).</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">RuntimePlugin</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">instance_pre</span><span class="p">:</span><span class="w"> </span><span class="nc">InstancePre</span><span class="o">&lt;</span><span class="n">InternalRuntime</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">state_pre</span><span class="p">:</span><span class="w"> </span><span class="nc">RuntimePluginStatePre</span><span class="p">,</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">indices</span><span class="p">:</span><span class="w"> </span><span class="nc">RuntimePluginIndices</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">RuntimePluginIndices</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">core</span><span class="p">:</span><span class="w"> </span><span class="nc">CoreIndices</span><span class="p">,</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">services</span><span class="p">:</span><span class="w"> </span><span class="nc">RuntimePluginIndicesServices</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">RuntimePluginIndicesServices</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">job_scheduler</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">JobSchedulerIndices</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">discord</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">DiscordIndices</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>With this you can then load the service specific world instance via <code>{world}Indices::load</code> on demand. This does do type checking of all exports on every call, which is not really needed after the first validation.</p>
+<p>Some questions about this approach:</p>
+<ul>
+<li>What is the cost memory wise of storing a dynamic amount of <code>{world}Pre</code> (old solution) vs a dynamic amount of <code>{world}Indices</code>?</li>
+<li>What is the cost of loading a <code>{world}</code> from a generic <code>Instance</code> via <code>{world}Indices::load</code> (new solution)?<br>
+=&gt; Which of the two approaches is recommended here?</li>
+</ul>
+
+
+
+<a name="619624303"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/619624303" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#619624303">(Aug 27 2026 at 18:44)</a>:</h4>
+<p>It's fine to have more things in a <code>Linker</code> than a guest needs, yeah. <code>{world}Pre</code> is relatively cheap and should be more-or-less the same cost as <code>{world}Indices</code>, neither being too too expensive. Loading a world from an instance can be some string lookups and type-checking, so not massive but O(size-of-world).</p>
+
+
+
+<a name="619624543"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/619624543" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#619624543">(Aug 27 2026 at 18:46)</a>:</h4>
+<p>Actually, no, loading a world from <code>{world}Indices</code> should be a pretty cheap operation, still O(world) but no name lookups or type-checking (that was done ahead of time hwne creating the indices). What you've sketched out here seems reasonable</p>
+
+
+
+<a name="619624932"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/619624932" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Celarye <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#619624932">(Aug 27 2026 at 18:48)</a>:</h4>
+<p>The method docs does say that the load method does type checking. And I think it said that creation of the Indices only does function existence checking? <span aria-label="thinking" class="emoji emoji-1f914" role="img" title="thinking">:thinking:</span></p>
+
+
+
+<a name="619625579"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/619625579" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Celarye <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#619625579">(Aug 27 2026 at 18:51)</a>:</h4>
+<p><img alt="image.png" class="inline-image" data-original-content-type="image/png" data-original-dimensions="1516x302" data-original-src="/user_uploads/15107/-SGPmBiRhwDwjaYBDrM8Of3c/image.png" src="/user_uploads/thumbnail/15107/-SGPmBiRhwDwjaYBDrM8Of3c/image.png/840x560.webp"><br>
+<img alt="image.png" class="inline-image" data-original-content-type="image/png" data-original-dimensions="1934x318" data-original-src="/user_uploads/15107/suZbKDoibOPNMyFvG3u679xh/image.png" src="/user_uploads/thumbnail/15107/suZbKDoibOPNMyFvG3u679xh/image.png/840x560.webp"></p>
+
+
+
+<a name="619625740"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/619625740" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#619625740">(Aug 27 2026 at 18:51)</a>:</h4>
+<p>I might be misremembering, but I thought creation of <code>FooIndices</code> does type-checking, and then using a <code>FooIndices</code> to get a <code>Foo</code> is some simple index lookups</p>
+
+
+
+<a name="619625743"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/619625743" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Celarye <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#619625743">(Aug 27 2026 at 18:51)</a>:</h4>
+<p>Although now looking at it it doesn't say <code>new</code> is limited to existence checking.</p>
+
+
+
+<a name="619625923"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/619625923" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Celarye <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#619625923">(Aug 27 2026 at 18:52)</a>:</h4>
+<p>I'm not too experienced with digging into proc macro code, but I'll see if I can take a look</p>
+
+
+
+<a name="619626205"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/619626205" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#619626205">(Aug 27 2026 at 18:53)</a>:</h4>
+<p>if it helps you can do <code>WASMTIME_DEBUG_BINDGEN=1</code> in your environment and that should spit out the generated code to a file somewhere which is <code>include!</code>'d which can work a bit better with editors/tooling sometimes</p>
+
+
+
+<a name="619626525"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/327223-wit-bindgen/topic/Optional%20imports%20and%20exports%20with%20wit-bindgen%20and%20wasmtime/near/619626525" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Celarye <a href="https://bytecodealliance.github.io/zulip-archive/stream/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime.html#619626525">(Aug 27 2026 at 18:54)</a>:</h4>
+<p>I think I can also use this: <a href="https://docs.rs/wasmtime/latest/src/wasmtime/opt/rustwide/target/debug/build/wasmtime-internal-component-macro/e620958884515fd5/out/hello-world2.rs.html#288-290">https://docs.rs/wasmtime/latest/src/wasmtime/opt/rustwide/target/debug/build/wasmtime-internal-component-macro/e620958884515fd5/out/hello-world2.rs.html#288-290</a></p>
+
+
+
+<hr><p>Last updated: Sep 05 2026 at 18:09 UTC</p>
+</html>

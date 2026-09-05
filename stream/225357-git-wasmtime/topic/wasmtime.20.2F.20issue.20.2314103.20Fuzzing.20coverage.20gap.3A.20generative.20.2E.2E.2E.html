@@ -1,0 +1,274 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14103 Fuzzing coverage gap: generative ... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314103.20Fuzzing.20coverage.20gap.3A.20generative.20.2E.2E.2E.html">wasmtime / issue #14103 Fuzzing coverage gap: generative ...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="615647786"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314103%20Fuzzing%20coverage%20gap%3A%20generative%20.../near/615647786" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314103.20Fuzzing.20coverage.20gap.3A.20generative.20.2E.2E.2E.html#615647786">(Aug 10 2026 at 15:08)</a>:</h4>
+<p>4ktLuffy opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14103">issue #14103</a>:</p>
+<blockquote>
+<h4>Feature</h4>
+<p>WASI doesn't appear to be exercised by any fuzz target. The <a href="https://storage.googleapis.com/oss-fuzz-coverage/wasmtime/reports/20260809/linux/src/wasmtime/crates/report.html">OSS-Fuzz <code>crates/</code> coverage report for 2026-08-09</a> lists 15 instrumented crates — <code>cache</code>, <code>cli-flags</code>, <code>component-util</code>, <code>core</code>, <code>cranelift</code>, <code>environ</code>, <code>fiber</code>, <code>fuzzing</code>, <code>jit-debug</code>, <code>jit-icache-coherence</code>, <code>test-util</code>, <code>unwinder</code>, <code>wasmtime</code>, <code>wast</code>, <code>winch</code> — and no <code>wasi*</code> crate is among them. Grepping <code>fuzz/fuzz_targets/</code> and <code>crates/fuzzing/src/</code> for <code>wasi</code> also returns nothing.</p>
+<p>Would a generative, stateful fuzz target for per-preopen <code>FsPerms</code> enforcement be useful? I'd rather ask than build, partly because there may be good reasons this hasn't been done that aren't visible from outside.</p>
+<h4>Benefit</h4>
+<p>Filesystem permissions look like they're enforced at three levels, and generative coverage seems to exist for the outer two but not the middle one:</p>
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Mechanism</th>
+<th>Generative coverage</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>WASIp1 <code>rights</code></td>
+<td>spec-level, per-fd</td>
+<td><code>wasi-testsuite</code> — fixed conformance cases (e.g. <code>truncation_rights.rs</code>)</td>
+</tr>
+<tr>
+<td><strong>wasmtime <code>FsPerms</code></strong></td>
+<td><strong>embedder-level, per-preopen</strong></td>
+<td><strong>none found</strong></td>
+</tr>
+<tr>
+<td>cap-std containment</td>
+<td>per-<code>Dir</code> handle</td>
+<td>cap-std's <code>fuzz_targets/cap-primitives.rs</code>, with <code>cfg(racy_asserts)</code> checks</td>
+</tr>
+</tbody>
+</table>
+<p>The three recent WASI advisories all sit in that middle layer:</p>
+<table>
+<thead>
+<tr>
+<th>Advisory</th>
+<th>Fix</th>
+<th>Cause</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GHSA-2r75-cxrj-cmph (High)</td>
+<td><code>dc740c909</code></td>
+<td><code>TRUNCATE</code> didn't set <code>open_mode \|= OpenMode::WRITE</code>, so the perms check saw a read-only open</td>
+</tr>
+<tr>
+<td>GHSA-4ch3-9j33-3pmj (Moderate)</td>
+<td><code>2dc3f443d</code></td>
+<td><code>link_at</code>/<code>rename_at</code> checked directory mutability but not permission parity</td>
+</tr>
+<tr>
+<td>GHSA-3p27-qvp9-27qf (Low)</td>
+<td><code>f069f125c</code></td>
+<td>WASIp1 <code>fd_renumber</code> descriptor-table handling</td>
+</tr>
+</tbody>
+</table>
+<p>In each the permission gate runs in <code>crates/wasi/src/filesystem.rs</code> before <code>cap_primitives</code> is called, so cap-std's fuzzer isn't positioned to catch them — and <code>FsPerms</code> has no cap-std analogue to test against. The regression tests added with those fixes (<code>p{1,2,3}_file_truncation_readonly.rs</code>, <code>p{1,2,3}_file_{hardlink,rename}_across_perms.rs</code>) are targeted cases rather than generated sequences.</p>
+<h4>Implementation</h4>
+<p>Sketch, open to redirection:</p>
+<ul>
+<li>Two or more preopens with differing <code>FsPerms</code> — the <code>link</code>/<code>rename</code> case needs at least two.</li>
+<li>Random sequences of filesystem operations across them, spanning the preopen boundary.</li>
+<li>Oracle: with a <code>ReadOnly</code> preopen, snapshot the tree before and after and assert it's unchanged. That follows the documented contract on <code>FsPerms</code> directly and needs no model of individual operation semantics — it wouldn't need to know <code>open_at(TRUNCATE)</code> should fail, only that a file got shorter. <code>atime</code> excluded, since reading metadata is permitted.</li>
+<li>A second oracle asserting host file descriptors return to baseline would cover the <code>fd_renumber</code> class.</li>
+<li>p1, p2 and p3 separately, since the regression tests suggest fixes don't automatically carry across surfaces.</li>
+</ul>
+<p>Before proposing any of it as a PR I'd calibrate: check out the commit before each of the three fixes and confirm the oracle fires, then confirm it's silent across <code>wasi-testsuite</code> and <code>crates/wasi/tests/</code>. If it can't detect the three bugs already known, it isn't worth reviewing.</p>
+<h4>Alternatives</h4>
+<p><strong>Extend the hand-written tests instead.</strong> <code>FsPerms</code> has two states, so the space is arguably small enough to enumerate — which is roughly what the current regression tests do. My hesitation is that the real space is operations × 2 permission states × 2+ preopens × path shapes × symlink/hard-link states × 3 API surfaces, and the <code>link</code>/<code>rename</code> issue was a relational property across two guest-chosen descriptors. But it's a fair objection and I'd rather hear it now than after writing the harness.</p>
+<p><strong>Fuzz at the cap-std layer.</strong> Doesn't reach it — <code>FsPerms</code> doesn't exist there.</p>
+<p><strong>Do nothing.</strong> Entirely possible this is deliberate; filesystem fuzzing is slow and awkward under OSS-Fuzz. If so, knowing that is worth the issue, and it may be worth a line in <code>fuzz/README.md</code> so the next person doesn't retrace it.</p>
+<hr>
+<p>Happy to take this to an RFC instead if that's a better fit.</p>
+</blockquote>
+
+
+
+<a name="615876952"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314103%20Fuzzing%20coverage%20gap%3A%20generative%20.../near/615876952" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314103.20Fuzzing.20coverage.20gap.3A.20generative.20.2E.2E.2E.html#615876952">(Aug 11 2026 at 15:04)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/14103#issuecomment-5254945383">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14103">issue #14103</a>:</p>
+<blockquote>
+<p>We generally try to avoid I/O in the fuzzers because it can greatly slow down execution time, and historically as you've found we generally haven't been too proactive about fuzzing WASI implementations. We've mostly been relying on the foundations of the <code>wasmtime</code> crate to more-or-less avoid the need to fuzz things. Nevertheless as you point out I/O is the whole purpose of this fuzzer, it's relatively clearly warranted, and it's clear that the logic in <code>wasmtime-wasi</code> itself is nontrivial enough to justify its own fuzzer. In that sense I'd agree that it'd be great to have a fuzzer in Wasmtime!</p>
+<p>Your constraints/implementation here all sound reasonable to me. One additional thing I might throw out there though would be to use OS-level primitives where possible. For example we may want to have a tmpfs on Linux to ensure everything stays in RAM and avoids the disk. There might be something interesting to do with read-only filesystems as well, but what we sort of want is to abort-the-process on an attempt to write rather than generate an error since the writability should be enforced at the <code>wasmtime-wasi</code> layer rather than the OS layer.</p>
+<p>Regardless though we also don't have to necessarily run this on OSS-Fuzz immediately. We've always got the option of running it locally for awhile and periodically and such. If you're willing to work on this that'd be much appreciated!</p>
+</blockquote>
+
+
+
+<a name="615876975"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314103%20Fuzzing%20coverage%20gap%3A%20generative%20.../near/615876975" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314103.20Fuzzing.20coverage.20gap.3A.20generative.20.2E.2E.2E.html#615876975">(Aug 11 2026 at 15:04)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasi:impl label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14103">Issue #14103</a>.</p>
+
+
+
+<a name="615876977"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314103%20Fuzzing%20coverage%20gap%3A%20generative%20.../near/615876977" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314103.20Fuzzing.20coverage.20gap.3A.20generative.20.2E.2E.2E.html#615876977">(Aug 11 2026 at 15:04)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the fuzzing label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14103">Issue #14103</a>.</p>
+
+
+
+<a name="615908941"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314103%20Fuzzing%20coverage%20gap%3A%20generative%20.../near/615908941" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314103.20Fuzzing.20coverage.20gap.3A.20generative.20.2E.2E.2E.html#615908941">(Aug 11 2026 at 17:32)</a>:</h4>
+<p>4ktLuffy <a href="https://github.com/bytecodealliance/wasmtime/issues/14103#issuecomment-5256645398">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14103">issue #14103</a>:</p>
+<blockquote>
+<p>Yessss, happy to take this on thanks for the detail</p>
+<p>Checking I've read the read only point right: a write reaching the OS at all means wasmtime-wasi has already failed, so it should abort rather than return an error the guest can't distinguish from a correct denial. That's a better signal than the before/after tree diff I described, and it points at the bug directly rather than requiring you to work backwards from a modified file.</p>
+<p>Two options for the mechanism, no strong view between them:</p>
+<ul>
+<li>seccomp <code>SECCOMP_RET_KILL_PROCESS</code> on writes to the read-only preopen's fds — real enforcement, Linux-only</li>
+<li>an in-process abort at the <code>cap_primitives</code> boundary — portable, but it's the same layer under test, so a bug there is a blind spot</li>
+</ul>
+<p>Any preference? Otherwise I'll start with tmpfs plus the in-process abort to get something running, and add seccomp after.</p>
+<p>Building locally on Linux first and ignoring OSS-Fuzz for now. I'll do the calibration described above before anything else, check it fires on the three advisories at their pre-fix commits so there's evidence it detects known bugs before it's worth your review time</p>
+</blockquote>
+
+
+
+<a name="615925100"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314103%20Fuzzing%20coverage%20gap%3A%20generative%20.../near/615925100" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314103.20Fuzzing.20coverage.20gap.3A.20generative.20.2E.2E.2E.html#615925100">(Aug 11 2026 at 18:48)</a>:</h4>
+<p>pchickey <a href="https://github.com/bytecodealliance/wasmtime/issues/14103#issuecomment-5257436651">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14103">issue #14103</a>:</p>
+<blockquote>
+<p>Thanks for offering to take on this work. Alex has outlined all of the difficult bits. Even if this isn't continuously fuzzed, I would still be grateful if there was a fuzzer I could set to work on a VM for a few days when there are significant changes to wasmtime-wasi.</p>
+<p>I'd prefer to see seccomp used to detect out-of-spec behavior to cap_primitives: cap_primitives is still part of our trusted computing base our project is responsible for and the kernel is not, and it would be nice if the approach keeps working if cap_primitives changes shape as we work on the design of the filesystem interfaces and implementation in the future.</p>
+<p>Enumerating the full set of disallowed behaviors is one of the hard parts here, but thats also something we can do iteratively and detail in the docs.</p>
+</blockquote>
+
+
+
+<a name="615925839"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314103%20Fuzzing%20coverage%20gap%3A%20generative%20.../near/615925839" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314103.20Fuzzing.20coverage.20gap.3A.20generative.20.2E.2E.2E.html#615925839">(Aug 11 2026 at 18:51)</a>:</h4>
+<p>pchickey edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/14103#issuecomment-5257436651">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14103">issue #14103</a>:</p>
+<blockquote>
+<p>Thanks for offering to take on this work. Alex has outlined all of the difficult bits. Even if this isn't continuously fuzzed, I would still be grateful if there was a fuzzer I could set to work on a VM for a few days when there are significant changes to wasmtime-wasi.</p>
+<p>I'd prefer to see seccomp used to detect out-of-spec behavior to cap_primitives: cap_primitives is still part of our trusted computing base our project is responsible for and the kernel is not, and it would be nice if the approach keeps working if cap_primitives changes shape as we work on the design of the filesystem interfaces and implementation in the future.</p>
+<p>Enumerating the full set of disallowed behaviors is one of the hard parts here, but thats also something we can do iteratively and detail in the docs. <a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-4ch3-9j33-3pmj">GHSA-4ch3-9j33-3pmj</a> should longer possible to express with the simplified FsPerms system, but my guess is if you carefully back out the fix, the other two should be findable?</p>
+</blockquote>
+
+
+
+<a name="615926450"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314103%20Fuzzing%20coverage%20gap%3A%20generative%20.../near/615926450" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314103.20Fuzzing.20coverage.20gap.3A.20generative.20.2E.2E.2E.html#615926450">(Aug 11 2026 at 18:54)</a>:</h4>
+<p>pchickey edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/14103#issuecomment-5257436651">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14103">issue #14103</a>:</p>
+<blockquote>
+<p>Thanks for offering to take on this work. Alex has outlined all of the difficult bits. Even if this isn't continuously fuzzed, I would still be grateful if there was a fuzzer I could set to work on a VM for a few days when there are significant changes to wasmtime-wasi.</p>
+<p>I'd prefer to see seccomp used to detect out-of-spec behavior to cap_primitives: cap_primitives is still part of our trusted computing base our project is responsible for and the kernel is not, and it would be nice if the approach keeps working if cap_primitives changes shape as we work on the design of the filesystem interfaces and implementation in the future.</p>
+<p>Enumerating the full set of disallowed behaviors is one of the hard parts here, but thats also something we can do iteratively and detail in the docs. <a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-4ch3-9j33-3pmj">GHSA-4ch3-9j33-3pmj</a> should longer possible to express with the simplified FsPerms system, but my guess is if you carefully back out their fix, the other two should be findable?</p>
+</blockquote>
+
+
+
+<a name="615928526"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314103%20Fuzzing%20coverage%20gap%3A%20generative%20.../near/615928526" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314103.20Fuzzing.20coverage.20gap.3A.20generative.20.2E.2E.2E.html#615928526">(Aug 11 2026 at 19:04)</a>:</h4>
+<p>4ktLuffy <a href="https://github.com/bytecodealliance/wasmtime/issues/14103#issuecomment-5257601373">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14103">issue #14103</a>:</p>
+<blockquote>
+<p>Makes sense, seccomp it is. The TCB argument is the convincing one, instrumenting at cap_primitives would have excluded cap_primitives itself from what's being tested.</p>
+<p>Agreed on GHSA-4ch3 too. #14010 collapsed DirPerms × FilePerms into a single bit, so the differentiated-file-perms shape that bug needed can't be constructed any more. For the other two I'll back the fixes out on main rather than checking out the pre-fix commits, which avoids fighting the old API.</p>
+<p>Will report back when there's something to look at.</p>
+</blockquote>
+
+
+
+<a name="616085712"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314103%20Fuzzing%20coverage%20gap%3A%20generative%20.../near/616085712" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314103.20Fuzzing.20coverage.20gap.3A.20generative.20.2E.2E.2E.html#616085712">(Aug 12 2026 at 13:05)</a>:</h4>
+<p>4ktLuffy <a href="https://github.com/bytecodealliance/wasmtime/issues/14103#issuecomment-5267196189">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14103">issue #14103</a>:</p>
+<blockquote>
+<p>Calibration results — both reproducible CVEs are detectable by backing out their fixes on current main (a481961), x86_64 Linux 6.8.</p>
+<p><strong>GHSA-2r75:</strong> removing <code>open_mode |= OpenMode::WRITE</code> (filesystem.rs:959) makes the detector fire on the truncating open, with the file hash unchanged, so it fires before the kernel truncates. Silent with the fix in place, and on a plain read-only open.</p>
+<p>Enumerating the disallowed behaviours really is the hard part, as you said, and the shape of it surprised me. TRUNCATE mutates via the open itself, so watching the write family sees nothing: the unit isn't "writes", it's any syscall that can mutate, and the mutating argument is sometimes a flag rather than the operation. Three corrections followed. Decode <code>struct open_how</code> for openat2 rather than classifying on the syscall number. Carry the legacy non-<code>at</code> forms — cap-primitives uses <code>*at</code> throughout, so that was my detector being incomplete rather than a reachable escape. And get follow semantics per-syscall: <code>unlinkat</code> removes a directory entry and doesn't follow the final component, so resolving with <code>realpath()</code> both missed an unlink inside the guarded tree and fired on one outside it. Containment is now canonicalised-parent-plus-unfollowed-basename for namespace operations, full resolution for the ones that follow, and a hand-walked symlink chain when an <code>O_CREAT</code> target doesn't exist yet.</p>
+<p><strong>GHSA-3p27:</strong> sampled <code>/proc/&lt;pid&gt;/fd</code> externally at two markers and compared the descriptors resolving into the preopen tree, with no wasmtime instrumentation. With the <code>fd_close</code> removed from <code>fd_renumber</code> (p1.rs:1875) the descriptor that <code>to</code> previously referred to is never released; with it, released. One entry per descriptor, so two handles on one path stay distinguishable — checked with same-file as well as distinct-file cases. Concurrent runtime fd activity during a sample isn't calibrated yet.</p>
+<p><strong>GHSA-4ch3</strong> not attempted, per your note that #14010 makes it inexpressible.</p>
+<p>Two things shape v1. The CLI can't construct the case under test — <code>--dir</code> is hardcoded to <code>FsPerms::ReadWrite</code> (common.rs:353) — so the target has to be an embedding. And a blind spot I went looking for and confirmed: with a ReadOnly and a ReadWrite preopen, I injected a misroute so an operation intended for the read-only preopen resolved against the writable one. The guest was allowed to create and write a file it shouldn't have and the detector recorded nothing, because every syscall involved is legal at the kernel layer and the intended preopen isn't inferable from the emitted syscall alone. So v1 detects "forbidden syscall through a protected descriptor", not "operation routed onto the wrong capability."</p>
+<p>Smoke controls only so far: a hand-written workload against the read-only preopen runs silent, with a liveness check confirming the same binary still fires. Nothing has run longer than seconds, and the harness currently needs a privileged container, so neither multi-day false-alarm rate nor handoff readiness is established.</p>
+</blockquote>
+
+
+
+<a name="616090058"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314103%20Fuzzing%20coverage%20gap%3A%20generative%20.../near/616090058" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314103.20Fuzzing.20coverage.20gap.3A.20generative.20.2E.2E.2E.html#616090058">(Aug 12 2026 at 13:25)</a>:</h4>
+<p>4ktLuffy edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/14103#issuecomment-5267196189">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14103">issue #14103</a>:</p>
+<blockquote>
+<p>Calibration results — both reproducible CVEs are detectable by backing out their fixes on current main (a481961), x86_64 Linux 6.8.</p>
+<p><strong>GHSA-2r75:</strong> removing <code>open_mode |= OpenMode::WRITE</code> (filesystem.rs:959) makes the detector fire on the truncating open, with the file hash unchanged, so it fires before the kernel truncates. Silent with the fix in place, and on a plain read-only open.</p>
+<p>Enumerating the disallowed behaviours really is the hard part, as you said, and the shape of it surprised me. TRUNCATE mutates via the open itself, so watching the write family sees nothing: the unit isn't "writes", it's any syscall that can mutate, and the mutating argument is sometimes a flag rather than the operation. Three corrections followed. Decode <code>struct open_how</code> for openat2 rather than classifying on the syscall number. Carry the legacy non-<code>at</code> forms — cap-primitives uses <code>*at</code> throughout, so that was my detector being incomplete rather than a reachable escape. And get follow semantics per-syscall: <code>unlinkat</code> removes a directory entry and doesn't follow the final component, so resolving with <code>realpath()</code> both missed an unlink inside the guarded tree and fired on one outside it. Containment is now canonicalised-parent-plus-unfollowed-basename for namespace operations, full resolution for the ones that follow, and a hand-walked symlink chain when an <code>O_CREAT</code> target doesn't exist yet.</p>
+<p><strong>GHSA-3p27:</strong> sampled <code>/proc/&lt;pid&gt;/fd</code> externally at two markers and compared the descriptors resolving into the preopen tree, with no wasmtime instrumentation. With the <code>fd_close</code> removed from <code>fd_renumber</code> (p1.rs:1875) the descriptor that <code>to</code> previously referred to is never released; with it, released. One entry per descriptor, so two handles on one path stay distinguishable — checked with same-file as well as distinct-file cases. Concurrent runtime fd activity during a sample isn't calibrated yet.</p>
+<p><strong>GHSA-4ch3</strong> not attempted, per your note that #14010 makes it inexpressible.</p>
+<p>Two things shape v1. The CLI can't construct the case under test — <code>--dir</code> is hardcoded to <code>FsPerms::ReadWrite</code> (common.rs:353) — so the target has to be an embedding. And a blind spot I went looking for and confirmed: with a ReadOnly and a ReadWrite preopen, I injected a misroute so an operation intended for the read-only preopen resolved against the writable one. The guest was allowed to create and write a file it shouldn't have and the detector recorded nothing, because every syscall involved is legal at the kernel layer and the intended preopen isn't inferable from the emitted syscall alone. So v1 detects "forbidden syscall through a protected descriptor", not "operation routed onto the wrong capability."</p>
+<p>Smoke controls only so far: a hand-written workload against the read-only preopen runs silent, with a liveness check confirming the same binary still fires. Nothing has run longer than seconds, and the harness currently needs a privileged container, so neither multi-day false-alarm rate nor handoff readiness is established and </p>
+<p>Working on the generator now, I'll follow up when there's something you could actually set running on a VM. If there's an operation set or a shape you'd rather see first, say so and I'll build that instead.</p>
+</blockquote>
+
+
+
+<a name="616319784"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314103%20Fuzzing%20coverage%20gap%3A%20generative%20.../near/616319784" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314103.20Fuzzing.20coverage.20gap.3A.20generative.20.2E.2E.2E.html#616319784">(Aug 13 2026 at 13:50)</a>:</h4>
+<p>4ktLuffy <a href="https://github.com/bytecodealliance/wasmtime/issues/14103#issuecomment-5281323015">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14103">issue #14103</a>:</p>
+<blockquote>
+<p><a href="https://github.com/user-attachments/files/31029834/wasi-fsperms-fuzzer.zip">wasi-fsperms-fuzzer.zip</a></p>
+<p>Follow-up to the calibration results: here's the fuzzer itself, attached.</p>
+<p><code>wasi-fsperms-fuzzer.zip</code> — 45 files, Apache-2.0 WITH LLVM-exception, same terms<br>
+as wasmtime. <code>README.md</code> first; <code>DESIGN.md</code> for why it is built this way.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="p">.</span><span class="o">/</span><span class="n">run</span><span class="p">.</span><span class="n">sh</span><span class="w"> </span><span class="o">/</span><span class="n">path</span><span class="o">/</span><span class="n">to</span><span class="o">/</span><span class="n">your</span><span class="o">/</span><span class="n">wasmtime</span>
+</code></pre></div>
+<p>Builds the host embedding against your checkout and fuzzes WASIp1 filesystem<br>
+operations against a read-only preopen. Your tree is mounted read-only for<br>
+<code>campaign</code> and <code>replay</code>, so it cannot be modified.</p>
+<p>The oracle sits below wasmtime rather than inside it: a <code>SECCOMP_RET_USER_NOTIF</code><br>
+supervisor holds each mutating syscall stopped before the kernel acts, resolves<br>
+the target through <code>/proc/&lt;pid&gt;/fd</code>, and fires if it lands inside the guarded<br>
+preopen — regardless of what WASI returned. On a firing the tree is verifiably<br>
+unchanged, because the tracee is killed while stopped.</p>
+<p>Every operation runs twice, against a read-only and a read-write preopen. A<br>
+denial only counts as evidence if the identical operation demonstrably succeeds<br>
+where it is permitted, so the verdict reports <em>witnessed</em> cells rather than<br>
+execution count:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">VERDICT</span><span class="p">:</span><span class="w"> </span><span class="nc">no</span><span class="w"> </span><span class="n">violation</span><span class="w"> </span><span class="n">observed</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="mi">40</span><span class="w"> </span><span class="n">executions</span><span class="p">.</span>
+<span class="w">  </span><span class="n">SCOPE</span><span class="p">:</span><span class="w"> </span><span class="nc">write</span><span class="o">-</span><span class="n">permission</span><span class="w"> </span><span class="n">enforcement</span><span class="p">,</span><span class="w"> </span><span class="n">WASIp1</span><span class="p">,</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="mi">65</span><span class="w"> </span><span class="n">witnessed</span>
+<span class="w">         </span><span class="n">cell</span><span class="p">(</span><span class="n">s</span><span class="p">)</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="mi">148</span><span class="w"> </span><span class="n">reached</span><span class="p">.</span><span class="w"> </span><span class="n">This</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="n">NOT</span><span class="w"> </span><span class="n">evidence</span><span class="w"> </span><span class="n">about</span><span class="w"> </span><span class="n">read</span>
+<span class="w">         </span><span class="n">confinement</span><span class="p">,</span><span class="w"> </span><span class="n">WASIp2</span><span class="p">,</span><span class="w"> </span><span class="n">or</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="mi">83</span><span class="w"> </span><span class="n">unwitnessed</span><span class="w"> </span><span class="n">cell</span><span class="p">(</span><span class="n">s</span><span class="p">).</span>
+</code></pre></div>
+<p>Calibration, reproducible by checking out <code>a481961</code> and running <code>selftest
+MODE=full</code> — it refuses to run against any other revision, because it patches<br>
+fixed line numbers and would otherwise patch the wrong ones. GHSA-2r75 and<br>
+GHSA-3p27 are both detected when their fixes are backed out and silent when<br>
+restored, plus a fresh bug injected into <code>create_directory_at</code> — a mechanism it<br>
+was never tuned for — with a four-way test that requires the injected bug to<br>
+demonstrably work when the detector is absent.</p>
+<p>A firing is an event, not a finding, until <code>replay.sh &lt;seed&gt;</code> reproduces it.<br>
+<code>minimize.sh</code> then reduces it to the smallest program that still fires (16<br>
+operations to 1 on the GHSA-2r75 reproduction).</p>
+<p>Limits worth knowing before you spend time on it:</p>
+<ul>
+<li>
+<p>Needs <code>--privileged</code> (seccomp user-notification listener + tmpfs). Linux<br>
+  x86_64 only. Intended for a disposable VM.</p>
+</li>
+<li>
+<p>~1000 lines of C in a Rust project, with no maintenance story.</p>
+</li>
+<li>
+<p>WASIp1 and write permission only. Read confinement and WASIp2 are untested,<br>
+  and cross-preopen misrouting is a verified blind spot of the syscall oracle —<br>
+  the A/B errno oracle is what covers it.</p>
+</li>
+<li>
+<p>I have not run it for days myself. Disk growth, descriptor leaks and the<br>
+  heartbeat are measured, but the longest campaign I have run is short, so the<br>
+  unattended behaviour is inferred rather than observed.</p>
+</li>
+</ul>
+<p>Happy to change the shape of it — in-tree, external, or something narrower — if<br>
+that is more useful than what I guessed at, and Thank you for your time!!</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Sep 05 2026 at 18:09 UTC</p>
+</html>

@@ -1,0 +1,112 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #14275 Add support for named imports to WAS... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html">wasmtime / PR #14275 Add support for named imports to WAS...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="621530730"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/621530730" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#621530730">(Sep 03 2026 at 21:44)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/pull/14275">PR #14275</a> from <code>alexcrichton:wasi-named-imports</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>This commit is at least an initial stab at making the <code>wasmtime-wasi</code> and <code>wasmtime-wasi-http</code> crates compatible with "named imports" or the <code>implements</code> field in the component model. This field enables importing an interface under a kebab-name while annotating that it's additionally to be considered an import of another interface's name. One example use case for this feature is [dependency isolation][diso] when composing two components together -- if they both import the filesystem the final component will import the filesystem twice under two different kebab names which means both components can have a different view of the filesystem.</p>
+<p>Wasmtime previously gained support for named imports and <code>implements</code> in <code>bindgen!</code> as part of #13513 where the <code>named_imports</code> option can be specified at <code>bindgen!</code>-time which generates traits that take an extra id-style parameter. This runtime parameter indicates which kebab-name is being invoked through which the runtime can then dispatch on.</p>
+<p>The goal here is to actually wire all this up in a way that's usable for embedders. Specifically <code>named_imports</code> bindings generation is now available for all WASIp2 and WASIp3 interfaces. Additionally all implementations of these <code>id</code>-carrying traits are routed through the previous implementations after locating the correct context to operate over.</p>
+<p>All implementations of WASI functionality are already modeled more-or-less as methods on <code>Wasi*CtxView</code>-style types which internally have a borrow to the actual state and the resource table to operate on. This fits quite cleanly with named imports where conceptually what we want is the ability to configure the context-per-kebab-name. This in theory will keep the maintenance burden managable as there's still largely one source of truth for the implementation. This neatly works for all <code>Host</code>-style traits which are literally methods on <code>Wasi*CtxView</code> types, meaning the <code>id</code>-carrying versions actually do just acquire a <code>Wasi*CtxView</code> and then delegate the method. This requires more finesse for <code>*WithStore</code> traits which work with <code>Access</code> and <code>Accessor</code>, however. The <code>id</code> parameter cannot be threaded into the <code>fn(..)</code> within the <code>Accessor</code>, so refactoring is performed where appropriate to make the implementation of each interface a one-liner to reduce duplication.</p>
+<p>The end result of all of this is that this is a very large commit but it's written in such a way that the Rust compiler in theory should catch all mistakes. In other words we're heavily relying on the type system and type checking here and don't ever rely on duplication of methods that hopefully-won't-change. There's a lot of traits and a lot of interfaces, hence the size of the commit, but conceptually everything is intended to be pretty simple.</p>
+<p>Some design decisions as part of this commit, in no particular order:</p>
+<ul>
+<li>
+<p>IDs are represented by <code>wasmtime_wasi::NamedId</code> which is a newtype-wrapper around <code>usize</code>. The goal here is to enable an efficient implementation of dealing with ids. This notably forces the embedder to derive some sort of string-to-id (and perhaps back) map when adding items to a linker.</p>
+</li>
+<li>
+<p>All of this is opt-in and nothing is changed by default. For example the <code>wasmtime</code> CLI does not support any of this yet -- in theory that would require the ability to configure <code>-S</code> flags per-named-import as opposed to all-at-once.</p>
+</li>
+<li>
+<p>Mapping a <code>NamedId</code> to a context is abstracted behind a trait rather than dictating that a <code>Vec</code> or <code>HashMap</code> or similar is required. This increases the cognitive load when reading code (more generics), but avoids making this design decision within these crates and leaves exact representations up to embedders.</p>
+</li>
+<li>
+<p>The <code>HasData</code> implementation can't reuse the preexisting <code>WasiCli</code>, and this uses a new <code>WasiCliNamed&lt;T&gt;</code> instead. This enables threading this trait-to-find-a-context to the right location for <code>*WithStore</code> trait impls.</p>
+</li>
+<li>
+<p>Some miscellaneous <code>bindgen!</code> issues have been fixed during this commit to ensure that this compiles and works correctly.</p>
+</li>
+<li>
+<p>An attempt has been made at documenting all the new primitives/structs/etc here. These are sort of difficult to align correctly unless you know what you're doing, so the documentation and examples are intended to serve as a way of spreading this knowledge.</p>
+</li>
+<li>
+<p>One possible alternative I ended up deciding not to do was to put some sort of map-to-context storage within each preexisting context type. For example commit would be simpler for the <code>*WithStore</code> and infrastructure if it reused the exact same <code>Self</code> type as all other impls do. My thinking though is that this requires dictating the use of a <code>HashMap</code> or something else which I was hoping to avoid. Additionally the preexisting context structures are already minimal enough that they're basically what you already want as the source for each implementation, so I wanted to lean on them as much as possible.</p>
+</li>
+<li>
+<p>The main wrinkle in the new implementation is that <code>Accessor</code> carries <code>fn(..)</code> to project out it's <code>D::Data&lt;'_&gt;</code> which means that it can't close over any information. This feature needs to in theory close over an <code>id: NamedId</code>, however, and there's no easy way to put this square peg into a round hole. To work around this internal implementations within <code>wasmtime-wasi{,-http}</code> now have a generic <code>F</code> parameter which is a closure which projects data, but this closure is typically only ever on the stack and doesn't make its way to the heap. This was one of the more awkward things to work around in this commit.</p>
+</li>
+<li>
+<p>The design here is intentionally done to help ensure that this commit is correct with minimal testing. It's not really feasible to duplicate the entire test suite just for named imports but these are duplicate trait impls which otherwise shouldn't be wrong. By ensuring that there's either strict delegation or each-function-is-at-least-one-line that the light amount of testing here is sufficient for keeping this working over time.</p>
+</li>
+</ul>
+<p>[diso]: <a href="https://github.com/spinframework/spin/pull/3708">https://github.com/spinframework/spin/pull/3708</a></p>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please review the Bytecode Alliance's AI tool usage policy at<br>
+<a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+</blockquote>
+
+
+
+<a name="621530734"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/621530734" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#621530734">(Sep 03 2026 at 21:44)</a>:</h4>
+<p>alexcrichton requested <a href="https://github.com/rvolosatovs">rvolosatovs</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14275">PR #14275</a>.</p>
+
+
+
+<a name="621530735"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/621530735" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#621530735">(Sep 03 2026 at 21:44)</a>:</h4>
+<p>alexcrichton requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-wasi-reviewers">wasmtime-wasi-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14275">PR #14275</a>.</p>
+
+
+
+<a name="621530737"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/621530737" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#621530737">(Sep 03 2026 at 21:44)</a>:</h4>
+<p>alexcrichton requested <a href="https://github.com/pchickey">pchickey</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14275">PR #14275</a>.</p>
+
+
+
+<a name="621530738"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/621530738" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#621530738">(Sep 03 2026 at 21:44)</a>:</h4>
+<p>alexcrichton requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14275">PR #14275</a>.</p>
+
+
+
+<a name="621533342"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/621533342" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#621533342">(Sep 03 2026 at 21:58)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/14275">PR #14275</a>.</p>
+
+
+
+<a name="621553217"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/621553217" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#621553217">(Sep 03 2026 at 23:44)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasi</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14275">PR #14275</a>.</p>
+
+
+
+<hr><p>Last updated: Sep 05 2026 at 18:09 UTC</p>
+</html>

@@ -1,0 +1,261 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #11869 Async libcalls &quot;block&quot; the store ... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html">wasmtime / issue #11869 Async libcalls &quot;block&quot; the store ...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="545132224"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311869%20Async%20libcalls%20%22block%22%20the%20store%20.../near/545132224" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html#545132224">(Oct 15 2025 at 21:45)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/issues/11869">issue #11869</a>:</p>
+<blockquote>
+<p>At this time the implementation of async libcalls in Wasmtime all use the <code>block_on</code> helper internally in the implementation. This has the property, though, that the store is "locked" while the libcall is waiting on the result meaning that in a component-model-async world it's not possible to make progress on anything else in the store while this is happening. This notably affects <code>Store::run_concurrent</code> as well where any select-ed async computation won't make progress because the wasm is locking up everything.</p>
+<p>To fix this it will require async libcalls to be refactored/reimplemented to not close over the store for the duration of their execution. Instead something like <code>Accessor</code> will be required where mutable access to a store can be temporarily granted but otherwise it's not held across <code>await</code> points. In implementing this it'll fix <code>run_concurrent</code> to correctly and actually run various computations in the provided closure concurrently. This will also enable other concurrent tasks within the store to make progress while a libcall is blocked.</p>
+</blockquote>
+
+
+
+<a name="545132227"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311869%20Async%20libcalls%20%22block%22%20the%20store%20.../near/545132227" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html#545132227">(Oct 15 2025 at 21:45)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasm-proposal:component-model-async label to <a href="https://github.com/bytecodealliance/wasmtime/issues/11869">Issue #11869</a>.</p>
+
+
+
+<a name="571349914"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311869%20Async%20libcalls%20%22block%22%20the%20store%20.../near/571349914" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html#571349914">(Feb 02 2026 at 05:29)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/11869#issuecomment-3832992306">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11869">issue #11869</a>:</p>
+<blockquote>
+<p>I talked with Luke and Joel about this a bit ago and wanted to write down some notes. Async libcalls right now are:</p>
+<ul>
+<li>Things that trigger an async limiter<ul>
+<li>table growth (all kinds)</li>
+<li>memory growth</li>
+</ul>
+</li>
+<li>Things that may trigger GC (async nature of GC, async limiter, etc)<ul>
+<li>table initialization</li>
+<li>growing the gc heap</li>
+<li>gc allocation</li>
+<li>array new/init data/elem</li>
+</ul>
+</li>
+<li>Fuel running out</li>
+<li>Epochs changing</li>
+</ul>
+<p>All of these libcalls fall into the category of "the wasm is stuck between two plain/normal wasm instructions". It would be a violation of runtime semantics if Wasmtime were to allow something else to interleave between instructions. For example during an epoch yield it's not valid for Wasmtime to run some other wasm within the store as that could have visible side effects.</p>
+<p>Put another way Wasmtime will need to enforce a "lock" where when these async situations are hit it prevents all wasm from continuing to execute. My rough idea for this is that the store, with concurrency enabled, will grow an async-recursive-mutex-of-sorts (probably not literally). This lock will be "bounced on" whenever wasm is entered via the host call or exited via a hostcall returning. The lock is then held across the async operation of an epoch/fuel/async limiters/gc/etc from above. The rough idea is that this is a <code>Option&lt;Vec&lt;Waker&gt;&gt;</code> in the store. If that's <code>None</code>, the lock isn't held. If it's <code>Some</code>, then the lock is held. When the lock is "dropped" then all the wakers are woken (if any).</p>
+<p>This'll likely require refactoring some various points within Wasmtime to instrument more entries/exits with <code>async</code> in Rust. Ideally the lock acquisition/bounce/etc are all native <code>async</code> functions. This'll probably require some finesse.</p>
+<p>The main learning from this is we can't simply start using <code>run_concurrent</code> (ish) within these libcalls. If we were to do that then we would accidentally allow the situation we don't want, which is executing wasm instructions between other instructions that don't allow interleaving. This means that to fully avoid blocking the store we'll have to add infrastructure, as opposed to just removing a limitation.</p>
+</blockquote>
+
+
+
+<a name="573930457"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311869%20Async%20libcalls%20%22block%22%20the%20store%20.../near/573930457" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html#573930457">(Feb 14 2026 at 22:31)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/11869#issuecomment-3902685168">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11869">issue #11869</a>:</p>
+<blockquote>
+<p>Another thought that occurs to me borne out of thoughts/discussion from <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">https://github.com/bytecodealliance/wasmtime/pull/12587</a> -- preventing wasm execution during an async libcall is not enough, we have to prevent mutation of the entire store. This includes things like executing wasm, but it extends to host-initiated modifications of tables/globals as well. That's a needle I don't know how to thread...</p>
+</blockquote>
+
+
+
+<a name="596629273"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311869%20Async%20libcalls%20%22block%22%20the%20store%20.../near/596629273" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html#596629273">(May 21 2026 at 05:15)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/11869#issuecomment-4505016762">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11869">issue #11869</a>:</p>
+<blockquote>
+<p>A finding from <a href="https://github.com/bytecodealliance/wasmtime/pull/13424#discussion_r3277475089">https://github.com/bytecodealliance/wasmtime/pull/13424#discussion_r3277475089</a> -- In that PR it's refactoring <code>table.grow</code> to split up the "grow" and "fill" ops. This means that tables-of-non-nullable-reference-types are temporarily invalid. This isn't a problem to wasm, but can in theory be a problem to the host if we epoch yield during the fill operation and the host is allowed to actually inspect the table. That's not possible today, due to this issue, but is something we'll want to consider when resolving this.</p>
+</blockquote>
+
+
+
+<a name="612619571"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311869%20Async%20libcalls%20%22block%22%20the%20store%20.../near/612619571" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html#612619571">(Jul 24 2026 at 16:57)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/11869#issuecomment-5072328389">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11869">issue #11869</a>:</p>
+<blockquote>
+<blockquote>
+<p>Another thought that occurs to me borne out of thoughts/discussion from <a href="https://github.com/bytecodealliance/wasmtime/pull/12587">#12587</a> -- preventing wasm execution during an async libcall is not enough, we have to prevent mutation of the entire store. This includes things like executing wasm, but it extends to host-initiated modifications of tables/globals as well. That's a needle I don't know how to thread...</p>
+</blockquote>
+<p>Doesn't this just imply that the existing behavior, where the whole store is blocked by an async libcall, is the correct behavior?</p>
+<p>Otherwise, when e.g. task A is paused because of an epoch interruption, we have to keep track of the transitive closure of state that task A can reach and keep all of that state "locked", only allowing unreachable-from-task-A state in the store to be accessed/modified. But, in practice, the reachable state is going to be basically the full store's state, because otherwise the embedder would just use multiple stores for disjoint guest state. Other tasks in the store are likely either also inside the same instance, or otherwise share <em>some</em> amount of state with task A, so we can't resume them anyways (that shared state will be locked). Additionally, tracking that reachable state is going to be somewhat ad-hoc, where as locking the whole store (which happens to be the current behavior!) is a principled and very easy to implement/maintain approach.</p>
+</blockquote>
+
+
+
+<a name="612679682"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311869%20Async%20libcalls%20%22block%22%20the%20store%20.../near/612679682" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html#612679682">(Jul 24 2026 at 23:04)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/11869#issuecomment-5075339697">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11869">issue #11869</a>:</p>
+<blockquote>
+<p>That's basically true yeah, but the one exception to that rule is the original genesis of this issue -- the <code>AsyncFn</code> passed to <code>run_concurrent</code>. Specifically the code inside of that <code>AsyncFn</code> appears like it's "blocking" meaning that if you were to apply a timeout within that <code>AsyncFn</code>, entirely independent of Wasmtime, it basically won't work. Once wasm does a blocking operation like an async-limit of memory growth the internals of the <code>AsyncFn</code>, timeouts and all, will never fire and are stuck until the blocking operation resolves. (I realize I'm using the term "blocking" here a bit inaccurately...)</p>
+<p>Technically the <code>Accessor</code> <em>almost</em> provides the perfect API for handling all of this as well.  (which is all that <code>run_concurrent</code> yields to the closure). If <code>Accessor::with</code> were an <code>async</code> function, then we could trivially handle all this because "store is locked" means that function temporarily blocks. Timeouts would still all progress as expected and everything would match embedder expectations. The problem though is that <code>Accessor::with</code> is a synchronous function that should not block, and that's what leaks the ability to modify everything in the store were we to run <code>run_concurrent</code> closures.</p>
+<p>The criticality of <code>run_concurrent</code> is debatable IMO. We've got <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.StoreContextMut.html#store-blocking-behavior">documentation referring to this issue's behavior</a> and we also <a href="https://github.com/bytecodealliance/wasmtime/blob/a5720e50d5ec9eab34eed690eee952abfdd0e3ba/crates/wasi-http/src/handler.rs#L435-L447">work around this issue</a> in in-repo situations. </p>
+</blockquote>
+
+
+
+<a name="613256412"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311869%20Async%20libcalls%20%22block%22%20the%20store%20.../near/613256412" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html#613256412">(Jul 28 2026 at 17:36)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/11869#issuecomment-5107593291">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11869">issue #11869</a>:</p>
+<blockquote>
+<blockquote>
+<p>Technically the <code>Accessor</code> _almost_ provides the perfect API for handling all of this as well. (which is all that <code>run_concurrent</code> yields to the closure). If <code>Accessor::with</code> were an <code>async</code> function, then we could trivially handle all this because "store is locked" means that function temporarily blocks. Timeouts would still all progress as expected and everything would match embedder expectations. The problem though is that <code>Accessor::with</code> is a synchronous function that should not block, and that's what leaks the ability to modify everything in the store were we to run <code>run_concurrent</code> closures.</p>
+</blockquote>
+<p>Should we add <code>Accessor::with_async</code> in that case? This would let callers yield to the event loop so other futures can progress, while still closing over the store and therefore preventing re-entry into Wasm (i.e. the <code>_async</code> behavior instead of the <code>_concurrent</code> behavior).</p>
+<p>Another way to implement that functionality, is to enter a nested event loop via e.g. <a href="https://docs.rs/tokio/latest/tokio/runtime/struct.Runtime.html#method.block_on"><code>tokio::runtime::Runtime::block_on</code></a>. Embedders can actually do that today:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">accessor</span><span class="p">.</span><span class="n">with</span><span class="p">(</span><span class="o">|</span><span class="n">store</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">my_tokio_runtime</span><span class="p">.</span><span class="n">block_on</span><span class="p">(</span><span class="k">async</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// lock `store` across async operations</span>
+<span class="w">        </span><span class="n">memory</span><span class="p">.</span><span class="n">grow_async</span><span class="p">(</span><span class="n">store</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<span class="w">        </span><span class="c1">// ...</span>
+<span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="w">    </span><span class="p">});</span>
+<span class="p">});</span>
+</code></pre></div>
+<p>But Wasmtime itself can't do that because it doesn't know the async runtime being used. We could add some kind of API to register a <code>block_on</code> function with Wasmtime to teach it how to do that though... Of course, I'm not sure this is any easier than implementing <code>Accessor::with_async</code> "correctly".</p>
+<blockquote>
+<p>The criticality of <code>run_concurrent</code> is debatable IMO.</p>
+</blockquote>
+<p>Are you saying you think we should maybe remove <code>run_concurrent</code> and <code>Accessor</code> completely? That seems pretty nuclear, and would remove our ability to multi-task between fibers within a store, no?</p>
+</blockquote>
+
+
+
+<a name="613259727"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311869%20Async%20libcalls%20%22block%22%20the%20store%20.../near/613259727" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html#613259727">(Jul 28 2026 at 17:48)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/11869#issuecomment-5107722345">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11869">issue #11869</a>:</p>
+<blockquote>
+<p>I guess this would require adding</p>
+<ul>
+<li><code>tls::get_async</code> to hold the <code>&amp;mut dyn VMStore</code> in an async closure</li>
+<li>Adding a wait queue for <code>Accessor::with</code>/<code>tls::get</code> on a taken <code>dyn VMStore</code>, instead of panicking</li>
+<li>Making <code>Accessor::with</code>/<code>tls::get</code> an async function, even when their closures are not, so that they can wait to run the closure until after it goes through the wait queue and gets the returned <code>dyn VMStore</code></li>
+</ul>
+<p>?</p>
+<p>That is... quite a bit of churn, but I think it would handle everything we want?</p>
+</blockquote>
+
+
+
+<a name="613265240"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311869%20Async%20libcalls%20%22block%22%20the%20store%20.../near/613265240" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html#613265240">(Jul 28 2026 at 18:13)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/11869#issuecomment-5107988113">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11869">issue #11869</a>:</p>
+<blockquote>
+<p>If adding <code>Accessor::with_async</code> then that would require removing <code>Accessor::with</code>, which to me is the real problem. Async yield points lock down the store meaning <code>with</code>, if it executes, is unsound. An API <code>Accessor::with</code> which panics conditionally depending on a yield point I also think would be too surprising, meaning that admitting <code>with_async</code> to unblock the future in <code>run_concurrent</code> would necessitate removing <code>with</code>. In doing this, however, it'd break what I would imagine are most calls to <code>with</code>, many of which are done in a sync context.</p>
+<p>For nested runtimes and <code>block_on</code>, regardless of whether that works that's definitely not the semantics that any runtime wants. The "blocking" behavior described in this issue is only blocking from the perspective of <code>run_concurrent</code>'s async closure argument. No literal thread-level OS blocking happens, which is what <code>block_on</code> would introduce.</p>
+<p>For the criticality aspect, I don't mean to propose removing <code>run_concurrent</code> or <code>Accessor</code>, instead just continuing to treat this issue as not-a-high-priority and hoping we have better ideas down the road.</p>
+<hr>
+<blockquote>
+<p>That is... quite a bit of churn, but I think it would handle everything we want?</p>
+</blockquote>
+<p>To clarify, you mean for adding <code>Accessor::with_async</code> and removing <code>Accessor::with</code> (morally at least)? If so the churn aspect is, in my opinion, the primary part to handle here. I'm not confident this is a case of "just update callers", and I think there will be quite a number of callers that just can't update.</p>
+</blockquote>
+
+
+
+<a name="613298387"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311869%20Async%20libcalls%20%22block%22%20the%20store%20.../near/613298387" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html#613298387">(Jul 28 2026 at 21:46)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/11869#issuecomment-5110028109">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11869">issue #11869</a>:</p>
+<blockquote>
+<blockquote>
+<p>To clarify, you mean for adding <code>Accessor::with_async</code> and removing <code>Accessor::with</code> (morally at least)?</p>
+</blockquote>
+<p>I would say that I am proposing what is morally an async lock around the <code>dyn VMStore</code> pointer we keep in TLS right now. Here is some rough pseudocode:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">pub</span><span class="w"> </span><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">with</span><span class="o">&lt;</span><span class="n">R</span><span class="o">&gt;</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">f</span><span class="p">:</span><span class="w"> </span><span class="nc">impl</span><span class="w"> </span><span class="nb">FnOnce</span><span class="p">(</span><span class="o">..</span><span class="p">.)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">R</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">R</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">store</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tls</span><span class="p">::</span><span class="n">lock</span><span class="p">().</span><span class="k">await</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">f</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">token</span><span class="p">.</span><span class="n">as_context_mut</span><span class="p">(</span><span class="n">store</span><span class="p">));</span>
+<span class="w">    </span><span class="n">tls</span><span class="p">::</span><span class="n">unlock</span><span class="p">(</span><span class="n">store</span><span class="p">);</span>
+<span class="w">    </span><span class="n">result</span>
+<span class="p">}</span>
+
+<span class="k">pub</span><span class="w"> </span><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">try_with</span><span class="o">&lt;</span><span class="n">R</span><span class="o">&gt;</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">f</span><span class="p">:</span><span class="w"> </span><span class="nc">impl</span><span class="w"> </span><span class="n">AsyncFnOnce</span><span class="p">(</span><span class="o">..</span><span class="p">.)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">R</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">R</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">store</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tls</span><span class="p">::</span><span class="n">try_lock</span><span class="p">().</span><span class="k">await</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">f</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">token</span><span class="p">.</span><span class="n">as_context_mut</span><span class="p">(</span><span class="n">store</span><span class="p">)).</span><span class="k">await</span><span class="p">;</span>
+<span class="w">    </span><span class="n">tls</span><span class="p">::</span><span class="n">unlock</span><span class="p">(</span><span class="n">store</span><span class="p">);</span>
+<span class="w">    </span><span class="n">result</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>where <code>tls::lock</code> and <code>tls::unlock</code> are probably actually a single <code>async fn tls::with&lt;R&gt;(f: impl AsyncFnOnce(&amp;mut dyn VMStore) -&gt; R) -&gt; R</code> function where:</p>
+<ul>
+<li>when locking if the <code>VMStore</code> has been taken we add ourselves to a wait queue (instead of panicking, which is what is done today) and</li>
+<li>when unlocking we wake up the next future in the wait queue if any.</li>
+</ul>
+</blockquote>
+
+
+
+<a name="613298450"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311869%20Async%20libcalls%20%22block%22%20the%20store%20.../near/613298450" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html#613298450">(Jul 28 2026 at 21:47)</a>:</h4>
+<p>fitzgen edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/11869#issuecomment-5110028109">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11869">issue #11869</a>:</p>
+<blockquote>
+<blockquote>
+<p>To clarify, you mean for adding <code>Accessor::with_async</code> and removing <code>Accessor::with</code> (morally at least)?</p>
+</blockquote>
+<p>I would say that I am proposing what is morally an async lock around the <code>dyn VMStore</code> pointer we keep in TLS right now. Here is some rough pseudocode:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">pub</span><span class="w"> </span><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">with</span><span class="o">&lt;</span><span class="n">R</span><span class="o">&gt;</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">f</span><span class="p">:</span><span class="w"> </span><span class="nc">impl</span><span class="w"> </span><span class="nb">FnOnce</span><span class="p">(</span><span class="o">..</span><span class="p">.)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">R</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">R</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">store</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tls</span><span class="p">::</span><span class="n">lock</span><span class="p">().</span><span class="k">await</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">f</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">token</span><span class="p">.</span><span class="n">as_context_mut</span><span class="p">(</span><span class="n">store</span><span class="p">));</span>
+<span class="w">    </span><span class="n">tls</span><span class="p">::</span><span class="n">unlock</span><span class="p">(</span><span class="n">store</span><span class="p">);</span>
+<span class="w">    </span><span class="n">result</span>
+<span class="p">}</span>
+
+<span class="k">pub</span><span class="w"> </span><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">try_with</span><span class="o">&lt;</span><span class="n">R</span><span class="o">&gt;</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">f</span><span class="p">:</span><span class="w"> </span><span class="nc">impl</span><span class="w"> </span><span class="n">AsyncFnOnce</span><span class="p">(</span><span class="o">..</span><span class="p">.)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">R</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">R</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">store</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tls</span><span class="p">::</span><span class="n">lock</span><span class="p">().</span><span class="k">await</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">f</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">token</span><span class="p">.</span><span class="n">as_context_mut</span><span class="p">(</span><span class="n">store</span><span class="p">)).</span><span class="k">await</span><span class="p">;</span>
+<span class="w">    </span><span class="n">tls</span><span class="p">::</span><span class="n">unlock</span><span class="p">(</span><span class="n">store</span><span class="p">);</span>
+<span class="w">    </span><span class="n">result</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>where <code>tls::lock</code> and <code>tls::unlock</code> are probably actually a single <code>async fn tls::with&lt;R&gt;(f: impl AsyncFnOnce(&amp;mut dyn VMStore) -&gt; R) -&gt; R</code> function where:</p>
+<ul>
+<li>when locking if the <code>VMStore</code> has been taken we add ourselves to a wait queue (instead of panicking, which is what is done today) and</li>
+<li>when unlocking we wake up the next future in the wait queue if any.</li>
+</ul>
+</blockquote>
+
+
+
+<a name="613298481"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311869%20Async%20libcalls%20%22block%22%20the%20store%20.../near/613298481" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html#613298481">(Jul 28 2026 at 21:47)</a>:</h4>
+<p>fitzgen edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/11869#issuecomment-5110028109">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11869">issue #11869</a>:</p>
+<blockquote>
+<blockquote>
+<p>To clarify, you mean for adding <code>Accessor::with_async</code> and removing <code>Accessor::with</code> (morally at least)?</p>
+</blockquote>
+<p>I would say that I am proposing what is morally an async lock around the <code>dyn VMStore</code> pointer we keep in TLS right now. Here is some rough pseudocode:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">pub</span><span class="w"> </span><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">with</span><span class="o">&lt;</span><span class="n">R</span><span class="o">&gt;</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">f</span><span class="p">:</span><span class="w"> </span><span class="nc">impl</span><span class="w"> </span><span class="nb">FnOnce</span><span class="p">(</span><span class="o">..</span><span class="p">.)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">R</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">R</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">store</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tls</span><span class="p">::</span><span class="n">lock</span><span class="p">().</span><span class="k">await</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">f</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">token</span><span class="p">.</span><span class="n">as_context_mut</span><span class="p">(</span><span class="n">store</span><span class="p">));</span>
+<span class="w">    </span><span class="n">tls</span><span class="p">::</span><span class="n">unlock</span><span class="p">(</span><span class="n">store</span><span class="p">);</span>
+<span class="w">    </span><span class="n">result</span>
+<span class="p">}</span>
+
+<span class="k">pub</span><span class="w"> </span><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">with_async</span><span class="o">&lt;</span><span class="n">R</span><span class="o">&gt;</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">f</span><span class="p">:</span><span class="w"> </span><span class="nc">impl</span><span class="w"> </span><span class="n">AsyncFnOnce</span><span class="p">(</span><span class="o">..</span><span class="p">.)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">R</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">R</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">store</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tls</span><span class="p">::</span><span class="n">lock</span><span class="p">().</span><span class="k">await</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">f</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">token</span><span class="p">.</span><span class="n">as_context_mut</span><span class="p">(</span><span class="n">store</span><span class="p">)).</span><span class="k">await</span><span class="p">;</span>
+<span class="w">    </span><span class="n">tls</span><span class="p">::</span><span class="n">unlock</span><span class="p">(</span><span class="n">store</span><span class="p">);</span>
+<span class="w">    </span><span class="n">result</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>where <code>tls::lock</code> and <code>tls::unlock</code> are probably actually a single <code>async fn tls::with&lt;R&gt;(f: impl AsyncFnOnce(&amp;mut dyn VMStore) -&gt; R) -&gt; R</code> function where:</p>
+<ul>
+<li>when locking if the <code>VMStore</code> has been taken we add ourselves to a wait queue (instead of panicking, which is what is done today) and</li>
+<li>when unlocking we wake up the next future in the wait queue if any.</li>
+</ul>
+</blockquote>
+
+
+
+<a name="613300475"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2311869%20Async%20libcalls%20%22block%22%20the%20store%20.../near/613300475" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2311869.20Async.20libcalls.20.22block.22.20the.20store.20.2E.2E.2E.html#613300475">(Jul 28 2026 at 22:05)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/11869#issuecomment-5110170066">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/11869">issue #11869</a>:</p>
+<blockquote>
+<p>That makes sense, yeah, and implementation-wise that's more-or-less what I'd expect as well (maybe some more store integration, something like that). The problem to overcome though is updating all callers of <code>Accessor::with</code> to be <code>async</code>, and I think that'd be a pretty major change.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Sep 05 2026 at 18:09 UTC</p>
+</html>

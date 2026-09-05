@@ -1,0 +1,113 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14239 GC panics while tracing a suspend... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314239.20GC.20panics.20while.20tracing.20a.20suspend.2E.2E.2E.html">wasmtime / issue #14239 GC panics while tracing a suspend...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="620195667"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314239%20GC%20panics%20while%20tracing%20a%20suspend.../near/620195667" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314239.20GC.20panics.20while.20tracing.20a.20suspend.2E.2E.2E.html#620195667">(Aug 31 2026 at 04:16)</a>:</h4>
+<p>rirze opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14239">issue #14239</a>:</p>
+<blockquote>
+<h3>Wasmtime version</h3>
+<p>This reproduces with Wasmtime 48.0.1 and current <code>main</code> at<br>
+<code>d8a0da6d661605713798c1c9c76be5c28e3159ff</code>.</p>
+<h3>Reproduction</h3>
+<p>With function references, exceptions, stack switching, and GC enabled, the<br>
+following test panics when guest allocations trigger GC while a continuation is<br>
+suspended:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#[cfg_attr(any(asan, miri), ignore)]</span>
+<span class="cp">#[test]</span>
+<span class="k">fn</span><span class="w"> </span><span class="nf">gc_traces_a_suspended_continuation</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">wat</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">r#"</span>
+<span class="s">        (module</span>
+<span class="s">            (type $ft (func))</span>
+<span class="s">            (type $ct (cont $ft))</span>
+<span class="s">            (type $st (struct (field i32)))</span>
+<span class="s">            (tag $t)</span>
+
+<span class="s">            (func $suspend</span>
+<span class="s">                (suspend $t)</span>
+<span class="s">            )</span>
+<span class="s">            (elem declare func $suspend)</span>
+
+<span class="s">            (func (export "entry")</span>
+<span class="s">                (local $continuation (ref null $ct))</span>
+<span class="s">                (local $i i32)</span>
+<span class="s">                (block $handler (result (ref $ct))</span>
+<span class="s">                    (resume $ct</span>
+<span class="s">                        (on $t $handler)</span>
+<span class="s">                        (cont.new $ct (ref.func $suspend)))</span>
+<span class="s">                    (return)</span>
+<span class="s">                )</span>
+<span class="s">                (local.set $continuation)</span>
+<span class="s">                (loop $allocate</span>
+<span class="s">                    (drop (struct.new $st (i32.const 7)))</span>
+<span class="s">                    (local.set $i (i32.add (local.get $i) (i32.const 1)))</span>
+<span class="s">                    (br_if $allocate (i32.lt_u (local.get $i) (i32.const 20000)))</span>
+<span class="s">                )</span>
+<span class="s">                (resume $ct (local.get $continuation))</span>
+<span class="s">            )</span>
+<span class="s">        )</span>
+<span class="s">    "#</span><span class="p">;</span>
+
+<span class="w">    </span><span class="n">test_utils</span><span class="p">::</span><span class="n">Runner</span><span class="p">::</span><span class="n">new</span><span class="p">().</span><span class="n">run_test</span><span class="p">::</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="p">(</span><span class="n">wat</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="p">[])</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3>Actual result</h3>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>panicked at crates/wasmtime/src/runtime/vm/traphandlers/backtrace.rs:340:18:
+expected one more VMStackLimits than continuations
+</code></pre></div>
+<p>The stack proceeds through <code>gc_alloc_raw</code>, <code>do_gc</code>,<br>
+<code>trace_wasm_continuation_roots</code>, <code>trace_suspended_continuation</code>, and<br>
+<code>trace_through_continuations</code>.</p>
+<h3>Expected result</h3>
+<p>GC should trace the suspended continuation and <code>entry</code> should complete normally.</p>
+<h3>Analysis</h3>
+<p><code>trace_through_continuations</code> handles the current activation before walking its<br>
+ancestors. It advances the stack-limits iterator past that activation, but does<br>
+not advance the matching continuation iterator. The remaining iterators<br>
+therefore have different lengths.</p>
+<p>Advancing <code>continuations_iter</code> once before making it peekable aligns it with the<br>
+existing stack-limits advance. The test above fails before that change and<br>
+passes afterward.</p>
+<p>This appears distinct from #13750, which concerns missing stack maps for<br>
+continuation payload values. The broader stack-switching tracking issue is<br>
+#10248.</p>
+<h3>Environment</h3>
+<ul>
+<li>OS: Linux x86_64</li>
+<li>Rust: 1.97.1<br>
+</li>
+</ul>
+</blockquote>
+
+
+
+<a name="620196087"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314239%20GC%20panics%20while%20tracing%20a%20suspend.../near/620196087" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314239.20GC.20panics.20while.20tracing.20a.20suspend.2E.2E.2E.html#620196087">(Aug 31 2026 at 04:21)</a>:</h4>
+<p>rirze <a href="https://github.com/bytecodealliance/wasmtime/issues/14239#issuecomment-5473676937">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14239">issue #14239</a>:</p>
+<blockquote>
+<p>PR that fixes this issue along with this test case: <a href="https://github.com/bytecodealliance/wasmtime/pull/14240">https://github.com/bytecodealliance/wasmtime/pull/14240</a></p>
+</blockquote>
+
+
+
+<a name="620331558"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314239%20GC%20panics%20while%20tracing%20a%20suspend.../near/620331558" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314239.20GC.20panics.20while.20tracing.20a.20suspend.2E.2E.2E.html#620331558">(Aug 31 2026 at 14:16)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasm-proposal:gc label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14239">Issue #14239</a>.</p>
+
+
+
+<a name="620331561"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314239%20GC%20panics%20while%20tracing%20a%20suspend.../near/620331561" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314239.20GC.20panics.20while.20tracing.20a.20suspend.2E.2E.2E.html#620331561">(Aug 31 2026 at 14:16)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasm-proposal:stack-switching label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14239">Issue #14239</a>.</p>
+
+
+
+<hr><p>Last updated: Sep 05 2026 at 18:09 UTC</p>
+</html>

@@ -1,0 +1,104 @@
+[
+    {
+        "content": "<p>pchickey opened <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13431\">PR #13431</a> from <code>pchickey:fix_ghsa_2r75_release_44</code> to <code>bytecodealliance:release-44.0.0</code>:</p>\n<blockquote>\n<p>In <code>wasmtime-wasi</code>, when a filesystem preopen is given <code>DirPerms::all()</code> and <code>FilePerms::READ</code> without <code>FilePerms::WRITE</code>,  this wasmtime-wasi enforced access control mechanism can be bypassed by using the wasip2 <code>descriptor.open-at</code> or wasip1 <code>path_open</code> interfaces by opening a file with <code>OpenFlags::TRUNCATE</code> oflag only, for example:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"n\">dir_descriptor</span><span class=\"p\">.</span><span class=\"n\">open_at</span><span class=\"p\">(</span>\n<span class=\"w\">   </span><span class=\"n\">PathFlags</span><span class=\"p\">::</span><span class=\"n\">empty</span><span class=\"p\">(),</span>\n<span class=\"w\">   </span><span class=\"n\">FILENAME</span><span class=\"p\">,</span>\n<span class=\"w\">   </span><span class=\"n\">OpenFlags</span><span class=\"p\">::</span><span class=\"n\">TRUNCATE</span><span class=\"p\">,</span>\n<span class=\"w\">   </span><span class=\"n\">DescriptorFlags</span><span class=\"p\">::</span><span class=\"n\">READ</span><span class=\"p\">,</span>\n<span class=\"p\">)</span>\n</code></pre></div>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"n\">wasip1</span><span class=\"p\">::</span><span class=\"n\">path_open</span><span class=\"p\">(</span>\n<span class=\"w\">    </span><span class=\"n\">dir_fd</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"mi\">0</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"n\">FILENAME</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"n\">wasip1</span><span class=\"p\">::</span><span class=\"n\">OFLAGS_TRUNC</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"n\">wasip1</span><span class=\"p\">::</span><span class=\"n\">RIGHTS_FD_READ</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"mi\">0</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"mi\">0</span>\n<span class=\"p\">)</span>\n</code></pre></div>\n<p>The root cause is that the clause that considered <code>OpenFlags::TRUNCATE</code> did not set <code>open_mode |= OpenMode::WRITE;</code>, used later in that function for the access control check against <code>FilePerms</code> for whether opening that file is permitted. With the bug corrected, these calls to <code>open-at</code> and <code>path_open</code> fail with <code>error-code.not-permitted</code> and <code>ERRNO_PERM</code> respectively.</p>\n<p>The bug in <code>crates/wasi/src/filesystem.rs</code>, <code>Dir::open_at</code>, lines 967–969:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"k\">if</span><span class=\"w\"> </span><span class=\"n\">oflags</span><span class=\"p\">.</span><span class=\"n\">contains</span><span class=\"p\">(</span><span class=\"n\">OpenFlags</span><span class=\"p\">::</span><span class=\"n\">TRUNCATE</span><span class=\"p\">)</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">    </span><span class=\"n\">opts</span><span class=\"p\">.</span><span class=\"n\">truncate</span><span class=\"p\">(</span><span class=\"kc\">true</span><span class=\"p\">).</span><span class=\"n\">write</span><span class=\"p\">(</span><span class=\"kc\">true</span><span class=\"p\">);</span>\n<span class=\"p\">}</span>\n</code></pre></div>\n<p>and the single line fix is:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"k\">if</span><span class=\"w\"> </span><span class=\"n\">oflags</span><span class=\"p\">.</span><span class=\"n\">contains</span><span class=\"p\">(</span><span class=\"n\">OpenFlags</span><span class=\"p\">::</span><span class=\"n\">TRUNCATE</span><span class=\"p\">)</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">    </span><span class=\"n\">opts</span><span class=\"p\">.</span><span class=\"n\">truncate</span><span class=\"p\">(</span><span class=\"kc\">true</span><span class=\"p\">).</span><span class=\"n\">write</span><span class=\"p\">(</span><span class=\"kc\">true</span><span class=\"p\">);</span>\n<span class=\"w\">    </span><span class=\"n\">open_mode</span><span class=\"w\"> </span><span class=\"o\">|=</span><span class=\"w\"> </span><span class=\"n\">OpenMode</span><span class=\"p\">::</span><span class=\"n\">WRITE</span><span class=\"p\">;</span>\n<span class=\"p\">}</span>\n</code></pre></div>\n<p>Only wasmtime-wasi embeddings that use a combination of DirPerms::MUTATE with FilePerms::READ are affected by this bug, e.g. those that use in the <code>WasiCtxBuilder</code>:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"n\">builder</span><span class=\"p\">.</span><span class=\"n\">preopened_dir</span><span class=\"p\">(</span><span class=\"s\">\"readonly\"</span><span class=\"p\">,</span><span class=\"w\"> </span><span class=\"s\">\"readonly\"</span><span class=\"p\">,</span><span class=\"w\"> </span><span class=\"n\">DirPerms</span><span class=\"p\">::</span><span class=\"n\">READ</span><span class=\"w\"> </span><span class=\"o\">|</span><span class=\"w\"> </span><span class=\"n\">DirPerms</span><span class=\"p\">::</span><span class=\"n\">MUTATE</span><span class=\"p\">,</span><span class=\"w\"> </span><span class=\"n\">FilePerms</span><span class=\"p\">::</span><span class=\"n\">READ</span><span class=\"p\">);</span>\n</code></pre></div>\n<p>In particular, the Wasmtime project's <code>wasmtime-cli</code>'s use of wasmtime-wasi is not affected, because it always sets <code>FilePerms::all()</code> for all preopens.</p>\n</blockquote>",
+        "id": 596789866,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779381262
+    },
+    {
+        "content": "<p>pchickey requested <a href=\"https://github.com/dicej\">dicej</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13431\">PR #13431</a>.</p>",
+        "id": 596789874,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779381263
+    },
+    {
+        "content": "<p>pchickey requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-wasi-reviewers\">wasmtime-wasi-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13431\">PR #13431</a>.</p>",
+        "id": 596789876,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779381264
+    },
+    {
+        "content": "<p>pchickey requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers\">wasmtime-core-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13431\">PR #13431</a>.</p>",
+        "id": 596789878,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779381264
+    },
+    {
+        "content": "<p>pchickey requested <a href=\"https://github.com/fitzgen\">fitzgen</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13431\">PR #13431</a>.</p>",
+        "id": 596789882,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779381265
+    },
+    {
+        "content": "<p>pchickey requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-default-reviewers\">wasmtime-default-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13431\">PR #13431</a>.</p>",
+        "id": 596789883,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779381265
+    },
+    {
+        "content": "<p><span aria-label=\"thumbs up\" class=\"emoji emoji-1f44d\" role=\"img\" title=\"thumbs up\">:thumbs_up:</span> dicej submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13431#pullrequestreview-4338841187\">PR review</a>.</p>",
+        "id": 596790963,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779381562
+    },
+    {
+        "content": "<p>pchickey edited <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13431\">PR #13431</a>:</p>\n<blockquote>\n<p>This is a backport of #13429 to the 44.0.0 release branch.</p>\n<p>&lt;details&gt;</p>\n<p>In <code>wasmtime-wasi</code>, when a filesystem preopen is given <code>DirPerms::all()</code> and <code>FilePerms::READ</code> without <code>FilePerms::WRITE</code>,  this wasmtime-wasi enforced access control mechanism can be bypassed by using the wasip2 <code>descriptor.open-at</code> or wasip1 <code>path_open</code> interfaces by opening a file with <code>OpenFlags::TRUNCATE</code> oflag only, for example:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"n\">dir_descriptor</span><span class=\"p\">.</span><span class=\"n\">open_at</span><span class=\"p\">(</span>\n<span class=\"w\">   </span><span class=\"n\">PathFlags</span><span class=\"p\">::</span><span class=\"n\">empty</span><span class=\"p\">(),</span>\n<span class=\"w\">   </span><span class=\"n\">FILENAME</span><span class=\"p\">,</span>\n<span class=\"w\">   </span><span class=\"n\">OpenFlags</span><span class=\"p\">::</span><span class=\"n\">TRUNCATE</span><span class=\"p\">,</span>\n<span class=\"w\">   </span><span class=\"n\">DescriptorFlags</span><span class=\"p\">::</span><span class=\"n\">READ</span><span class=\"p\">,</span>\n<span class=\"p\">)</span>\n</code></pre></div>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"n\">wasip1</span><span class=\"p\">::</span><span class=\"n\">path_open</span><span class=\"p\">(</span>\n<span class=\"w\">    </span><span class=\"n\">dir_fd</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"mi\">0</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"n\">FILENAME</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"n\">wasip1</span><span class=\"p\">::</span><span class=\"n\">OFLAGS_TRUNC</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"n\">wasip1</span><span class=\"p\">::</span><span class=\"n\">RIGHTS_FD_READ</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"mi\">0</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"mi\">0</span>\n<span class=\"p\">)</span>\n</code></pre></div>\n<p>The root cause is that the clause that considered <code>OpenFlags::TRUNCATE</code> did not set <code>open_mode |= OpenMode::WRITE;</code>, used later in that function for the access control check against <code>FilePerms</code> for whether opening that file is permitted. With the bug corrected, these calls to <code>open-at</code> and <code>path_open</code> fail with <code>error-code.not-permitted</code> and <code>ERRNO_PERM</code> respectively.</p>\n<p>The bug in <code>crates/wasi/src/filesystem.rs</code>, <code>Dir::open_at</code>, lines 967–969:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"k\">if</span><span class=\"w\"> </span><span class=\"n\">oflags</span><span class=\"p\">.</span><span class=\"n\">contains</span><span class=\"p\">(</span><span class=\"n\">OpenFlags</span><span class=\"p\">::</span><span class=\"n\">TRUNCATE</span><span class=\"p\">)</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">    </span><span class=\"n\">opts</span><span class=\"p\">.</span><span class=\"n\">truncate</span><span class=\"p\">(</span><span class=\"kc\">true</span><span class=\"p\">).</span><span class=\"n\">write</span><span class=\"p\">(</span><span class=\"kc\">true</span><span class=\"p\">);</span>\n<span class=\"p\">}</span>\n</code></pre></div>\n<p>and the single line fix is:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"k\">if</span><span class=\"w\"> </span><span class=\"n\">oflags</span><span class=\"p\">.</span><span class=\"n\">contains</span><span class=\"p\">(</span><span class=\"n\">OpenFlags</span><span class=\"p\">::</span><span class=\"n\">TRUNCATE</span><span class=\"p\">)</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">    </span><span class=\"n\">opts</span><span class=\"p\">.</span><span class=\"n\">truncate</span><span class=\"p\">(</span><span class=\"kc\">true</span><span class=\"p\">).</span><span class=\"n\">write</span><span class=\"p\">(</span><span class=\"kc\">true</span><span class=\"p\">);</span>\n<span class=\"w\">    </span><span class=\"n\">open_mode</span><span class=\"w\"> </span><span class=\"o\">|=</span><span class=\"w\"> </span><span class=\"n\">OpenMode</span><span class=\"p\">::</span><span class=\"n\">WRITE</span><span class=\"p\">;</span>\n<span class=\"p\">}</span>\n</code></pre></div>\n<p>Only wasmtime-wasi embeddings that use a combination of DirPerms::MUTATE with FilePerms::READ are affected by this bug, e.g. those that use in the <code>WasiCtxBuilder</code>:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"n\">builder</span><span class=\"p\">.</span><span class=\"n\">preopened_dir</span><span class=\"p\">(</span><span class=\"s\">\"readonly\"</span><span class=\"p\">,</span><span class=\"w\"> </span><span class=\"s\">\"readonly\"</span><span class=\"p\">,</span><span class=\"w\"> </span><span class=\"n\">DirPerms</span><span class=\"p\">::</span><span class=\"n\">READ</span><span class=\"w\"> </span><span class=\"o\">|</span><span class=\"w\"> </span><span class=\"n\">DirPerms</span><span class=\"p\">::</span><span class=\"n\">MUTATE</span><span class=\"p\">,</span><span class=\"w\"> </span><span class=\"n\">FilePerms</span><span class=\"p\">::</span><span class=\"n\">READ</span><span class=\"p\">);</span>\n</code></pre></div>\n<p>In particular, the Wasmtime project's <code>wasmtime-cli</code>'s use of wasmtime-wasi is not affected, because it always sets <code>FilePerms::all()</code> for all preopens.</p>\n<p>&lt;/details&gt;</p>\n</blockquote>",
+        "id": 596792469,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779381993
+    },
+    {
+        "content": "<p>pchickey updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13431\">PR #13431</a>.</p>",
+        "id": 596793773,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779382361
+    },
+    {
+        "content": "<p>pchickey has enabled auto merge for <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13431\">PR #13431</a>.</p>",
+        "id": 596793931,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779382405
+    },
+    {
+        "content": "<p>pchickey has disabled auto merge for <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13431\">PR #13431</a>.</p>",
+        "id": 596801961,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779384702
+    },
+    {
+        "content": "<p><span aria-label=\"cross mark\" class=\"emoji emoji-274c\" role=\"img\" title=\"cross mark\">:cross_mark:</span> pchickey closed without merge <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13431\">PR #13431</a>.</p>",
+        "id": 596801964,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779384703
+    },
+    {
+        "content": "<p>pchickey <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13431#issuecomment-4510872127\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13431\">PR #13431</a>:</p>\n<blockquote>\n<p>One of the macos ci runners has hung, closing and reopening to hopefully get a fresh run?</p>\n</blockquote>",
+        "id": 596801967,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779384704
+    },
+    {
+        "content": "<p>pchickey reopened <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13431\">PR #13431</a> from <code>pchickey:fix_ghsa_2r75_release_44</code> to <code>bytecodealliance:release-44.0.0</code>.</p>",
+        "id": 596801980,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779384708
+    },
+    {
+        "content": "<p>pchickey edited a <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13431#issuecomment-4510872127\">comment</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13431\">PR #13431</a>:</p>\n<blockquote>\n<p>One of the macos ci runners has hung and the cancel button isnt working, closing and reopening to hopefully get a fresh run?</p>\n</blockquote>",
+        "id": 596802072,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779384731
+    },
+    {
+        "content": "<p>pchickey has enabled auto merge for <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13431\">PR #13431</a>.</p>",
+        "id": 596802722,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779384917
+    },
+    {
+        "content": "<p><span aria-label=\"check\" class=\"emoji emoji-2705\" role=\"img\" title=\"check\">:check:</span> pchickey merged <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13431\">PR #13431</a>.</p>",
+        "id": 596807968,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1779386220
+    }
+]

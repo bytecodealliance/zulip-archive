@@ -1,0 +1,148 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14286 WASI 0.2 pollable.block blocks th... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314286.20WASI.200.2E2.20pollable.2Eblock.20blocks.20th.2E.2E.2E.html">wasmtime / issue #14286 WASI 0.2 pollable.block blocks th...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="621879720"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314286%20WASI%200.2%20pollable.block%20blocks%20th.../near/621879720" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314286.20WASI.200.2E2.20pollable.2Eblock.20blocks.20th.2E.2E.2E.html#621879720">(Sep 05 2026 at 08:24)</a>:</h4>
+<p>somdoron opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14286">issue #14286</a>:</p>
+<blockquote>
+<p>When a component whose export is lifted with <code>async</code> blocks in WASI 0.2 (for<br>
+example <code>wasi:io/poll@0.2</code>'s <code>pollable.block</code> or <code>poll</code>), the whole<br>
+<code>Store</code> stops until that call returns. Nothing else driven by<br>
+<code>Store::run_concurrent</code> makes progress in the meantime, and an <code>async</code>-lowered<br>
+call into that component comes back as <code>RETURNED</code> instead of <code>STARTED</code>. The<br>
+same component blocking through <code>wasi:clocks@0.3</code> <code>wait-for</code> behaves as<br>
+expected: only its own task suspends and other tasks keep running.</p>
+<p>This matters for mixing WASI 0.2 and 0.3 components in one store: any 0.2<br>
+component that waits on I/O effectively serializes everything around it.</p>
+<h3>Test Case</h3>
+<p>Standalone reproduction (single <code>cargo run</code>, builds and composes the components<br>
+itself): <a href="https://github.com/somdoron/wasmtime-p2-block-repro">https://github.com/somdoron/wasmtime-p2-block-repro</a></p>
+<p>Attached separately for convenience (with a <code>.txt</code> suffix so GitHub accepts them):</p>
+<ul>
+<li>
+<p><code>repro.wit.txt</code> — the WIT package (<code>local:repro</code>) with both worlds. It also needs<br>
+<code>wasi:io@0.2.6</code>, <code>wasi:clocks@0.2.6</code> and <code>wasi:clocks@0.3.0-rc-2026-03-15</code><br>
+  in <code>wit/deps/</code>.</p>
+</li>
+<li>
+<p><code>sleeper-p2.wat.txt</code> — component 1 (world <code>sleeper-p2</code>): <code>sleep</code> is lifted<br>
+  async-stackful and blocks in WASI 0.2 via <code>monotonic-clock.subscribe-duration</code></p>
+<ul>
+<li><code>pollable.block</code>.</li>
+<li><code>main.wat.txt</code> — component 2 (world <code>main</code>): <code>go</code> is lifted async-stackful, starts<br>
+component 1's <code>sleep(long)</code> and a <code>wasi:clocks@0.3</code> <code>wait-for(short)</code>, both<br>
+with <code>canon lower ... async</code>, and waits on both.</li>
+</ul>
+</li>
+</ul>
+<p>Each core module is turned into a component with<br>
+<code>wit_component::embed_component_metadata</code> + <code>ComponentEncoder</code> against its<br>
+world, then the two are composed with <code>wac plug</code> (component 1 into component 2).</p>
+<h3>Steps to Reproduce</h3>
+<ul>
+<li><code>git clone https://github.com/somdoron/wasmtime-p2-block-repro &amp;&amp; cargo run</code>, or by hand:</li>
+<li>Build both components from the attached WAT and WIT files and compose them with <code>wac plug</code> (component 1 into component 2).</li>
+<li>Configure the engine with <code>wasm_component_model_async</code>, <code>wasm_component_model_more_async_builtins</code>, <code>wasm_component_model_async_stackful</code> and <code>concurrency_support</code> enabled.</li>
+<li>Add <code>wasmtime_wasi::p3::add_to_linker</code> and <code>wasmtime_wasi::p2::add_to_linker_async</code> to the linker, plus a host implementation of <code>local:repro/log</code> that prints the events with timestamps.</li>
+<li>Instantiate and run <code>store.run_concurrent(|acc| go.call_concurrent(acc, (300_000_000, 100_000_000)))</code>.</li>
+</ul>
+<h3>Expected Results</h3>
+<p>The async-lowered call into component 1 returns <code>STARTED</code>, component 1 suspends<br>
+on its own task inside <code>pollable.block</code>, the 100ms timer fires first, total<br>
+≈300ms.</p>
+<p><a href="https://github.com/WebAssembly/component-model/blob/main/design/mvp/Concurrency.md#blocking">Concurrency.md, "Blocking"</a>:</p>
+<blockquote>
+<p>When a thread calls an import using the async ABI, the Component Model<br>
+guarantees that if the callee task <strong>blocks</strong>, control flow is immediately<br>
+returned back to the caller's thread.</p>
+</blockquote>
+<blockquote>
+<p>If instead the task has <em>not</em> yet returned a value and the callee's function<br>
+type declares the <code>async</code> effect, control flow returns directly to the caller.<br>
+If the caller used the <em>async</em> ABI, then control flow returns to Core<br>
+WebAssembly, indicating that the call "blocked" by returning the non-zero<br>
+index of a new subtask.</p>
+</blockquote>
+<p><code>sleep</code> is <code>async</code> in WIT and component 2 lowers it with <code>async</code>, so once<br>
+component 1's task blocks the call must come back to component 2 as <code>STARTED</code>.<br>
+The same section does leave it to the host to decide what counts as blocking<br>
+for host-implemented imports ("what counts as 'blocking' is up to the host"),<br>
+but Wasmtime already treats the WASI 0.3 equivalent as blocking, and a<br>
+300ms timer wait is hard to see as anything else.</p>
+<p>The spec is also explicit that the WASI 0.2 sync ABI is meant to keep working<br>
+inside this model rather than being a separate, non-concurrent world<br>
+(<a href="https://github.com/WebAssembly/component-model/blob/main/design/mvp/Concurrency.md#summary">Summary</a><br>
+and <a href="https://github.com/WebAssembly/component-model/blob/main/design/mvp/Concurrency.md#goals">Goals</a>):</p>
+<blockquote>
+<p>The new async ABI can be used alongside or instead of the existing WASI 0.2<br>
+"sync ABI" to call or implement any <code>async</code>-typed functions. When <em>calling</em><br>
+an imported function via the async ABI, if the <code>async</code> callee blocks, control<br>
+flow is returned immediately to the caller, and the callee continues<br>
+executing concurrently. [...] Critically, both sync-ABI-calls-async-ABI and<br>
+async-ABI-calls-sync-ABI pairings have well-defined, composable behavior for<br>
+both inter-component and intra-component calls.</p>
+</blockquote>
+<blockquote>
+<p>Avoid partitioning interfaces and components into separate ecosystems based<br>
+on degree of concurrency; don't give components a "color".</p>
+</blockquote>
+<p>Component 1 here is exactly the "traditional sync code compiled to a component<br>
+exporting <code>async</code> functions" case the Summary describes, except that its sync<br>
+imports are WASI 0.2 rather than WASI 0.3.</p>
+<h3>Actual Results</h3>
+<p>The async-lowered call blocks for the full 300ms and returns <code>RETURNED</code>. The<br>
+100ms timer hasn't even been started yet when it returns. Total ≈400ms.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="p">[</span><span class="w">   </span><span class="mi">0</span><span class="n">ms</span><span class="p">]</span><span class="w"> </span><span class="n">component</span><span class="w"> </span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="nc">go</span><span class="w"> </span><span class="n">entered</span>
+<span class="p">[</span><span class="w">   </span><span class="mi">1</span><span class="n">ms</span><span class="p">]</span><span class="w"> </span><span class="n">component</span><span class="w"> </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="nc">entered</span>
+<span class="p">[</span><span class="w"> </span><span class="mi">303</span><span class="n">ms</span><span class="p">]</span><span class="w"> </span><span class="n">component</span><span class="w"> </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="nc">woke</span><span class="w">                                       </span><span class="o">&lt;--</span><span class="w"> </span><span class="mi">300</span><span class="n">ms</span><span class="p">,</span><span class="w"> </span><span class="n">store</span><span class="w"> </span><span class="n">idle</span>
+<span class="p">[</span><span class="w"> </span><span class="mi">303</span><span class="n">ms</span><span class="p">]</span><span class="w"> </span><span class="n">component</span><span class="w"> </span><span class="mi">2</span><span class="p">:</span><span class="w">   </span><span class="nc">LONG</span><span class="w">  </span><span class="p">(</span><span class="n">component</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span><span class="w"> </span><span class="n">call</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="w">      </span><span class="o">&lt;--</span><span class="w"> </span><span class="n">RETURNED</span><span class="p">,</span><span class="w"> </span><span class="n">not</span><span class="w"> </span><span class="n">STARTED</span>
+<span class="p">[</span><span class="w"> </span><span class="mi">304</span><span class="n">ms</span><span class="p">]</span><span class="w"> </span><span class="n">component</span><span class="w"> </span><span class="mi">2</span><span class="p">:</span><span class="w">   </span><span class="nc">SHORT</span><span class="w"> </span><span class="p">(</span><span class="n">p3</span><span class="w"> </span><span class="n">timer</span><span class="p">)</span><span class="w">     </span><span class="n">call</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">17</span><span class="w">    </span><span class="o">&lt;--</span><span class="w"> </span><span class="n">STARTED</span><span class="p">,</span><span class="w"> </span><span class="n">subtask</span><span class="w"> </span><span class="mi">1</span>
+<span class="p">[</span><span class="w"> </span><span class="mi">406</span><span class="n">ms</span><span class="p">]</span><span class="w"> </span><span class="n">component</span><span class="w"> </span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="nc">EVENT</span><span class="w"> </span><span class="n">from</span><span class="w"> </span><span class="n">subtask</span><span class="w"> </span><span class="mi">1</span>
+<span class="p">[</span><span class="w"> </span><span class="mi">406</span><span class="n">ms</span><span class="p">]</span><span class="w"> </span><span class="n">component</span><span class="w"> </span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="nc">go</span><span class="w"> </span><span class="n">finished</span>
+<span class="n">total</span><span class="w"> </span><span class="mi">406</span><span class="n">ms</span>
+</code></pre></div>
+<p>Blocking in <code>wasi:io/poll@0.2.6#poll</code> instead of <code>pollable.block</code> behaves the<br>
+same.</p>
+<h3>Versions and Environment</h3>
+<p>Wasmtime version or commit: 45.0.3; also reproduced on <code>main</code> at 0754181e4b</p>
+<p>Operating system: macOS</p>
+<p>Architecture: aarch64</p>
+<h3>Extra Info</h3>
+<p>I see two possible directions and would appreciate guidance on which one is<br>
+preferred:</p>
+<ul>
+<li>
+<p>Fix it on the host side, so that the blocking <code>wasi:io@0.2</code> operations in<br>
+<code>wasmtime-wasi-io</code> suspend only the calling task when the caller is allowed<br>
+  to suspend (and keep blocking the store as today when it isn't).</p>
+</li>
+<li>
+<p>Provide a WASI 0.2 → 0.3 adapter component, similar to the existing<br>
+  preview1 → 0.2 adapter, implementing <code>wasi:io/poll@0.2</code> and the blocking<br>
+<code>wasi:io/streams@0.2</code> operations on top of the 0.3 <code>async</code> functions and<br>
+  streams, so every wait in the composed component is already an <code>async</code><br>
+  import. This assumes 0.3 exposes enough to build a <code>pollable</code> for every 0.2<br>
+  resource, which I haven't checked.</p>
+</li>
+</ul>
+<p>Happy to work on either.</p>
+</blockquote>
+
+
+
+<a name="621879722"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314286%20WASI%200.2%20pollable.block%20blocks%20th.../near/621879722" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314286.20WASI.200.2E2.20pollable.2Eblock.20blocks.20th.2E.2E.2E.html#621879722">(Sep 05 2026 at 08:24)</a>:</h4>
+<p><a href="https://github.com/somdoron">somdoron</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14286">Issue #14286</a>.</p>
+
+
+
+<hr><p>Last updated: Sep 05 2026 at 18:09 UTC</p>
+</html>

@@ -1,0 +1,102 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #14272 Cranelift: fix `uadd_overflow` + loa... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314272.20Cranelift.3A.20fix.20.60uadd_overflow.60.20.2B.20loa.2E.2E.2E.html">wasmtime / PR #14272 Cranelift: fix `uadd_overflow` + loa...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="621182000"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314272%20Cranelift%3A%20fix%20%60uadd_overflow%60%20%2B%20loa.../near/621182000" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314272.20Cranelift.3A.20fix.20.60uadd_overflow.60.20.2B.20loa.2E.2E.2E.html#621182000">(Sep 02 2026 at 23:05)</a>:</h4>
+<p>cfallin requested <a href="https://github.com/fitzgen">fitzgen</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14272">PR #14272</a>.</p>
+
+
+
+<a name="621182005"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314272%20Cranelift%3A%20fix%20%60uadd_overflow%60%20%2B%20loa.../near/621182005" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314272.20Cranelift.3A.20fix.20.60uadd_overflow.60.20.2B.20loa.2E.2E.2E.html#621182005">(Sep 02 2026 at 23:05)</a>:</h4>
+<p>cfallin requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14272">PR #14272</a>.</p>
+
+
+
+<a name="621182006"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314272%20Cranelift%3A%20fix%20%60uadd_overflow%60%20%2B%20loa.../near/621182006" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314272.20Cranelift.3A.20fix.20.60uadd_overflow.60.20.2B.20loa.2E.2E.2E.html#621182006">(Sep 02 2026 at 23:05)</a>:</h4>
+<p>cfallin opened <a href="https://github.com/bytecodealliance/wasmtime/pull/14272">PR #14272</a> from <code>cfallin:fuzzbug-fix</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>In #14271 we got a fuzzbug that had a <code>uadd_overflow</code> with (i) a sinkable load as one argument, (ii) multiple uses of the flag output, so its flag result would have to be materialized anyway.</p>
+<p>This results in the lowering happening twice: once to feed the flags into the branch, and once to actually materialize the bool value. That's fine: the whole point of the new mechanism is that the common case is to use the overflow as a branch input only, not as a materialized bool, so a double lowering here is harmless (two extra cycles).</p>
+<p>The issue arises because of a bit of logic I had forgotten we added several years ago in #9510 that declares <em>all</em> multi-def instructions as "value roots" that will only be lowered <em>once</em>. This allows loads to sink into such instructions always (if only used once by that instruction of course), but in turn requires a promise that we will do what we say on the tin: we will only <em>ever</em> lower any multi-def instruction once.</p>
+<p>I believe that this eliminates any practical way of optimizing overflow-flag insts, or doing fusion of bool flags into conditional branches at all, because these inherently require lowering at use sites (because of the way that we don't regalloc flags).</p>
+<p>It is also a somewhat dangerous (IMHO, now with perspective) exception to our otherwise principled "multiplicity" analysis: we otherwise assume (i) that any given instruction is only lowered once, unless (ii) truly used multiple times in the DFG. That is what allows us to reason about code motion of loads in a princpled way (because we can't duplicate a load). That principle is pretty simple; declaring some instructions "roots" and allowing them to "kill" multiplicity adds this footgun that will strike whenever we forget the exception and write a lowering rule like the overflow cases.</p>
+<p>Fortunately it seems we don't actually get any test failures when removing that feature (and the test from #9510 is still in-tree?), so it's not required anymore; so this PR removes the feature. The attached test will panic without the fix.</p>
+<p>Fixes #14271.</p>
+<p>(Some more philosophical thought: our pre-pass that computes multiplicity is itself a choice, but the alternative requires us to give up single-pass lowering altogether and forces code motion into an iterative/fixpoint kind of framework. Consider: we have multiple uses of a given load; when we see the first use, how do we know whether it's the only use (and we can sink it into here) or there will be another? The multiplicity analysis is what answers that ahead of time, and despite its main limitation (it cannot be updated live), it seems to work well overall if we stick to the framework.)</p>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please review the Bytecode Alliance's AI tool usage policy at<br>
+<a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+</blockquote>
+
+
+
+<a name="621184411"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314272%20Cranelift%3A%20fix%20%60uadd_overflow%60%20%2B%20loa.../near/621184411" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314272.20Cranelift.3A.20fix.20.60uadd_overflow.60.20.2B.20loa.2E.2E.2E.html#621184411">(Sep 02 2026 at 23:19)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/14272">PR #14272</a>.</p>
+
+
+
+<a name="621205019"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314272%20Cranelift%3A%20fix%20%60uadd_overflow%60%20%2B%20loa.../near/621205019" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314272.20Cranelift.3A.20fix.20.60uadd_overflow.60.20.2B.20loa.2E.2E.2E.html#621205019">(Sep 03 2026 at 01:11)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14272">PR #14272</a>.</p>
+
+
+
+<a name="621205020"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314272%20Cranelift%3A%20fix%20%60uadd_overflow%60%20%2B%20loa.../near/621205020" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314272.20Cranelift.3A.20fix.20.60uadd_overflow.60.20.2B.20loa.2E.2E.2E.html#621205020">(Sep 03 2026 at 01:11)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift:area:machinst</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14272">PR #14272</a>.</p>
+
+
+
+<a name="621492933"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314272%20Cranelift%3A%20fix%20%60uadd_overflow%60%20%2B%20loa.../near/621492933" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314272.20Cranelift.3A.20fix.20.60uadd_overflow.60.20.2B.20loa.2E.2E.2E.html#621492933">(Sep 03 2026 at 19:10)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> fitzgen submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14272#pullrequestreview-5105800342">PR review</a>.</p>
+
+
+
+<a name="621492959"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314272%20Cranelift%3A%20fix%20%60uadd_overflow%60%20%2B%20loa.../near/621492959" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314272.20Cranelift.3A.20fix.20.60uadd_overflow.60.20.2B.20loa.2E.2E.2E.html#621492959">(Sep 03 2026 at 19:10)</a>:</h4>
+<p>fitzgen added <a href="https://github.com/bytecodealliance/wasmtime/pull/14272">PR #14272 Cranelift: fix <code>uadd_overflow</code> + load sinking.</a> to the merge queue</p>
+
+
+
+<a name="621499911"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314272%20Cranelift%3A%20fix%20%60uadd_overflow%60%20%2B%20loa.../near/621499911" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314272.20Cranelift.3A.20fix.20.60uadd_overflow.60.20.2B.20loa.2E.2E.2E.html#621499911">(Sep 03 2026 at 19:37)</a>:</h4>
+<p><span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span> fitzgen merged <a href="https://github.com/bytecodealliance/wasmtime/pull/14272">PR #14272</a>.</p>
+
+
+
+<a name="621499915"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314272%20Cranelift%3A%20fix%20%60uadd_overflow%60%20%2B%20loa.../near/621499915" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314272.20Cranelift.3A.20fix.20.60uadd_overflow.60.20.2B.20loa.2E.2E.2E.html#621499915">(Sep 03 2026 at 19:37)</a>:</h4>
+<p>fitzgen removed <a href="https://github.com/bytecodealliance/wasmtime/pull/14272">PR #14272 Cranelift: fix <code>uadd_overflow</code> + load sinking.</a> from the merge queue</p>
+
+
+
+<hr><p>Last updated: Sep 05 2026 at 18:09 UTC</p>
+</html>

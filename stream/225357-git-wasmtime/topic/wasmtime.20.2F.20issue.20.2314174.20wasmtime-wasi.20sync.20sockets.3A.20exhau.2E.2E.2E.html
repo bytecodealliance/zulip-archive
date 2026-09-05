@@ -1,0 +1,78 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14174 wasmtime-wasi sync sockets: exhau... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314174.20wasmtime-wasi.20sync.20sockets.3A.20exhau.2E.2E.2E.html">wasmtime / issue #14174 wasmtime-wasi sync sockets: exhau...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="617718324"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314174%20wasmtime-wasi%20sync%20sockets%3A%20exhau.../near/617718324" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314174.20wasmtime-wasi.20sync.20sockets.3A.20exhau.2E.2E.2E.html#617718324">(Aug 20 2026 at 14:57)</a>:</h4>
+<p>SteveDeFacto opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14174">issue #14174</a>:</p>
+<blockquote>
+<h3>Summary</h3>
+<p>For a <strong>synchronous</strong> wasip2 guest (<code>wasi:cli</code> run world, <code>wasmtime run -S inherit-network</code>) doing nonblocking socket I/O in an event loop, <code>output-stream.check-write</code> intermittently reports "no budget" for <strong>every open socket simultaneously</strong>, for hundreds of milliseconds up to multiple seconds, while the kernel reports the sockets writable the whole time (<code>poll(2)</code> with zero timeout returns POLLOUT). All sockets then unblock at the same instant. From the guest's side this looks like its entire socket set freezing; in our production system (a streaming app serving one busy SSE writer plus several keep-alive connections) stalls reached 14 s.</p>
+<h3>Mechanism (instrumented)</h3>
+<p>The CLI executes the whole guest inside one outer <code>Runtime::block_on</code>, so every sync host shim entered through <code>wasmtime_wasi::runtime::in_tokio</code> shares that single task's <strong>tokio coop budget</strong> (128). <code>tokio::io::unix</code> <code>Registration::poll_ready</code> — the path under p2 <code>check-write</code> / <code>poll_write_ready</code> — consults <code>coop::poll_proceed</code> <strong>before</strong> consulting readiness. When the budget is exhausted, every socket's readiness poll returns <code>Pending</code> regardless of kernel state. The sync shims poll with <strong>noop wakers</strong>, so the normal contract ("you'll be woken when the budget resets") is void — nothing re-polls until an unrelated host call happens to yield, which is why the whole set freezes and releases together.</p>
+<p>We proved this by re-polling under <code>tokio::task::unconstrained</code> at each divergence: <strong>1,004 of 1,006</strong> write-side divergences flipped to Ready with the budget removed. (The remaining handful, plus a smaller read-side class, are ordinary edge-cache lag: <code>try_read</code>/<code>try_write</code> short-circuit on cached readiness bits, and an edge consumed at the wrong moment never re-fires for a socket that <em>stays</em> ready.) In one 5-minute window under load we counted 2,098 "kernel says POLLOUT, cache says Pending" events. A 10 ms heartbeat task on the same runtime logged zero scheduling gaps &gt;100 ms through every stall — the workers and driver were healthy; the budget gate was the blocker.</p>
+<p><code>try_read</code>/<code>try_write</code> themselves have no coop gate, which is why <em>reads</em> kept limping along while <code>check-write</code> starved — a confusing asymmetry when debugging from the guest side.</p>
+<h3>Reproduction shape</h3>
+<p>Sync p2 guest with an event loop that, each turn, does nonblocking reads/writes across several sockets (one continuously-written stream + a few keep-alive request sockets), under CPU contention (we pin the whole process to one core with <code>taskset</code>; on 32 idle cores it stays clean). Within minutes, <code>check-write</code> returns 0 for all sockets in bursts of 0.2–1.2 s locally (much longer on smaller cgroup slices in production). wasmtime @ <code>ac0772970b9ad2cd53866d95db69e26311fe3b75</code>; also reproduces with our threads patches removed (a second guest thread merely multiplies the frequency ~7-12x).</p>
+<h3>Fixes we validated</h3>
+<ol>
+<li><strong>Level-check fallback</strong> (what we ship): on the sync send/recv/readiness paths, when the cached path says "not ready", ask the kernel (direct nonblocking send/recv or zero-timeout <code>poll(2)</code>) before believing it; register the waker before answering Ready so async callers keep their contract. This eliminated the stalls entirely under a 30-minute soak (12,594/12,594 probes clean, worst 16 ms; previously 59 stalls &gt;500 ms per 10 min) and also absorbs the edge-cache-lag class. Patch (against the commit above, plain-<code>git apply</code>): <a href="https://github.com/EnclaveHost/enclave/blob/main/wasm/wasmtime-socket-level-check.patch">https://github.com/EnclaveHost/enclave/blob/main/wasm/wasmtime-socket-level-check.patch</a></li>
+<li><code>tokio::task::unconstrained</code> around the sync shims' polls fixes the coop class alone (but not the edge-lag class).</li>
+</ol>
+<p>Happy to adapt the patch into a PR if the approach is acceptable — or if you'd prefer the <code>unconstrained</code> route for the sync shims, that's a smaller change that covers ~99.8% of the observed events.<br>
+</p>
+</blockquote>
+
+
+
+<a name="618032056"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314174%20wasmtime-wasi%20sync%20sockets%3A%20exhau.../near/618032056" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314174.20wasmtime-wasi.20sync.20sockets.3A.20exhau.2E.2E.2E.html#618032056">(Aug 21 2026 at 23:07)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/14174#issuecomment-5376316955">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14174">issue #14174</a>:</p>
+<blockquote>
+<p>Thanks for the report! What you describe here sounds reasonable but is also something I'm not entirely familiar with myself. A hang sounds like a bug no matter what, however, so this part:</p>
+<blockquote>
+<p>nothing re-polls until an unrelated host call happens to yield</p>
+</blockquote>
+<p>is something that I'd like to better understand. Are you able to share a reproduction of this event occurring? Or is this something that's pretty difficult to pin down?</p>
+</blockquote>
+
+
+
+<a name="619597827"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314174%20wasmtime-wasi%20sync%20sockets%3A%20exhau.../near/619597827" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314174.20wasmtime-wasi.20sync.20sockets.3A.20exhau.2E.2E.2E.html#619597827">(Aug 27 2026 at 16:51)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the wasi:impl label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14174">Issue #14174</a>.</p>
+
+
+
+<a name="621095013"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314174%20wasmtime-wasi%20sync%20sockets%3A%20exhau.../near/621095013" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314174.20wasmtime-wasi.20sync.20sockets.3A.20exhau.2E.2E.2E.html#621095013">(Sep 02 2026 at 17:19)</a>:</h4>
+<p>alexcrichton closed <a href="https://github.com/bytecodealliance/wasmtime/issues/14174">issue #14174</a>:</p>
+<blockquote>
+<h3>Summary</h3>
+<p>For a <strong>synchronous</strong> wasip2 guest (<code>wasi:cli</code> run world, <code>wasmtime run -S inherit-network</code>) doing nonblocking socket I/O in an event loop, <code>output-stream.check-write</code> intermittently reports "no budget" for <strong>every open socket simultaneously</strong>, for hundreds of milliseconds up to multiple seconds, while the kernel reports the sockets writable the whole time (<code>poll(2)</code> with zero timeout returns POLLOUT). All sockets then unblock at the same instant. From the guest's side this looks like its entire socket set freezing; in our production system (a streaming app serving one busy SSE writer plus several keep-alive connections) stalls reached 14 s.</p>
+<h3>Mechanism (instrumented)</h3>
+<p>The CLI executes the whole guest inside one outer <code>Runtime::block_on</code>, so every sync host shim entered through <code>wasmtime_wasi::runtime::in_tokio</code> shares that single task's <strong>tokio coop budget</strong> (128). <code>tokio::io::unix</code> <code>Registration::poll_ready</code> — the path under p2 <code>check-write</code> / <code>poll_write_ready</code> — consults <code>coop::poll_proceed</code> <strong>before</strong> consulting readiness. When the budget is exhausted, every socket's readiness poll returns <code>Pending</code> regardless of kernel state. The sync shims poll with <strong>noop wakers</strong>, so the normal contract ("you'll be woken when the budget resets") is void — nothing re-polls until an unrelated host call happens to yield, which is why the whole set freezes and releases together.</p>
+<p>We proved this by re-polling under <code>tokio::task::unconstrained</code> at each divergence: <strong>1,004 of 1,006</strong> write-side divergences flipped to Ready with the budget removed. (The remaining handful, plus a smaller read-side class, are ordinary edge-cache lag: <code>try_read</code>/<code>try_write</code> short-circuit on cached readiness bits, and an edge consumed at the wrong moment never re-fires for a socket that <em>stays</em> ready.) In one 5-minute window under load we counted 2,098 "kernel says POLLOUT, cache says Pending" events. A 10 ms heartbeat task on the same runtime logged zero scheduling gaps &gt;100 ms through every stall — the workers and driver were healthy; the budget gate was the blocker.</p>
+<p><code>try_read</code>/<code>try_write</code> themselves have no coop gate, which is why <em>reads</em> kept limping along while <code>check-write</code> starved — a confusing asymmetry when debugging from the guest side.</p>
+<h3>Reproduction shape</h3>
+<p>Sync p2 guest with an event loop that, each turn, does nonblocking reads/writes across several sockets (one continuously-written stream + a few keep-alive request sockets), under CPU contention (we pin the whole process to one core with <code>taskset</code>; on 32 idle cores it stays clean). Within minutes, <code>check-write</code> returns 0 for all sockets in bursts of 0.2–1.2 s locally (much longer on smaller cgroup slices in production). wasmtime @ <code>ac0772970b9ad2cd53866d95db69e26311fe3b75</code>; also reproduces with our threads patches removed (a second guest thread merely multiplies the frequency ~7-12x).</p>
+<h3>Fixes we validated</h3>
+<ol>
+<li><strong>Level-check fallback</strong> (what we ship): on the sync send/recv/readiness paths, when the cached path says "not ready", ask the kernel (direct nonblocking send/recv or zero-timeout <code>poll(2)</code>) before believing it; register the waker before answering Ready so async callers keep their contract. This eliminated the stalls entirely under a 30-minute soak (12,594/12,594 probes clean, worst 16 ms; previously 59 stalls &gt;500 ms per 10 min) and also absorbs the edge-cache-lag class. Patch (against the commit above, plain-<code>git apply</code>): <a href="https://github.com/EnclaveHost/enclave/blob/main/wasm/wasmtime-socket-level-check.patch">https://github.com/EnclaveHost/enclave/blob/main/wasm/wasmtime-socket-level-check.patch</a></li>
+<li><code>tokio::task::unconstrained</code> around the sync shims' polls fixes the coop class alone (but not the edge-lag class).</li>
+</ol>
+<p>Happy to adapt the patch into a PR if the approach is acceptable — or if you'd prefer the <code>unconstrained</code> route for the sync shims, that's a smaller change that covers ~99.8% of the observed events.<br>
+</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Sep 05 2026 at 18:09 UTC</p>
+</html>

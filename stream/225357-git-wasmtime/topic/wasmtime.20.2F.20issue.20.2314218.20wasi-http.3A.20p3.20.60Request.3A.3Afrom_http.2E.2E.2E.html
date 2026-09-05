@@ -1,0 +1,89 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14218 wasi-http: p3 `Request::from_http... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314218.20wasi-http.3A.20p3.20.60Request.3A.3Afrom_http.2E.2E.2E.html">wasmtime / issue #14218 wasi-http: p3 `Request::from_http...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="619642596"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314218%20wasi-http%3A%20p3%20%60Request%3A%3Afrom_http.../near/619642596" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314218.20wasi-http.3A.20p3.20.60Request.3A.3Afrom_http.2E.2E.2E.html#619642596">(Aug 27 2026 at 20:18)</a>:</h4>
+<p>andrewweston opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14218">issue #14218</a>:</p>
+<blockquote>
+<h3>Summary</h3>
+<p><code>p3::Request::from_http</code> and <code>p3::Response::from_http</code> return</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="p">(</span><span class="bp">Self</span><span class="p">,</span><span class="w"> </span><span class="k">impl</span><span class="w"> </span><span class="n">Future</span><span class="o">&lt;</span><span class="n">Output</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">(),</span><span class="w"> </span><span class="n">Error</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nb">Send</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="o">'</span><span class="nb">static</span><span class="p">)</span>
+</code></pre></div>
+<p>Under the Rust 2024 edition capture rules, the opaque return type implicitly captures the elided lifetime of the <code>hooks: &amp;mut dyn WasiHttpHooks</code> parameter. The future's body never borrows <code>hooks</code> — it is only used synchronously (via <code>FieldMap::new_immutable</code>) before <code>Self::new</code> is called — but callers are constrained as if the borrow lived inside the future.</p>
+<p>Present in <code>wasmtime-wasi-http</code> 48.0.1 and on <code>main</code>:</p>
+<ul>
+<li><a href="https://github.com/bytecodealliance/wasmtime/blob/main/crates/wasi-http/src/p3/request.rs">https://github.com/bytecodealliance/wasmtime/blob/main/crates/wasi-http/src/p3/request.rs</a> (<code>from_http</code>)</li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/blob/main/crates/wasi-http/src/p3/response.rs">https://github.com/bytecodealliance/wasmtime/blob/main/crates/wasi-http/src/p3/response.rs</a> (<code>from_http</code>)</li>
+</ul>
+<h3>Why it matters</h3>
+<p>In the usual embedding, hooks live inside the store data behind <code>WasiHttpView::http()</code>, so the natural call site is inside a short-lived store access (e.g. <code>Accessor::with</code> under <code>run_concurrent</code>). The returned future then cannot escape the closure:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="n">request</span><span class="p">,</span><span class="w"> </span><span class="n">io</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">store</span><span class="p">.</span><span class="n">with</span><span class="p">(</span><span class="o">|</span><span class="k">mut</span><span class="w"> </span><span class="n">access</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">cx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">access</span><span class="p">.</span><span class="n">as_context_mut</span><span class="p">();</span>
+<span class="w">    </span><span class="n">Request</span><span class="p">::</span><span class="n">from_http</span><span class="p">(</span><span class="n">cx</span><span class="p">.</span><span class="n">data_mut</span><span class="p">().</span><span class="n">http</span><span class="p">().</span><span class="n">hooks</span><span class="p">,</span><span class="w"> </span><span class="n">req</span><span class="p">)</span>
+<span class="p">});</span>
+</code></pre></div>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>error[E0515]: cannot return value referencing function parameter `access`
+note: this call may capture more lifetimes than intended, because Rust 2024
+      has adjusted the `impl Trait` lifetime capture rules
+help: if you can modify this crate, add a precise capturing bound to avoid
+      overcapturing: `+ use&lt;T&gt;`
+</code></pre></div>
+<h3>Suggested fix</h3>
+<p>Add precise-capture bounds so only the body type parameter is captured:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">impl</span><span class="w"> </span><span class="n">Future</span><span class="o">&lt;</span><span class="n">Output</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">(),</span><span class="w"> </span><span class="n">Error</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nb">Send</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="o">'</span><span class="nb">static</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="k">use</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span>
+</code></pre></div>
+<p>on both <code>from_http</code> functions (<code>Request::new</code>/<code>Response::new</code> are unaffected — they have no borrowed inputs).</p>
+<h3>Workaround</h3>
+<p>Decompose the request manually: build <code>FieldMap::new_immutable(hooks, headers)</code> inside the store access, then assemble with <code>Request::new</code> outside it.</p>
+</blockquote>
+
+
+
+<a name="619666174"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314218%20wasi-http%3A%20p3%20%60Request%3A%3Afrom_http.../near/619666174" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314218.20wasi-http.3A.20p3.20.60Request.3A.3Afrom_http.2E.2E.2E.html#619666174">(Aug 27 2026 at 22:56)</a>:</h4>
+<p>rvolosatovs closed <a href="https://github.com/bytecodealliance/wasmtime/issues/14218">issue #14218</a>:</p>
+<blockquote>
+<h3>Summary</h3>
+<p><code>p3::Request::from_http</code> and <code>p3::Response::from_http</code> return</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="p">(</span><span class="bp">Self</span><span class="p">,</span><span class="w"> </span><span class="k">impl</span><span class="w"> </span><span class="n">Future</span><span class="o">&lt;</span><span class="n">Output</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">(),</span><span class="w"> </span><span class="n">Error</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nb">Send</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="o">'</span><span class="nb">static</span><span class="p">)</span>
+</code></pre></div>
+<p>Under the Rust 2024 edition capture rules, the opaque return type implicitly captures the elided lifetime of the <code>hooks: &amp;mut dyn WasiHttpHooks</code> parameter. The future's body never borrows <code>hooks</code> — it is only used synchronously (via <code>FieldMap::new_immutable</code>) before <code>Self::new</code> is called — but callers are constrained as if the borrow lived inside the future.</p>
+<p>Present in <code>wasmtime-wasi-http</code> 48.0.1 and on <code>main</code>:</p>
+<ul>
+<li><a href="https://github.com/bytecodealliance/wasmtime/blob/main/crates/wasi-http/src/p3/request.rs">https://github.com/bytecodealliance/wasmtime/blob/main/crates/wasi-http/src/p3/request.rs</a> (<code>from_http</code>)</li>
+<li><a href="https://github.com/bytecodealliance/wasmtime/blob/main/crates/wasi-http/src/p3/response.rs">https://github.com/bytecodealliance/wasmtime/blob/main/crates/wasi-http/src/p3/response.rs</a> (<code>from_http</code>)</li>
+</ul>
+<h3>Why it matters</h3>
+<p>In the usual embedding, hooks live inside the store data behind <code>WasiHttpView::http()</code>, so the natural call site is inside a short-lived store access (e.g. <code>Accessor::with</code> under <code>run_concurrent</code>). The returned future then cannot escape the closure:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="n">request</span><span class="p">,</span><span class="w"> </span><span class="n">io</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">store</span><span class="p">.</span><span class="n">with</span><span class="p">(</span><span class="o">|</span><span class="k">mut</span><span class="w"> </span><span class="n">access</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">cx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">access</span><span class="p">.</span><span class="n">as_context_mut</span><span class="p">();</span>
+<span class="w">    </span><span class="n">Request</span><span class="p">::</span><span class="n">from_http</span><span class="p">(</span><span class="n">cx</span><span class="p">.</span><span class="n">data_mut</span><span class="p">().</span><span class="n">http</span><span class="p">().</span><span class="n">hooks</span><span class="p">,</span><span class="w"> </span><span class="n">req</span><span class="p">)</span>
+<span class="p">});</span>
+</code></pre></div>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>error[E0515]: cannot return value referencing function parameter `access`
+note: this call may capture more lifetimes than intended, because Rust 2024
+      has adjusted the `impl Trait` lifetime capture rules
+help: if you can modify this crate, add a precise capturing bound to avoid
+      overcapturing: `+ use&lt;T&gt;`
+</code></pre></div>
+<h3>Suggested fix</h3>
+<p>Add precise-capture bounds so only the body type parameter is captured:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">impl</span><span class="w"> </span><span class="n">Future</span><span class="o">&lt;</span><span class="n">Output</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">(),</span><span class="w"> </span><span class="n">Error</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nb">Send</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="o">'</span><span class="nb">static</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="k">use</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span>
+</code></pre></div>
+<p>on both <code>from_http</code> functions (<code>Request::new</code>/<code>Response::new</code> are unaffected — they have no borrowed inputs).</p>
+<h3>Workaround</h3>
+<p>Decompose the request manually: build <code>FieldMap::new_immutable(hooks, headers)</code> inside the store access, then assemble with <code>Request::new</code> outside it.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Sep 05 2026 at 18:09 UTC</p>
+</html>
