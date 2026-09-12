@@ -1,0 +1,62 @@
+[
+    {
+        "content": "<p>gfx opened <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14211\">PR #14211</a> from <code>wado-lang:gfx/alias-analysis-rpo-worklist</code> to <code>bytecodealliance:main</code>:</p>\n<blockquote>\n<p>Fixes #14210.</p>\n<p><code>AliasAnalysis::compute_block_input_states</code> drains its worklist LIFO, so on a<br>\nbranch it runs the entire tail of the function off of one successor before it<br>\nlooks at the other, and then redoes that tail once the second predecessor<br>\nupdates the join point. A module whose globals all allocate compiles to one<br>\nsynthesized initializer that is a long chain of diamonds, where that means each<br>\nblock is visited O(N) times and each visit walks O(N) alias regions. Ordering<br>\nthe worklist by reverse postorder converges in a single pass instead.</p>\n<p>Compiling a module of N <code>struct.new</code> global initializers under the copying<br>\ncollector; compile times for ordinary modules are unchanged:</p>\n<table>\n<thead>\n<tr>\n<th style=\"text-align: right;\">N</th>\n<th style=\"text-align: right;\">before</th>\n<th style=\"text-align: right;\">after</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td style=\"text-align: right;\">250</td>\n<td style=\"text-align: right;\">0.17 s</td>\n<td style=\"text-align: right;\">0.01 s</td>\n</tr>\n<tr>\n<td style=\"text-align: right;\">500</td>\n<td style=\"text-align: right;\">1.01 s</td>\n<td style=\"text-align: right;\">0.03 s</td>\n</tr>\n<tr>\n<td style=\"text-align: right;\">1000</td>\n<td style=\"text-align: right;\">8.6 s</td>\n<td style=\"text-align: right;\">0.08 s</td>\n</tr>\n<tr>\n<td style=\"text-align: right;\">2000</td>\n<td style=\"text-align: right;\">67.0 s</td>\n<td style=\"text-align: right;\">0.22 s</td>\n</tr>\n</tbody>\n</table>\n<p>Note that visit order also affects the precision of the fixpoint, so this<br>\nchanges generated code: <code>tests/disas/gc/array-copy-with-fuel.wat</code> now forwards<br>\ntwo loads it previously reloaded, and its expectation is updated here.</p>\n<p>This does not make the pass linear. <code>LastStores</code> keeps a dense <code>SecondaryMap</code><br>\nover alias regions, so it remains quadratic in the number of regions, which<br>\nstarts to show again around N=8000.<br>\n</p>\n</blockquote>",
+        "id": 619301053,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787754714
+    },
+    {
+        "content": "<p>gfx requested <a href=\"https://github.com/cfallin\">cfallin</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14211\">PR #14211</a>.</p>",
+        "id": 619301056,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787754714
+    },
+    {
+        "content": "<p>gfx requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers\">wasmtime-compiler-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14211\">PR #14211</a>.</p>",
+        "id": 619301058,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787754714
+    },
+    {
+        "content": "<p>gfx requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers\">wasmtime-core-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14211\">PR #14211</a>.</p>",
+        "id": 619301059,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787754714
+    },
+    {
+        "content": "<p>cfallin <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14211#issuecomment-5427286989\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14211\">PR #14211</a>:</p>\n<blockquote>\n<blockquote>\n<p>Note that visit order also affects the precision of the fixpoint</p>\n</blockquote>\n<p>This is pretty deeply concerning. The fixpoint should converge to exactly the same answer no matter the visit order, because we have defined a lattice and we reprocess blocks when their input states change. Can you detail your thoughts here?</p>\n</blockquote>",
+        "id": 619309624,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787756693
+    },
+    {
+        "content": "<p>gfx <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14211#issuecomment-5427796213\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14211\">PR #14211</a>:</p>\n<blockquote>\n<p>Sorry, that sentence was misleading.</p>\n<p>The disagreement arm of <code>LastStores::meet_from</code> yields <code>Some(loc)</code> -- the<br>\nsuccessor's own first instruction -- rather than a bottom element. Once a<br>\nslot holds that value, the meet yields it again against every other input,<br>\nand reports no change.</p>\n<p>I instrumented <code>compute_block_input_states</code> to dump the converged<br>\n<code>block_input</code> and ran <code>tests/disas/gc/array-copy-with-fuel.wat</code> under both<br>\norders. For <code>u0:0</code> they converge to different states. <code>block6</code> has exactly<br>\none predecessor, <code>block5</code>, yet under the current LIFO order its last store<br>\nfor regions 6 and 7 is <code>inst102</code>, <code>block6</code>'s own first instruction; under RPO<br>\nit is <code>inst154</code>, <code>block5</code>'s.</p>\n<p>The two loads in the expectation follow from that. They read <code>region6 v162</code><br>\nand <code>region7 v163</code>, exactly what <code>block5</code> already loaded, so <code>last_store</code> is<br>\nthe only part of the <code>MemoryLoc</code> key that differs.</p>\n<p>I also ran a variant that keeps per-block out-states and recomputes <code>in[B]</code><br>\nfrom all predecessors' current ones instead of meeting in place. <code>block6</code><br>\nthen agrees under both orders, but <code>block1</code>, <code>block7</code>, <code>block8</code> and <code>block9</code><br>\nstill differ.</p>\n<p>Three of those four configurations -- LIFO or RPO, meet-in-place or<br>\nrecompute -- produce the new expectation for this test; only today's<br>\nLIFO/meet-in-place produces the two extra loads. <code>observed_stores</code> for<br>\n<code>u0:0</code> is identical under both orders.</p>\n<p>I'll reword the description accordingly: the fixpoint isn't unique, and the<br>\nold order picked a worse one.<br>\n</p>\n</blockquote>",
+        "id": 619324155,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787760277
+    },
+    {
+        "content": "<p>gfx edited a <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14211#issuecomment-5427796213\">comment</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14211\">PR #14211</a>:</p>\n<blockquote>\n<p>Sorry, that sentence was misleading.</p>\n<p>The disagreement arm of <code>LastStores::meet_from</code> yields <code>Some(loc)</code> -- the<br>\nsuccessor's own first instruction -- rather than a bottom element. Once a<br>\nslot holds that value, the meet yields it again against every other input,<br>\nand reports no change.</p>\n<p>I instrumented <code>compute_block_input_states</code> to dump the converged<br>\n<code>block_input</code> and ran <code>tests/disas/gc/array-copy-with-fuel.wat</code> under both<br>\norders. For <code>u0:0</code> they converge to different states. <code>block6</code> has exactly<br>\none predecessor, <code>block5</code>, yet under the current LIFO order its last store<br>\nfor regions 6 and 7 is <code>inst102</code>, <code>block6</code>'s own first instruction; under RPO<br>\nit is <code>inst154</code>, <code>block5</code>'s.</p>\n<p>The two loads in the expectation follow from that. They read <code>region6 v162</code><br>\nand <code>region7 v163</code>, exactly what <code>block5</code> already loaded, so <code>last_store</code> is<br>\nthe only part of the <code>MemoryLoc</code> key that differs.</p>\n<p>I also ran a variant that keeps per-block out-states and recomputes <code>in[B]</code><br>\nfrom all predecessors' current ones instead of meeting in place. <code>block6</code><br>\nthen agrees under both orders, but <code>block1</code>, <code>block7</code>, <code>block8</code> and <code>block9</code><br>\nstill differ.</p>\n<p>Three of those four configurations -- LIFO or RPO, meet-in-place or<br>\nrecompute -- produce the new expectation for this test; only today's<br>\nLIFO/meet-in-place produces the two extra loads. <code>observed_stores</code> for<br>\n<code>u0:0</code> is identical under both orders.</p>\n<p>What the description should have said: the fixpoint isn't unique, and the old order picked a worse one.</p>\n</blockquote>",
+        "id": 619324607,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787760390
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>cranelift</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14211\">PR #14211</a>.</p>",
+        "id": 619353924,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787768253
+    },
+    {
+        "content": "<p><span aria-label=\"cross mark\" class=\"emoji emoji-274c\" role=\"img\" title=\"cross mark\">:cross_mark:</span> gfx closed without merge <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14211\">PR #14211</a>.</p>",
+        "id": 621204721,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788397802
+    },
+    {
+        "content": "<p>gfx <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14211#issuecomment-5518778640\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14211\">PR #14211</a>:</p>\n<blockquote>\n<p>Closing (reason: <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14253\">https://github.com/bytecodealliance/wasmtime/pull/14253</a>)</p>\n</blockquote>",
+        "id": 621204846,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788397849
+    }
+]

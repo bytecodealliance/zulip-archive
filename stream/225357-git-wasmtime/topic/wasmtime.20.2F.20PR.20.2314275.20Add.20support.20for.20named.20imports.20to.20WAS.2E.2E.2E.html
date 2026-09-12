@@ -1,0 +1,451 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #14275 Add support for named imports to WAS... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html">wasmtime / PR #14275 Add support for named imports to WAS...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="621530730"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/621530730" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#621530730">(Sep 03 2026 at 21:44)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/pull/14275">PR #14275</a> from <code>alexcrichton:wasi-named-imports</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>This commit is at least an initial stab at making the <code>wasmtime-wasi</code> and <code>wasmtime-wasi-http</code> crates compatible with "named imports" or the <code>implements</code> field in the component model. This field enables importing an interface under a kebab-name while annotating that it's additionally to be considered an import of another interface's name. One example use case for this feature is [dependency isolation][diso] when composing two components together -- if they both import the filesystem the final component will import the filesystem twice under two different kebab names which means both components can have a different view of the filesystem.</p>
+<p>Wasmtime previously gained support for named imports and <code>implements</code> in <code>bindgen!</code> as part of #13513 where the <code>named_imports</code> option can be specified at <code>bindgen!</code>-time which generates traits that take an extra id-style parameter. This runtime parameter indicates which kebab-name is being invoked through which the runtime can then dispatch on.</p>
+<p>The goal here is to actually wire all this up in a way that's usable for embedders. Specifically <code>named_imports</code> bindings generation is now available for all WASIp2 and WASIp3 interfaces. Additionally all implementations of these <code>id</code>-carrying traits are routed through the previous implementations after locating the correct context to operate over.</p>
+<p>All implementations of WASI functionality are already modeled more-or-less as methods on <code>Wasi*CtxView</code>-style types which internally have a borrow to the actual state and the resource table to operate on. This fits quite cleanly with named imports where conceptually what we want is the ability to configure the context-per-kebab-name. This in theory will keep the maintenance burden managable as there's still largely one source of truth for the implementation. This neatly works for all <code>Host</code>-style traits which are literally methods on <code>Wasi*CtxView</code> types, meaning the <code>id</code>-carrying versions actually do just acquire a <code>Wasi*CtxView</code> and then delegate the method. This requires more finesse for <code>*WithStore</code> traits which work with <code>Access</code> and <code>Accessor</code>, however. The <code>id</code> parameter cannot be threaded into the <code>fn(..)</code> within the <code>Accessor</code>, so refactoring is performed where appropriate to make the implementation of each interface a one-liner to reduce duplication.</p>
+<p>The end result of all of this is that this is a very large commit but it's written in such a way that the Rust compiler in theory should catch all mistakes. In other words we're heavily relying on the type system and type checking here and don't ever rely on duplication of methods that hopefully-won't-change. There's a lot of traits and a lot of interfaces, hence the size of the commit, but conceptually everything is intended to be pretty simple.</p>
+<p>Some design decisions as part of this commit, in no particular order:</p>
+<ul>
+<li>
+<p>IDs are represented by <code>wasmtime_wasi::NamedId</code> which is a newtype-wrapper around <code>usize</code>. The goal here is to enable an efficient implementation of dealing with ids. This notably forces the embedder to derive some sort of string-to-id (and perhaps back) map when adding items to a linker.</p>
+</li>
+<li>
+<p>All of this is opt-in and nothing is changed by default. For example the <code>wasmtime</code> CLI does not support any of this yet -- in theory that would require the ability to configure <code>-S</code> flags per-named-import as opposed to all-at-once.</p>
+</li>
+<li>
+<p>Mapping a <code>NamedId</code> to a context is abstracted behind a trait rather than dictating that a <code>Vec</code> or <code>HashMap</code> or similar is required. This increases the cognitive load when reading code (more generics), but avoids making this design decision within these crates and leaves exact representations up to embedders.</p>
+</li>
+<li>
+<p>The <code>HasData</code> implementation can't reuse the preexisting <code>WasiCli</code>, and this uses a new <code>WasiCliNamed&lt;T&gt;</code> instead. This enables threading this trait-to-find-a-context to the right location for <code>*WithStore</code> trait impls.</p>
+</li>
+<li>
+<p>Some miscellaneous <code>bindgen!</code> issues have been fixed during this commit to ensure that this compiles and works correctly.</p>
+</li>
+<li>
+<p>An attempt has been made at documenting all the new primitives/structs/etc here. These are sort of difficult to align correctly unless you know what you're doing, so the documentation and examples are intended to serve as a way of spreading this knowledge.</p>
+</li>
+<li>
+<p>One possible alternative I ended up deciding not to do was to put some sort of map-to-context storage within each preexisting context type. For example commit would be simpler for the <code>*WithStore</code> and infrastructure if it reused the exact same <code>Self</code> type as all other impls do. My thinking though is that this requires dictating the use of a <code>HashMap</code> or something else which I was hoping to avoid. Additionally the preexisting context structures are already minimal enough that they're basically what you already want as the source for each implementation, so I wanted to lean on them as much as possible.</p>
+</li>
+<li>
+<p>The main wrinkle in the new implementation is that <code>Accessor</code> carries <code>fn(..)</code> to project out it's <code>D::Data&lt;'_&gt;</code> which means that it can't close over any information. This feature needs to in theory close over an <code>id: NamedId</code>, however, and there's no easy way to put this square peg into a round hole. To work around this internal implementations within <code>wasmtime-wasi{,-http}</code> now have a generic <code>F</code> parameter which is a closure which projects data, but this closure is typically only ever on the stack and doesn't make its way to the heap. This was one of the more awkward things to work around in this commit.</p>
+</li>
+<li>
+<p>The design here is intentionally done to help ensure that this commit is correct with minimal testing. It's not really feasible to duplicate the entire test suite just for named imports but these are duplicate trait impls which otherwise shouldn't be wrong. By ensuring that there's either strict delegation or each-function-is-at-least-one-line that the light amount of testing here is sufficient for keeping this working over time.</p>
+</li>
+</ul>
+<p>[diso]: <a href="https://github.com/spinframework/spin/pull/3708">https://github.com/spinframework/spin/pull/3708</a></p>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please review the Bytecode Alliance's AI tool usage policy at<br>
+<a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+</blockquote>
+
+
+
+<a name="621530734"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/621530734" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#621530734">(Sep 03 2026 at 21:44)</a>:</h4>
+<p>alexcrichton requested <a href="https://github.com/rvolosatovs">rvolosatovs</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14275">PR #14275</a>.</p>
+
+
+
+<a name="621530735"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/621530735" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#621530735">(Sep 03 2026 at 21:44)</a>:</h4>
+<p>alexcrichton requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-wasi-reviewers">wasmtime-wasi-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14275">PR #14275</a>.</p>
+
+
+
+<a name="621530737"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/621530737" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#621530737">(Sep 03 2026 at 21:44)</a>:</h4>
+<p>alexcrichton requested <a href="https://github.com/pchickey">pchickey</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14275">PR #14275</a>.</p>
+
+
+
+<a name="621530738"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/621530738" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#621530738">(Sep 03 2026 at 21:44)</a>:</h4>
+<p>alexcrichton requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14275">PR #14275</a>.</p>
+
+
+
+<a name="621533342"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/621533342" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#621533342">(Sep 03 2026 at 21:58)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/14275">PR #14275</a>.</p>
+
+
+
+<a name="621553217"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/621553217" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#621553217">(Sep 03 2026 at 23:44)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasi</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14275">PR #14275</a>.</p>
+
+
+
+<a name="622603639"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/622603639" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#622603639">(Sep 08 2026 at 17:12)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> rvolosatovs submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14275#pullrequestreview-5144825292">PR review</a>:</p>
+<blockquote>
+<p>Sorry for the delay, missed this one in my inbox. Currently still working on a full review, but I noticed that the PR introduces a regression against latest <code>main</code> (b7764a705c245aa6fda46f9050e5cf9be62162b7), so sharing it early.</p>
+<p>For a case like this:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">ErrorA</span><span class="p">;</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">ErrorB</span><span class="p">;</span>
+<span class="n">wasmtime</span><span class="p">::</span><span class="n">component</span><span class="p">::</span><span class="n">bindgen</span><span class="o">!</span><span class="p">({</span>
+<span class="w">    </span><span class="n">inline</span><span class="p">:</span><span class="w"> </span><span class="s">"</span>
+<span class="s">        package test:collision;</span>
+<span class="s">        interface a { enum error { failed } }</span>
+<span class="s">        interface b { enum error { failed } }</span>
+<span class="s">        interface combined {</span>
+<span class="s">            use a.{error as error-a};</span>
+<span class="s">            use b.{error as error-b};</span>
+<span class="s">            first: func() -&gt; result&lt;_, error-a&gt;;</span>
+<span class="s">            second: func() -&gt; result&lt;_, error-b&gt;;</span>
+<span class="s">        }</span>
+<span class="s">        world test { import combined; }</span>
+<span class="s">    "</span><span class="p">,</span>
+<span class="w">    </span><span class="n">imports</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">default</span><span class="p">:</span><span class="w"> </span><span class="nc">trappable</span><span class="w"> </span><span class="p">},</span>
+<span class="w">    </span><span class="n">named_imports</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="s">"test:collision/combined"</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="w"> </span><span class="p">},</span>
+<span class="w">    </span><span class="n">trappable_error_type</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="s">"test:collision/a.error"</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">ErrorA</span><span class="p">,</span>
+<span class="w">        </span><span class="s">"test:collision/b.error"</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">ErrorB</span><span class="p">,</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="p">});</span>
+</code></pre></div>
+<p>I'm getting:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">error</span><span class="p">[</span><span class="n">E0308</span><span class="p">]:</span><span class="w"> </span><span class="nc">mismatched</span><span class="w"> </span><span class="n">types</span>
+<span class="w">  </span><span class="o">-</span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">src</span><span class="o">/</span><span class="n">lib</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">3</span><span class="p">:</span><span class="mi">1</span>
+<span class="w">   </span><span class="o">|</span>
+<span class="w"> </span><span class="mi">3</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">wasmtime</span><span class="p">::</span><span class="n">component</span><span class="p">::</span><span class="n">bindgen</span><span class="o">!</span><span class="p">({</span>
+<span class="w"> </span><span class="mi">4</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="o">|</span><span class="w">     </span><span class="n">inline</span><span class="p">:</span><span class="w"> </span><span class="s">"</span>
+<span class="s"> 5 | |         package test:collision;</span>
+<span class="s"> 6 | |         interface a { enum error { failed } }</span>
+<span class="s">...  |</span>
+<span class="s">21 | |     },</span>
+<span class="s">22 | | });</span>
+<span class="s">   | |  ^</span>
+<span class="s">   | |  |</span>
+<span class="s">   | |__expected `ErrorA`, found `ErrorB`</span>
+<span class="s">   |    arguments to this function are incorrect</span>
+<span class="s">   |</span>
+<span class="s">note: method defined here</span>
+<span class="s">  --&gt; src/lib.rs:3:1</span>
+<span class="s">   |</span>
+<span class="s"> 3 | / wasmtime::component::bindgen!({</span>
+<span class="s"> 4 | |     inline: "</span>
+<span class="w"> </span><span class="mi">5</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="o">|</span><span class="w">         </span><span class="n">package</span><span class="w"> </span><span class="n">test</span><span class="p">:</span><span class="nc">collision</span><span class="p">;</span>
+<span class="w"> </span><span class="mi">6</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="o">|</span><span class="w">         </span><span class="n">interface</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">enum</span><span class="w"> </span><span class="nc">error</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">failed</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="p">}</span>
+<span class="o">..</span><span class="p">.</span><span class="w">  </span><span class="o">|</span>
+<span class="mi">21</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="o">|</span><span class="w">     </span><span class="p">},</span>
+<span class="mi">22</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="p">});</span>
+<span class="w">   </span><span class="o">|</span><span class="w"> </span><span class="o">|</span><span class="n">__</span><span class="o">^</span>
+<span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="n">note</span><span class="p">:</span><span class="w"> </span><span class="nc">this</span><span class="w"> </span><span class="n">error</span><span class="w"> </span><span class="n">originates</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="kr">macro</span><span class="w"> </span><span class="err">`</span><span class="n">wasmtime</span><span class="p">::</span><span class="n">component</span><span class="p">::</span><span class="n">bindgen</span><span class="err">`</span><span class="w"> </span><span class="p">(</span><span class="k">in</span><span class="w"> </span><span class="n">Nightly</span><span class="w"> </span><span class="n">builds</span><span class="p">,</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="o">-</span><span class="n">Z</span><span class="w"> </span><span class="kr">macro</span><span class="o">-</span><span class="n">backtrace</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">more</span><span class="w"> </span><span class="n">info</span><span class="p">)</span>
+</code></pre></div>
+<p>While it works on current main</p>
+</blockquote>
+
+
+
+<a name="622618362"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/622618362" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#622618362">(Sep 08 2026 at 18:02)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> rvolosatovs submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14275#pullrequestreview-5145141096">PR review</a>.</p>
+
+
+
+<a name="622618365"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/622618365" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#622618365">(Sep 08 2026 at 18:02)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> rvolosatovs created <a href="https://github.com/bytecodealliance/wasmtime/pull/14275#discussion_r3960754079">PR review comment</a>:</p>
+<blockquote>
+<p>nit; since we're dropping these, should probably drop this one as well?</p>
+<p><div class="codehilite" data-code-language="suggestion"><pre><span></span><code>        ?;
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="622618366"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/622618366" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#622618366">(Sep 08 2026 at 18:02)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> rvolosatovs created <a href="https://github.com/bytecodealliance/wasmtime/pull/14275#discussion_r3960702834">PR review comment</a>:</p>
+<blockquote>
+<p>Is the plan to indefinitely duplicate implementations of all WASI interfaces using this scheme or could we consider <em>always</em> generating bindings with a <code>id: Option&lt;NamedId&gt;</code> or <code>id: Option&lt;T&gt;</code>? (perhaps once the feature is stable)</p>
+<p>On a similar note, since additional functionality is likely to be added to WIT and be relevant (e.g. annotations, external-id etc.), would it make sense to introduce something like a unified context type? Something like a</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">struct</span><span class="w"> </span><span class="nc">InterfaceContext</span><span class="o">&lt;</span><span class="n">Name</span><span class="p">,</span><span class="w"> </span><span class="n">Id</span><span class="p">,</span><span class="w"> </span><span class="n">Annotations</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">   </span><span class="n">name</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">Name</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="w">   </span><span class="n">external_id</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">Id</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="w">   </span><span class="n">annotations</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">Annotations</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="k">struct</span><span class="w"> </span><span class="nc">FuncContext</span><span class="o">&lt;</span><span class="n">Name</span><span class="p">,</span><span class="w"> </span><span class="n">Id</span><span class="p">,</span><span class="w"> </span><span class="n">Annotations</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">   </span><span class="n">interface</span><span class="p">:</span><span class="w"> </span><span class="nc">InterfaceContext</span><span class="o">&lt;</span><span class="n">Name</span><span class="p">,</span><span class="w"> </span><span class="n">Id</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="w">   </span><span class="n">external_id</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">Id</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="w">   </span><span class="n">annotations</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">Annotations</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="c1">// not sure what this is yet, but we probably don't want to use wasmtime::component::Val, so likely this is a WIT type passed to bindgen given latest discussions?</span>
+<span class="p">}</span>
+
+<span class="k">impl</span><span class="w"> </span><span class="n">FuncContext</span><span class="w"> </span><span class="p">{</span>
+<span class="w">   </span><span class="k">fn</span><span class="w"> </span><span class="nf">is_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">bool</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="o">..</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">impl</span><span class="w"> </span><span class="n">InterfaceContext</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">fn</span><span class="w"> </span><span class="nf">is_empty</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">bool</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="o">..</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>We could then generate something like:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">trait</span><span class="w"> </span><span class="n">HostFields</span><span class="w"> </span><span class="p">{</span>
+<span class="w">   </span><span class="k">fn</span><span class="w"> </span><span class="nf">from_list</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">cx</span><span class="p">:</span><span class="w"> </span><span class="nc">wasmtime</span><span class="p">::</span><span class="n">component</span><span class="p">::</span><span class="n">FuncContext</span><span class="o">&lt;</span><span class="n">NamedId</span><span class="p">,</span><span class="w"> </span><span class="n">ExternalId</span><span class="p">,</span><span class="w"> </span><span class="n">Annotations</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="n">entries</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="p">(</span><span class="nb">String</span><span class="p">,</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="kt">u8</span><span class="o">&gt;</span><span class="p">)</span><span class="o">&gt;</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">HeaderResult</span><span class="o">&lt;</span><span class="n">Resource</span><span class="o">&lt;</span><span class="n">FieldMap</span><span class="o">&gt;&gt;</span>
+</code></pre></div>
+<p>I guess what I'm trying to point out is that it seems like this goes beyond just the interface names, since the <code>external-id</code> and annotations might also be of importance for the embedder.</p>
+<p>More concretely:</p>
+<ol>
+<li>Should we <em>always</em> generate bindings, which take an additional parameter instead of the split into named and unnamed?</li>
+<li>Should we generalize this to account for the upcoming additions and instead allow embedders to derive a custom <em>per-function</em> context at link time? (this would replace a generic <code>{Func,Interface}Context</code> I suggested above by either a wasmtime-wasi provided abstraction or, (IMO) ideally, a generic <code>T</code> that embedder could supply and derive at link time)</li>
+</ol>
+<p>WDYT?</p>
+</blockquote>
+
+
+
+<a name="622635867"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/622635867" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#622635867">(Sep 08 2026 at 19:12)</a>:</h4>
+<p>alexcrichton edited <a href="https://github.com/bytecodealliance/wasmtime/pull/14275">PR #14275</a>:</p>
+<blockquote>
+<p>This commit is at least an initial stab at making the <code>wasmtime-wasi</code> and <code>wasmtime-wasi-http</code> crates compatible with "named imports" or the <code>implements</code> field in the component model. This field enables importing an interface under a kebab-name while annotating that it's additionally to be considered an import of another interface's name. One example use case for this feature is [dependency isolation][diso] when composing two components together -- if they both import the filesystem the final component will import the filesystem twice under two different kebab names which means both components can have a different view of the filesystem.</p>
+<p>Wasmtime previously gained support for named imports and <code>implements</code> in <code>bindgen!</code> as part of #13513 where the <code>named_imports</code> option can be specified at <code>bindgen!</code>-time which generates traits that take an extra id-style parameter. This runtime parameter indicates which kebab-name is being invoked through which the runtime can then dispatch on.</p>
+<p>The goal here is to actually wire all this up in a way that's usable for embedders. Specifically <code>named_imports</code> bindings generation is now available for all WASIp2 and WASIp3 interfaces. Additionally all implementations of these <code>id</code>-carrying traits are routed through the previous implementations after locating the correct context to operate over.</p>
+<p>All implementations of WASI functionality are already modeled more-or-less as methods on <code>Wasi*CtxView</code>-style types which internally have a borrow to the actual state and the resource table to operate on. This fits quite cleanly with named imports where conceptually what we want is the ability to configure the context-per-kebab-name. This in theory will keep the maintenance burden managable as there's still largely one source of truth for the implementation. This neatly works for all <code>Host</code>-style traits which are literally methods on <code>Wasi*CtxView</code> types, meaning the <code>id</code>-carrying versions actually do just acquire a <code>Wasi*CtxView</code> and then delegate the method. This requires more finesse for <code>*WithStore</code> traits which work with <code>Access</code> and <code>Accessor</code>, however. The <code>id</code> parameter cannot be threaded into the <code>fn(..)</code> within the <code>Accessor</code>, so refactoring is performed where appropriate to make the implementation of each interface a one-liner to reduce duplication.</p>
+<p>The end result of all of this is that this is a very large commit but it's written in such a way that the Rust compiler in theory should catch all mistakes. In other words we're heavily relying on the type system and type checking here and don't ever rely on duplication of methods that hopefully-won't-change. There's a lot of traits and a lot of interfaces, hence the size of the commit, but conceptually everything is intended to be pretty simple.</p>
+<p>Some design decisions as part of this commit, in no particular order:</p>
+<ul>
+<li>
+<p>IDs are represented by <code>wasmtime_wasi::NamedId</code> which is a newtype-wrapper around <code>usize</code>. The goal here is to enable an efficient implementation of dealing with ids. This notably forces the embedder to derive some sort of string-to-id (and perhaps back) map when adding items to a linker.</p>
+</li>
+<li>
+<p>All of this is opt-in and nothing is changed by default. For example the <code>wasmtime</code> CLI does not support any of this yet -- in theory that would require the ability to configure <code>-S</code> flags per-named-import as opposed to all-at-once.</p>
+</li>
+<li>
+<p>Mapping a <code>NamedId</code> to a context is abstracted behind a trait rather than dictating that a <code>Vec</code> or <code>HashMap</code> or similar is required. This increases the cognitive load when reading code (more generics), but avoids making this design decision within these crates and leaves exact representations up to embedders.</p>
+</li>
+<li>
+<p>The <code>HasData</code> implementation can't reuse the preexisting <code>WasiCli</code>, and this uses a new <code>WasiCliNamed&lt;T&gt;</code> instead. This enables threading this trait-to-find-a-context to the right location for <code>*WithStore</code> trait impls.</p>
+</li>
+<li>
+<p>Some miscellaneous <code>bindgen!</code> issues have been fixed during this commit to ensure that this compiles and works correctly.</p>
+</li>
+<li>
+<p>An attempt has been made at documenting all the new primitives/structs/etc here. These are sort of difficult to align correctly unless you know what you're doing, so the documentation and examples are intended to serve as a way of spreading this knowledge.</p>
+</li>
+<li>
+<p>One possible alternative I ended up deciding not to do was to put some sort of map-to-context storage within each preexisting context type. For example commit would be simpler for the <code>*WithStore</code> and infrastructure if it reused the exact same <code>Self</code> type as all other impls do. My thinking though is that this requires dictating the use of a <code>HashMap</code> or something else which I was hoping to avoid. Additionally the preexisting context structures are already minimal enough that they're basically what you already want as the source for each implementation, so I wanted to lean on them as much as possible.</p>
+</li>
+<li>
+<p>The main wrinkle in the new implementation is that <code>Accessor</code> carries <code>fn(..)</code> to project out it's <code>D::Data&lt;'_&gt;</code> which means that it can't close over any information. This feature needs to in theory close over an <code>id: NamedId</code>, however, and there's no easy way to put this square peg into a round hole. To work around this internal implementations within <code>wasmtime-wasi{,-http}</code> now have a generic <code>F</code> parameter which is a closure which projects data, but this closure is typically only ever on the stack and doesn't make its way to the heap. This was one of the more awkward things to work around in this commit.</p>
+</li>
+<li>
+<p>The design here is intentionally done to help ensure that this commit is correct with minimal testing. It's not really feasible to duplicate the entire test suite just for named imports but these are duplicate trait impls which otherwise shouldn't be wrong. By ensuring that there's either strict delegation or each-function-is-at-least-one-line that the light amount of testing here is sufficient for keeping this working over time.</p>
+</li>
+</ul>
+<p>[diso]: <a href="https://github.com/spinframework/spin/pull/3708">https://github.com/spinframework/spin/pull/3708</a></p>
+<p>Closes #14185</p>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please review the Bytecode Alliance's AI tool usage policy at<br>
+<a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+</blockquote>
+
+
+
+<a name="622892568"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/622892568" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#622892568">(Sep 09 2026 at 15:54)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14275#pullrequestreview-5156729678">PR review</a>.</p>
+
+
+
+<a name="622892571"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/622892571" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#622892571">(Sep 09 2026 at 15:54)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14275#discussion_r3970443226">PR review comment</a>:</p>
+<blockquote>
+<p>I'm not really sure myself what the end-state of this is all going to be, but my thinking for now is, yeah, we'd duplicate bindings for now with named imports.</p>
+<p>I'm hesitant to always generate traits with <code>Option&lt;Id&gt;</code> given the various use cases in play here. The <code>wasmtime-wasi</code> crate in theory needs to be as-general-as-possible and as-flexible-as-possible to serve a relatively wide variety of use cases which is the main constraint. With <code>Option&lt;Id&gt;</code> the implementation has to always be ready for either case of <code>None</code> or <code>Some</code>, even in the situation when an embedder doesn't want to deal with named imports at all. Given that I'm hesitant to impose the runtime requirement that all embedders provide some piece of functionality to handle the <code>Some</code> even when that's never used. By having separate impls/functions it keeps the functionality needed to be provided by the runtime separate at least.</p>
+<p>Not that I think this is a great state of affairs though, it's not exactly pleasant having to duplicate things. While the risk of divergence is somewhat low due to all the generated traits and such it's still quite annoying to have to deal with. My rough thinking was to walk down the incremental "just add one more feature" approach for now and then see how far that takes us in maybe 6mo-1y time and look back to see if we can design things better.</p>
+<hr>
+<p>For threading more information about the imports through, that's a good question and one I'd not considered! I'm always wary of runtime parameters/state though in the sense that it's on the hot path for all host functions as the state needs to be assembled. I'm also a bit wary of adding more generics into the system where <code>wasmtime-wasi</code> is sort of already at the breaking point...</p>
+<p>One perhaps saving grace though is the <code>lookup</code> is already passed the kebab-name of the import and that'd be a relatively natural place to put everything else. Basically we could hand everything over to the embedder and say "go ham with this but give back an id" and the embedder could record in its own tables the mapping from id to various import attributes.</p>
+</blockquote>
+
+
+
+<a name="622892773"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/622892773" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#622892773">(Sep 09 2026 at 15:55)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/14275">PR #14275</a>.</p>
+
+
+
+<a name="622896536"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/622896536" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#622896536">(Sep 09 2026 at 16:05)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> rvolosatovs submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14275#pullrequestreview-5156870455">PR review</a>:</p>
+<blockquote>
+<p>LGTM apart from the <code>trappable_error_type</code> issue</p>
+</blockquote>
+
+
+
+<a name="622970522"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/622970522" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#622970522">(Sep 09 2026 at 20:41)</a>:</h4>
+<p>alexcrichton updated <a href="https://github.com/bytecodealliance/wasmtime/pull/14275">PR #14275</a>.</p>
+
+
+
+<a name="622970757"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/622970757" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#622970757">(Sep 09 2026 at 20:42)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/14275#issuecomment-5608459521">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14275">PR #14275</a>:</p>
+<blockquote>
+<p>I tried a few different tacts for how to solve that and I ended up with the latest commit. @rvolosatovs mind double-checking that to make sure it's ok?</p>
+<p>I'm realizing that the handling of trappable error types in named imports is kind of unfortunate where it's basically a lot more duplication than it otherwise is for non-named imports. I don't know of an easy way to solve that, but I do know of a hard way to solve that, and I basically decided to not do that just yet (documented in the code comments in the lates commit)</p>
+</blockquote>
+
+
+
+<a name="623614144"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/623614144" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#623614144">(Sep 11 2026 at 17:20)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> rvolosatovs submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14275#pullrequestreview-5181298415">PR review</a>:</p>
+<blockquote>
+<p>Looks like using named imports with interfaces containing <code>unstable</code> does not work:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">wasmtime</span><span class="p">::</span><span class="n">component</span><span class="p">::</span><span class="n">bindgen</span><span class="o">!</span><span class="p">({</span>
+<span class="w">    </span><span class="n">inline</span><span class="p">:</span><span class="w"> </span><span class="s">"</span>
+<span class="s">    package wasmtime:test;</span>
+
+<span class="s">    world test {</span>
+<span class="s">        import a: wasi:sockets/network@0.2.12;</span>
+<span class="s">    }</span>
+<span class="s">    "</span><span class="p">,</span>
+<span class="w">    </span><span class="n">path</span><span class="p">:</span><span class="w"> </span><span class="s">"src/p2/wit"</span><span class="p">,</span>
+<span class="w">    </span><span class="n">world</span><span class="p">:</span><span class="w"> </span><span class="s">"wasmtime:test/test"</span><span class="p">,</span>
+<span class="w">    </span><span class="n">with</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="s">"wasi:sockets/network"</span><span class="p">:</span><span class="w"> </span><span class="nc">wasmtime_wasi</span><span class="p">::</span><span class="n">p2</span><span class="p">::</span><span class="n">bindings</span><span class="p">::</span><span class="n">sockets</span><span class="p">::</span><span class="n">network</span><span class="p">,</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="n">named_imports</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="s">"wasi:sockets/network"</span><span class="p">:</span><span class="w"> </span><span class="nc">wasmtime_wasi</span><span class="p">::</span><span class="n">NamedId</span><span class="p">,</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="p">});</span>
+</code></pre></div>
+<p>fails with:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">error</span><span class="p">[</span><span class="n">E0616</span><span class="p">]:</span><span class="w"> </span><span class="nc">field</span><span class="w"> </span><span class="err">`</span><span class="n">network_error_code</span><span class="err">`</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="err">`</span><span class="n">wasmtime_wasi</span><span class="p">::</span><span class="n">p2</span><span class="p">::</span><span class="n">bindings</span><span class="p">::</span><span class="n">sockets</span><span class="p">::</span><span class="n">network</span><span class="p">::</span><span class="n">LinkOptions</span><span class="err">`</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="n">private</span>
+<span class="w">   </span><span class="o">-</span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">crates</span><span class="o">/</span><span class="n">wasi</span><span class="o">/</span><span class="n">tests</span><span class="o">/</span><span class="n">all</span><span class="o">/</span><span class="n">p2</span><span class="o">/</span><span class="n">async_</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">580</span><span class="p">:</span><span class="mi">1</span>
+<span class="w">    </span><span class="o">|</span>
+<span class="mi">580</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">wasmtime</span><span class="p">::</span><span class="n">component</span><span class="p">::</span><span class="n">bindgen</span><span class="o">!</span><span class="p">({</span>
+<span class="mi">581</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="o">|</span><span class="w">     </span><span class="n">inline</span><span class="p">:</span><span class="w"> </span><span class="s">"</span>
+<span class="s">582 | |     package wasmtime:test;</span>
+<span class="s">...   |</span>
+<span class="s">595 | |     },</span>
+<span class="s">596 | | });</span>
+<span class="s">    | |__^ private field</span>
+<span class="s">    |</span>
+<span class="s">    = note: this error originates in the macro `wasmtime::component::bindgen` (in Nightly builds, run with -Z macro-backtrace for more info)</span>
+<span class="s">help: a method `network_error_code` also exists, call it with parentheses</span>
+<span class="s">    |</span>
+<span class="s">596 | })(_);</span>
+</code></pre></div>
+<p>That said, it does not work on <code>main</code> either, where it fails with:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">error</span><span class="p">[</span><span class="n">E0425</span><span class="p">]:</span><span class="w"> </span><span class="nc">cannot</span><span class="w"> </span><span class="n">find</span><span class="w"> </span><span class="k">type</span><span class="w"> </span><span class="err">`</span><span class="n">LinkOptions</span><span class="err">`</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">this</span><span class="w"> </span><span class="n">scope</span>
+<span class="w">   </span><span class="o">-</span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">crates</span><span class="o">/</span><span class="n">wasi</span><span class="o">/</span><span class="n">tests</span><span class="o">/</span><span class="n">all</span><span class="o">/</span><span class="n">p2</span><span class="o">/</span><span class="n">async_</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">513</span><span class="p">:</span><span class="mi">1</span>
+<span class="w">    </span><span class="o">|</span>
+<span class="mi">513</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">wasmtime</span><span class="p">::</span><span class="n">component</span><span class="p">::</span><span class="n">bindgen</span><span class="o">!</span><span class="p">({</span>
+<span class="mi">514</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="o">|</span><span class="w">     </span><span class="n">inline</span><span class="p">:</span><span class="w"> </span><span class="s">"</span>
+<span class="s">515 | |     package wasmtime:test;</span>
+<span class="s">...   |</span>
+<span class="s">528 | |     },</span>
+<span class="s">529 | | });</span>
+<span class="s">    | |__^ not found in this scope</span>
+<span class="s">    |</span>
+<span class="s">    = help: consider importing one of these structs:</span>
+<span class="s">            crate::p2::api::LinkOptions</span>
+<span class="s">            crate::p2::async_::named_wasi_import::LinkOptions</span>
+<span class="s">    = note: this error originates in the macro `wasmtime::component::bindgen` (in Nightly builds, run with -Z macro-backtrace for more info)</span>
+</code></pre></div>
+<p>so this does not appear to be a regression and probably can be fixed in a follow-up, therefore LGTM</p>
+</blockquote>
+
+
+
+<a name="623614150"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314275%20Add%20support%20for%20named%20imports%20to%20WAS.../near/623614150" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314275.20Add.20support.20for.20named.20imports.20to.20WAS.2E.2E.2E.html#623614150">(Sep 11 2026 at 17:20)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> rvolosatovs created <a href="https://github.com/bytecodealliance/wasmtime/pull/14275#discussion_r3991451090">PR review comment</a>:</p>
+<blockquote>
+<p>looks like this assertion fires with an invocation like this:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">wasmtime</span><span class="p">::</span><span class="n">component</span><span class="p">::</span><span class="n">bindgen</span><span class="o">!</span><span class="p">({</span>
+<span class="w">    </span><span class="n">inline</span><span class="p">:</span><span class="w"> </span><span class="nc">r</span><span class="p">#</span><span class="s">"</span>
+<span class="s">    package test:pkg;</span>
+
+<span class="s">    interface types {</span>
+<span class="s">        variant error {</span>
+<span class="s">            test,</span>
+<span class="s">        }</span>
+<span class="s">    }</span>
+
+<span class="s">    interface test {</span>
+<span class="s">        use types.{error};</span>
+
+<span class="s">        test: func() -&gt; result&lt;_, error&gt;;</span>
+<span class="s">    }</span>
+
+<span class="s">    world repro {</span>
+<span class="s">        import test;</span>
+<span class="s">    }</span>
+<span class="s">"</span><span class="p">#,</span>
+<span class="w">    </span><span class="n">world</span><span class="p">:</span><span class="w"> </span><span class="s">"repro"</span><span class="p">,</span>
+<span class="w">    </span><span class="n">trappable_error_type</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="s">"test:pkg/test.error"</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="n">imports</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">default</span><span class="p">:</span><span class="w"> </span><span class="nc">trappable</span><span class="p">,</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">});</span>
+</code></pre></div>
+<p>Current <code>main</code> silently ignores the config.</p>
+<p>Not sure there's anything worth fixing here, just calling it out. A nicer error message would probably help, but the panic is arguably an improvement compared to current <code>main</code></p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Sep 12 2026 at 18:08 UTC</p>
+</html>

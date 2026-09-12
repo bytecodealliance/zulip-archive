@@ -1,0 +1,56 @@
+[
+    {
+        "content": "<p>Hello,</p>\n<p>I would like to use epoch-based interruption with wasmtime but my target doesn't have 64 bits atomics. I would like to add support for this in the wasmtime. There are two orthogonal questions on which I would like feedback before trying to contribute anything </p>\n<ul>\n<li>Should the epoch counter be an u64 in all cases or can it be lowered to an u32/u16  for platforms that only have atomics up to u32/u16 ?</li>\n<li>Should the atomics supported only be <code>core::sync::atomic</code> or is it ok to use the <a href=\"https://docs.rs/portable-atomic/latest/portable_atomic/\"><code>portable-atomics</code></a> crate's atomic types. </li>\n</ul>\n<p>For the first question, this would increase mean writing stuff like : </p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"w\">    </span><span class=\"cp\">#[cfg( target_has_atomic = </span><span class=\"s\">\"64\"</span><span class=\"cp\">)]</span>\n<span class=\"w\">    </span><span class=\"n\">epoch</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">AtomicU64</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"cp\">#[cfg(all(feature = </span><span class=\"s\">\"runtime\"</span><span class=\"cp\">, target_has_atomic = </span><span class=\"s\">\"32\"</span><span class=\"cp\">, not(target_has_atomic = </span><span class=\"s\">\"64\"</span><span class=\"cp\">)))]</span>\n<span class=\"w\">    </span><span class=\"n\">epoch</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">AtomicU32</span><span class=\"p\">,</span>\n\n<span class=\"c1\">// On every function previously #[cfg( target_has_atomic = \"64\")]</span>\n<span class=\"cp\">#[cfg(any(target_has_atomic = </span><span class=\"s\">\"64\"</span><span class=\"cp\">, target_has_atomic = </span><span class=\"s\">\"32\"</span><span class=\"cp\">))]</span>\n<span class=\"k\">fn</span><span class=\"w\"> </span><span class=\"nf\">a</span><span class=\"p\">()</span><span class=\"w\"> </span><span class=\"p\">{}</span>\n</code></pre></div>\n<p>And documenting that the maximum number of epochs isn't the same for every platform. </p>\n<p>Using <code>portable-atomic</code> would allow every platform that supports <code>portable-atomic</code> to use an <code>AtomicU64</code>. This would most likely require adding a new <code>portable-atomic</code> feature to <code>wasmtime</code> that enables this dependency and uses its atomic types instead of the ones provided by <code>core</code>.</p>",
+        "id": 542280951,
+        "sender_full_name": "Antoine Lavandier",
+        "timestamp": 1759240022
+    },
+    {
+        "content": "<p>Would using fuel work for your use case? Epochs get pretty tricky without 64-bit atomics unfortunately. One of the difficulties is plumbing this support through not only <code>#[cfg]</code> but through. Cranelift as well to understand it's a 32-bit variable instead of a 64-bit variable</p>",
+        "id": 542286183,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1759241174
+    },
+    {
+        "content": "<p>Then using <code>portable-atomic</code> would be more suited than lowering the size of the atomics. <br>\nI could probably use fuel provided that it works well with <code>async</code> but I'm worried about the increased code size from the fuel instrumentation</p>",
+        "id": 542290068,
+        "sender_full_name": "Antoine Lavandier",
+        "timestamp": 1759242082
+    },
+    {
+        "content": "<p>Oh that'd be an interesting point of comparison yeah, code size with/without fuel. If the code size of fuel vs epochs is a tipping point it's honestly probably easier to make the code size for fuel smaller (e.g. I assume you're using Pulley so we could start adding some custom opcodes)</p>",
+        "id": 542291104,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1759242339
+    },
+    {
+        "content": "<p>Otherwise though one way we could manage <code>#[cfg]</code> is to, in theory, have:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"cp\">#[cfg(long_expr)]</span>\n<span class=\"k\">mod</span><span class=\"w\"> </span><span class=\"nn\">epoch64</span><span class=\"p\">;</span>\n<span class=\"cp\">#[cfg(not(long_expr), longer_expr)]</span>\n<span class=\"k\">mod</span><span class=\"w\"> </span><span class=\"nn\">epoch32</span><span class=\"p\">;</span>\n<span class=\"cp\">#[cfg(not(long_expr), not(longer_expr))]</span>\n<span class=\"k\">mod</span><span class=\"w\"> </span><span class=\"nn\">epoch_disabled</span><span class=\"p\">;</span>\n</code></pre></div>\n<p>or something like that, basically only having <code>#[cfg]</code> at the module level and stuffing it all in there</p>",
+        "id": 542291661,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1759242457
+    },
+    {
+        "content": "<p>I tried to precompile the same component with the following options :</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"w\">    </span><span class=\"n\">config</span><span class=\"p\">.</span><span class=\"n\">memory_reservation</span><span class=\"p\">(</span><span class=\"mi\">0</span><span class=\"p\">);</span>\n<span class=\"w\">    </span><span class=\"n\">config</span><span class=\"p\">.</span><span class=\"n\">wasm_custom_page_sizes</span><span class=\"p\">(</span><span class=\"kc\">true</span><span class=\"p\">);</span>\n<span class=\"w\">    </span><span class=\"n\">config</span><span class=\"p\">.</span><span class=\"n\">memory_may_move</span><span class=\"p\">(</span><span class=\"kc\">false</span><span class=\"p\">);</span>\n<span class=\"w\">    </span><span class=\"n\">config</span><span class=\"p\">.</span><span class=\"n\">memory_init_cow</span><span class=\"p\">(</span><span class=\"kc\">false</span><span class=\"p\">);</span>\n<span class=\"w\">    </span><span class=\"n\">config</span><span class=\"p\">.</span><span class=\"n\">cranelift_opt_level</span><span class=\"p\">(</span><span class=\"n\">wasmtime</span><span class=\"p\">::</span><span class=\"n\">OptLevel</span><span class=\"p\">::</span><span class=\"n\">SpeedAndSize</span><span class=\"p\">);</span>\n<span class=\"w\">    </span><span class=\"n\">config</span><span class=\"p\">.</span><span class=\"n\">target</span><span class=\"p\">(</span><span class=\"s\">\"pulley32\"</span><span class=\"p\">);</span>\n</code></pre></div>\n<ul>\n<li>Initial size before precompilation: <code>6262</code> bytes</li>\n<li>Without instrumentation: <code>19952</code> bytes </li>\n<li>With epoch: <code>24456</code>bytes (122% of the un-instrumented code)</li>\n<li>With fuel: <code>26528</code> bytes (132% of the un-instrumented code)</li>\n</ul>",
+        "id": 542294427,
+        "sender_full_name": "Antoine Lavandier",
+        "timestamp": 1759243090
+    },
+    {
+        "content": "<p>If using the <code>portable-atomic</code> it could also be as simple as changing this in <code>engine.rs</code> </p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"k\">use</span><span class=\"w\"> </span><span class=\"n\">core</span><span class=\"p\">::</span><span class=\"n\">sync</span><span class=\"p\">::</span><span class=\"n\">atomic</span><span class=\"p\">::</span><span class=\"n\">Ordering</span><span class=\"p\">;</span>\n<span class=\"cp\">#[cfg(target_has_atomic = </span><span class=\"s\">\"64\"</span><span class=\"cp\">)]</span>\n<span class=\"k\">use</span><span class=\"w\"> </span><span class=\"n\">core</span><span class=\"p\">::</span><span class=\"n\">sync</span><span class=\"p\">::</span><span class=\"n\">atomic</span><span class=\"p\">::</span><span class=\"n\">AtomicU64</span><span class=\"p\">;</span>\n<span class=\"cp\">#[cfg(feature = </span><span class=\"s\">\"portable-atomic\"</span><span class=\"cp\">)]</span>\n<span class=\"k\">use</span><span class=\"w\"> </span><span class=\"n\">portable_atomic</span><span class=\"p\">::</span><span class=\"n\">AtomicU64</span><span class=\"p\">;</span>\n</code></pre></div>\n<p>Or am I missing something with regards to Cranelift ?</p>",
+        "id": 542295477,
+        "sender_full_name": "Antoine Lavandier",
+        "timestamp": 1759243350
+    },
+    {
+        "content": "<p>I'm not really sure, I don't know how portable-atomic is itself implemented</p>",
+        "id": 542309897,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1759246883
+    },
+    {
+        "content": "<p>I'd have to dig into how an atomic 64-bit read works, because for example that's what Cranelift does and whatever portable-atomic does would need to be reflected into Cranelift too</p>",
+        "id": 542309995,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1759246906
+    }
+]
