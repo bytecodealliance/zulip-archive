@@ -1,0 +1,501 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14325 gc_ops fuzzbug: Potential leak in... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314325.20gc_ops.20fuzzbug.3A.20Potential.20leak.20in.2E.2E.2E.html">wasmtime / issue #14325 gc_ops fuzzbug: Potential leak in...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="623791005"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314325%20gc_ops%20fuzzbug%3A%20Potential%20leak%20in.../near/623791005" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314325.20gc_ops.20fuzzbug.3A.20Potential.20leak.20in.2E.2E.2E.html#623791005">(Sep 12 2026 at 23:15)</a>:</h4>
+<p>khagankhan opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14325">issue #14325</a>:</p>
+<blockquote>
+<p>I was fuzzing wasmtime locally with <code>gc_ops</code> and I think there may be potential leak in the DRC. Reduced to wast for easier debug, so there is no need for fmt.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">wasmtime</span><span class="w"> </span><span class="mf">50.0.0</span><span class="o">-</span><span class="n">dev</span><span class="w"> </span><span class="p">(</span><span class="mi">2</span><span class="n">be5e3a62</span><span class="w"> </span><span class="mi">2026</span><span class="o">-</span><span class="mi">09</span><span class="o">-</span><span class="mi">11</span><span class="p">)</span>
+</code></pre></div>
+<p><code>table.fill</code> with a constant <code>ref.null</code> on a GC-reference table is lowered to a <code>memset</code> when <code>-O table-lazy-init=n</code> bypassing the DRC write barrier. The eligibility check <code>allows_memset</code> permits the fast path for any table once lazy init is off. <code>array.fill</code> seems to be working correctly. </p>
+<p>For the given file:</p>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">type</span> <span class="nv">$bytes</span> <span class="p">(</span><span class="err">array</span> <span class="p">(</span><span class="k">mut</span> <span class="err">i</span><span class="mi">8</span><span class="p">)))</span>
+  <span class="p">(</span><span class="k">table</span> <span class="nv">$t</span> <span class="mi">1</span> <span class="err">anyref</span><span class="p">)</span>
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"run"</span><span class="p">)</span> <span class="p">(</span><span class="k">param</span> <span class="nv">$n</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="p">(</span><span class="k">loop</span> <span class="nv">$l</span>
+      <span class="p">(</span><span class="err">table.set</span> <span class="nv">$t</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="err">array.new_default</span> <span class="nv">$bytes</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mf">65536</span><span class="p">)))</span>
+      <span class="p">(</span><span class="err">table.fill</span> <span class="nv">$t</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="err">ref.null</span> <span class="err">any</span><span class="p">)</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">1</span><span class="p">))</span>
+      <span class="p">(</span><span class="nb">local.set</span> <span class="nv">$n</span> <span class="p">(</span><span class="nb">i32.sub</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$n</span><span class="p">)</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">1</span><span class="p">)))</span>
+      <span class="p">(</span><span class="nb">br_if</span> <span class="nv">$l</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$n</span><span class="p">)))))</span>
+<span class="p">(</span><span class="err">assert_</span><span class="nb">return</span> <span class="p">(</span><span class="err">invoke</span> <span class="s2">"run"</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mf">100000</span><span class="p">)))</span>
+</code></pre></div>
+<ol>
+<li>Allocate 64KB array.</li>
+<li>Set it to the table slot 0</li>
+<li>Overwrite that slot with <code>ref.null any</code></li>
+</ol>
+<p>So at the end of each iteration the array becomes unreachable (garbage) that should be collected at some point.</p>
+<h2>Actual behavior:</h2>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">time</span><span class="w">  </span><span class="n">wasmtime</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">C</span><span class="w"> </span><span class="n">collector</span><span class="o">=</span><span class="n">drc</span><span class="w"> </span><span class="o">-</span><span class="n">O</span><span class="w"> </span><span class="n">table</span><span class="o">-</span><span class="n">lazy</span><span class="o">-</span><span class="n">init</span><span class="o">=</span><span class="n">n</span><span class="w"> </span><span class="n">t</span><span class="p">.</span><span class="n">wast</span>
+
+<span class="n">Error</span><span class="p">:</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="n">script</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="o">'</span><span class="na">t</span><span class="p">.</span><span class="n">wast</span><span class="o">'</span>
+
+<span class="n">Caused</span><span class="w"> </span><span class="n">by</span><span class="p">:</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">:</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">directive</span><span class="w"> </span><span class="n">on</span><span class="w"> </span><span class="n">t</span><span class="p">.</span><span class="n">wast</span><span class="p">:</span><span class="mi">10</span>
+<span class="w">    </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="nc">error</span><span class="w"> </span><span class="k">while</span><span class="w"> </span><span class="n">executing</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">wasm</span><span class="w"> </span><span class="n">backtrace</span><span class="p">:</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">:</span><span class="w">     </span><span class="mh">0x33</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">wasm</span><span class="o">-</span><span class="n">function</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+<span class="w">                    </span><span class="n">at</span><span class="w"> </span><span class="p">.</span><span class="o">/</span><span class="n">t</span><span class="p">.</span><span class="n">wast</span><span class="p">:</span><span class="mi">6</span><span class="p">:</span><span class="mi">36</span>
+<span class="w">    </span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="nc">GC</span><span class="w"> </span><span class="n">heap</span><span class="w"> </span><span class="n">out</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">memory</span><span class="p">:</span><span class="w"> </span><span class="nc">no</span><span class="w"> </span><span class="n">capacity</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">allocation</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="mi">65564</span><span class="w"> </span><span class="n">bytes</span>
+
+
+<span class="n">real</span><span class="w">    </span><span class="mi">0</span><span class="n">m53</span><span class="p">.</span><span class="mi">094</span><span class="n">s</span>
+<span class="n">user</span><span class="w">    </span><span class="mi">0</span><span class="n">m48</span><span class="p">.</span><span class="mi">324</span><span class="n">s</span>
+<span class="n">sys</span><span class="w">     </span><span class="mi">0</span><span class="n">m4</span><span class="p">.</span><span class="mi">504</span><span class="n">s</span>
+</code></pre></div>
+<p>&lt;details&gt;<br>
+&lt;summary&gt;Trace Execution of Actual Behavior&lt;/summary&gt;</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>2026-09-12T21:46:30.936173Z TRACE wasmtime::runtime::store::gc: ============ Begin GC ===========
+                  GC heap capacity = 0x40000000 bytes
+        last post-GC live-set size = 0x0fffffc0 bytes
+               GC heap utilization = 25.00%
+2026-09-12T21:46:30.936226Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots
+2026-09-12T21:46:30.936260Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: Wasm stack
+2026-09-12T21:46:30.936405Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: Wasm stack
+2026-09-12T21:46:30.936535Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: continuations
+2026-09-12T21:46:30.936581Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: continuations
+2026-09-12T21:46:30.936644Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: vmctx
+2026-09-12T21:46:30.936725Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: vmctx
+2026-09-12T21:46:30.936791Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: instance
+2026-09-12T21:46:30.936835Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: instance
+2026-09-12T21:46:30.936893Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: user
+2026-09-12T21:46:30.936942Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: user
+2026-09-12T21:46:30.936998Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: pending exception
+2026-09-12T21:46:30.937034Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: pending exception
+2026-09-12T21:46:30.937068Z TRACE wasmtime::runtime::store::gc: End trace GC roots
+2026-09-12T21:46:31.188664Z TRACE wasmtime::runtime::store::gc: ============ End GC ===========
+             GC heap capacity = 0x40000000 bytes
+        post-GC live-set size = 0x3fffff00 bytes
+          GC heap utilization = 100.00%
+2026-09-12T21:46:31.188825Z TRACE wasmtime::runtime::store::gc: Attempting to grow the GC heap by at least 0x1001c bytes
+2026-09-12T21:46:31.188944Z TRACE wasmtime::runtime::store::gc:   -&gt; grew GC heap by 0x40000000 bytes: new size is 0x80000000 bytes
+2026-09-12T21:46:44.379767Z TRACE wasmtime::runtime::store::gc: Got GC heap OOM: GC heap out of memory: no capacity for allocation of 65564 bytes
+2026-09-12T21:46:44.379869Z TRACE wasmtime::runtime::store::gc: Grow GC heap first, collecting if growth failed, then retrying
+2026-09-12T21:46:44.379904Z TRACE wasmtime::runtime::store::gc: Attempting to grow the GC heap by at least 0x1001c bytes
+2026-09-12T21:46:44.379990Z TRACE wasmtime::runtime::store::gc:   -&gt; grew GC heap by 0x80000000 bytes: new size is 0x100000000 bytes
+2026-09-12T21:47:10.116957Z TRACE wasmtime::runtime::store::gc: Got GC heap OOM: GC heap out of memory: no capacity for allocation of 65564 bytes
+2026-09-12T21:47:10.117057Z TRACE wasmtime::runtime::store::gc: Collecting first, then retrying; growing GC heap if collecting didn't free up enough space, then retrying again
+2026-09-12T21:47:10.117106Z TRACE wasmtime::runtime::store::gc: collect_and_maybe_grow_gc_heap(bytes_needed = None)
+2026-09-12T21:47:10.117143Z TRACE wasmtime::runtime::store::gc: ============ Begin GC ===========
+                  GC heap capacity = 0x100000000 bytes
+        last post-GC live-set size = 0x3fffff00 bytes
+               GC heap utilization = 25.00%
+2026-09-12T21:47:10.117190Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots
+2026-09-12T21:47:10.117214Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: Wasm stack
+2026-09-12T21:47:10.117367Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: Wasm stack
+2026-09-12T21:47:10.117506Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: continuations
+2026-09-12T21:47:10.117549Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: continuations
+2026-09-12T21:47:10.117600Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: vmctx
+2026-09-12T21:47:10.117683Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: vmctx
+2026-09-12T21:47:10.117742Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: instance
+2026-09-12T21:47:10.117782Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: instance
+2026-09-12T21:47:10.117830Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: user
+2026-09-12T21:47:10.117877Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: user
+2026-09-12T21:47:10.117925Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: pending exception
+2026-09-12T21:47:10.117956Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: pending exception
+2026-09-12T21:47:10.117980Z TRACE wasmtime::runtime::store::gc: End trace GC roots
+2026-09-12T21:47:10.980060Z TRACE wasmtime::runtime::store::gc: ============ End GC ===========
+             GC heap capacity = 0x100000000 bytes
+        post-GC live-set size = 0xfffffc00 bytes
+          GC heap utilization = 100.00%
+2026-09-12T21:47:10.980342Z TRACE wasmtime::runtime::store::gc: Attempting to grow the GC heap by at least 0x1001c bytes
+Error: failed to run script file 't.wast'
+
+Caused by:
+    0: failed directive on t.wast:10
+    1: error while executing at wasm backtrace:
+    0:     0x33 - wasm-function[0]
+                    at ./t.wast:6:36
+    2: GC heap out of memory: no capacity for allocation of 65564 bytes
+</code></pre></div>
+<p>&lt;/details&gt;</p>
+<h2>Expected behavior:</h2>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">time</span><span class="w"> </span><span class="n">wasmtime</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">C</span><span class="w"> </span><span class="n">collector</span><span class="o">=</span><span class="n">drc</span><span class="w"> </span><span class="o">-</span><span class="n">O</span><span class="w"> </span><span class="n">table</span><span class="o">-</span><span class="n">lazy</span><span class="o">-</span><span class="n">init</span><span class="o">=</span><span class="n">y</span><span class="w"> </span><span class="n">t</span><span class="p">.</span><span class="n">wast</span>
+
+<span class="n">real</span><span class="w">    </span><span class="mi">4</span><span class="n">m20</span><span class="p">.</span><span class="mi">215</span><span class="n">s</span>
+<span class="n">user</span><span class="w">    </span><span class="mi">4</span><span class="n">m18</span><span class="p">.</span><span class="mi">943</span><span class="n">s</span>
+<span class="n">sys</span><span class="w">     </span><span class="mi">0</span><span class="n">m0</span><span class="p">.</span><span class="mi">049</span><span class="n">s</span>
+</code></pre></div>
+<p>&lt;details&gt;<br>
+&lt;summary&gt;Trace Execution of Expected Behavior&lt;/summary&gt;</p>
+<p><div class="codehilite" data-code-language="Text only"><pre><span></span><code>2026-09-12T22:52:48.882121Z TRACE wasmtime::runtime::store::gc: ============ Begin GC ===========
+                  GC heap capacity = 0x00040000 bytes
+        last post-GC live-set size = 0x00000000 bytes
+               GC heap utilization = 0.00%
+2026-09-12T22:52:48.882211Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots
+2026-09-12T22:52:48.882250Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: Wasm stack
+2026-09-12T22:52:48.882436Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: Wasm stack
+2026-09-12T22:52:48.882592Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: continuations
+2026-09-12T22:52:48.882643Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: continuations
+2026-09-12T22:52:48.882706Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: vmctx
+2026-09-12T22:52:48.882803Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: vmctx
+2026-09-12T22:52:48.882867Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: instance
+2026-09-12T22:52:48.882925Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: instance
+2026-09-12T22:52:48.882985Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: user
+2026-09-12T22:52:48.883041Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: user
+2026-09-12T22:52:48.883101Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: pending exception
+2026-09-12T22:52:48.883146Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: pending exception
+2026-09-12T22:52:48.883186Z TRACE wasmtime::runtime::store::gc: End trace GC roots
+2026-09-12T22:52:48.888927Z TRACE wasmtime::runtime::store::gc: ============ End GC ===========
+             GC heap capacity = 0x00040000 bytes
+        post-GC live-set size = 0x00000000 bytes
+          GC heap utilization = 0.00%
+2026-09-12T22:52:48.891610Z TRACE wasmtime::runtime::store::gc: Got GC heap OOM: GC heap out of memory: no capacity for allocation of 65564 bytes
+2026-09-12T22:52:48.891851Z TRACE wasmtime::runtime::store::gc: Collecting first, then retrying; growing GC heap if collecting didn't free up enough space, then retrying again
+2026-09-12T22:52:48.891937Z TRACE wasmtime::runtime::store::gc: collect_and_maybe_grow_gc_heap(bytes_needed = None)
+2026-09-12T22:52:48.892004Z TRACE wasmtime::runtime::store::gc: ============ Begin GC ===========
+                  GC heap capacity = 0x00040000 bytes
+        last post-GC live-set size = 0x00000000 bytes
+               GC heap utilization = 0.00%
+2026-09-12T22:52:48.892120Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots
+2026-09-12T22:52:48.892159Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: Wasm stack
+2026-09
+[message truncated]
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="623791006"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314325%20gc_ops%20fuzzbug%3A%20Potential%20leak%20in.../near/623791006" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314325.20gc_ops.20fuzzbug.3A.20Potential.20leak.20in.2E.2E.2E.html#623791006">(Sep 12 2026 at 23:15)</a>:</h4>
+<p><a href="https://github.com/khagankhan">khagankhan</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14325">Issue #14325</a>.</p>
+
+
+
+<a name="623791007"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314325%20gc_ops%20fuzzbug%3A%20Potential%20leak%20in.../near/623791007" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314325.20gc_ops.20fuzzbug.3A.20Potential.20leak.20in.2E.2E.2E.html#623791007">(Sep 12 2026 at 23:15)</a>:</h4>
+<p><a href="https://github.com/khagankhan">khagankhan</a> added the fuzz-bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14325">Issue #14325</a>.</p>
+
+
+
+<a name="623791297"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314325%20gc_ops%20fuzzbug%3A%20Potential%20leak%20in.../near/623791297" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314325.20gc_ops.20fuzzbug.3A.20Potential.20leak.20in.2E.2E.2E.html#623791297">(Sep 12 2026 at 23:19)</a>:</h4>
+<p>khagankhan edited <a href="https://github.com/bytecodealliance/wasmtime/issues/14325">issue #14325</a>:</p>
+<blockquote>
+<p>I was fuzzing wasmtime locally with <code>gc_ops</code> and I think there may be potential leak in the DRC. Reduced to wast for easier debug, so there is no need for fmt.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">wasmtime</span><span class="w"> </span><span class="mf">50.0.0</span><span class="o">-</span><span class="n">dev</span><span class="w"> </span><span class="p">(</span><span class="mi">2</span><span class="n">be5e3a62</span><span class="w"> </span><span class="mi">2026</span><span class="o">-</span><span class="mi">09</span><span class="o">-</span><span class="mi">11</span><span class="p">)</span>
+</code></pre></div>
+<p><code>table.fill</code> with a constant <code>ref.null</code> on a GC-reference table is lowered to a <code>memset</code> when <code>-O table-lazy-init=n</code> bypassing the DRC write barrier. The eligibility check <code>allows_memset</code> permits the fast path for any table once lazy init is off. <code>array.fill</code> seems to be working correctly. </p>
+<p>For the given file:</p>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">type</span> <span class="nv">$bytes</span> <span class="p">(</span><span class="err">array</span> <span class="p">(</span><span class="k">mut</span> <span class="err">i</span><span class="mi">8</span><span class="p">)))</span>
+  <span class="p">(</span><span class="k">table</span> <span class="nv">$t</span> <span class="mi">1</span> <span class="err">anyref</span><span class="p">)</span>
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"run"</span><span class="p">)</span> <span class="p">(</span><span class="k">param</span> <span class="nv">$n</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="p">(</span><span class="k">loop</span> <span class="nv">$l</span>
+      <span class="p">(</span><span class="err">table.set</span> <span class="nv">$t</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="err">array.new_default</span> <span class="nv">$bytes</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mf">65536</span><span class="p">)))</span>
+      <span class="p">(</span><span class="err">table.fill</span> <span class="nv">$t</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="err">ref.null</span> <span class="err">any</span><span class="p">)</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">1</span><span class="p">))</span>
+      <span class="p">(</span><span class="nb">local.set</span> <span class="nv">$n</span> <span class="p">(</span><span class="nb">i32.sub</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$n</span><span class="p">)</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">1</span><span class="p">)))</span>
+      <span class="p">(</span><span class="nb">br_if</span> <span class="nv">$l</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$n</span><span class="p">)))))</span>
+<span class="p">(</span><span class="err">assert_</span><span class="nb">return</span> <span class="p">(</span><span class="err">invoke</span> <span class="s2">"run"</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mf">100000</span><span class="p">)))</span>
+</code></pre></div>
+<ol>
+<li>Allocate 64KB array.</li>
+<li>Set it to the table slot 0</li>
+<li>Overwrite that slot with <code>ref.null any</code></li>
+</ol>
+<p>So at the end of each iteration the array becomes unreachable (garbage) that should be collected at some point.</p>
+<h2>Actual behavior:</h2>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">time</span><span class="w"> </span><span class="p">.</span><span class="o">/</span><span class="n">target</span><span class="o">/</span><span class="n">release</span><span class="o">/</span><span class="n">wasmtime</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">C</span><span class="w"> </span><span class="n">collector</span><span class="o">=</span><span class="n">drc</span><span class="w"> </span><span class="o">-</span><span class="n">O</span><span class="w"> </span><span class="n">table</span><span class="o">-</span><span class="n">lazy</span><span class="o">-</span><span class="n">init</span><span class="o">=</span><span class="n">n</span><span class="w"> </span><span class="n">t</span><span class="p">.</span><span class="n">wast</span>
+<span class="n">Error</span><span class="p">:</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="n">script</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="o">'</span><span class="na">t</span><span class="p">.</span><span class="n">wast</span><span class="o">'</span>
+
+<span class="n">Caused</span><span class="w"> </span><span class="n">by</span><span class="p">:</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">:</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">directive</span><span class="w"> </span><span class="n">on</span><span class="w"> </span><span class="n">t</span><span class="p">.</span><span class="n">wast</span><span class="p">:</span><span class="mi">10</span>
+<span class="w">    </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="nc">error</span><span class="w"> </span><span class="k">while</span><span class="w"> </span><span class="n">executing</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">wasm</span><span class="w"> </span><span class="n">backtrace</span><span class="p">:</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">:</span><span class="w">     </span><span class="mh">0x33</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">wasm</span><span class="o">-</span><span class="n">function</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+<span class="w">                    </span><span class="n">at</span><span class="w"> </span><span class="p">.</span><span class="o">/</span><span class="n">t</span><span class="p">.</span><span class="n">wast</span><span class="p">:</span><span class="mi">6</span><span class="p">:</span><span class="mi">36</span>
+<span class="w">    </span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="nc">GC</span><span class="w"> </span><span class="n">heap</span><span class="w"> </span><span class="n">out</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">memory</span><span class="p">:</span><span class="w"> </span><span class="nc">no</span><span class="w"> </span><span class="n">capacity</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">allocation</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="mi">65564</span><span class="w"> </span><span class="n">bytes</span>
+
+
+<span class="n">real</span><span class="w">    </span><span class="mi">0</span><span class="n">m5</span><span class="p">.</span><span class="mi">701</span><span class="n">s</span>
+<span class="n">user</span><span class="w">    </span><span class="mi">0</span><span class="n">m1</span><span class="p">.</span><span class="mi">110</span><span class="n">s</span>
+<span class="n">sys</span><span class="w">     </span><span class="mi">0</span><span class="n">m4</span><span class="p">.</span><span class="mi">536</span><span class="n">s</span>
+</code></pre></div>
+<p>&lt;details&gt;<br>
+&lt;summary&gt;Trace Execution of Actual Behavior&lt;/summary&gt;</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>2026-09-12T21:46:30.936173Z TRACE wasmtime::runtime::store::gc: ============ Begin GC ===========
+                  GC heap capacity = 0x40000000 bytes
+        last post-GC live-set size = 0x0fffffc0 bytes
+               GC heap utilization = 25.00%
+2026-09-12T21:46:30.936226Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots
+2026-09-12T21:46:30.936260Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: Wasm stack
+2026-09-12T21:46:30.936405Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: Wasm stack
+2026-09-12T21:46:30.936535Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: continuations
+2026-09-12T21:46:30.936581Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: continuations
+2026-09-12T21:46:30.936644Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: vmctx
+2026-09-12T21:46:30.936725Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: vmctx
+2026-09-12T21:46:30.936791Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: instance
+2026-09-12T21:46:30.936835Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: instance
+2026-09-12T21:46:30.936893Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: user
+2026-09-12T21:46:30.936942Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: user
+2026-09-12T21:46:30.936998Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: pending exception
+2026-09-12T21:46:30.937034Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: pending exception
+2026-09-12T21:46:30.937068Z TRACE wasmtime::runtime::store::gc: End trace GC roots
+2026-09-12T21:46:31.188664Z TRACE wasmtime::runtime::store::gc: ============ End GC ===========
+             GC heap capacity = 0x40000000 bytes
+        post-GC live-set size = 0x3fffff00 bytes
+          GC heap utilization = 100.00%
+2026-09-12T21:46:31.188825Z TRACE wasmtime::runtime::store::gc: Attempting to grow the GC heap by at least 0x1001c bytes
+2026-09-12T21:46:31.188944Z TRACE wasmtime::runtime::store::gc:   -&gt; grew GC heap by 0x40000000 bytes: new size is 0x80000000 bytes
+2026-09-12T21:46:44.379767Z TRACE wasmtime::runtime::store::gc: Got GC heap OOM: GC heap out of memory: no capacity for allocation of 65564 bytes
+2026-09-12T21:46:44.379869Z TRACE wasmtime::runtime::store::gc: Grow GC heap first, collecting if growth failed, then retrying
+2026-09-12T21:46:44.379904Z TRACE wasmtime::runtime::store::gc: Attempting to grow the GC heap by at least 0x1001c bytes
+2026-09-12T21:46:44.379990Z TRACE wasmtime::runtime::store::gc:   -&gt; grew GC heap by 0x80000000 bytes: new size is 0x100000000 bytes
+2026-09-12T21:47:10.116957Z TRACE wasmtime::runtime::store::gc: Got GC heap OOM: GC heap out of memory: no capacity for allocation of 65564 bytes
+2026-09-12T21:47:10.117057Z TRACE wasmtime::runtime::store::gc: Collecting first, then retrying; growing GC heap if collecting didn't free up enough space, then retrying again
+2026-09-12T21:47:10.117106Z TRACE wasmtime::runtime::store::gc: collect_and_maybe_grow_gc_heap(bytes_needed = None)
+2026-09-12T21:47:10.117143Z TRACE wasmtime::runtime::store::gc: ============ Begin GC ===========
+                  GC heap capacity = 0x100000000 bytes
+        last post-GC live-set size = 0x3fffff00 bytes
+               GC heap utilization = 25.00%
+2026-09-12T21:47:10.117190Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots
+2026-09-12T21:47:10.117214Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: Wasm stack
+2026-09-12T21:47:10.117367Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: Wasm stack
+2026-09-12T21:47:10.117506Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: continuations
+2026-09-12T21:47:10.117549Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: continuations
+2026-09-12T21:47:10.117600Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: vmctx
+2026-09-12T21:47:10.117683Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: vmctx
+2026-09-12T21:47:10.117742Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: instance
+2026-09-12T21:47:10.117782Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: instance
+2026-09-12T21:47:10.117830Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: user
+2026-09-12T21:47:10.117877Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: user
+2026-09-12T21:47:10.117925Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: pending exception
+2026-09-12T21:47:10.117956Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: pending exception
+2026-09-12T21:47:10.117980Z TRACE wasmtime::runtime::store::gc: End trace GC roots
+2026-09-12T21:47:10.980060Z TRACE wasmtime::runtime::store::gc: ============ End GC ===========
+             GC heap capacity = 0x100000000 bytes
+        post-GC live-set size = 0xfffffc00 bytes
+          GC heap utilization = 100.00%
+2026-09-12T21:47:10.980342Z TRACE wasmtime::runtime::store::gc: Attempting to grow the GC heap by at least 0x1001c bytes
+Error: failed to run script file 't.wast'
+
+Caused by:
+    0: failed directive on t.wast:10
+    1: error while executing at wasm backtrace:
+    0:     0x33 - wasm-function[0]
+                    at ./t.wast:6:36
+    2: GC heap out of memory: no capacity for allocation of 65564 bytes
+</code></pre></div>
+<p>&lt;/details&gt;</p>
+<h2>Expected behavior:</h2>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">time</span><span class="w"> </span><span class="p">.</span><span class="o">/</span><span class="n">target</span><span class="o">/</span><span class="n">release</span><span class="o">/</span><span class="n">wasmtime</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">C</span><span class="w"> </span><span class="n">collector</span><span class="o">=</span><span class="n">drc</span><span class="w"> </span><span class="o">-</span><span class="n">O</span><span class="w"> </span><span class="n">table</span><span class="o">-</span><span class="n">lazy</span><span class="o">-</span><span class="n">init</span><span class="o">=</span><span class="n">y</span><span class="w"> </span><span class="n">t</span><span class="p">.</span><span class="n">wast</span>
+
+<span class="n">real</span><span class="w">    </span><span class="mi">0</span><span class="n">m0</span><span class="p">.</span><span class="mi">671</span><span class="n">s</span>
+<span class="n">user</span><span class="w">    </span><span class="mi">0</span><span class="n">m0</span><span class="p">.</span><span class="mi">650</span><span class="n">s</span>
+<span class="n">sys</span><span class="w">     </span><span class="mi">0</span><span class="n">m0</span><span class="p">.</span><span class="mi">011</span><span class="n">s</span>
+</code></pre></div>
+<p>&lt;details&gt;<br>
+&lt;summary&gt;Trace Execution of Expected Behavior&lt;/summary&gt;</p>
+<p><div class="codehilite" data-code-language="Text only"><pre><span></span><code>2026-09-12T22:52:48.882121Z TRACE wasmtime::runtime::store::gc: ============ Begin GC ===========
+                  GC heap capacity = 0x00040000 bytes
+        last post-GC live-set size = 0x00000000 bytes
+               GC heap utilization = 0.00%
+2026-09-12T22:52:48.882211Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots
+2026-09-12T22:52:48.882250Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: Wasm stack
+2026-09-12T22:52:48.882436Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: Wasm stack
+2026-09-12T22:52:48.882592Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: continuations
+2026-09-12T22:52:48.882643Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: continuations
+2026-09-12T22:52:48.882706Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: vmctx
+2026-09-12T22:52:48.882803Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: vmctx
+2026-09-12T22:52:48.882867Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: instance
+2026-09-12T22:52:48.882925Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: instance
+2026-09-12T22:52:48.882985Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: user
+2026-09-12T22:52:48.883041Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: user
+2026-09-12T22:52:48.883101Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: pending exception
+2026-09-12T22:52:48.883146Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: pending exception
+2026-09-12T22:52:48.883186Z TRACE wasmtime::runtime::store::gc: End trace GC roots
+2026-09-12T22:52:48.888927Z TRACE wasmtime::runtime::store::gc: ============ End GC ===========
+             GC heap capacity = 0x00040000 bytes
+        post-GC live-set size = 0x00000000 bytes
+          GC heap utilization = 0.00%
+2026-09-12T22:52:48.891610Z TRACE wasmtime::runtime::store::gc: Got GC heap OOM: GC heap out of memory: no capacity for allocation of 65564 bytes
+2026-09-12T22:52:48.891851Z TRACE wasmtime::runtime::store::gc: Collecting first, then retrying; growing GC heap if collecting didn't free up enough space, then retrying again
+2026-09-12T22:52:48.891937Z TRACE wasmtime::runtime::store::gc: collect_and_maybe_grow_gc_heap(bytes_needed = None)
+2026-09-12T22:52:48.892004Z TRACE wasmtime::runtime::store::gc: ============ Begin GC ===========
+                  GC heap capacity = 0x00040000 bytes
+        last post-GC live-set size = 0x00000000 bytes
+               GC heap utilization = 0.00%
+2026-09-12T22:52:48.892120Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots
+2026-09-12T22:52:48.892159Z TRACE wasmtime::runtime::store::gc: Begin trace GC roo
+[message truncated]
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="624084678"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314325%20gc_ops%20fuzzbug%3A%20Potential%20leak%20in.../near/624084678" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314325.20gc_ops.20fuzzbug.3A.20Potential.20leak.20in.2E.2E.2E.html#624084678">(Sep 14 2026 at 14:55)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/14325#issuecomment-5665950969">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14325">issue #14325</a>:</p>
+<blockquote>
+<p>Definitely a bug, thanks! Should be fixed over at <a href="https://github.com/bytecodealliance/wasmtime/pull/14328">https://github.com/bytecodealliance/wasmtime/pull/14328</a></p>
+</blockquote>
+
+
+
+<a name="624097645"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314325%20gc_ops%20fuzzbug%3A%20Potential%20leak%20in.../near/624097645" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314325.20gc_ops.20fuzzbug.3A.20Potential.20leak.20in.2E.2E.2E.html#624097645">(Sep 14 2026 at 15:33)</a>:</h4>
+<p>cfallin closed <a href="https://github.com/bytecodealliance/wasmtime/issues/14325">issue #14325</a>:</p>
+<blockquote>
+<p>I was fuzzing wasmtime locally with <code>gc_ops</code> and I think there may be potential leak in the DRC. Reduced to wast for easier debug, so there is no need for fmt.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">wasmtime</span><span class="w"> </span><span class="mf">50.0.0</span><span class="o">-</span><span class="n">dev</span><span class="w"> </span><span class="p">(</span><span class="mi">2</span><span class="n">be5e3a62</span><span class="w"> </span><span class="mi">2026</span><span class="o">-</span><span class="mi">09</span><span class="o">-</span><span class="mi">11</span><span class="p">)</span>
+</code></pre></div>
+<p><code>table.fill</code> with a constant <code>ref.null</code> on a GC-reference table is lowered to a <code>memset</code> when <code>-O table-lazy-init=n</code> bypassing the DRC write barrier. The eligibility check <code>allows_memset</code> permits the fast path for any table once lazy init is off. <code>array.fill</code> seems to be working correctly. </p>
+<p>For the given file:</p>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">type</span> <span class="nv">$bytes</span> <span class="p">(</span><span class="err">array</span> <span class="p">(</span><span class="k">mut</span> <span class="err">i</span><span class="mi">8</span><span class="p">)))</span>
+  <span class="p">(</span><span class="k">table</span> <span class="nv">$t</span> <span class="mi">1</span> <span class="err">anyref</span><span class="p">)</span>
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"run"</span><span class="p">)</span> <span class="p">(</span><span class="k">param</span> <span class="nv">$n</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="p">(</span><span class="k">loop</span> <span class="nv">$l</span>
+      <span class="p">(</span><span class="err">table.set</span> <span class="nv">$t</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="err">array.new_default</span> <span class="nv">$bytes</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mf">65536</span><span class="p">)))</span>
+      <span class="p">(</span><span class="err">table.fill</span> <span class="nv">$t</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="err">ref.null</span> <span class="err">any</span><span class="p">)</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">1</span><span class="p">))</span>
+      <span class="p">(</span><span class="nb">local.set</span> <span class="nv">$n</span> <span class="p">(</span><span class="nb">i32.sub</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$n</span><span class="p">)</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">1</span><span class="p">)))</span>
+      <span class="p">(</span><span class="nb">br_if</span> <span class="nv">$l</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$n</span><span class="p">)))))</span>
+<span class="p">(</span><span class="err">assert_</span><span class="nb">return</span> <span class="p">(</span><span class="err">invoke</span> <span class="s2">"run"</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mf">100000</span><span class="p">)))</span>
+</code></pre></div>
+<ol>
+<li>Allocate 64KB array.</li>
+<li>Set it to the table slot 0</li>
+<li>Overwrite that slot with <code>ref.null any</code></li>
+</ol>
+<p>So at the end of each iteration the array becomes unreachable (garbage) that should be collected at some point.</p>
+<h2>Actual behavior:</h2>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">time</span><span class="w"> </span><span class="p">.</span><span class="o">/</span><span class="n">target</span><span class="o">/</span><span class="n">release</span><span class="o">/</span><span class="n">wasmtime</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">C</span><span class="w"> </span><span class="n">collector</span><span class="o">=</span><span class="n">drc</span><span class="w"> </span><span class="o">-</span><span class="n">O</span><span class="w"> </span><span class="n">table</span><span class="o">-</span><span class="n">lazy</span><span class="o">-</span><span class="n">init</span><span class="o">=</span><span class="n">n</span><span class="w"> </span><span class="n">t</span><span class="p">.</span><span class="n">wast</span>
+<span class="n">Error</span><span class="p">:</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="n">script</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="o">'</span><span class="na">t</span><span class="p">.</span><span class="n">wast</span><span class="o">'</span>
+
+<span class="n">Caused</span><span class="w"> </span><span class="n">by</span><span class="p">:</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">:</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">directive</span><span class="w"> </span><span class="n">on</span><span class="w"> </span><span class="n">t</span><span class="p">.</span><span class="n">wast</span><span class="p">:</span><span class="mi">10</span>
+<span class="w">    </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="nc">error</span><span class="w"> </span><span class="k">while</span><span class="w"> </span><span class="n">executing</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">wasm</span><span class="w"> </span><span class="n">backtrace</span><span class="p">:</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">:</span><span class="w">     </span><span class="mh">0x33</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">wasm</span><span class="o">-</span><span class="n">function</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+<span class="w">                    </span><span class="n">at</span><span class="w"> </span><span class="p">.</span><span class="o">/</span><span class="n">t</span><span class="p">.</span><span class="n">wast</span><span class="p">:</span><span class="mi">6</span><span class="p">:</span><span class="mi">36</span>
+<span class="w">    </span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="nc">GC</span><span class="w"> </span><span class="n">heap</span><span class="w"> </span><span class="n">out</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">memory</span><span class="p">:</span><span class="w"> </span><span class="nc">no</span><span class="w"> </span><span class="n">capacity</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">allocation</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="mi">65564</span><span class="w"> </span><span class="n">bytes</span>
+
+
+<span class="n">real</span><span class="w">    </span><span class="mi">0</span><span class="n">m5</span><span class="p">.</span><span class="mi">701</span><span class="n">s</span>
+<span class="n">user</span><span class="w">    </span><span class="mi">0</span><span class="n">m1</span><span class="p">.</span><span class="mi">110</span><span class="n">s</span>
+<span class="n">sys</span><span class="w">     </span><span class="mi">0</span><span class="n">m4</span><span class="p">.</span><span class="mi">536</span><span class="n">s</span>
+</code></pre></div>
+<p>&lt;details&gt;<br>
+&lt;summary&gt;Trace Execution of Actual Behavior&lt;/summary&gt;</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>2026-09-12T21:46:30.936173Z TRACE wasmtime::runtime::store::gc: ============ Begin GC ===========
+                  GC heap capacity = 0x40000000 bytes
+        last post-GC live-set size = 0x0fffffc0 bytes
+               GC heap utilization = 25.00%
+2026-09-12T21:46:30.936226Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots
+2026-09-12T21:46:30.936260Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: Wasm stack
+2026-09-12T21:46:30.936405Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: Wasm stack
+2026-09-12T21:46:30.936535Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: continuations
+2026-09-12T21:46:30.936581Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: continuations
+2026-09-12T21:46:30.936644Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: vmctx
+2026-09-12T21:46:30.936725Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: vmctx
+2026-09-12T21:46:30.936791Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: instance
+2026-09-12T21:46:30.936835Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: instance
+2026-09-12T21:46:30.936893Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: user
+2026-09-12T21:46:30.936942Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: user
+2026-09-12T21:46:30.936998Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: pending exception
+2026-09-12T21:46:30.937034Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: pending exception
+2026-09-12T21:46:30.937068Z TRACE wasmtime::runtime::store::gc: End trace GC roots
+2026-09-12T21:46:31.188664Z TRACE wasmtime::runtime::store::gc: ============ End GC ===========
+             GC heap capacity = 0x40000000 bytes
+        post-GC live-set size = 0x3fffff00 bytes
+          GC heap utilization = 100.00%
+2026-09-12T21:46:31.188825Z TRACE wasmtime::runtime::store::gc: Attempting to grow the GC heap by at least 0x1001c bytes
+2026-09-12T21:46:31.188944Z TRACE wasmtime::runtime::store::gc:   -&gt; grew GC heap by 0x40000000 bytes: new size is 0x80000000 bytes
+2026-09-12T21:46:44.379767Z TRACE wasmtime::runtime::store::gc: Got GC heap OOM: GC heap out of memory: no capacity for allocation of 65564 bytes
+2026-09-12T21:46:44.379869Z TRACE wasmtime::runtime::store::gc: Grow GC heap first, collecting if growth failed, then retrying
+2026-09-12T21:46:44.379904Z TRACE wasmtime::runtime::store::gc: Attempting to grow the GC heap by at least 0x1001c bytes
+2026-09-12T21:46:44.379990Z TRACE wasmtime::runtime::store::gc:   -&gt; grew GC heap by 0x80000000 bytes: new size is 0x100000000 bytes
+2026-09-12T21:47:10.116957Z TRACE wasmtime::runtime::store::gc: Got GC heap OOM: GC heap out of memory: no capacity for allocation of 65564 bytes
+2026-09-12T21:47:10.117057Z TRACE wasmtime::runtime::store::gc: Collecting first, then retrying; growing GC heap if collecting didn't free up enough space, then retrying again
+2026-09-12T21:47:10.117106Z TRACE wasmtime::runtime::store::gc: collect_and_maybe_grow_gc_heap(bytes_needed = None)
+2026-09-12T21:47:10.117143Z TRACE wasmtime::runtime::store::gc: ============ Begin GC ===========
+                  GC heap capacity = 0x100000000 bytes
+        last post-GC live-set size = 0x3fffff00 bytes
+               GC heap utilization = 25.00%
+2026-09-12T21:47:10.117190Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots
+2026-09-12T21:47:10.117214Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: Wasm stack
+2026-09-12T21:47:10.117367Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: Wasm stack
+2026-09-12T21:47:10.117506Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: continuations
+2026-09-12T21:47:10.117549Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: continuations
+2026-09-12T21:47:10.117600Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: vmctx
+2026-09-12T21:47:10.117683Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: vmctx
+2026-09-12T21:47:10.117742Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: instance
+2026-09-12T21:47:10.117782Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: instance
+2026-09-12T21:47:10.117830Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: user
+2026-09-12T21:47:10.117877Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: user
+2026-09-12T21:47:10.117925Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: pending exception
+2026-09-12T21:47:10.117956Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: pending exception
+2026-09-12T21:47:10.117980Z TRACE wasmtime::runtime::store::gc: End trace GC roots
+2026-09-12T21:47:10.980060Z TRACE wasmtime::runtime::store::gc: ============ End GC ===========
+             GC heap capacity = 0x100000000 bytes
+        post-GC live-set size = 0xfffffc00 bytes
+          GC heap utilization = 100.00%
+2026-09-12T21:47:10.980342Z TRACE wasmtime::runtime::store::gc: Attempting to grow the GC heap by at least 0x1001c bytes
+Error: failed to run script file 't.wast'
+
+Caused by:
+    0: failed directive on t.wast:10
+    1: error while executing at wasm backtrace:
+    0:     0x33 - wasm-function[0]
+                    at ./t.wast:6:36
+    2: GC heap out of memory: no capacity for allocation of 65564 bytes
+</code></pre></div>
+<p>&lt;/details&gt;</p>
+<h2>Expected behavior:</h2>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">time</span><span class="w"> </span><span class="p">.</span><span class="o">/</span><span class="n">target</span><span class="o">/</span><span class="n">release</span><span class="o">/</span><span class="n">wasmtime</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">C</span><span class="w"> </span><span class="n">collector</span><span class="o">=</span><span class="n">drc</span><span class="w"> </span><span class="o">-</span><span class="n">O</span><span class="w"> </span><span class="n">table</span><span class="o">-</span><span class="n">lazy</span><span class="o">-</span><span class="n">init</span><span class="o">=</span><span class="n">y</span><span class="w"> </span><span class="n">t</span><span class="p">.</span><span class="n">wast</span>
+
+<span class="n">real</span><span class="w">    </span><span class="mi">0</span><span class="n">m0</span><span class="p">.</span><span class="mi">671</span><span class="n">s</span>
+<span class="n">user</span><span class="w">    </span><span class="mi">0</span><span class="n">m0</span><span class="p">.</span><span class="mi">650</span><span class="n">s</span>
+<span class="n">sys</span><span class="w">     </span><span class="mi">0</span><span class="n">m0</span><span class="p">.</span><span class="mi">011</span><span class="n">s</span>
+</code></pre></div>
+<p>&lt;details&gt;<br>
+&lt;summary&gt;Trace Execution of Expected Behavior&lt;/summary&gt;</p>
+<p><div class="codehilite" data-code-language="Text only"><pre><span></span><code>2026-09-12T22:52:48.882121Z TRACE wasmtime::runtime::store::gc: ============ Begin GC ===========
+                  GC heap capacity = 0x00040000 bytes
+        last post-GC live-set size = 0x00000000 bytes
+               GC heap utilization = 0.00%
+2026-09-12T22:52:48.882211Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots
+2026-09-12T22:52:48.882250Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: Wasm stack
+2026-09-12T22:52:48.882436Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: Wasm stack
+2026-09-12T22:52:48.882592Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: continuations
+2026-09-12T22:52:48.882643Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: continuations
+2026-09-12T22:52:48.882706Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: vmctx
+2026-09-12T22:52:48.882803Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: vmctx
+2026-09-12T22:52:48.882867Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: instance
+2026-09-12T22:52:48.882925Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: instance
+2026-09-12T22:52:48.882985Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: user
+2026-09-12T22:52:48.883041Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: user
+2026-09-12T22:52:48.883101Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots :: pending exception
+2026-09-12T22:52:48.883146Z TRACE wasmtime::runtime::store::gc: End trace GC roots :: pending exception
+2026-09-12T22:52:48.883186Z TRACE wasmtime::runtime::store::gc: End trace GC roots
+2026-09-12T22:52:48.888927Z TRACE wasmtime::runtime::store::gc: ============ End GC ===========
+             GC heap capacity = 0x00040000 bytes
+        post-GC live-set size = 0x00000000 bytes
+          GC heap utilization = 0.00%
+2026-09-12T22:52:48.891610Z TRACE wasmtime::runtime::store::gc: Got GC heap OOM: GC heap out of memory: no capacity for allocation of 65564 bytes
+2026-09-12T22:52:48.891851Z TRACE wasmtime::runtime::store::gc: Collecting first, then retrying; growing GC heap if collecting didn't free up enough space, then retrying again
+2026-09-12T22:52:48.891937Z TRACE wasmtime::runtime::store::gc: collect_and_maybe_grow_gc_heap(bytes_needed = None)
+2026-09-12T22:52:48.892004Z TRACE wasmtime::runtime::store::gc: ============ Begin GC ===========
+                  GC heap capacity = 0x00040000 bytes
+        last post-GC live-set size = 0x00000000 bytes
+               GC heap utilization = 0.00%
+2026-09-12T22:52:48.892120Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots
+2026-09-12T22:52:48.892159Z TRACE wasmtime::runtime::store::gc: Begin trace GC roots
+[message truncated]
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Sep 15 2026 at 21:08 UTC</p>
+</html>
