@@ -1,0 +1,196 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14347 Support embedder-provided CoW mem... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314347.20Support.20embedder-provided.20CoW.20mem.2E.2E.2E.html">wasmtime / issue #14347 Support embedder-provided CoW mem...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="624505110"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314347%20Support%20embedder-provided%20CoW%20mem.../near/624505110" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314347.20Support.20embedder-provided.20CoW.20mem.2E.2E.2E.html#624505110">(Sep 16 2026 at 01:36)</a>:</h4>
+<p>benjamincburns opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14347">issue #14347</a>:</p>
+<blockquote>
+<h4>Feature</h4>
+<p>Make it possible to initialize an instance's linear memory from an embedder-provided, file-backed CoW image, independently of the compiled module.</p>
+<h4>Benefit</h4>
+<p>I'm running largish (hundreds of MiB) pre-initialized modules using Wasmtime's copy-on-write memory initialization. My setup also uses lifecycle hooks, similar to AWS Lambda SnapStart. I call an init hook, let it do application-specific setup, then capture the resulting state.</p>
+<p>This saves initialization work, but increases the size of the pre-initialized module, increasing the time that cold requests spend faulting those pages into memory.</p>
+<p>I'd like to compile the module once, run the init hook while observing which code and linear-memory pages become resident, and capture the resulting linear memory separately. New instances would use that captured memory as their CoW initialization image, with the compiled code unchanged.</p>
+<p>That would let me prefetch the observed working set without recompiling and changing the layout I'm measuring. It also lets me pack the selected pages together on disk while preserving their guest addresses, for added prefetch efficiency.</p>
+<p>I can't find a public API for supplying that replacement memory image, which is why I'm requesting this feature.</p>
+<h4>Implementation</h4>
+<p>I have a Linux-specific proof-of-concept that installs an immutable file-backed image into an existing memory's CoW slot. It supports page-aligned extents mapping file offsets to linear-memory offsets, including images whose physical page order differs from their logical order.</p>
+<p>Obviously my proof-of-concept approach is less efficient than one that supplies the image on instantiation, that way we'd avoid redundant memory initialization work. All the same, here's a snippet showing use of the proof-of-concept. <code>CowMemoryImage</code> and <code>Memory::restore_cow_image</code> are my additions.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="c1">// snapshot_file contains the captured linear memory.</span>
+<span class="c1">// Its contents must remain unchanged while any image or instance uses it.</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">image</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">CowMemoryImage</span><span class="p">::</span><span class="n">from_file</span><span class="p">(</span><span class="n">snapshot_file</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">captured_length_bytes</span><span class="p">)</span><span class="o">?</span>
+<span class="p">};</span>
+
+<span class="c1">// `memory` belongs to a newly instantiated, idle `store`.</span>
+<span class="c1">// Grow it to the captured size before installing the image.</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">current_pages</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">memory</span><span class="p">.</span><span class="n">size</span><span class="p">(</span><span class="o">&amp;</span><span class="n">store</span><span class="p">);</span>
+<span class="k">if</span><span class="w"> </span><span class="n">captured_pages</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="n">current_pages</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">memory</span><span class="p">.</span><span class="n">grow</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="n">captured_pages</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">current_pages</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Err</span><span class="p">(</span><span class="n">error</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">memory</span><span class="p">.</span><span class="n">restore_cow_image</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">image</span><span class="p">)</span>
+<span class="p">}</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// The prototype does not promise an unchanged memory on failure.</span>
+<span class="w">    </span><span class="nb">drop</span><span class="p">(</span><span class="n">store</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nb">Err</span><span class="p">(</span><span class="n">error</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="c1">// Restore captured globals and other required instance state</span>
+<span class="c1">// before calling into the guest.</span>
+</code></pre></div>
+<p>I'm open to whatever alternative API you guys might prefer.</p>
+<p>The implementation needs to preserve memory limits, guard regions, private-write isolation and pooling-allocator reset behavior, with clear ownership and failure semantics.</p>
+<p>I'm only asking for the linear-memory mechanism here. Capture happens after the guest call returns. My embedding handles the other instance state and the prefetch policy.</p>
+<p>I haven't tested it yet, but I think I can accomplish a similar packing/prefetching scheme for code pages without modification to Wasmtime via <code>Module::deserialize_raw</code> and <code>CustomCodeMemory</code>. If that's not the case, I'll likely open a new ticket for a strategy to support a similar prefetch/packing scheme for code pages.</p>
+<h4>Alternatives</h4>
+<p>I couldn't think of any strong alternatives that don't remove some benefit offered by the above.</p>
+<p>Baking the captured memory into data segments and recompiling could work, provided I can map the linear-memory offsets into the final artifact. However, packing selected pages together would then require custom loading rather than using Wasmtime's normal file-loading path. Further, unless recompilation preserves the compiled code's layout, the code-page offsets collected during init would need a separate translation before I could use them for prefetching and packing.</p>
+<p>Copying the captured bytes into each new instance loses the sharing and demand-paging benefits of file-backed CoW initialization.</p>
+<p>I guess theoretically I could do something via <code>MemoryCreator</code>, but I'd have to bring my own CoW machinery, and it wouldn't directly support the pooling allocator we use.</p>
+</blockquote>
+
+
+
+<a name="624509205"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314347%20Support%20embedder-provided%20CoW%20mem.../near/624509205" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314347.20Support.20embedder-provided.20CoW.20mem.2E.2E.2E.html#624509205">(Sep 16 2026 at 02:07)</a>:</h4>
+<p>benjamincburns <a href="https://github.com/bytecodealliance/wasmtime/issues/14347#issuecomment-5690938265">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14347">issue #14347</a>:</p>
+<blockquote>
+<p>Ah I see in <a href="https://github.com/bytecodealliance/wasmtime/issues/12517#issuecomment-3855454102">https://github.com/bytecodealliance/wasmtime/issues/12517#issuecomment-3855454102</a> that the approach of supplying memory on init is likely not going to be acceptable due to the need to preserve wasm memory init semantics.</p>
+<p>And reading the comments further, I think the strategy in <a href="https://github.com/bytecodealliance/wasmtime/issues/12517#issuecomment-3861772348">this comment</a> could work for us, except we'd lose the further optimization of packing pre-fetched pages into a contiguous region of the file.</p>
+<p>I'll have to go searching to see if there's some mechanism we can use to control the layout of backing files on disk, and measure the effect of prefetching a contiguous region of the file again.</p>
+<p>I'll do some experiments and close this if the strategy works.</p>
+</blockquote>
+
+
+
+<a name="624509396"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314347%20Support%20embedder-provided%20CoW%20mem.../near/624509396" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314347.20Support.20embedder-provided.20CoW.20mem.2E.2E.2E.html#624509396">(Sep 16 2026 at 02:09)</a>:</h4>
+<p>benjamincburns edited <a href="https://github.com/bytecodealliance/wasmtime/issues/14347">issue #14347</a>:</p>
+<blockquote>
+<h4>Feature</h4>
+<p>Make it possible to initialize an instance's linear memory from an embedder-provided, file-backed CoW image, independently of the compiled module.</p>
+<h4>Benefit</h4>
+<p>I'm running largish (hundreds of MiB) pre-initialized modules using Wasmtime's copy-on-write memory initialization. My setup also uses lifecycle hooks, similar to AWS Lambda SnapStart. I call an init hook, let it do application-specific setup, then capture the resulting state.</p>
+<p>This saves initialization work, but increases the size of the pre-initialized module, increasing the time that cold requests spend faulting those pages into memory.</p>
+<p>I'd like to compile the module once, run the init hook while observing which code and linear-memory pages become resident, and capture the resulting linear memory separately. New instances would use that captured memory as their CoW initialization image, with the compiled code unchanged.</p>
+<p>That would let me prefetch the observed working set without recompiling and changing the layout I'm measuring. It also lets me pack the selected pages together on disk while preserving their guest addresses, for added prefetch efficiency.</p>
+<p>I can't find a public API for supplying that replacement memory image, which is why I'm requesting this feature.</p>
+<h4>Implementation</h4>
+<p>I have a Linux-specific proof-of-concept that installs an immutable file-backed image into an existing memory's CoW slot. It supports page-aligned extents mapping file offsets to linear-memory offsets, including images whose physical page order differs from their logical order.</p>
+<p>Obviously my proof-of-concept approach is less efficient than one that supplies the image on instantiation, that way we'd avoid redundant memory initialization work. All the same, here's a snippet showing use of the proof-of-concept. <code>CowMemoryImage</code> and <code>Memory::restore_cow_image</code> are my additions.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="c1">// snapshot_file contains the captured linear memory.</span>
+<span class="c1">// Its contents must remain unchanged while any image or instance uses it.</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">image</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">CowMemoryImage</span><span class="p">::</span><span class="n">from_file</span><span class="p">(</span><span class="n">snapshot_file</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">captured_length_bytes</span><span class="p">)</span><span class="o">?</span>
+<span class="p">};</span>
+
+<span class="c1">// `memory` belongs to a newly instantiated, idle `store`.</span>
+<span class="c1">// Grow it to the captured size before installing the image.</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">current_pages</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">memory</span><span class="p">.</span><span class="n">size</span><span class="p">(</span><span class="o">&amp;</span><span class="n">store</span><span class="p">);</span>
+<span class="k">if</span><span class="w"> </span><span class="n">captured_pages</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="n">current_pages</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">memory</span><span class="p">.</span><span class="n">grow</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="n">captured_pages</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">current_pages</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Err</span><span class="p">(</span><span class="n">error</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">memory</span><span class="p">.</span><span class="n">restore_cow_image</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">image</span><span class="p">)</span>
+<span class="p">}</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// The prototype does not promise an unchanged memory on failure.</span>
+<span class="w">    </span><span class="nb">drop</span><span class="p">(</span><span class="n">store</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nb">Err</span><span class="p">(</span><span class="n">error</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="c1">// Restore captured globals and other required instance state</span>
+<span class="c1">// before calling into the guest.</span>
+</code></pre></div>
+<p>I'm open to whatever alternative API you guys might prefer.</p>
+<p>I'm only asking for the linear-memory mechanism here. I haven't tested it yet, but I think I can accomplish a similar packing/prefetching scheme for code pages without modification to Wasmtime via <code>Module::deserialize_raw</code> and <code>CustomCodeMemory</code>. If that's not the case, I'll likely open a new ticket for a strategy to support a similar prefetch/packing scheme for code pages.</p>
+<h4>Alternatives</h4>
+<p>I couldn't think of any strong alternatives that don't remove some benefit offered by the above.</p>
+<p>Baking the captured memory into data segments and recompiling could work, provided I can map the linear-memory offsets into the final artifact. However, packing selected pages together would then require custom loading rather than using Wasmtime's normal file-loading path. Further, unless recompilation preserves the compiled code's layout, the code-page offsets collected during init would need a separate translation before I could use them for prefetching and packing.</p>
+<p>Copying the captured bytes into each new instance loses the sharing and demand-paging benefits of file-backed CoW initialization.</p>
+<p>I guess theoretically I could do something via <code>MemoryCreator</code>, but I'd have to bring my own CoW machinery, and it wouldn't directly support the pooling allocator we use.</p>
+</blockquote>
+
+
+
+<a name="624700654"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314347%20Support%20embedder-provided%20CoW%20mem.../near/624700654" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314347.20Support.20embedder-provided.20CoW.20mem.2E.2E.2E.html#624700654">(Sep 16 2026 at 16:34)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/14347#issuecomment-5700986817">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14347">issue #14347</a>:</p>
+<blockquote>
+<p>Reading over this I was about to basically say the same thing as the <a href="https://github.com/bytecodealliance/wasmtime/issues/12517#issuecomment-3861772348">comment you already linked</a>, and yeah if that works I think that would work best. Basically modeling situations as wasm primitives is generally far easier to support and reason about where possible.</p>
+<p>If this problem is reduced to a storage issue of where the pages are source from though that's where I think we could consider adding something. So long as wasm semantics are preserved we've got a lot of leeway of how exactly they're implemented, for example if you wanted to provide a custom CoW image we'd internally verify the image matches the wasm module and could then tweak things internally. Basically storage options are flexible and optimizations as well so long as it's always framed within the context of preserving preexisting wasm semantics.</p>
+</blockquote>
+
+
+
+<a name="625101410"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314347%20Support%20embedder-provided%20CoW%20mem.../near/625101410" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314347.20Support.20embedder-provided.20CoW.20mem.2E.2E.2E.html#625101410">(Sep 17 2026 at 22:57)</a>:</h4>
+<p>benjamincburns <a href="https://github.com/bytecodealliance/wasmtime/issues/14347#issuecomment-5722319573">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14347">issue #14347</a>:</p>
+<blockquote>
+<p>@alexcrichton I think for the moment I won't have the time to run those experiments, but on further reflection I don't think it will perform as well as the scheme I'm already running. In particular, I'm not sure whether I'd be able to combine this with the learned prefetch optimisation as described above, and even if I do figure that out, I worry that the extra step on initialisation would offset the performance improvement that I'd see from prefetching.</p>
+<p>If you guys are open to allowing captured CoW images on init, that would also be much easier to consume and implement vs a custom memory importing scheme, and I suspect that it will perform better (at least in my case), so long as the validation steps you mentioned weren't particularly onerous.</p>
+<p>We're doing some structural checking when loading the memory image (dimensions, alignment, bounds, coverage), if that's what you had in mind? We also rely on a cryptographic signature and fs-verity in prod to ensure the authenticity and integrity of our serialized guest template bundle at time of registration and time of use, but I'd imagine that's likely well beyond what you were thinking.</p>
+<p>All of that is to say, if you were thinking that wasmtime would own the serialization format for these images, I'd just ask that it be extensible and/or support embedder-defined extent mappings so that we can pack prefetched pages in to a contiguous region of the file.</p>
+</blockquote>
+
+
+
+<a name="625101451"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314347%20Support%20embedder-provided%20CoW%20mem.../near/625101451" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314347.20Support.20embedder-provided.20CoW.20mem.2E.2E.2E.html#625101451">(Sep 17 2026 at 22:57)</a>:</h4>
+<p>benjamincburns edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/14347#issuecomment-5722319573">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14347">issue #14347</a>:</p>
+<blockquote>
+<p>@alexcrichton I think for the moment I won't have the time to run those experiments, but on further reflection I don't think it will perform as well as the scheme I'm already running. In particular, I'm not sure whether I'd be able to combine this with the learned prefetch optimisation as described above, and even if I do figure that out, I worry that the extra step on initialization would offset the performance improvement that I'd see from prefetching.</p>
+<p>If you guys are open to allowing captured CoW images on init, that would also be much easier to consume and implement vs a custom memory importing scheme, and I suspect that it will perform better (at least in my case), so long as the validation steps you mentioned weren't particularly onerous.</p>
+<p>We're doing some structural checking when loading the memory image (dimensions, alignment, bounds, coverage), if that's what you had in mind? We also rely on a cryptographic signature and fs-verity in prod to ensure the authenticity and integrity of our serialized guest template bundle at time of registration and time of use, but I'd imagine that's likely well beyond what you were thinking.</p>
+<p>All of that is to say, if you were thinking that wasmtime would own the serialization format for these images, I'd just ask that it be extensible and/or support embedder-defined extent mappings so that we can pack prefetched pages in to a contiguous region of the file.</p>
+</blockquote>
+
+
+
+<a name="625101476"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314347%20Support%20embedder-provided%20CoW%20mem.../near/625101476" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314347.20Support.20embedder-provided.20CoW.20mem.2E.2E.2E.html#625101476">(Sep 17 2026 at 22:57)</a>:</h4>
+<p>benjamincburns edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/14347#issuecomment-5722319573">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14347">issue #14347</a>:</p>
+<blockquote>
+<p>@alexcrichton I think for the moment I won't have the time to run those experiments, but on further reflection I don't think it will perform as well as the scheme I'm already running. In particular, I'm not sure whether I'd be able to combine this with the learned prefetch optimisation as described above, and even if I do figure that out, I worry that the extra step on activation would offset the performance improvement that I'd see from prefetching.</p>
+<p>If you guys are open to allowing captured CoW images on init, that would also be much easier to consume and implement vs a custom memory importing scheme, and I suspect that it will perform better (at least in my case), so long as the validation steps you mentioned weren't particularly onerous.</p>
+<p>We're doing some structural checking when loading the memory image (dimensions, alignment, bounds, coverage), if that's what you had in mind? We also rely on a cryptographic signature and fs-verity in prod to ensure the authenticity and integrity of our serialized guest template bundle at time of registration and time of use, but I'd imagine that's likely well beyond what you were thinking.</p>
+<p>All of that is to say, if you were thinking that wasmtime would own the serialization format for these images, I'd just ask that it be extensible and/or support embedder-defined extent mappings so that we can pack prefetched pages in to a contiguous region of the file.</p>
+</blockquote>
+
+
+
+<a name="625101623"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314347%20Support%20embedder-provided%20CoW%20mem.../near/625101623" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314347.20Support.20embedder-provided.20CoW.20mem.2E.2E.2E.html#625101623">(Sep 17 2026 at 22:59)</a>:</h4>
+<p>benjamincburns edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/14347#issuecomment-5722319573">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14347">issue #14347</a>:</p>
+<blockquote>
+<p>@alexcrichton I think for the moment I won't have the time to run those experiments, but on further reflection I don't think it will perform as well as the scheme I'm already running. In particular, I'm not sure whether I'd be able to combine this with the learned prefetch optimisation as described above, and even if I do figure that out, I worry that the extra step on activation would offset the performance improvement that I'd see from prefetching.</p>
+<p>If you guys are open to allowing captured CoW images on init, by allowing for embedders to define where the pages are sourced from, I think that would be much easier to consume and implement vs a custom memory importing scheme, and I suspect that it will perform better (at least in my case), so long as the validation steps you mentioned weren't particularly onerous.</p>
+<p>We're doing some structural checking when loading the memory image (dimensions, alignment, bounds, coverage), if that's what you had in mind? We also rely on a cryptographic signature and fs-verity in prod to ensure the authenticity and integrity of our serialized guest template bundle at time of registration and time of use, but I'd imagine that's likely well beyond what you were thinking.</p>
+<p>All of that is to say, if you were thinking that wasmtime would own the serialization format for these images, I'd just ask that it be extensible and/or support embedder-defined extent mappings so that we can pack prefetched pages in to a contiguous region of the file.</p>
+</blockquote>
+
+
+
+<a name="625286116"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314347%20Support%20embedder-provided%20CoW%20mem.../near/625286116" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314347.20Support.20embedder-provided.20CoW.20mem.2E.2E.2E.html#625286116">(Sep 18 2026 at 16:20)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/14347#issuecomment-5732887373">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14347">issue #14347</a>:</p>
+<blockquote>
+<p>How exactly this would get added to Wasmtime I'm not entirely sure, what I was vaguely envisioning is that given a component or module during deserialization/compilation you'd provide some sort of "ok but use the data segments from this fd" or something like that, probably specified as some sort of set of fds and offsets. Given that Wasmtime would verify the contents of those fds against the actual data segments expected and then go from there. Or... something like that, it's all pretty vague and nebulous and I'm not sure if it'd work out.</p>
+<p>Overall though this feature is definitely something that we're going to want to have in one form or another at some point. Historically the use case I've heard of for this is an interpreted language (e.g. JS) which has an initial interpreter/memory snapshot. Wizening would then load an application, and then the final heap snapshot is in theory a smaller diff from the original snapshot than the entire snapshot. Beyond historical discussions of "we probably want layers" there hasn't been much discussion of how exactly to implement such a feature and/or model it. For example Wasmtime supports separately compiled code and memory insofar as components can import modules, but beyond that the support is pretty limited. Wasmtime won't do any sort of layering/sharing data sections across components.</p>
+<p>In the end though I personally still think this is something we're going to want to model as wasms overall. That'll require engine changes to fit the performance profile regardless, but without changing the wasm toolchain/pipeline I think there's limited options available to Wasmtime in terms of optimizations.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Sep 19 2026 at 19:05 UTC</p>
+</html>

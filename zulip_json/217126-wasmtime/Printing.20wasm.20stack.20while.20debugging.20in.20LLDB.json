@@ -1,0 +1,104 @@
+[
+    {
+        "content": "<p>I have tried debugging according to <a href=\"https://docs.wasmtime.dev/examples-debugging-guest.html\">https://docs.wasmtime.dev/examples-debugging-guest.html</a> . It seems to work - I can attach the LLDB, step though instructions, inspect memory using <code>x/8</code>. But how do I inspect the operand stack?</p>\n<p>For example, if I'm at \"call\" in</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"w\">    </span><span class=\"mh\">0x40000000000000b9</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"kt\">i32</span><span class=\"p\">.</span><span class=\"k\">const</span><span class=\"w\"> </span><span class=\"mi\">1</span>\n<span class=\"w\">    </span><span class=\"mh\">0x40000000000000bb</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"kt\">i32</span><span class=\"p\">.</span><span class=\"k\">const</span><span class=\"w\"> </span><span class=\"mi\">0</span>\n<span class=\"w\">    </span><span class=\"mh\">0x40000000000000bd</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">call</span><span class=\"w\">   </span><span class=\"mi\">0</span>\n</code></pre></div>\n<p>how do I see that \"1\" and \"0\" that are currently in the stack and then see what call put to stack after returning?</p>",
+        "id": 615398704,
+        "sender_full_name": "_Vi",
+        "timestamp": 1786227461
+    },
+    {
+        "content": "<p>That support is missing in LLDB. The underlying protocol that we implement can provide the information (and LLDB uses it to get the data needed to print locals, etc) but LLDB's UI has no command for it</p>",
+        "id": 615399098,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1786227878
+    },
+    {
+        "content": "<p>We could in theory also support an alternative environment (rendered through DAP) that gives a raw machine-level view; I haven't had time to do that but contributions welcome (the debug-component APIs should provide everything needed)</p>",
+        "id": 615399140,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1786227916
+    },
+    {
+        "content": "<p>Is there a hack like using <code>x</code>on some magical address that will reveal the stack, like {the <code>0x40000000000000a7</code> that consistently contains the code for _start}, but for the stack?</p>\n<p>Is there other, non-LLDB or non-Wasmtime debugging experience for WASI with everything implemented?</p>",
+        "id": 615399875,
+        "sender_full_name": "_Vi",
+        "timestamp": 1786228599
+    },
+    {
+        "content": "<p>no and no, as far as I know; the right way to do this would be to either implement the extensions in LLDB's Wasm machine model to understand the stack and expose it as printable state (not too hard) or build our own Wasm-native debugging stack (very hard)</p>",
+        "id": 615400028,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1786228739
+    },
+    {
+        "content": "<p>Update for this thread: we've built this. Hexana 0.18 (JetBrains IDEs, free) shows the live operand stack during Wasm debugging: stop at an instruction, see the actual stack-machine values, step and watch them change. Works in LLDB sessions against Wasmtime/WAMR and in Node.js over CDP. Details: <a href=\"https://bsky.app/profile/minamoto79.bsky.social/post/3mthexkw6ns2b\">https://bsky.app/profile/minamoto79.bsky.social/post/3mthexkw6ns2b</a></p>\n<p>Chris's read was exactly right: the protocol has the data, the missing piece was the UI layer. Thanks to this thread for the nudge, _Vi's question moved it up our list. If it misbehaves on your modules, that's the feedback we want.</p>",
+        "id": 617527309,
+        "sender_full_name": "Vasily Levchenko",
+        "timestamp": 1787166021
+    },
+    {
+        "content": "<p><span class=\"user-mention\" data-user-id=\"1179392\">@Vasily Levchenko</span> pretty cool; are you contributing the enhancements upstream to LLDB?</p>",
+        "id": 617527763,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1787166147
+    },
+    {
+        "content": "<p>(Or does your UI get at the low-level connection directly and bypass LLDB somehow?)</p>",
+        "id": 617527842,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1787166165
+    },
+    {
+        "content": "<p>@Chris Fallin we didn't change lldb, we're using WebAssembly extension of gdb protocol. It looks like packet family: qWasmCallStack, qWasmLocal, qWasmGlobal, qWasmStackValue is enough  to get all required information.</p>",
+        "id": 617530771,
+        "sender_full_name": "Vasily Levchenko",
+        "timestamp": 1787167014
+    },
+    {
+        "content": "<p>Yes, LLDB supports the Wasm extensions and it's what we recommend using with Wasmtime. You mention \"works in LLDB sessions against Wasmtime\" which is why I'm assuming you've made some changes to LLDB to support printing the value stack</p>",
+        "id": 617532795,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1787167704
+    },
+    {
+        "content": "<p>LLDB knows about those commands and uses them, including to evaluate source-level locals, but doesn't have UI-layer support to invoke them directly and (e.g.) print the value stack</p>",
+        "id": 617532936,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1787167750
+    },
+    {
+        "content": "<p>We send commands like:</p>\n<blockquote>\n<p>(lldb) process plugin packet send qWasmStackValue:0;0<br>\n  packet: qWasmStackValue:0;0<br>\nresponse: f0ff0f00</p>\n</blockquote>\n<p>and decode the value basing on type information we've parsed from debug information from dwarf sections.</p>",
+        "id": 617540284,
+        "sender_full_name": "Vasily Levchenko",
+        "timestamp": 1787170173
+    },
+    {
+        "content": "<p>Ah, gotcha, so there's backdoor access via LLDB itself. Interesting, thanks! Would be great if someone wired this up to something akin to <code>info registers</code> (e.g., <code>info wasm-stack</code> and <code>info wasm-locals</code>) for native CLI debugger users</p>",
+        "id": 617540626,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1787170289
+    },
+    {
+        "content": "<p>yeah that would be great <span aria-label=\"slight smile\" class=\"emoji emoji-1f642\" role=\"img\" title=\"slight smile\">:slight_smile:</span></p>",
+        "id": 617541425,
+        "sender_full_name": "Vasily Levchenko",
+        "timestamp": 1787170567
+    },
+    {
+        "content": "<p>So the answer to \"Is there a hack like using <code>x</code> on some magical address that will reveal the stack...?\" question back there was actually \"yes\" rather than \"no\" - <br>\nI have checked that <code>process plugin packet send qWasmStackValue:0;0</code> indeed allows you to inspect the data stack - it shows <code>UNIMPLEMENTED</code> if the stack is empty and the little-endian representation of the value if not. <br>\nYou can change the final <code>0</code> to other number to dig deeper into the stack.<br>\nI also see <code>process plugin packet send qWasmGlobal:0;5</code> and <code>qWasmLocal</code> working and giving me the thing I was interested in.</p>\n<p>Shall those tricks be documented somewhere (e.g. on <a href=\"https://docs.wasmtime.dev/examples-debugging-guest.html\">examples-debugging-guest.html</a>) until proper support rolls in?</p>",
+        "id": 617562661,
+        "sender_full_name": "_Vi",
+        "timestamp": 1787179526
+    },
+    {
+        "content": "<blockquote>\n<p>Shall those tricks be documented somewhere (e.g. on <a href=\"https://docs.wasmtime.dev/examples-debugging-guest.html\">examples-debugging-guest.html</a>) until proper support rolls in?</p>\n</blockquote>\n<p>Probably not; I'm happy it worked for the above use-case and maybe it makes sense for a UI to use this backdoor but I would not advise users to manually send raw gdbstub packets -- it would be far too easy to desync the connection / get it into a bad state</p>",
+        "id": 617563287,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1787179940
+    },
+    {
+        "content": "<p>Anyone who wants this in LLDB should file a feature request upstream (on the LLVM repo)</p>",
+        "id": 617563346,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1787179972
+    }
+]

@@ -1,0 +1,142 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #14350 `component`: Defer host task creation · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314350.20.60component.60.3A.20Defer.20host.20task.20creation.html">wasmtime / PR #14350 `component`: Defer host task creation</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="624758973"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314350%20%60component%60%3A%20Defer%20host%20task%20creation/near/624758973" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314350.20.60component.60.3A.20Defer.20host.20task.20creation.html#624758973">(Sep 16 2026 at 19:56)</a>:</h4>
+<p>adamrk opened <a href="https://github.com/bytecodealliance/wasmtime/pull/14350">PR #14350</a> from <code>adamrk:abk/deferred-host-task</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>Defer creation of a <code>HostTask</code> and insertion of it in the <code>Store</code> until it is required. This is an optimization on wasm-&gt;host calls where the <code>HostTask</code> may not actually be needed. The <code>HostTask</code> is materialized if the host future actually suspends (doesn't return <code>Ready</code> on the first poll), or if it tries to lower a borrowed resource (which requires inserting its <code>CallContext</code> into the <code>Store</code> to get a persistent identifier for it).</p>
+<p>The work is separated into 3 commits:</p>
+<ul>
+<li>Add benchmarks for nop wasm-&gt;host calls that pass a borrow and where the host suspends before returning.</li>
+<li>Make the <code>u32</code> identifier for <code>CallContext</code>s an proper enum</li>
+<li>The actual change of deferring <code>HostTask</code> creation.</li>
+</ul>
+<p>These are the changes I see in the wasm-&gt;host benchmarks:<br>
+Baseline benchmarks:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">component</span><span class="o">-</span><span class="k">async</span><span class="o">/</span><span class="n">wasm</span><span class="o">-</span><span class="n">to</span><span class="o">-</span><span class="n">host</span>
+<span class="w">                        </span><span class="n">time</span><span class="p">:</span><span class="w">   </span><span class="p">[</span><span class="mf">354.02</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="mf">366.83</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="mf">380.05</span><span class="w"> </span><span class="n">ns</span><span class="p">]</span>
+<span class="n">component</span><span class="o">-</span><span class="k">async</span><span class="o">/</span><span class="n">wasm</span><span class="o">-</span><span class="n">to</span><span class="o">-</span><span class="n">host</span><span class="o">-</span><span class="n">borrow</span>
+<span class="w">                        </span><span class="n">time</span><span class="p">:</span><span class="w">   </span><span class="p">[</span><span class="mf">462.76</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="mf">479.96</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="mf">497.66</span><span class="w"> </span><span class="n">ns</span><span class="p">]</span>
+<span class="n">component</span><span class="o">-</span><span class="k">async</span><span class="o">/</span><span class="n">wasm</span><span class="o">-</span><span class="n">to</span><span class="o">-</span><span class="n">host</span><span class="o">-</span><span class="n">pending</span><span class="o">-</span><span class="n">once</span>
+<span class="w">                        </span><span class="n">time</span><span class="p">:</span><span class="w">   </span><span class="p">[</span><span class="mf">2.5383</span><span class="w"> </span><span class="err">µ</span><span class="n">s</span><span class="w"> </span><span class="mf">2.6139</span><span class="w"> </span><span class="err">µ</span><span class="n">s</span><span class="w"> </span><span class="mf">2.6873</span><span class="w"> </span><span class="err">µ</span><span class="n">s</span><span class="p">]</span>
+</code></pre></div>
+<p>With changes:</p>
+<p><div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">component</span><span class="o">-</span><span class="k">async</span><span class="o">/</span><span class="n">wasm</span><span class="o">-</span><span class="n">to</span><span class="o">-</span><span class="n">host</span>
+<span class="w">                        </span><span class="n">time</span><span class="p">:</span><span class="w">   </span><span class="p">[</span><span class="mf">283.83</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="mf">296.05</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="mf">308.65</span><span class="w"> </span><span class="n">ns</span><span class="p">]</span>
+<span class="w">                        </span><span class="n">change</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="err">−</span><span class="mf">21.162</span><span class="o">%</span><span class="w"> </span><span class="err">−</span><span class="mf">17.822</span><span class="o">%</span><span class="w"> </span><span class="err">−</span><span class="mf">14.374</span><span class="o">%</span><span class="p">]</span><span class="w"> </span><span class="p">(</span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0.00</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mf">0.05</span><span class="p">)</span>
+<span class="w">                        </span><span class="n">Performance</span><span class="w"> </span><span class="n">has</span><span class="w"> </span><span class="n">improved</span><span class="p">.</span>
+<span class="n">component</span><span class="o">-</span><span class="k">async</span><span class="o">/</span><span class="n">wasm</span><span class="o">-</span><span class="n">to</span><span class="o">-</span><span class="n">host</span><span class="o">-</span><span class="n">borrow</span>
+<span class="w">                        </span><span class="n">time</span><span class="p">:</span><span class="w">   </span><span class="p">[</span><span class="mf">377.80</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="mf">392.33</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="mf">406.01</span><span class="w"> </span><span class="n">ns</span><span class="p">]</span>
+<span class="w">                        </span><span class="n">change</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="err">−</span><span class="mf">31.982</span><span class="o">%</span><span class="w"> </span><span class="err">−</span><span class="mf">29.587</span><span class="o">%</span><span class="w"> </span><span class="err">−</span><span class="mf">26.924</span><span class="o">%</span><span class="p">]</span><span class="w"> </span><span class="p">(</span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0.00</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mf">0.05</span><span class="p">)</span>
+<span class="w">                        </span><span class="n">Performance</span><span class="w"> </span><span class="n">has</span><span class="w"> </span><span class="n">improved</span><span class="p">.</span>
+<span class="n">component</span><span class="o">-</span><span class="k">async</span><span class="o">/</span><span class="n">wasm</span><span class="o">-</span><span class="n">to</span><span class="o">-</span><span class="n">host</span><span class="o">-</span><span class="n">pending</span><span class="o">-</span><span class="n">once</span>
+<span class="w">                        </span><span class="n">time</span><span class="p">:</span><span class="w">   </span><span class="p">[</span><span class="mf">2.4307</span><span class="w"> </span><span class="err">µ</span><span class="n">s</span><span class="w"> </span><span class="mf">2.5107</span><span class="w"> </span><span class="err">µ</span><span class="n">s</span><span class="w"> </span><span class="mf">2.5932</span><span class="w"> </span><span class="err">µ</span><span class="n">s</span><span class="p">]</span>
+<span class="w">                        </span><span class="n">change</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="err">−</span><span class="mf">3.0505</span><span class="o">%</span><span class="w"> </span><span class="o">+</span><span class="mf">0.1437</span><span class="o">%</span><span class="w"> </span><span class="o">+</span><span class="mf">3.5901</span><span class="o">%</span><span class="p">]</span><span class="w"> </span><span class="p">(</span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0.94</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mf">0.05</span><span class="p">)</span>
+<span class="w">                        </span><span class="n">No</span><span class="w"> </span><span class="n">change</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">performance</span><span class="w"> </span><span class="n">detected</span><span class="p">.</span>
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="624778689"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314350%20%60component%60%3A%20Defer%20host%20task%20creation/near/624778689" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314350.20.60component.60.3A.20Defer.20host.20task.20creation.html#624778689">(Sep 16 2026 at 21:44)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14350">PR #14350</a>.</p>
+
+
+
+<a name="624940003"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314350%20%60component%60%3A%20Defer%20host%20task%20creation/near/624940003" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314350.20.60component.60.3A.20Defer.20host.20task.20creation.html#624940003">(Sep 17 2026 at 12:35)</a>:</h4>
+<p>adamrk updated <a href="https://github.com/bytecodealliance/wasmtime/pull/14350">PR #14350</a>.</p>
+
+
+
+<a name="624968394"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314350%20%60component%60%3A%20Defer%20host%20task%20creation/near/624968394" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314350.20.60component.60.3A.20Defer.20host.20task.20creation.html#624968394">(Sep 17 2026 at 13:07)</a>:</h4>
+<p>adamrk updated <a href="https://github.com/bytecodealliance/wasmtime/pull/14350">PR #14350</a>.</p>
+
+
+
+<a name="625005106"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314350%20%60component%60%3A%20Defer%20host%20task%20creation/near/625005106" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314350.20.60component.60.3A.20Defer.20host.20task.20creation.html#625005106">(Sep 17 2026 at 15:14)</a>:</h4>
+<p>adamrk updated <a href="https://github.com/bytecodealliance/wasmtime/pull/14350">PR #14350</a>.</p>
+
+
+
+<a name="625017252"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314350%20%60component%60%3A%20Defer%20host%20task%20creation/near/625017252" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314350.20.60component.60.3A.20Defer.20host.20task.20creation.html#625017252">(Sep 17 2026 at 16:00)</a>:</h4>
+<p>adamrk has marked <a href="https://github.com/bytecodealliance/wasmtime/pull/14350">PR #14350</a> as ready for review.</p>
+
+
+
+<a name="625017258"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314350%20%60component%60%3A%20Defer%20host%20task%20creation/near/625017258" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314350.20.60component.60.3A.20Defer.20host.20task.20creation.html#625017258">(Sep 17 2026 at 16:00)</a>:</h4>
+<p>adamrk requested <a href="https://github.com/dicej">dicej</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14350">PR #14350</a>.</p>
+
+
+
+<a name="625017259"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314350%20%60component%60%3A%20Defer%20host%20task%20creation/near/625017259" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314350.20.60component.60.3A.20Defer.20host.20task.20creation.html#625017259">(Sep 17 2026 at 16:00)</a>:</h4>
+<p>adamrk requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14350">PR #14350</a>.</p>
+
+
+
+<a name="625017260"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314350%20%60component%60%3A%20Defer%20host%20task%20creation/near/625017260" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314350.20.60component.60.3A.20Defer.20host.20task.20creation.html#625017260">(Sep 17 2026 at 16:00)</a>:</h4>
+<p>adamrk requested <a href="https://github.com/alexcrichton">alexcrichton</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14350">PR #14350</a>.</p>
+
+
+
+<a name="625017263"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314350%20%60component%60%3A%20Defer%20host%20task%20creation/near/625017263" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314350.20.60component.60.3A.20Defer.20host.20task.20creation.html#625017263">(Sep 17 2026 at 16:00)</a>:</h4>
+<p>adamrk requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-default-reviewers">wasmtime-default-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14350">PR #14350</a>.</p>
+
+
+
+<a name="625069006"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314350%20%60component%60%3A%20Defer%20host%20task%20creation/near/625069006" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314350.20.60component.60.3A.20Defer.20host.20task.20creation.html#625069006">(Sep 17 2026 at 19:42)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14350#pullrequestreview-5240583187">PR review</a>:</p>
+<blockquote>
+<p>Some great wins, thanks!</p>
+</blockquote>
+
+
+
+<a name="625069009"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314350%20%60component%60%3A%20Defer%20host%20task%20creation/near/625069009" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314350.20.60component.60.3A.20Defer.20host.20task.20creation.html#625069009">(Sep 17 2026 at 19:42)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14350#discussion_r4040759808">PR review comment</a>:</p>
+<blockquote>
+<p>Could this be moved into <code>host_task_create</code>? To the extent that <code>set_thread</code> is a somewhat-hot function and I think that's the only caller which would otherwise trigger this, it might help keep this function a bit leaner to move it over there. That might mess up and/or require moving around some debug assertions though</p>
+</blockquote>
+
+
+
+<a name="625069010"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314350%20%60component%60%3A%20Defer%20host%20task%20creation/near/625069010" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314350.20.60component.60.3A.20Defer.20host.20task.20creation.html#625069010">(Sep 17 2026 at 19:42)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14350#discussion_r4040749252">PR review comment</a>:</p>
+<blockquote>
+<p>Could you add a debug-assert on this branch that <code>materialized_task</code> is <code>None</code>?</p>
+</blockquote>
+
+
+
+<a name="625069011"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314350%20%60component%60%3A%20Defer%20host%20task%20creation/near/625069011" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314350.20.60component.60.3A.20Defer.20host.20task.20creation.html#625069011">(Sep 17 2026 at 19:42)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14350#discussion_r4040765949">PR review comment</a>:</p>
+<blockquote>
+<p>And, similarly, for handling <code>deferred_host_call_context</code> getting cleared above, could that move into the <code>first_poll</code> function or similar?</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Sep 19 2026 at 19:05 UTC</p>
+</html>

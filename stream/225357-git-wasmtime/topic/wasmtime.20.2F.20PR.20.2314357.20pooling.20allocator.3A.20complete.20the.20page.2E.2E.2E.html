@@ -1,0 +1,98 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #14357 pooling allocator: complete the page... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html">wasmtime / PR #14357 pooling allocator: complete the page...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="625374473"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/625374473" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#625374473">(Sep 19 2026 at 02:38)</a>:</h4>
+<p>HasanH47 opened <a href="https://github.com/bytecodealliance/wasmtime/pull/14357">PR #14357</a> from <code>HasanH47:pagemap-reset-complete-traversal</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p><code>reset_with_pagemap</code> collects dirty regions into a stack buffer of 32 and<br>
+treats the kernel's <code>walk_end</code> as the end of the memory it will ever reset<br>
+in place: everything after it is decommitted with <code>madvise(DONTNEED)</code>.</p>
+<p>Two consequences we hit running a QuickJS-based guest with a fresh<br>
+instance per request (pooling allocator, <code>memory_init_cow</code>, <code>pagemap_scan</code>):</p>
+<ol>
+<li>
+<p><strong>Throughput.</strong> A JS heap dirties far more than 32 disjoint runs, so<br>
+   the scan stopped early on every reset and the rest of the heap was<br>
+   decommitted. Each new instance then re-faulted its heap (95–315 minor<br>
+   faults per request measured with <code>perf stat</code>), and the <code>madvise</code> +<br>
+<code>mprotect</code> storm capped multi-core scaling with TLB-shootdown IPIs.<br>
+   Resuming the scan from <code>walk_end</code> whenever the buffer filled, and<br>
+   stopping early only when the <code>keep_resident</code> page budget is spent (which<br>
+   is what <code>walk_end</code> is for), brought a request from 2.1 ms to 1.0 ms on<br>
+   one core and ×5 at 16 concurrent instances on a 16-core host, with 0<br>
+   faults per request.</p>
+</li>
+<li>
+<p><strong>Freshness.</strong> The mask requires <code>PRESENT</code>. A dirty page the kernel has<br>
+   swapped out is <code>WRITTEN | SWAPPED</code>, not <code>PRESENT</code>; it is neither reset in<br>
+   place nor decommitted (it sits before <code>walk_end</code>), so the next instance in<br>
+   the slot reads the previous instance's bytes. We reproduced this with a<br>
+   swapfile and <code>MADV_PAGEOUT</code> between two instantiations of the same slot:<br>
+   the second instance observed the first's heap and trapped in the<br>
+   allocator. Requiring <code>WRITTEN</code> and not <code>PFNZERO</code>/<code>FILE</code> regardless of<br>
+   residency fixes it — resetting a swapped page pages it in and overwrites<br>
+   it, which is the cost of correctness. With 32 regions the accidental<br>
+   decommit of everything after <code>walk_end</code> hid most of this; with a complete<br>
+   traversal it would be exposed on every host with swap, so the two changes<br>
+   belong together.</p>
+</li>
+</ol>
+<p>The patch keeps the fixed stack buffer (64 regions) and loops the ioctl,<br>
+so there is still no allocation on the reset path. Unit tests in<br>
+<code>pagemap.rs</code> (they skip where <code>PAGEMAP_SCAN</code> is unavailable):</p>
+<ul>
+<li>
+<p><code>reset_resumes_past_the_region_buffer</code>: 200 disjoint dirty pages in a<br>
+  400-page mapping, <code>keep_resident</code> = everything — all 200 reset in place,<br>
+  nothing decommitted, the mapping reads zero;</p>
+</li>
+<li>
+<p><code>reset_stops_at_the_page_budget</code>: same mapping, <code>keep_resident</code> = 100<br>
+  pages — exactly 100 reset, the rest decommitted;</p>
+</li>
+<li>
+<p><code>reset_covers_dirty_pages_that_were_paged_out</code>: 64 dirty pages,<br>
+<code>MADV_PAGEOUT</code>, then the reset — every page reset (on a host with swap<br>
+  this fails with the old <code>PRESENT</code> mask; elsewhere it is the ordinary<br>
+  reset).</p>
+</li>
+</ul>
+</blockquote>
+
+
+
+<a name="625374475"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/625374475" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#625374475">(Sep 19 2026 at 02:38)</a>:</h4>
+<p>HasanH47 requested <a href="https://github.com/dicej">dicej</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14357">PR #14357</a>.</p>
+
+
+
+<a name="625374476"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/625374476" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#625374476">(Sep 19 2026 at 02:38)</a>:</h4>
+<p>HasanH47 requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14357">PR #14357</a>.</p>
+
+
+
+<a name="625375613"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/625375613" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#625375613">(Sep 19 2026 at 02:56)</a>:</h4>
+<p>HasanH47 updated <a href="https://github.com/bytecodealliance/wasmtime/pull/14357">PR #14357</a>.</p>
+
+
+
+<a name="625383384"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/625383384" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#625383384">(Sep 19 2026 at 04:46)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14357">PR #14357</a>.</p>
+
+
+
+<hr><p>Last updated: Sep 19 2026 at 19:05 UTC</p>
+</html>
