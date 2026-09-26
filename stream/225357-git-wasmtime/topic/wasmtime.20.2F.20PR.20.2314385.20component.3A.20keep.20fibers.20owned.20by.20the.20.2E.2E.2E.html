@@ -1,0 +1,208 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #14385 component: keep fibers owned by the ... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314385.20component.3A.20keep.20fibers.20owned.20by.20the.20.2E.2E.2E.html">wasmtime / PR #14385 component: keep fibers owned by the ...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="626280306"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314385%20component%3A%20keep%20fibers%20owned%20by%20the%20.../near/626280306" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314385.20component.3A.20keep.20fibers.20owned.20by.20the.20.2E.2E.2E.html#626280306">(Sep 23 2026 at 10:35)</a>:</h4>
+<p>Byte-Naut opened <a href="https://github.com/bytecodealliance/wasmtime/pull/14385">PR #14385</a> from <code>Byte-Naut:issue-14241</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>Part of #14241.</p>
+<h2>Motivation</h2>
+<p>While reviewing #14146, @alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/14146#discussion_r3883919087">pointed out</a> that many places in <code>concurrent.rs</code> have a live fiber in scope across a <code>?</code>. These only fail when an internal invariant is already broken, but if one did, the unfinished fiber would be dropped and <code>StoreFiber</code>'s <code>Drop</code> would panic, turning a trap or <code>bail_bug!</code> into a process abort. @dicej filed #14241 to track this and described the two safe options: keep the fiber owned by the store, or hold it in an RAII guard that disposes of it through the store.</p>
+<p>This PR applies those two options to the handoffs I found in <code>concurrent.rs</code>.</p>
+<h2>Changes</h2>
+<ul>
+<li><code>resume_fiber</code> and <code>run_on_worker</code>: hold the fiber in a small private <code>DisposeFiber</code> guard until it reaches its destination, so an early return disposes of it through the existing <code>StoreFiber::dispose</code>. In the <code>Yielding</code> and <code>ExplicitlySuspending</code> arms the thread lookup now happens before the fiber is taken; previously the right-hand side of the assignment took the fiber first. The two waiter arms use <code>Entry</code> so the fiber only moves into a vacant slot.</li>
+<li><code>Waitable::mark_ready</code>: do the fallible lookups while the waiter is still in its set, and only remove it once its destination has been checked.</li>
+<li><code>set_switch_item</code>: if the slot is already occupied, push the incoming item onto the high-priority queue before the existing <code>bail_bug!</code>, so the store still owns its fiber.</li>
+<li><code>handle_work_item</code> (<code>ResumeThread</code>) and <code>subtask_cancel</code>: put the fiber-owning state back before the existing <code>bail_bug!</code>s.</li>
+<li><code>resume_thread</code>: reuse the already-borrowed <code>ConcurrentState</code> instead of looking it up again after taking the fiber.</li>
+</ul>
+<p>Not changed: happy-path scheduling, error values and messages, the panic for duplicate waiters, and the assertion in <code>StoreFiber::drop</code> for fibers that were never disposed. There are no public API changes. About 200 of the added lines are tests.</p>
+<h2>Design</h2>
+<p><code>DisposeFiber</code> follows the same pattern as the existing <code>Dispose</code> guard in <code>poll_until</code> and the <code>Drop</code> impl of <code>FiberFuture</code>: it calls <code>StoreFiber::dispose</code> only if the fiber has not been handed off yet. Elsewhere the fix is a reordering so that the fiber is taken last, which avoids adding a guard where the lookup can simply happen first.</p>
+<p>One thing worth calling out for review: when <code>set_switch_item</code> finds the slot occupied, the incoming item goes to <code>high_priority</code> only so that it is disposed of with the store. The <code>bail_bug!</code> poisons the store, so the item never runs. Happy to keep it somewhere else if that reads better.</p>
+<h2>Testing</h2>
+<p>These paths are only reachable once an invariant is already broken, so the new unit tests in <code>concurrent.rs</code> (<code>fiber_disposal_tests</code>) set up the broken state directly: an invalid waitable set, thread, or caller when a fiber suspends, an invalid waiting thread in <code>mark_ready</code>, and an occupied switch slot. Each test checks that the original error is returned and that the fiber is either disposed of or still owned by the store. All six abort the test process on current <code>main</code> and pass with this change, with and without debug assertions.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">cargo</span><span class="w"> </span><span class="n">test</span><span class="w"> </span><span class="o">-</span><span class="n">p</span><span class="w"> </span><span class="n">wasmtime</span><span class="w"> </span><span class="o">--</span><span class="n">lib</span><span class="w"> </span><span class="n">fiber_disposal_tests</span>
+</code></pre></div>
+<p>Locally: fmt, clippy, the full <code>wasmtime</code> lib test suite, and the async component-model <code>.wast</code> tests on Cranelift and Winch pass.</p>
+<p>Developed with assistance from Claude (Anthropic). Per the Bytecode Alliance AI Tool Use Policy, I'm the author and accountable for this change.</p>
+</blockquote>
+
+
+
+<a name="626280308"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314385%20component%3A%20keep%20fibers%20owned%20by%20the%20.../near/626280308" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314385.20component.3A.20keep.20fibers.20owned.20by.20the.20.2E.2E.2E.html#626280308">(Sep 23 2026 at 10:35)</a>:</h4>
+<p>Byte-Naut requested <a href="https://github.com/pchickey">pchickey</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14385">PR #14385</a>.</p>
+
+
+
+<a name="626280309"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314385%20component%3A%20keep%20fibers%20owned%20by%20the%20.../near/626280309" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314385.20component.3A.20keep.20fibers.20owned.20by.20the.20.2E.2E.2E.html#626280309">(Sep 23 2026 at 10:35)</a>:</h4>
+<p>Byte-Naut requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14385">PR #14385</a>.</p>
+
+
+
+<a name="626282930"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314385%20component%3A%20keep%20fibers%20owned%20by%20the%20.../near/626282930" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314385.20component.3A.20keep.20fibers.20owned.20by.20the.20.2E.2E.2E.html#626282930">(Sep 23 2026 at 10:49)</a>:</h4>
+<p>Byte-Naut updated <a href="https://github.com/bytecodealliance/wasmtime/pull/14385">PR #14385</a>.</p>
+
+
+
+<a name="626282959"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314385%20component%3A%20keep%20fibers%20owned%20by%20the%20.../near/626282959" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314385.20component.3A.20keep.20fibers.20owned.20by.20the.20.2E.2E.2E.html#626282959">(Sep 23 2026 at 10:49)</a>:</h4>
+<p>Byte-Naut edited <a href="https://github.com/bytecodealliance/wasmtime/pull/14385">PR #14385</a>:</p>
+<blockquote>
+<p>Fixes #14241.</p>
+<h2>Motivation</h2>
+<p>While reviewing #14146, @alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/14146#discussion_r3883919087">[pointed out](https://github.com/bytecodealliance/wasmtime/pull/14146#discussion_r3883919087)</a> that many places in <code>concurrent.rs</code> have a live fiber in scope across a <code>?</code>. These only fail when an internal invariant is already broken, but if one did, the unfinished fiber would be dropped and <code>StoreFiber</code>'s <code>Drop</code> would panic, turning a trap or <code>bail_bug!</code> into a process abort. @dicej filed #14241 to track this and described the two safe options: keep the fiber owned by the store, or hold it in an RAII guard that disposes of it through the store.</p>
+<p>This PR applies those two options to the fiber handoffs in <code>concurrent.rs</code>.</p>
+<h2>Changes</h2>
+<ul>
+<li><code>resume_fiber</code> and <code>run_on_worker</code>: hold the fiber in a small private <code>DisposeFiber</code> guard until it reaches its destination, so an early return disposes of it through the existing <code>StoreFiber::dispose</code>. In the <code>Yielding</code> and <code>ExplicitlySuspending</code> arms the thread lookup now happens before the fiber is taken; previously the right-hand side of the assignment took the fiber first. The two waiter arms use <code>Entry</code> so the fiber only moves into a vacant slot.</li>
+<li><code>Waitable::mark_ready</code>: do the fallible lookups while the waiter is still in its set, and only remove it once its destination has been checked.</li>
+<li><code>set_switch_item</code>: if the slot is already occupied, push the incoming item onto the high-priority queue before the existing <code>bail_bug!</code>, so the store still owns its fiber.</li>
+<li><code>handle_work_item</code> (<code>ResumeThread</code>) and <code>subtask_cancel</code>: put the fiber-owning state back before the existing <code>bail_bug!</code>s.</li>
+<li><code>resume_thread</code>: reuse the already-borrowed <code>ConcurrentState</code> instead of looking it up again after taking the fiber.</li>
+</ul>
+<p>Not changed: happy-path scheduling, error values and messages, the panic for duplicate waiters, and the assertion in <code>StoreFiber::drop</code> for fibers that were never disposed. There are no public API changes. About 200 of the added lines are tests.</p>
+<h2>Design</h2>
+<p><code>DisposeFiber</code> follows the same pattern as the existing <code>Dispose</code> guard in <code>poll_until</code> and the <code>Drop</code> impl of <code>FiberFuture</code>: it calls <code>StoreFiber::dispose</code> only if the fiber has not been handed off yet. Elsewhere the fix is a reordering so that the fiber is taken last, which avoids adding a guard where the lookup can simply happen first.</p>
+<p>One thing worth calling out for review: when <code>set_switch_item</code> finds the slot occupied, the incoming item goes to <code>high_priority</code> only so that it is disposed of with the store. The <code>bail_bug!</code> poisons the store, so the item never runs. Happy to keep it somewhere else if that reads better.</p>
+<h2>Testing</h2>
+<p>These paths are only reachable once an invariant is already broken, so the new unit tests in <code>concurrent.rs</code> (<code>fiber_disposal_tests</code>) set up the broken state directly: an invalid waitable set, thread, or caller when a fiber suspends, an invalid waiting thread in <code>mark_ready</code>, and an occupied switch slot. Each test checks that the original error is returned and that the fiber is either disposed of or still owned by the store. All six abort the test process on current <code>main</code> and pass with this change, with and without debug assertions.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">cargo</span><span class="w"> </span><span class="n">test</span><span class="w"> </span><span class="o">-</span><span class="n">p</span><span class="w"> </span><span class="n">wasmtime</span><span class="w"> </span><span class="o">--</span><span class="n">lib</span><span class="w"> </span><span class="n">fiber_disposal_tests</span>
+</code></pre></div>
+<p>Locally: fmt, clippy, the full <code>wasmtime</code> lib test suite, and the async component-model <code>.wast</code> tests on Cranelift and Winch pass.</p>
+<p>Developed with assistance from Claude (Anthropic). Per the Bytecode Alliance AI Tool Use Policy, I'm the author and accountable for this change.</p>
+</blockquote>
+
+
+
+<a name="626284905"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314385%20component%3A%20keep%20fibers%20owned%20by%20the%20.../near/626284905" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314385.20component.3A.20keep.20fibers.20owned.20by.20the.20.2E.2E.2E.html#626284905">(Sep 23 2026 at 10:59)</a>:</h4>
+<p>Byte-Naut edited <a href="https://github.com/bytecodealliance/wasmtime/pull/14385">PR #14385</a>:</p>
+<blockquote>
+<p>Fixes #14241.</p>
+<h2>Motivation</h2>
+<p>While reviewing #14146, @alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/14146#discussion_r3883919087">pointed out</a> that many places in <code>concurrent.rs</code> have a live fiber in scope across a <code>?</code>. These only fail when an internal invariant is already broken, but if one did, the unfinished fiber would be dropped and <code>StoreFiber</code>'s <code>Drop</code> would panic, turning a trap or <code>bail_bug!</code> into a process abort. @dicej filed #14241 to track this and described the two safe options: keep the fiber owned by the store, or hold it in an RAII guard that disposes of it through the store.</p>
+<p>This PR applies those two options to the fiber handoffs in <code>concurrent.rs</code>.</p>
+<h2>Changes</h2>
+<ul>
+<li><code>resume_fiber</code> and <code>run_on_worker</code>: hold the fiber in a small private <code>DisposeFiber</code> guard until it reaches its destination, so an early return disposes of it through the existing <code>StoreFiber::dispose</code>. In the <code>Yielding</code> and <code>ExplicitlySuspending</code> arms the thread lookup now happens before the fiber is taken; previously the right-hand side of the assignment took the fiber first. The two waiter arms use <code>Entry</code> so the fiber only moves into a vacant slot.</li>
+<li><code>Waitable::mark_ready</code>: do the fallible lookups while the waiter is still in its set, and only remove it once its destination has been checked.</li>
+<li><code>set_switch_item</code>: if the slot is already occupied, push the incoming item onto the high-priority queue before the existing <code>bail_bug!</code>, so the store still owns its fiber.</li>
+<li><code>handle_work_item</code> (<code>ResumeThread</code>) and <code>subtask_cancel</code>: put the fiber-owning state back before the existing <code>bail_bug!</code>s.</li>
+<li><code>resume_thread</code>: reuse the already-borrowed <code>ConcurrentState</code> instead of looking it up again after taking the fiber.</li>
+</ul>
+<p>Not changed: happy-path scheduling, error values and messages, the panic for duplicate waiters, and the assertion in <code>StoreFiber::drop</code> for fibers that were never disposed. There are no public API changes. About 200 of the added lines are tests.</p>
+<h2>Design</h2>
+<p><code>DisposeFiber</code> follows the same pattern as the existing <code>Dispose</code> guard in <code>poll_until</code> and the <code>Drop</code> impl of <code>FiberFuture</code>: it calls <code>StoreFiber::dispose</code> only if the fiber has not been handed off yet. Elsewhere the fix is a reordering so that the fiber is taken last, which avoids adding a guard where the lookup can simply happen first.</p>
+<p>One thing worth calling out for review: when <code>set_switch_item</code> finds the slot occupied, the incoming item goes to <code>high_priority</code> only so that it is disposed of with the store. The <code>bail_bug!</code> poisons the store, so the item never runs. Happy to keep it somewhere else if that reads better.</p>
+<h2>Testing</h2>
+<p>These paths are only reachable once an invariant is already broken, so the new unit tests in <code>concurrent.rs</code> (<code>fiber_disposal_tests</code>) set up the broken state directly: an invalid waitable set, thread, or caller when a fiber suspends, an invalid waiting thread in <code>mark_ready</code>, and an occupied switch slot. Each test checks that the original error is returned and that the fiber is either disposed of or still owned by the store. All six abort the test process on current <code>main</code> and pass with this change, with and without debug assertions.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">cargo</span><span class="w"> </span><span class="n">test</span><span class="w"> </span><span class="o">-</span><span class="n">p</span><span class="w"> </span><span class="n">wasmtime</span><span class="w"> </span><span class="o">--</span><span class="n">lib</span><span class="w"> </span><span class="n">fiber_disposal_tests</span>
+</code></pre></div>
+<p>Locally: fmt, clippy, the full <code>wasmtime</code> lib test suite, and the async component-model <code>.wast</code> tests on Cranelift and Winch pass.</p>
+<p>Developed with assistance from Claude (Anthropic). Per the Bytecode Alliance AI Tool Use Policy, I'm the author and accountable for this change.</p>
+</blockquote>
+
+
+
+<a name="626309837"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314385%20component%3A%20keep%20fibers%20owned%20by%20the%20.../near/626309837" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314385.20component.3A.20keep.20fibers.20owned.20by.20the.20.2E.2E.2E.html#626309837">(Sep 23 2026 at 12:53)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14385">PR #14385</a>.</p>
+
+
+
+<a name="626323393"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314385%20component%3A%20keep%20fibers%20owned%20by%20the%20.../near/626323393" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314385.20component.3A.20keep.20fibers.20owned.20by.20the.20.2E.2E.2E.html#626323393">(Sep 23 2026 at 13:43)</a>:</h4>
+<p>dicej requested <a href="https://github.com/dicej">dicej</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14385">PR #14385</a>.</p>
+
+
+
+<a name="626328519"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314385%20component%3A%20keep%20fibers%20owned%20by%20the%20.../near/626328519" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314385.20component.3A.20keep.20fibers.20owned.20by.20the.20.2E.2E.2E.html#626328519">(Sep 23 2026 at 14:02)</a>:</h4>
+<p>dicej <a href="https://github.com/bytecodealliance/wasmtime/pull/14385#issuecomment-5796248051">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14385">PR #14385</a>:</p>
+<blockquote>
+<p>Thanks, @Byte-Naut!</p>
+<blockquote>
+<p>One thing worth calling out for review: when <code>set_switch_item</code> finds the slot occupied, the incoming item goes to <code>high_priority</code> only so that it is disposed of with the store. The <code>bail_bug!</code> poisons the store, so the item never runs. Happy to keep it somewhere else if that reads better.</p>
+</blockquote>
+<p>FWIW, my solution in #14382 was to <a href="https://github.com/dicej/wasmtime/blob/3349215bece4371d6c9c0d16e6043aa9e6792073/crates/wasmtime/src/runtime/component/concurrent.rs#L2337-L2340">store the item in <code>ConcurrentState::table</code> using <code>push</code></a> and then update <code>take_fibers_and_futures</code> to make sure we <a href="https://github.com/dicej/wasmtime/blob/3349215bece4371d6c9c0d16e6043aa9e6792073/crates/wasmtime/src/runtime/component/concurrent.rs#L5869-L5873">look for it there</a>.  That's arguably a bit less confusing than using <code>high_priority</code> given that we have no intention of running it.  I agree that, since we're poisoning the store anyway, there's no functional difference.</p>
+</blockquote>
+
+
+
+<a name="626332002"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314385%20component%3A%20keep%20fibers%20owned%20by%20the%20.../near/626332002" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314385.20component.3A.20keep.20fibers.20owned.20by.20the.20.2E.2E.2E.html#626332002">(Sep 23 2026 at 14:14)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14385#pullrequestreview-5292065689">PR review</a>:</p>
+<blockquote>
+<p>LGTM, thanks; just a couple of suggestions inline.</p>
+<p>Regarding the conflicts with <a href="https://github.com/bytecodealliance/wasmtime/pull/14382">https://github.com/bytecodealliance/wasmtime/pull/14382</a>: let me know if you need help resolving them.</p>
+</blockquote>
+
+
+
+<a name="626332004"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314385%20component%3A%20keep%20fibers%20owned%20by%20the%20.../near/626332004" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314385.20component.3A.20keep.20fibers.20owned.20by.20the.20.2E.2E.2E.html#626332004">(Sep 23 2026 at 14:14)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/14385#discussion_r4083336144">PR review comment</a>:</p>
+<blockquote>
+<p>A comment here to remind the reader why we're putting the object back in the store would be helpful.</p>
+</blockquote>
+
+
+
+<a name="626332005"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314385%20component%3A%20keep%20fibers%20owned%20by%20the%20.../near/626332005" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314385.20component.3A.20keep.20fibers.20owned.20by.20the.20.2E.2E.2E.html#626332005">(Sep 23 2026 at 14:14)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> dicej created <a href="https://github.com/bytecodealliance/wasmtime/pull/14385#discussion_r4083378749">PR review comment</a>:</p>
+<blockquote>
+<p>Again, a comment here would be helpful to remind the reader why we're putting this back in the store.</p>
+</blockquote>
+
+
+
+<a name="626354194"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314385%20component%3A%20keep%20fibers%20owned%20by%20the%20.../near/626354194" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314385.20component.3A.20keep.20fibers.20owned.20by.20the.20.2E.2E.2E.html#626354194">(Sep 23 2026 at 15:20)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/14385#issuecomment-5797545091">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14385">PR #14385</a>:</p>
+<blockquote>
+<p>Personally I'm a bit wary of a strategy like this because everywhere a fiber might be used we still have to proactively reach for the <code>DisposeFiber</code> abstraction and use it. I was toying with something locally awhile back akin to what @dicej said by leaving fibers in the table and only pulling them out temporarily, but I never got around to cleaning it up (and would be happy to not have to do so). I'd personally perfer to push on that path first because by construction fibers are largely at-rest in the table and then they're only temporarily removed in the brief and readily-auditable moment where they're actually resumed.</p>
+</blockquote>
+
+
+
+<a name="626477530"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314385%20component%3A%20keep%20fibers%20owned%20by%20the%20.../near/626477530" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314385.20component.3A.20keep.20fibers.20owned.20by.20the.20.2E.2E.2E.html#626477530">(Sep 24 2026 at 00:01)</a>:</h4>
+<p>Byte-Naut <a href="https://github.com/bytecodealliance/wasmtime/pull/14385#issuecomment-5804967145">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14385">PR #14385</a>:</p>
+<blockquote>
+<p>Thanks both. Happy to take the "fibers stay in the table" approach instead. My rough plan: keep each fiber in its GuestThread state and have queued work items and waiters refer to the thread, taking the fiber out only while it's being resumed. That shouldn't add allocations or state on the normal path beyond a table lookup at resume time; if something does, I'll call it out. @alexcrichton does that match what you had in mind, and is there anything from your local attempt I should follow? I can do this on this PR or as a new one, whichever you prefer.</p>
+</blockquote>
+
+
+
+<a name="626800487"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314385%20component%3A%20keep%20fibers%20owned%20by%20the%20.../near/626800487" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314385.20component.3A.20keep.20fibers.20owned.20by.20the.20.2E.2E.2E.html#626800487">(Sep 25 2026 at 06:11)</a>:</h4>
+<p><span aria-label="cross mark" class="emoji emoji-274c" role="img" title="cross mark">:cross_mark:</span> Byte-Naut closed without merge <a href="https://github.com/bytecodealliance/wasmtime/pull/14385">PR #14385</a>.</p>
+
+
+
+<a name="626800489"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314385%20component%3A%20keep%20fibers%20owned%20by%20the%20.../near/626800489" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314385.20component.3A.20keep.20fibers.20owned.20by.20the.20.2E.2E.2E.html#626800489">(Sep 25 2026 at 06:11)</a>:</h4>
+<p>Byte-Naut <a href="https://github.com/bytecodealliance/wasmtime/pull/14385#issuecomment-5827745539">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14385">PR #14385</a>:</p>
+<blockquote>
+<p>I've put the table-based approach up as #14418, following @alexcrichton's suggestion above: guest fibers now stay in their thread's state (or the worker slot), and are only taken out while <code>resume_fiber</code> runs them, so work items and waiters just carry thread ids. It also covers the two new cases from #14382, and the spots @dicej's inline comments were on no longer move fibers around, so I'll close this in favor of it.</p>
+<p>Thanks both for the quick and clear feedback, and @dicej for the pointer on keeping items in the table.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Sep 26 2026 at 20:06 UTC</p>
+</html>

@@ -1,0 +1,147 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #14383 Fix a bug in elaborartion that led t... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314383.20Fix.20a.20bug.20in.20elaborartion.20that.20led.20t.2E.2E.2E.html">wasmtime / PR #14383 Fix a bug in elaborartion that led t...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="626183014"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314383%20Fix%20a%20bug%20in%20elaborartion%20that%20led%20t.../near/626183014" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314383.20Fix.20a.20bug.20in.20elaborartion.20that.20led.20t.2E.2E.2E.html#626183014">(Sep 23 2026 at 00:22)</a>:</h4>
+<p>fitzgen requested <a href="https://github.com/cfallin">cfallin</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14383">PR #14383</a>.</p>
+
+
+
+<a name="626183015"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314383%20Fix%20a%20bug%20in%20elaborartion%20that%20led%20t.../near/626183015" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314383.20Fix.20a.20bug.20in.20elaborartion.20that.20led.20t.2E.2E.2E.html#626183015">(Sep 23 2026 at 00:22)</a>:</h4>
+<p>fitzgen opened <a href="https://github.com/bytecodealliance/wasmtime/pull/14383">PR #14383</a> from <code>fitzgen:missed-licm</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>We would pop any loop from the loop stack that our current block was not currently contained within, however a loop header can dominate the current block while the block is also not part of the natural loop (e.g. a block that returns or traps or otherwise exits the loop), and this, combined with our dominator-based walk CFG walk, led to e.g. the following sequence of events:</p>
+<ul>
+<li>starting to elaborate the loop header, pushing it onto the <code>loop_stack</code></li>
+<li>...</li>
+<li>starting to elaborate the i^th dominator-tree child of the loop header, which exits the loop, and therefore does not reach a loop back edge, and is not part of the loop<ul>
+<li>popping from the <code>loop_stack</code> while its entries do not contain this block, including our loop header</li>
+</ul>
+</li>
+<li>finish elaborating the i^th dominator-tree child of the loop header</li>
+<li>starting to elaborate the i+1^th dominator-tree child of the loop header, which _is_ part of the loop<ul>
+<li>failing to LICM loop-invariant instructions in this block because the loop header is not on <code>loop_stack</code> anymore</li>
+</ul>
+</li>
+</ul>
+<p>This commit fixes the bug by (1) truncating the loop stack to the depth it was before processing a block once we are done processing it, rather than doing a pop-while loop, and (2) keeping track of which entries within <code>loop_stack</code> the current block is within (since we are dominated by all of them, but not necessarily a member of all of them).</p>
+<p>This is a ~2.25x speed up (i.e. shaves off ~55% of runtime) for the increment-each-byte-in-buf compile-time builtin benchmarks:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">increment</span><span class="o">-</span><span class="n">each</span><span class="o">-</span><span class="n">byte</span><span class="o">-</span><span class="k">in</span><span class="o">-</span><span class="n">buf</span><span class="o">/</span><span class="n">concurrency_support</span><span class="o">=</span><span class="kc">true</span><span class="o">/</span><span class="n">compile</span><span class="o">-</span><span class="n">time</span><span class="o">-</span><span class="n">builtins</span><span class="o">-</span><span class="n">host</span><span class="o">-</span><span class="n">buf</span><span class="o">-</span><span class="n">api</span>
+<span class="w">                        </span><span class="n">time</span><span class="p">:</span><span class="w">   </span><span class="p">[</span><span class="mf">104.61</span><span class="w"> </span><span class="err">µ</span><span class="n">s</span><span class="w"> </span><span class="mf">105.49</span><span class="w"> </span><span class="err">µ</span><span class="n">s</span><span class="w"> </span><span class="mf">106.53</span><span class="w"> </span><span class="err">µ</span><span class="n">s</span><span class="p">]</span>
+<span class="w">                        </span><span class="n">change</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="err">−</span><span class="mf">55.679</span><span class="o">%</span><span class="w"> </span><span class="err">−</span><span class="mf">55.076</span><span class="o">%</span><span class="w"> </span><span class="err">−</span><span class="mf">54.441</span><span class="o">%</span><span class="p">]</span><span class="w"> </span><span class="p">(</span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0.00</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mf">0.05</span><span class="p">)</span>
+<span class="w">                        </span><span class="n">Performance</span><span class="w"> </span><span class="n">has</span><span class="w"> </span><span class="n">improved</span><span class="p">.</span>
+<span class="n">Found</span><span class="w"> </span><span class="mi">8</span><span class="w"> </span><span class="n">outliers</span><span class="w"> </span><span class="n">among</span><span class="w"> </span><span class="mi">100</span><span class="w"> </span><span class="n">measurements</span><span class="w"> </span><span class="p">(</span><span class="mf">8.00</span><span class="o">%</span><span class="p">)</span>
+<span class="w">  </span><span class="mi">8</span><span class="w"> </span><span class="p">(</span><span class="mf">8.00</span><span class="o">%</span><span class="p">)</span><span class="w"> </span><span class="n">high</span><span class="w"> </span><span class="n">mild</span>
+
+<span class="n">increment</span><span class="o">-</span><span class="n">each</span><span class="o">-</span><span class="n">byte</span><span class="o">-</span><span class="k">in</span><span class="o">-</span><span class="n">buf</span><span class="o">/</span><span class="n">concurrency_support</span><span class="o">=</span><span class="kc">false</span><span class="o">/</span><span class="n">compile</span><span class="o">-</span><span class="n">time</span><span class="o">-</span><span class="n">builtins</span><span class="o">-</span><span class="n">host</span><span class="o">-</span><span class="n">buf</span><span class="o">-</span><span class="n">api</span>
+<span class="w">                        </span><span class="n">time</span><span class="p">:</span><span class="w">   </span><span class="p">[</span><span class="mf">103.79</span><span class="w"> </span><span class="err">µ</span><span class="n">s</span><span class="w"> </span><span class="mf">104.79</span><span class="w"> </span><span class="err">µ</span><span class="n">s</span><span class="w"> </span><span class="mf">106.12</span><span class="w"> </span><span class="err">µ</span><span class="n">s</span><span class="p">]</span>
+<span class="w">                        </span><span class="n">change</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="err">−</span><span class="mf">56.150</span><span class="o">%</span><span class="w"> </span><span class="err">−</span><span class="mf">55.525</span><span class="o">%</span><span class="w"> </span><span class="err">−</span><span class="mf">54.814</span><span class="o">%</span><span class="p">]</span><span class="w"> </span><span class="p">(</span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0.00</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mf">0.05</span><span class="p">)</span>
+<span class="w">                        </span><span class="n">Performance</span><span class="w"> </span><span class="n">has</span><span class="w"> </span><span class="n">improved</span><span class="p">.</span>
+<span class="n">Found</span><span class="w"> </span><span class="mi">7</span><span class="w"> </span><span class="n">outliers</span><span class="w"> </span><span class="n">among</span><span class="w"> </span><span class="mi">100</span><span class="w"> </span><span class="n">measurements</span><span class="w"> </span><span class="p">(</span><span class="mf">7.00</span><span class="o">%</span><span class="p">)</span>
+<span class="w">  </span><span class="mi">7</span><span class="w"> </span><span class="p">(</span><span class="mf">7.00</span><span class="o">%</span><span class="p">)</span><span class="w"> </span><span class="n">high</span><span class="w"> </span><span class="n">severe</span>
+</code></pre></div>
+<p>And a ~1.8x speed up (i.e. shaves off ~44% of runtime) for the increment-random-byte-in-buf compile-time builtins benchmarks:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">increment</span><span class="o">-</span><span class="n">random</span><span class="o">-</span><span class="n">byte</span><span class="o">-</span><span class="k">in</span><span class="o">-</span><span class="n">buf</span><span class="o">/</span><span class="n">concurrency_support</span><span class="o">=</span><span class="kc">true</span><span class="o">/</span><span class="n">compile</span><span class="o">-</span><span class="n">time</span><span class="o">-</span><span class="n">builtins</span><span class="o">-</span><span class="n">host</span><span class="o">-</span><span class="n">buf</span><span class="o">-</span><span class="n">api</span>
+<span class="w">                        </span><span class="n">time</span><span class="p">:</span><span class="w">   </span><span class="p">[</span><span class="mf">1.0027</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="mf">1.0107</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="mf">1.0196</span><span class="w"> </span><span class="n">ns</span><span class="p">]</span>
+<span class="w">                        </span><span class="n">change</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="err">−</span><span class="mf">44.342</span><span class="o">%</span><span class="w"> </span><span class="err">−</span><span class="mf">43.835</span><span class="o">%</span><span class="w"> </span><span class="err">−</span><span class="mf">43.324</span><span class="o">%</span><span class="p">]</span><span class="w"> </span><span class="p">(</span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0.00</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mf">0.05</span><span class="p">)</span>
+<span class="w">                        </span><span class="n">Performance</span><span class="w"> </span><span class="n">has</span><span class="w"> </span><span class="n">improved</span><span class="p">.</span>
+<span class="n">Found</span><span class="w"> </span><span class="mi">4</span><span class="w"> </span><span class="n">outliers</span><span class="w"> </span><span class="n">among</span><span class="w"> </span><span class="mi">100</span><span class="w"> </span><span class="n">measurements</span><span class="w"> </span><span class="p">(</span><span class="mf">4.00</span><span class="o">%</span><span class="p">)</span>
+<span class="w">  </span><span class="mi">4</span><span class="w"> </span><span class="p">(</span><span class="mf">4.00</span><span class="o">%</span><span class="p">)</span><span class="w"> </span><span class="n">high</span><span class="w"> </span><span class="n">mild</span>
+
+<span class="n">increment</span><span class="o">-</span><span class="n">random</span><span class="o">-</span><span class="n">byte</span><span class="o">-</span><span class="k">in</span><span class="o">-</span><span class="n">buf</span><span class="o">/</span><span class="n">concurrency_support</span><span class="o">=</span><span class="kc">false</span><span class="o">/</span><span class="n">compile</span><span class="o">-</span><span class="n">time</span><span class="o">-</span><span class="n">builtins</span><span class="o">-</span><span class="n">host</span><span class="o">-</span><span class="n">buf</span><span class="o">-</span><span class="n">api</span>
+<span class="w">                        </span><span class="n">time</span><span class="p">:</span><span class="w">   </span><span class="p">[</span><span class="mf">1.0086</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="mf">1.0120</span><span class="w"> </span><span class="n">ns</span><span class="w"> </span><span class="mf">1.0155</span><span class="w"> </span><span class="n">ns</span><span class="p">]</span>
+<span class="w">                        </span><span class="n">change</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="err">−</span><span class="mf">44.209</span><span class="o">%</span><span class="w"> </span><span class="err">−</span><span class="mf">43.591</span><span class="o">%</span><span class="w"> </span><span class="err">−</span><span class="mf">43.011</span><span class="o">%</span><span class="p">]</span><span class="w"> </span><span class="p">(</span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0.00</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mf">0.05</span><span class="p">)</span>
+<span class="w">                        </span><span class="n">Performance</span><span class="w"> </span><span class="n">has</span><span class="w"> </span><span class="n">improved</span><span class="p">.</span>
+</code></pre></div>
+<p>On Sightglass, this is a bit of a wash, with a few benchmarks improving and a few regressing, generally sub 1% deltas. The two biggest effects were that <code>regex</code> got ~4.3% faster and <code>bz2</code> got 1.5% slower. I'm assuming the regressions are due to longer live ranges causing more spills, and these spills being placed suboptimally.</p>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please review the Bytecode Alliance's AI tool usage policy at<br>
+<a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+</blockquote>
+
+
+
+<a name="626183016"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314383%20Fix%20a%20bug%20in%20elaborartion%20that%20led%20t.../near/626183016" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314383.20Fix.20a.20bug.20in.20elaborartion.20that.20led.20t.2E.2E.2E.html#626183016">(Sep 23 2026 at 00:22)</a>:</h4>
+<p>fitzgen requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14383">PR #14383</a>.</p>
+
+
+
+<a name="626183018"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314383%20Fix%20a%20bug%20in%20elaborartion%20that%20led%20t.../near/626183018" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314383.20Fix.20a.20bug.20in.20elaborartion.20that.20led.20t.2E.2E.2E.html#626183018">(Sep 23 2026 at 00:22)</a>:</h4>
+<p>fitzgen requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14383">PR #14383</a>.</p>
+
+
+
+<a name="626192122"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314383%20Fix%20a%20bug%20in%20elaborartion%20that%20led%20t.../near/626192122" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314383.20Fix.20a.20bug.20in.20elaborartion.20that.20led.20t.2E.2E.2E.html#626192122">(Sep 23 2026 at 01:52)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14383">PR #14383</a>.</p>
+
+
+
+<a name="626460140"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314383%20Fix%20a%20bug%20in%20elaborartion%20that%20led%20t.../near/626460140" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314383.20Fix.20a.20bug.20in.20elaborartion.20that.20led.20t.2E.2E.2E.html#626460140">(Sep 23 2026 at 22:16)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> cfallin submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14383#pullrequestreview-5297433095">PR review</a>:</p>
+<blockquote>
+<p>Looks good -- thanks for catching this!</p>
+</blockquote>
+
+
+
+<a name="626460168"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314383%20Fix%20a%20bug%20in%20elaborartion%20that%20led%20t.../near/626460168" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314383.20Fix.20a.20bug.20in.20elaborartion.20that.20led.20t.2E.2E.2E.html#626460168">(Sep 23 2026 at 22:16)</a>:</h4>
+<p>cfallin added <a href="https://github.com/bytecodealliance/wasmtime/pull/14383">PR #14383 Fix a bug in elaborartion that led to missed LICM hoisting</a> to the merge queue.</p>
+
+
+
+<a name="626466301"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314383%20Fix%20a%20bug%20in%20elaborartion%20that%20led%20t.../near/626466301" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314383.20Fix.20a.20bug.20in.20elaborartion.20that.20led.20t.2E.2E.2E.html#626466301">(Sep 23 2026 at 22:42)</a>:</h4>
+<p>github-merge-queue[bot] removed <a href="https://github.com/bytecodealliance/wasmtime/pull/14383">PR #14383 Fix a bug in elaborartion that led to missed LICM hoisting</a> from the merge queue.</p>
+
+
+
+<a name="626466780"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314383%20Fix%20a%20bug%20in%20elaborartion%20that%20led%20t.../near/626466780" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314383.20Fix.20a.20bug.20in.20elaborartion.20that.20led.20t.2E.2E.2E.html#626466780">(Sep 23 2026 at 22:43)</a>:</h4>
+<p>fitzgen added <a href="https://github.com/bytecodealliance/wasmtime/pull/14383">PR #14383 Fix a bug in elaborartion that led to missed LICM hoisting</a> to the merge queue.</p>
+
+
+
+<a name="626472073"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314383%20Fix%20a%20bug%20in%20elaborartion%20that%20led%20t.../near/626472073" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314383.20Fix.20a.20bug.20in.20elaborartion.20that.20led.20t.2E.2E.2E.html#626472073">(Sep 23 2026 at 23:10)</a>:</h4>
+<p><span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span> fitzgen merged <a href="https://github.com/bytecodealliance/wasmtime/pull/14383">PR #14383</a>.</p>
+
+
+
+<a name="626472076"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314383%20Fix%20a%20bug%20in%20elaborartion%20that%20led%20t.../near/626472076" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314383.20Fix.20a.20bug.20in.20elaborartion.20that.20led.20t.2E.2E.2E.html#626472076">(Sep 23 2026 at 23:10)</a>:</h4>
+<p>fitzgen removed <a href="https://github.com/bytecodealliance/wasmtime/pull/14383">PR #14383 Fix a bug in elaborartion that led to missed LICM hoisting</a> from the merge queue.</p>
+
+
+
+<hr><p>Last updated: Sep 26 2026 at 20:06 UTC</p>
+</html>

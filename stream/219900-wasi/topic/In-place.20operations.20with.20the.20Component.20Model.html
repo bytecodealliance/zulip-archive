@@ -1,0 +1,118 @@
+<html>
+<head><meta charset="utf-8"><title>In-place operations with the Component Model · wasi · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/index.html">wasi</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/In-place.20operations.20with.20the.20Component.20Model.html">In-place operations with the Component Model</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="626057743"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/In-place%20operations%20with%20the%20Component%20Model/near/626057743" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Robbe Haegeman <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/In-place.20operations.20with.20the.20Component.20Model.html#626057743">(Sep 22 2026 at 15:07)</a>:</h4>
+<p>Hey!<br>
+As part of trying to port <a href="https://github.com/WebAssembly/wasi-crypto/tree/main/wit"><code>wasi-crypto</code></a> to the component model, we got stuck at trying to support in-place encryption/decryption (i.e. encryption where the entire process happens through operations on the input buffer, making it the result buffer as well).</p>
+<p>The current API has functions accept a <code>list&lt;u8&gt;</code> and return a <code>list&lt;u8&gt;</code> which means that the operatations would create a copy. <br>
+The data to be encrypted can be arbitrarily large, meaning the extra copy could become an issue. Normally <code>streams</code> could be used to prevent copying entire buffers at a time, but since the cryptographic operations do not work sequentially and often multiple passes are required, they can't be applied here.</p>
+<p>Potential proposals we've seen that could solve this include:</p>
+<ol>
+<li><a href="https://github.com/WebAssembly/component-model/issues/369">Caller provided buffers question component-model#369</a></li>
+<li><a href="https://github.com/WebAssembly/WASI/issues/594">Request: Support sharing mutable memory between host and guest WASI#594</a></li>
+</ol>
+<p>We have <a href="https://github.com/WebAssembly/wasi-crypto/issues/95">an issue tracking this</a>, but wanted to ask around if people have found workarounds for this issue, if we made invalid assumptions related to the memory usage, or if there are updates on the proposal timelines.</p>
+<p>CC: <span class="user-mention" data-user-id="253999">@Frank Denis</span></p>
+
+
+
+<a name="626107644"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/In-place%20operations%20with%20the%20Component%20Model/near/626107644" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luke Wagner <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/In-place.20operations.20with.20the.20Component.20Model.html#626107644">(Sep 22 2026 at 17:53)</a>:</h4>
+<p>In the short-term, one approach that I think could work for the WIT as-written is to stash the caller-supplied <code>list&lt;u8&gt;</code> pointer in a special global that is returned by <code>realloc</code> when it is called to allocate the returned <code>list&lt;u8&gt;</code>.  Then, when the host impl sees the arg pointer and result pointer are the same, it could work in-place.  (IIRC, wasi-crypto already specifies this opportunistic reuse-the-buffer-if-it's-the-same behavior in WITX.)  I believe this trick is used by wasi-libc for the caller-supplied buffer of <code>read()</code> (to avoid what would similarly be an extra copy) and so I expect there is some magic function that is called by wasi-libc (to stash the buffer in the global) that you could also call for the wasi-crypto bindings, although this part is a bit fuzzy.</p>
+<p>In the next iteration of the ABI (the "Lazy ABI"), where the plan is to kill <code>realloc</code>, I think we can have a more direct way of passing in a caller-supplied buffer that avoids the global+realloc shenanigans.</p>
+<p>And lastly, for more-advanced use cases, I do still think that adding a <code>writable-buffer</code> WIT type as discussed in CM/#369 makes sense as the most general solution (but also more verbose and complex in various languages' bindings), just not yet prioritized given limited resources etc.</p>
+
+
+
+<a name="626249604"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/In-place%20operations%20with%20the%20Component%20Model/near/626249604" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Robbe Haegeman <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/In-place.20operations.20with.20the.20Component.20Model.html#626249604">(Sep 23 2026 at 08:35)</a>:</h4>
+<p>Thank you for the information!<br>
+I'll try the short-term approach you proposed and will get back to this thread with the results :)</p>
+
+
+
+<a name="626919368"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/In-place%20operations%20with%20the%20Component%20Model/near/626919368" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Robbe Haegeman <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/In-place.20operations.20with.20the.20Component.20Model.html#626919368">(Sep 25 2026 at 15:15)</a>:</h4>
+<p>Hey Luke, I wasn't able to find the short-term approach you mentioned within the <code>wasi-libc</code> code directly, but I assume you mean the trick used within the <a href="https://github.com/bytecodealliance/wasmtime/blob/4f87260abb0b64a6f0654a396551240edd270b71/crates/wasi-preview1-component-adapter/src/lib.rs">wasi-preview1-component-adapter</a> code instead. Note I'm using <code>wasmtime</code> 46.0.2, since that matches my current <code>wasi-crypto</code> host.</p>
+<p>From what I can gather, the host does not seem to have the ability to choose where the result is placed (the <code>realloc</code> is always a guest export), but since the adapter is merged into the guest code itself, it is allowed to provide its own <code>cabi_import_realloc</code>:</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/4f87260abb0b64a6f0654a396551240edd270b71/crates/wasi-preview1-component-adapter/src/lib.rs#L221-L236">src</a></p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#[unsafe(no_mangle)]</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">unsafe</span><span class="w"> </span><span class="k">extern</span><span class="w"> </span><span class="s">"C"</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">cabi_import_realloc</span><span class="p">(</span>
+<span class="w">    </span><span class="n">old_ptr</span><span class="p">:</span><span class="w"> </span><span class="o">*</span><span class="k">mut</span><span class="w"> </span><span class="kt">u8</span><span class="p">,</span>
+<span class="w">    </span><span class="n">old_size</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">,</span>
+<span class="w">    </span><span class="n">align</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">,</span>
+<span class="w">    </span><span class="n">new_size</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">,</span>
+<span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="o">*</span><span class="k">mut</span><span class="w"> </span><span class="kt">u8</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">ptr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">null_mut</span><span class="p">::</span><span class="o">&lt;</span><span class="kt">u8</span><span class="o">&gt;</span><span class="p">();</span>
+<span class="w">    </span><span class="n">State</span><span class="p">::</span><span class="n">with</span><span class="p">(</span><span class="o">|</span><span class="n">state</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">alloc</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">state</span><span class="p">.</span><span class="n">import_alloc</span><span class="p">.</span><span class="n">replace</span><span class="p">(</span><span class="n">ImportAlloc</span><span class="p">::</span><span class="nb">None</span><span class="p">);</span>
+<span class="w">        </span><span class="n">ptr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">alloc</span><span class="p">.</span><span class="n">alloc</span><span class="p">(</span><span class="n">old_ptr</span><span class="p">,</span><span class="w"> </span><span class="n">old_size</span><span class="p">,</span><span class="w"> </span><span class="n">align</span><span class="p">,</span><span class="w"> </span><span class="n">new_size</span><span class="p">)</span><span class="w"> </span><span class="p">};</span>
+<span class="w">        </span><span class="n">state</span><span class="p">.</span><span class="n">import_alloc</span><span class="p">.</span><span class="n">set</span><span class="p">(</span><span class="n">alloc</span><span class="p">);</span>
+<span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="w">    </span><span class="p">});</span>
+<span class="w">    </span><span class="n">ptr</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Within <code>fd_read</code> (<a href="https://github.com/bytecodealliance/wasmtime/blob/4f87260abb0b64a6f0654a396551240edd270b71/crates/wasi-preview1-component-adapter/src/lib.rs#L1317-L1322">src</a>)</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="c1">// `ptr` and `len` are the caller's destination buffer (the first non-empty iovec)</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">data</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">state</span><span class="p">.</span><span class="n">with_one_import_alloc</span><span class="p">(</span><span class="n">ptr</span><span class="p">,</span><span class="w"> </span><span class="n">len</span><span class="p">,</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">blocking_mode</span><span class="p">.</span><span class="n">read</span><span class="p">(</span><span class="n">wasi_stream</span><span class="p">,</span><span class="w"> </span><span class="n">read_len</span><span class="p">)</span>
+<span class="p">})</span><span class="o">?</span><span class="p">;</span>
+
+<span class="fm">assert!</span><span class="p">(</span><span class="n">data</span><span class="p">.</span><span class="n">is_empty</span><span class="p">()</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">data</span><span class="p">.</span><span class="n">as_ptr</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">ptr</span><span class="p">);</span>
+<span class="fm">assert!</span><span class="p">(</span><span class="n">data</span><span class="p">.</span><span class="n">len</span><span class="p">()</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="n">len</span><span class="p">);</span>
+</code></pre></div>
+<p>Which then reuses the memory of the caller's buffer for the result <a href="https://github.com/bytecodealliance/wasmtime/blob/4f87260abb0b64a6f0654a396551240edd270b71/crates/wasi-preview1-component-adapter/src/lib.rs#L2984-L2991">src</a></p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="sd">/// Configure that `cabi_import_realloc` will allocate once from</span>
+<span class="sd">/// `base` with at most `len` bytes for the duration of `f`.</span>
+<span class="sd">///</span>
+<span class="sd">/// Panics if the import allocator is already configured.</span>
+<span class="k">fn</span><span class="w"> </span><span class="nf">with_one_import_alloc</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">base</span><span class="p">:</span><span class="w"> </span><span class="o">*</span><span class="k">mut</span><span class="w"> </span><span class="kt">u8</span><span class="p">,</span><span class="w"> </span><span class="n">len</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">,</span><span class="w"> </span><span class="n">f</span><span class="p">:</span><span class="w"> </span><span class="nc">impl</span><span class="w"> </span><span class="nb">FnOnce</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">T</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">T</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">alloc</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">BumpAlloc</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">base</span><span class="p">,</span><span class="w"> </span><span class="n">len</span><span class="w"> </span><span class="p">};</span>
+<span class="w">    </span><span class="bp">self</span><span class="p">.</span><span class="n">with_import_alloc</span><span class="p">(</span><span class="n">ImportAlloc</span><span class="p">::</span><span class="n">OneAlloc</span><span class="p">(</span><span class="n">alloc</span><span class="p">),</span><span class="w"> </span><span class="n">f</span><span class="p">).</span><span class="mi">0</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>There is quite a bit of additional surrounding code within the file, but these are the most important snippets.</p>
+<p>However, it does produce results!<br>
+It isn't able to fully eliminate the copying, since the guest-&gt;host-&gt;guest copying still occurs, but it avoids the guest's second, message-sized allocation for the result, which can save quite a bit of guest memory!<br>
+I had an LLM create a demo implementation based on the adapter to gather some results:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>AES-256-GCM encrypt in place (compared):
+  input:          0x116c60, 4194304 bytes
+  output:         0x116c60, 4194320 bytes
+  heap peak:      +0 bytes
+  heap total:     0 bytes over 0 allocation(s)
+  linear memory:  +0 bytes (0 pages)
+
+AES-256-GCM encrypt plain (compared):
+  input:          0x516c80, 4194304 bytes
+  output:         0x916c90, 4194320 bytes
+  heap peak:      +4194320 bytes
+  heap total:     4194320 bytes over 1 allocation(s)
+  linear memory:  +4194304 bytes (64 pages)
+</code></pre></div>
+<blockquote>
+<p>[!NOTE]<br>
+These results are only about the call itself, the input buffer has to be allocated as well of course.</p>
+</blockquote>
+<p>This was captured using the <code>allocation-counter</code> crate within <a href="https://github.com/idlab-discover/wasmtime-wasi-crypto/tree/e43147cd4a101545a8f5c315e22d8c23abd1eb8a/test-components/wasi-crypto-in-place">a test component</a>, with most of the code for the trick being copied over from the <code>wasi-preview1-component-adapter</code>.<br>
+The end result allows commands, which operate on a <code>list&lt;u8&gt;</code> and return a <code>list&lt;u8&gt;</code> that fits in the input buffer's capacity, to avoid the additional allocation by wrapping it in a <code>call_in_place</code> function call.</p>
+<p>I wanted to ask a few follow-up questions about this though:</p>
+<ol>
+<li>Was this what you were referring to or did I jump down the wrong rabbit hole?</li>
+<li>Is there a timeline for the <code>0.3.y</code> release which includes the <a href="https://github.com/WebAssembly/component-model/issues/383"><code>lazy ABI</code></a>?</li>
+<li>Is it guaranteed that all arguments are fully read / copied into the host before <code>realloc</code> is called? The adapter does not seem to use this trick to reuse an input buffer and if this assumption does not hold, then it could introduce potential nasties down the line.</li>
+</ol>
+
+
+
+<hr><p>Last updated: Sep 26 2026 at 20:06 UTC</p>
+</html>

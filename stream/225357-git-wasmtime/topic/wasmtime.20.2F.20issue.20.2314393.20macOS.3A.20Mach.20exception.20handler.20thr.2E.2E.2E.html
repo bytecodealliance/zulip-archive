@@ -1,0 +1,392 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14393 macOS: Mach exception handler thr... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314393.20macOS.3A.20Mach.20exception.20handler.20thr.2E.2E.2E.html">wasmtime / issue #14393 macOS: Mach exception handler thr...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="626489174"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314393%20macOS%3A%20Mach%20exception%20handler%20thr.../near/626489174" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314393.20macOS.3A.20Mach.20exception.20handler.20thr.2E.2E.2E.html#626489174">(Sep 24 2026 at 01:51)</a>:</h4>
+<p>libkakashi opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14393">issue #14393</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p>On macOS, the Mach exception handler thread receives with<br>
+<code>MACH_RCV_MSG | MACH_RCV_INTERRUPT</code> and calls <code>libc::abort()</code> on any result other<br>
+than <code>KERN_SUCCESS</code> or <code>MACH_RCV_PORT_CHANGED</code><br>
+(<a href="https://github.com/bytecodealliance/wasmtime/blob/63edc9e1e1e9927dbeb5e66284d21be8e3c31237/crates/wasmtime/src/runtime/vm/sys/unix/machports.rs#L216">machports.rs#L216</a>,<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/63edc9e1e1e9927dbeb5e66284d21be8e3c31237/crates/wasmtime/src/runtime/vm/sys/unix/machports.rs#L224-L233">#L224-L233</a>).</p>
+<p>Because <code>MACH_RCV_INTERRUPT</code> is set, libsystem's <code>mach_msg</code> wrapper does not retry<br>
+an interrupted receive. It returns <code>MACH_RCV_INTERRUPTED</code> (<code>0x10004005</code>) to the caller. So if the<br>
+embedding process catches any signal and the kernel delivers it to the handler<br>
+thread, the handler thread aborts the whole process:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">mach_msg</span><span class="w"> </span><span class="n">failed</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="mi">268451845</span><span class="w"> </span><span class="p">(</span><span class="mi">10004005</span><span class="p">)</span>
+</code></pre></div>
+<p>This is reachable in real applications. Zed embeds Wasmtime for its extensions and<br>
+crashes on macOS with SIGABRT on exactly this thread (details below).</p>
+<h2>Versions</h2>
+<ul>
+<li>Reproduced with the <code>wasmtime</code> Python package 49.0.0.</li>
+<li>Observed in the field with Wasmtime 48.0.1 (embedded in Zed 1.21 / 1.22).</li>
+<li>The receive loop is unchanged on <code>main</code> at <code>63edc9e1e1</code>.</li>
+<li>macOS 27.0 (26A428), arm64 (Mac16,6).</li>
+</ul>
+<h2>Reproduction</h2>
+<div class="codehilite" data-code-language="Python"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">os</span><span class="o">,</span><span class="w"> </span><span class="nn">signal</span><span class="o">,</span><span class="w"> </span><span class="nn">subprocess</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">wasmtime</span>
+
+<span class="c1"># Any caught signal works; SIGCHLD is the common one (async-process/smol install</span>
+<span class="c1"># a SIGCHLD handler on macOS to reap children).</span>
+<span class="n">signal</span><span class="o">.</span><span class="n">signal</span><span class="p">(</span><span class="n">signal</span><span class="o">.</span><span class="n">SIGCHLD</span><span class="p">,</span> <span class="k">lambda</span> <span class="o">*</span><span class="n">_</span><span class="p">:</span> <span class="kc">None</span><span class="p">)</span>
+
+<span class="n">engine</span> <span class="o">=</span> <span class="n">wasmtime</span><span class="o">.</span><span class="n">Engine</span><span class="p">()</span>  <span class="c1"># spawns the Mach exception handler thread</span>
+
+<span class="c1"># Only to make delivery deterministic: block SIGCHLD on this thread so the kernel</span>
+<span class="c1"># must deliver it to the one thread that still accepts it, the handler thread.</span>
+<span class="n">signal</span><span class="o">.</span><span class="n">pthread_sigmask</span><span class="p">(</span><span class="n">signal</span><span class="o">.</span><span class="n">SIG_BLOCK</span><span class="p">,</span> <span class="p">{</span><span class="n">signal</span><span class="o">.</span><span class="n">SIGCHLD</span><span class="p">})</span>
+
+<span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">50</span><span class="p">):</span>
+    <span class="n">pid</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">posix_spawn</span><span class="p">(</span><span class="s2">"/usr/bin/true"</span><span class="p">,</span> <span class="p">[</span><span class="s2">"true"</span><span class="p">],</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">)</span>
+    <span class="n">os</span><span class="o">.</span><span class="n">waitpid</span><span class="p">(</span><span class="n">pid</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">"survived"</span><span class="p">)</span>
+</code></pre></div>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">python</span><span class="w"> </span><span class="n">repro</span><span class="p">.</span><span class="n">py</span>
+<span class="n">mach_msg</span><span class="w"> </span><span class="n">failed</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="mi">268451845</span><span class="w"> </span><span class="p">(</span><span class="mi">10004005</span><span class="p">)</span>
+<span class="cp">$</span><span class="w"> </span><span class="n">echo</span><span class="w"> </span><span class="cp">$</span><span class="o">?</span>
+<span class="mi">134</span>
+</code></pre></div>
+<p>Controls:</p>
+<table>
+<thead>
+<tr>
+<th>Variant</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>As above</td>
+<td>aborts on the first child exit</td>
+</tr>
+<tr>
+<td>No <code>SIGCHLD</code> handler (default disposition)</td>
+<td>survives 50 child exits</td>
+</tr>
+<tr>
+<td>Handler installed, main thread not masked</td>
+<td>survives 3 × 500 child exits (the kernel delivered every signal to the main thread)</td>
+</tr>
+<tr>
+<td><code>footprint</code>, <code>vmmap -summary</code>, <code>sample</code> against an idle process with an <code>Engine</code></td>
+<td>no abort</td>
+</tr>
+</tbody>
+</table>
+<p>The same behaviour at the Mach level, independent of Wasmtime:</p>
+<p>&lt;details&gt;<br>
+&lt;summary&gt;C check: interruptible vs non-interruptible receive under a caught signal&lt;/summary&gt;</p>
+<div class="codehilite" data-code-language="C"><pre><span></span><code><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;mach/mach.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;pthread.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;signal.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;spawn.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdio.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;sys/wait.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;unistd.h&gt;</span>
+<span class="k">extern</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">**</span><span class="n">environ</span><span class="p">;</span>
+<span class="k">static</span><span class="w"> </span><span class="n">mach_port_t</span><span class="w"> </span><span class="n">port</span><span class="p">;</span>
+<span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">on_chld</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">s</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="p">(</span><span class="kt">void</span><span class="p">)</span><span class="n">s</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="o">*</span><span class="nf">receiver</span><span class="p">(</span><span class="kt">void</span><span class="w"> </span><span class="o">*</span><span class="n">arg</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">mach_msg_header_t</span><span class="w"> </span><span class="n">h</span><span class="p">;</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="n">body</span><span class="p">[</span><span class="mi">512</span><span class="p">];</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="n">msg</span><span class="p">;</span>
+<span class="w">    </span><span class="n">mach_msg_option_t</span><span class="w"> </span><span class="n">opt</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">MACH_RCV_MSG</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="p">)</span><span class="n">arg</span><span class="w"> </span><span class="o">?</span><span class="w"> </span><span class="n">MACH_RCV_INTERRUPT</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="n">kern_return_t</span><span class="w"> </span><span class="n">kr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mach_msg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">msg</span><span class="p">.</span><span class="n">h</span><span class="p">,</span><span class="w"> </span><span class="n">opt</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="w"> </span><span class="n">msg</span><span class="p">,</span><span class="w"> </span><span class="n">port</span><span class="p">,</span><span class="w"> </span><span class="n">MACH_MSG_TIMEOUT_NONE</span><span class="p">,</span><span class="w"> </span><span class="n">MACH_PORT_NULL</span><span class="p">);</span>
+<span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"receiver returned 0x%x</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">kr</span><span class="p">);</span>
+<span class="w">    </span><span class="n">fflush</span><span class="p">(</span><span class="n">stdout</span><span class="p">);</span>
+<span class="w">    </span><span class="n">_exit</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="kt">int</span><span class="w"> </span><span class="nf">main</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">argc</span><span class="p">,</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">**</span><span class="n">argv</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">interrupt</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">argc</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">    </span><span class="n">mach_port_allocate</span><span class="p">(</span><span class="n">mach_task_self</span><span class="p">(),</span><span class="w"> </span><span class="n">MACH_PORT_RIGHT_RECEIVE</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">port</span><span class="p">);</span>
+<span class="w">    </span><span class="n">signal</span><span class="p">(</span><span class="n">SIGCHLD</span><span class="p">,</span><span class="w"> </span><span class="n">on_chld</span><span class="p">);</span><span class="w">  </span><span class="cm">/* Darwin's signal() uses SA_RESTART */</span>
+<span class="w">    </span><span class="n">pthread_t</span><span class="w"> </span><span class="n">t</span><span class="p">;</span><span class="w"> </span><span class="n">pthread_create</span><span class="p">(</span><span class="o">&amp;</span><span class="n">t</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">receiver</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">interrupt</span><span class="p">);</span>
+<span class="w">    </span><span class="n">sleep</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="kt">sigset_t</span><span class="w"> </span><span class="n">s</span><span class="p">;</span><span class="w"> </span><span class="n">sigemptyset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">s</span><span class="p">);</span><span class="w"> </span><span class="n">sigaddset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">s</span><span class="p">,</span><span class="w"> </span><span class="n">SIGCHLD</span><span class="p">);</span>
+<span class="w">    </span><span class="n">pthread_sigmask</span><span class="p">(</span><span class="n">SIG_BLOCK</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">s</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">20</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">pid_t</span><span class="w"> </span><span class="n">pid</span><span class="p">;</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">av</span><span class="p">[]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="s">"/usr/bin/true"</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">};</span>
+<span class="w">        </span><span class="n">posix_spawn</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pid</span><span class="p">,</span><span class="w"> </span><span class="s">"/usr/bin/true"</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">av</span><span class="p">,</span><span class="w"> </span><span class="n">environ</span><span class="p">);</span>
+<span class="w">        </span><span class="n">waitpid</span><span class="p">(</span><span class="n">pid</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">        </span><span class="n">usleep</span><span class="p">(</span><span class="mi">50000</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"receiver still blocked after 20 signals</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="p">.</span><span class="o">/</span><span class="n">t</span><span class="w">              </span><span class="p">#</span><span class="w"> </span><span class="n">without</span><span class="w"> </span><span class="n">MACH_RCV_INTERRUPT</span>
+<span class="n">receiver</span><span class="w"> </span><span class="n">still</span><span class="w"> </span><span class="n">blocked</span><span class="w"> </span><span class="n">after</span><span class="w"> </span><span class="mi">20</span><span class="w"> </span><span class="n">signals</span>
+<span class="cp">$</span><span class="w"> </span><span class="p">.</span><span class="o">/</span><span class="n">t</span><span class="w"> </span><span class="n">interrupt</span><span class="w">    </span><span class="p">#</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="n">MACH_RCV_INTERRUPT</span><span class="p">,</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">handler_thread</span>
+<span class="n">receiver</span><span class="w"> </span><span class="n">returned</span><span class="w"> </span><span class="mh">0x10004005</span>
+</code></pre></div>
+<p><code>SA_RESTART</code> does not help, because <code>mach_msg</code> is a Mach trap rather than a BSD<br>
+system call.</p>
+<p>&lt;/details&gt;</p>
+<h2>In the field: Zed</h2>
+<p>Zed crashed twice with the same report, on 2026-09-21 after 80 h of uptime and on<br>
+2026-09-24 after 9 h. Both are <code>EXC_CRASH (SIGABRT)</code>, and the faulting thread is:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">__pthread_kill</span>
+<span class="n">pthread_kill</span>
+<span class="n">abort</span>
+<span class="n">std</span><span class="p">::</span><span class="n">sys</span><span class="p">::</span><span class="n">backtrace</span><span class="p">::</span><span class="n">__rust_begin_short_backtrace</span><span class="p">::</span><span class="o">&lt;&lt;</span><span class="n">wasmtime</span><span class="p">::</span><span class="n">runtime</span><span class="p">::</span><span class="n">vm</span><span class="p">::</span><span class="n">sys</span><span class="p">::</span><span class="n">unix</span><span class="p">::</span><span class="n">machports</span><span class="p">::</span><span class="n">TrapHandler</span><span class="o">&gt;</span><span class="p">::</span><span class="n">new</span><span class="p">::{</span><span class="n">closure</span><span class="p">#</span><span class="mi">0</span><span class="p">},</span><span class="w"> </span><span class="p">()</span><span class="o">&gt;</span>
+<span class="o">?</span>
+<span class="o">?</span>
+<span class="n">_pthread_start</span>
+<span class="n">thread_start</span>
+</code></pre></div>
+<p>The <code>eprintln!</code> output is lost in a GUI app, so the minidump is the only record.<br>
+The aborting thread's stack contains <code>0x10004005</code> (<code>MACH_RCV_INTERRUPTED</code>), where<br>
+the <code>eprintln!("{kret}")</code> argument would be spilled. The other abort path<br>
+(<code>unexpected msg header id</code>) does not match that value.</p>
+<p>I have not identified what interrupted the wait inside Zed. What I ruled out:</p>
+<ul>
+<li>
+<p><strong>Process-directed signals.</strong> XNU gives a process-directed signal to the first<br>
+  non-workqueue thread that does not mask it (<code>get_signalthread</code>). In both crashes<br>
+  the handler thread is 18th, behind 17 ordinary pthreads: main, 7 Rayon workers,<br>
+  NSEventThread, and others. An isolated Zed 1.22 instance survived 10,000<br>
+<code>kill -CHLD</code>, and 24,000 more in bursts while throttled to background priority.</p>
+</li>
+<li>
+<p><strong>Handler spill-over.</strong> A signal can reach a later thread while earlier threads<br>
+  are still inside the handler. A C model with the same thread layout and a stalling<br>
+  handler aborts at exactly the 18th signal. But in the crash minidump, taken while<br>
+  all threads were suspended, no thread other than the aborting one had a<br>
+<code>_sigtramp</code> frame. The main thread was in a GPUI render.</p>
+</li>
+<li>
+<p><strong>Inspection and scheduling.</strong> <code>footprint</code>, <code>vmmap</code>, <code>sample</code>,<br>
+<code>thread_suspend</code>/<code>thread_resume</code> and <code>SIGSTOP</code>/<code>SIGCONT</code> do not interrupt the<br>
+  receive. <code>thread_abort_safely</code> on the handler thread does.</p>
+</li>
+</ul>
+<p>So something aimed an interrupt at that thread directly, and I could not find its<br>
+source. Wasmtime's behaviour is the same whatever the source: one interrupted wait<br>
+takes down the host application.</p>
+<h2>Possible fixes</h2>
+<ol>
+<li>Treat <code>MACH_RCV_INTERRUPTED</code> as a retry: <code>continue</code> the loop.</li>
+<li>
+<p>Drop <code>MACH_RCV_INTERRUPT</code>, so libsystem retries the receive itself. Shutdown<br>
+   already arrives as <code>MACH_RCV_PORT_CHANGED</code>, so the flag does not look necessary<br>
+   for that. I could not find why it was added, so please correct me if it is<br>
+   load-bearing.</p>
+</li>
+<li>
+<p>Additionally block all signals on the handler thread, since it only needs Mach<br>
+   messages. This keeps any signal from interrupting it, whatever the embedder<br>
+   installs.</p>
+</li>
+</ol>
+<p>(1) or (2) fixes the abort. (3) is defence in depth. I have not built a patched<br>
+Wasmtime.<br>
+</p>
+</blockquote>
+
+
+
+<a name="626499473"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314393%20macOS%3A%20Mach%20exception%20handler%20thr.../near/626499473" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314393.20macOS.3A.20Mach.20exception.20handler.20thr.2E.2E.2E.html#626499473">(Sep 24 2026 at 03:10)</a>:</h4>
+<p>pchickey <a href="https://github.com/bytecodealliance/wasmtime/issues/14393#issuecomment-5806775476">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14393">issue #14393</a>:</p>
+<blockquote>
+<p>This issue doesn't appear to comply with our policy on tool-generated content, and requires additional justification for why it is valuable enough to the project for us to read it. Please see our developer policy on AI-generated contributions: <a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>
+</blockquote>
+
+
+
+<a name="626750813"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314393%20macOS%3A%20Mach%20exception%20handler%20thr.../near/626750813" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314393.20macOS.3A.20Mach.20exception.20handler.20thr.2E.2E.2E.html#626750813">(Sep 24 2026 at 23:07)</a>:</h4>
+<p>pchickey closed <a href="https://github.com/bytecodealliance/wasmtime/issues/14393">issue #14393</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p>On macOS, the Mach exception handler thread receives with<br>
+<code>MACH_RCV_MSG | MACH_RCV_INTERRUPT</code> and calls <code>libc::abort()</code> on any result other<br>
+than <code>KERN_SUCCESS</code> or <code>MACH_RCV_PORT_CHANGED</code><br>
+(<a href="https://github.com/bytecodealliance/wasmtime/blob/63edc9e1e1e9927dbeb5e66284d21be8e3c31237/crates/wasmtime/src/runtime/vm/sys/unix/machports.rs#L216">machports.rs#L216</a>,<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/63edc9e1e1e9927dbeb5e66284d21be8e3c31237/crates/wasmtime/src/runtime/vm/sys/unix/machports.rs#L224-L233">#L224-L233</a>).</p>
+<p>Because <code>MACH_RCV_INTERRUPT</code> is set, libsystem's <code>mach_msg</code> wrapper does not retry<br>
+an interrupted receive. It returns <code>MACH_RCV_INTERRUPTED</code> (<code>0x10004005</code>) to the caller. So if the<br>
+embedding process catches any signal and the kernel delivers it to the handler<br>
+thread, the handler thread aborts the whole process:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">mach_msg</span><span class="w"> </span><span class="n">failed</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="mi">268451845</span><span class="w"> </span><span class="p">(</span><span class="mi">10004005</span><span class="p">)</span>
+</code></pre></div>
+<p>This is reachable in real applications. Zed embeds Wasmtime for its extensions and<br>
+crashes on macOS with SIGABRT on exactly this thread (details below).</p>
+<h2>Versions</h2>
+<ul>
+<li>Reproduced with the <code>wasmtime</code> Python package 49.0.0.</li>
+<li>Observed in the field with Wasmtime 48.0.1 (embedded in Zed 1.21 / 1.22).</li>
+<li>The receive loop is unchanged on <code>main</code> at <code>63edc9e1e1</code>.</li>
+<li>macOS 27.0 (26A428), arm64 (Mac16,6).</li>
+</ul>
+<h2>Reproduction</h2>
+<div class="codehilite" data-code-language="Python"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">os</span><span class="o">,</span><span class="w"> </span><span class="nn">signal</span><span class="o">,</span><span class="w"> </span><span class="nn">subprocess</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">wasmtime</span>
+
+<span class="c1"># Any caught signal works; SIGCHLD is the common one (async-process/smol install</span>
+<span class="c1"># a SIGCHLD handler on macOS to reap children).</span>
+<span class="n">signal</span><span class="o">.</span><span class="n">signal</span><span class="p">(</span><span class="n">signal</span><span class="o">.</span><span class="n">SIGCHLD</span><span class="p">,</span> <span class="k">lambda</span> <span class="o">*</span><span class="n">_</span><span class="p">:</span> <span class="kc">None</span><span class="p">)</span>
+
+<span class="n">engine</span> <span class="o">=</span> <span class="n">wasmtime</span><span class="o">.</span><span class="n">Engine</span><span class="p">()</span>  <span class="c1"># spawns the Mach exception handler thread</span>
+
+<span class="c1"># Only to make delivery deterministic: block SIGCHLD on this thread so the kernel</span>
+<span class="c1"># must deliver it to the one thread that still accepts it, the handler thread.</span>
+<span class="n">signal</span><span class="o">.</span><span class="n">pthread_sigmask</span><span class="p">(</span><span class="n">signal</span><span class="o">.</span><span class="n">SIG_BLOCK</span><span class="p">,</span> <span class="p">{</span><span class="n">signal</span><span class="o">.</span><span class="n">SIGCHLD</span><span class="p">})</span>
+
+<span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">50</span><span class="p">):</span>
+    <span class="n">pid</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">posix_spawn</span><span class="p">(</span><span class="s2">"/usr/bin/true"</span><span class="p">,</span> <span class="p">[</span><span class="s2">"true"</span><span class="p">],</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">)</span>
+    <span class="n">os</span><span class="o">.</span><span class="n">waitpid</span><span class="p">(</span><span class="n">pid</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">"survived"</span><span class="p">)</span>
+</code></pre></div>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">python</span><span class="w"> </span><span class="n">repro</span><span class="p">.</span><span class="n">py</span>
+<span class="n">mach_msg</span><span class="w"> </span><span class="n">failed</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="mi">268451845</span><span class="w"> </span><span class="p">(</span><span class="mi">10004005</span><span class="p">)</span>
+<span class="cp">$</span><span class="w"> </span><span class="n">echo</span><span class="w"> </span><span class="cp">$</span><span class="o">?</span>
+<span class="mi">134</span>
+</code></pre></div>
+<p>Controls:</p>
+<table>
+<thead>
+<tr>
+<th>Variant</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>As above</td>
+<td>aborts on the first child exit</td>
+</tr>
+<tr>
+<td>No <code>SIGCHLD</code> handler (default disposition)</td>
+<td>survives 50 child exits</td>
+</tr>
+<tr>
+<td>Handler installed, main thread not masked</td>
+<td>survives 3 × 500 child exits (the kernel delivered every signal to the main thread)</td>
+</tr>
+<tr>
+<td><code>footprint</code>, <code>vmmap -summary</code>, <code>sample</code> against an idle process with an <code>Engine</code></td>
+<td>no abort</td>
+</tr>
+</tbody>
+</table>
+<p>The same behaviour at the Mach level, independent of Wasmtime:</p>
+<p>&lt;details&gt;<br>
+&lt;summary&gt;C check: interruptible vs non-interruptible receive under a caught signal&lt;/summary&gt;</p>
+<div class="codehilite" data-code-language="C"><pre><span></span><code><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;mach/mach.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;pthread.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;signal.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;spawn.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdio.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;sys/wait.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;unistd.h&gt;</span>
+<span class="k">extern</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">**</span><span class="n">environ</span><span class="p">;</span>
+<span class="k">static</span><span class="w"> </span><span class="n">mach_port_t</span><span class="w"> </span><span class="n">port</span><span class="p">;</span>
+<span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">on_chld</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">s</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="p">(</span><span class="kt">void</span><span class="p">)</span><span class="n">s</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="o">*</span><span class="nf">receiver</span><span class="p">(</span><span class="kt">void</span><span class="w"> </span><span class="o">*</span><span class="n">arg</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">mach_msg_header_t</span><span class="w"> </span><span class="n">h</span><span class="p">;</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="n">body</span><span class="p">[</span><span class="mi">512</span><span class="p">];</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="n">msg</span><span class="p">;</span>
+<span class="w">    </span><span class="n">mach_msg_option_t</span><span class="w"> </span><span class="n">opt</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">MACH_RCV_MSG</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="p">)</span><span class="n">arg</span><span class="w"> </span><span class="o">?</span><span class="w"> </span><span class="n">MACH_RCV_INTERRUPT</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="n">kern_return_t</span><span class="w"> </span><span class="n">kr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mach_msg</span><span class="p">(</span><span class="o">&amp;</span><span class="n">msg</span><span class="p">.</span><span class="n">h</span><span class="p">,</span><span class="w"> </span><span class="n">opt</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="w"> </span><span class="n">msg</span><span class="p">,</span><span class="w"> </span><span class="n">port</span><span class="p">,</span><span class="w"> </span><span class="n">MACH_MSG_TIMEOUT_NONE</span><span class="p">,</span><span class="w"> </span><span class="n">MACH_PORT_NULL</span><span class="p">);</span>
+<span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"receiver returned 0x%x</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">kr</span><span class="p">);</span>
+<span class="w">    </span><span class="n">fflush</span><span class="p">(</span><span class="n">stdout</span><span class="p">);</span>
+<span class="w">    </span><span class="n">_exit</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="kt">int</span><span class="w"> </span><span class="nf">main</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">argc</span><span class="p">,</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">**</span><span class="n">argv</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">interrupt</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">argc</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">    </span><span class="n">mach_port_allocate</span><span class="p">(</span><span class="n">mach_task_self</span><span class="p">(),</span><span class="w"> </span><span class="n">MACH_PORT_RIGHT_RECEIVE</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">port</span><span class="p">);</span>
+<span class="w">    </span><span class="n">signal</span><span class="p">(</span><span class="n">SIGCHLD</span><span class="p">,</span><span class="w"> </span><span class="n">on_chld</span><span class="p">);</span><span class="w">  </span><span class="cm">/* Darwin's signal() uses SA_RESTART */</span>
+<span class="w">    </span><span class="n">pthread_t</span><span class="w"> </span><span class="n">t</span><span class="p">;</span><span class="w"> </span><span class="n">pthread_create</span><span class="p">(</span><span class="o">&amp;</span><span class="n">t</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">receiver</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">interrupt</span><span class="p">);</span>
+<span class="w">    </span><span class="n">sleep</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="kt">sigset_t</span><span class="w"> </span><span class="n">s</span><span class="p">;</span><span class="w"> </span><span class="n">sigemptyset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">s</span><span class="p">);</span><span class="w"> </span><span class="n">sigaddset</span><span class="p">(</span><span class="o">&amp;</span><span class="n">s</span><span class="p">,</span><span class="w"> </span><span class="n">SIGCHLD</span><span class="p">);</span>
+<span class="w">    </span><span class="n">pthread_sigmask</span><span class="p">(</span><span class="n">SIG_BLOCK</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">s</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">20</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">pid_t</span><span class="w"> </span><span class="n">pid</span><span class="p">;</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">av</span><span class="p">[]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="s">"/usr/bin/true"</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">};</span>
+<span class="w">        </span><span class="n">posix_spawn</span><span class="p">(</span><span class="o">&amp;</span><span class="n">pid</span><span class="p">,</span><span class="w"> </span><span class="s">"/usr/bin/true"</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">av</span><span class="p">,</span><span class="w"> </span><span class="n">environ</span><span class="p">);</span>
+<span class="w">        </span><span class="n">waitpid</span><span class="p">(</span><span class="n">pid</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">        </span><span class="n">usleep</span><span class="p">(</span><span class="mi">50000</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"receiver still blocked after 20 signals</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="p">.</span><span class="o">/</span><span class="n">t</span><span class="w">              </span><span class="p">#</span><span class="w"> </span><span class="n">without</span><span class="w"> </span><span class="n">MACH_RCV_INTERRUPT</span>
+<span class="n">receiver</span><span class="w"> </span><span class="n">still</span><span class="w"> </span><span class="n">blocked</span><span class="w"> </span><span class="n">after</span><span class="w"> </span><span class="mi">20</span><span class="w"> </span><span class="n">signals</span>
+<span class="cp">$</span><span class="w"> </span><span class="p">.</span><span class="o">/</span><span class="n">t</span><span class="w"> </span><span class="n">interrupt</span><span class="w">    </span><span class="p">#</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="n">MACH_RCV_INTERRUPT</span><span class="p">,</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">handler_thread</span>
+<span class="n">receiver</span><span class="w"> </span><span class="n">returned</span><span class="w"> </span><span class="mh">0x10004005</span>
+</code></pre></div>
+<p><code>SA_RESTART</code> does not help, because <code>mach_msg</code> is a Mach trap rather than a BSD<br>
+system call.</p>
+<p>&lt;/details&gt;</p>
+<h2>In the field: Zed</h2>
+<p>Zed crashed twice with the same report, on 2026-09-21 after 80 h of uptime and on<br>
+2026-09-24 after 9 h. Both are <code>EXC_CRASH (SIGABRT)</code>, and the faulting thread is:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">__pthread_kill</span>
+<span class="n">pthread_kill</span>
+<span class="n">abort</span>
+<span class="n">std</span><span class="p">::</span><span class="n">sys</span><span class="p">::</span><span class="n">backtrace</span><span class="p">::</span><span class="n">__rust_begin_short_backtrace</span><span class="p">::</span><span class="o">&lt;&lt;</span><span class="n">wasmtime</span><span class="p">::</span><span class="n">runtime</span><span class="p">::</span><span class="n">vm</span><span class="p">::</span><span class="n">sys</span><span class="p">::</span><span class="n">unix</span><span class="p">::</span><span class="n">machports</span><span class="p">::</span><span class="n">TrapHandler</span><span class="o">&gt;</span><span class="p">::</span><span class="n">new</span><span class="p">::{</span><span class="n">closure</span><span class="p">#</span><span class="mi">0</span><span class="p">},</span><span class="w"> </span><span class="p">()</span><span class="o">&gt;</span>
+<span class="o">?</span>
+<span class="o">?</span>
+<span class="n">_pthread_start</span>
+<span class="n">thread_start</span>
+</code></pre></div>
+<p>The <code>eprintln!</code> output is lost in a GUI app, so the minidump is the only record.<br>
+The aborting thread's stack contains <code>0x10004005</code> (<code>MACH_RCV_INTERRUPTED</code>), where<br>
+the <code>eprintln!("{kret}")</code> argument would be spilled. The other abort path<br>
+(<code>unexpected msg header id</code>) does not match that value.</p>
+<p>I have not identified what interrupted the wait inside Zed. What I ruled out:</p>
+<ul>
+<li>
+<p><strong>Process-directed signals.</strong> XNU gives a process-directed signal to the first<br>
+  non-workqueue thread that does not mask it (<code>get_signalthread</code>). In both crashes<br>
+  the handler thread is 18th, behind 17 ordinary pthreads: main, 7 Rayon workers,<br>
+  NSEventThread, and others. An isolated Zed 1.22 instance survived 10,000<br>
+<code>kill -CHLD</code>, and 24,000 more in bursts while throttled to background priority.</p>
+</li>
+<li>
+<p><strong>Handler spill-over.</strong> A signal can reach a later thread while earlier threads<br>
+  are still inside the handler. A C model with the same thread layout and a stalling<br>
+  handler aborts at exactly the 18th signal. But in the crash minidump, taken while<br>
+  all threads were suspended, no thread other than the aborting one had a<br>
+<code>_sigtramp</code> frame. The main thread was in a GPUI render.</p>
+</li>
+<li>
+<p><strong>Inspection and scheduling.</strong> <code>footprint</code>, <code>vmmap</code>, <code>sample</code>,<br>
+<code>thread_suspend</code>/<code>thread_resume</code> and <code>SIGSTOP</code>/<code>SIGCONT</code> do not interrupt the<br>
+  receive. <code>thread_abort_safely</code> on the handler thread does.</p>
+</li>
+</ul>
+<p>So something aimed an interrupt at that thread directly, and I could not find its<br>
+source. Wasmtime's behaviour is the same whatever the source: one interrupted wait<br>
+takes down the host application.</p>
+<h2>Possible fixes</h2>
+<ol>
+<li>Treat <code>MACH_RCV_INTERRUPTED</code> as a retry: <code>continue</code> the loop.</li>
+<li>
+<p>Drop <code>MACH_RCV_INTERRUPT</code>, so libsystem retries the receive itself. Shutdown<br>
+   already arrives as <code>MACH_RCV_PORT_CHANGED</code>, so the flag does not look necessary<br>
+   for that. I could not find why it was added, so please correct me if it is<br>
+   load-bearing.</p>
+</li>
+<li>
+<p>Additionally block all signals on the handler thread, since it only needs Mach<br>
+   messages. This keeps any signal from interrupting it, whatever the embedder<br>
+   installs.</p>
+</li>
+</ol>
+<p>(1) or (2) fixes the abort. (3) is defence in depth. I have not built a patched<br>
+Wasmtime.<br>
+</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Sep 26 2026 at 20:06 UTC</p>
+</html>

@@ -1,0 +1,118 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #14384 component: fix ResourceAny conversio... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314384.20component.3A.20fix.20ResourceAny.20conversio.2E.2E.2E.html">wasmtime / PR #14384 component: fix ResourceAny conversio...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="626183570"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314384%20component%3A%20fix%20ResourceAny%20conversio.../near/626183570" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314384.20component.3A.20fix.20ResourceAny.20conversio.2E.2E.2E.html#626183570">(Sep 23 2026 at 00:28)</a>:</h4>
+<p>Byte-Naut opened <a href="https://github.com/bytecodealliance/wasmtime/pull/14384">PR #14384</a> from <code>Byte-Naut:issue-7793</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>Closes #7793.</p>
+<h3>Motivation</h3>
+<p>Converting a <code>Resource::&lt;T&gt;::new_borrow(rep)</code> (or <code>ResourceDynamic::new_borrow</code>) into a <code>ResourceAny</code> eagerly inserted a borrow into the host resource table. That operation requires an active component call scope, so performing the conversion outside of a call reached <code>bail_bug!("no current scope")</code>, which panics in debug builds and returns a <code>WasmtimeBug</code> error in release builds. @rvolosatovs reported this in #7793 with a minimal reproducer, and @alexcrichton pointed out that borrow lowering has to be deferred until a call is actually in progress, the way <code>Resource&lt;T&gt;</code> already does it. The reproducer has been sitting commented out in <code>can_use_own_for_borrow</code> since then.</p>
+<h3>Changes</h3>
+<ul>
+<li><code>ResourceAny</code> now carries an internal <code>ResourceAnyIndex</code> that is either a host table index (unchanged behavior for every existing <code>ResourceAny</code>) or the raw <code>rep</code> of a synthetic borrow.</li>
+<li><code>HostResource::try_into_resource_any</code> returns the synthetic variant for <code>new_borrow</code> resources instead of touching the host table. Owned and table-backed resources are handled exactly as before.</li>
+<li><code>try_into_resource</code> / <code>try_into_resource_dynamic</code>, <code>resource_drop</code>, and the <code>own</code>/<code>borrow</code> lowering paths handle the new variant; <code>lift</code> is unchanged and still produces table-backed values.</li>
+<li>Update the <code>ResourceAny</code> docs to state which values require <code>resource_drop</code>, and add a release note.</li>
+<li>Tests: enable the previously disabled part of <code>can_use_own_for_borrow</code> and extend it with the typed round-trip, a type mismatch, the own-lowering error, and the forgotten-drop trap; <code>resource_dynamic</code> gains the same paths for <code>ResourceDynamic</code>.</li>
+</ul>
+<h3>Design</h3>
+<p>The synthetic variant has no host table slot, so conversion, the typed round-trip, and <code>resource_drop</code> no longer need a call scope; <code>resource_drop</code> on such a value is a documented no-op. When the value is lowered into a guest <code>borrow</code> parameter, <code>lower_to_index</code> passes the <code>rep</code> straight to <code>guest_resource_lower_borrow</code>, which runs during the call and keeps guest-side borrow accounting intact: a guest that fails to drop the handle still traps with "borrow handles still remain at the end of the call". Lowering a synthetic borrow as <code>own</code> keeps producing the existing "cannot lower a <code>borrow</code> resource into an <code>own</code>" error, and resource type checks run before either lowering path. Borrows lifted from a guest remain table-backed and keep their drop obligation, so nothing changes for embedders who never call <code>new_borrow</code>.</p>
+<p>One behavior change worth calling out for review: previously, converting a <code>new_borrow</code> resource while a call was already active would create a table-backed borrow that had to be dropped before that call returned. That obligation no longer exists, which matches how <code>Resource&lt;T&gt;</code> borrows behave when passed directly. Happy to adjust if a different policy is preferred.</p>
+<h3>Testing</h3>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">cargo</span><span class="w"> </span><span class="n">test</span><span class="w"> </span><span class="o">--</span><span class="n">test</span><span class="w"> </span><span class="n">all</span><span class="w"> </span><span class="n">component_model</span><span class="p">::</span><span class="n">resources</span>
+</code></pre></div>
+<p>Locally: fmt, clippy, and the full <code>component_model</code> test suite pass. The baseline reproduces the <code>BUG: no current scope</code> panic on <code>main</code>.</p>
+<p>Thanks to @rvolosatovs for the clear reproducer and root-cause analysis, and to @alexcrichton for pointing at the deferred-lowering approach. In line with the Bytecode Alliance AI tool policy: Claude was used to assist with analysis and drafting; I have reviewed and tested every change here and am accountable for it.</p>
+</blockquote>
+
+
+
+<a name="626183574"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314384%20component%3A%20fix%20ResourceAny%20conversio.../near/626183574" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314384.20component.3A.20fix.20ResourceAny.20conversio.2E.2E.2E.html#626183574">(Sep 23 2026 at 00:28)</a>:</h4>
+<p>Byte-Naut requested <a href="https://github.com/dicej">dicej</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14384">PR #14384</a>.</p>
+
+
+
+<a name="626183575"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314384%20component%3A%20fix%20ResourceAny%20conversio.../near/626183575" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314384.20component.3A.20fix.20ResourceAny.20conversio.2E.2E.2E.html#626183575">(Sep 23 2026 at 00:28)</a>:</h4>
+<p>Byte-Naut requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14384">PR #14384</a>.</p>
+
+
+
+<a name="626183580"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314384%20component%3A%20fix%20ResourceAny%20conversio.../near/626183580" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314384.20component.3A.20fix.20ResourceAny.20conversio.2E.2E.2E.html#626183580">(Sep 23 2026 at 00:28)</a>:</h4>
+<p>Byte-Naut requested <a href="https://github.com/fitzgen">fitzgen</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14384">PR #14384</a>.</p>
+
+
+
+<a name="626183581"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314384%20component%3A%20fix%20ResourceAny%20conversio.../near/626183581" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314384.20component.3A.20fix.20ResourceAny.20conversio.2E.2E.2E.html#626183581">(Sep 23 2026 at 00:28)</a>:</h4>
+<p>Byte-Naut requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-default-reviewers">wasmtime-default-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14384">PR #14384</a>.</p>
+
+
+
+<a name="626192124"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314384%20component%3A%20fix%20ResourceAny%20conversio.../near/626192124" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314384.20component.3A.20fix.20ResourceAny.20conversio.2E.2E.2E.html#626192124">(Sep 23 2026 at 01:52)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14384">PR #14384</a>.</p>
+
+
+
+<a name="626192126"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314384%20component%3A%20fix%20ResourceAny%20conversio.../near/626192126" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314384.20component.3A.20fix.20ResourceAny.20conversio.2E.2E.2E.html#626192126">(Sep 23 2026 at 01:52)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:docs</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14384">PR #14384</a>.</p>
+
+
+
+<a name="626458926"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314384%20component%3A%20fix%20ResourceAny%20conversio.../near/626458926" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314384.20component.3A.20fix.20ResourceAny.20conversio.2E.2E.2E.html#626458926">(Sep 23 2026 at 22:12)</a>:</h4>
+<p>fitzgen unassigned fitzgen from <a href="https://github.com/bytecodealliance/wasmtime/pull/14384">PR #14384 component: fix ResourceAny conversion of synthetic borrowed host resources</a>.</p>
+
+
+
+<a name="626458989"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314384%20component%3A%20fix%20ResourceAny%20conversio.../near/626458989" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314384.20component.3A.20fix.20ResourceAny.20conversio.2E.2E.2E.html#626458989">(Sep 23 2026 at 22:12)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/pull/14384#issuecomment-5803817664">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14384">PR #14384</a>:</p>
+<blockquote>
+<p>Not particularly familiar with this area of code; gonna let @dicej handle this review.</p>
+</blockquote>
+
+
+
+<a name="626911683"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314384%20component%3A%20fix%20ResourceAny%20conversio.../near/626911683" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314384.20component.3A.20fix.20ResourceAny.20conversio.2E.2E.2E.html#626911683">(Sep 25 2026 at 14:47)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> dicej submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14384#pullrequestreview-5319076703">PR review</a>:</p>
+<blockquote>
+<p>Thanks, @Byte-Naut!</p>
+</blockquote>
+
+
+
+<a name="626911753"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314384%20component%3A%20fix%20ResourceAny%20conversio.../near/626911753" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314384.20component.3A.20fix.20ResourceAny.20conversio.2E.2E.2E.html#626911753">(Sep 25 2026 at 14:48)</a>:</h4>
+<p>dicej added <a href="https://github.com/bytecodealliance/wasmtime/pull/14384">PR #14384 component: fix ResourceAny conversion of synthetic borrowed host resources</a> to the merge queue.</p>
+
+
+
+<a name="626919448"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314384%20component%3A%20fix%20ResourceAny%20conversio.../near/626919448" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314384.20component.3A.20fix.20ResourceAny.20conversio.2E.2E.2E.html#626919448">(Sep 25 2026 at 15:15)</a>:</h4>
+<p><span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span> dicej merged <a href="https://github.com/bytecodealliance/wasmtime/pull/14384">PR #14384</a>.</p>
+
+
+
+<a name="626919451"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314384%20component%3A%20fix%20ResourceAny%20conversio.../near/626919451" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314384.20component.3A.20fix.20ResourceAny.20conversio.2E.2E.2E.html#626919451">(Sep 25 2026 at 15:15)</a>:</h4>
+<p>dicej removed <a href="https://github.com/bytecodealliance/wasmtime/pull/14384">PR #14384 component: fix ResourceAny conversion of synthetic borrowed host resources</a> from the merge queue.</p>
+
+
+
+<hr><p>Last updated: Sep 26 2026 at 20:06 UTC</p>
+</html>

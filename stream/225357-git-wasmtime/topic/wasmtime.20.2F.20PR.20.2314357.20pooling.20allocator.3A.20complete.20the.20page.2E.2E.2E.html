@@ -1,0 +1,330 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #14357 pooling allocator: complete the page... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html">wasmtime / PR #14357 pooling allocator: complete the page...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="625374473"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/625374473" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#625374473">(Sep 19 2026 at 02:38)</a>:</h4>
+<p>HasanH47 opened <a href="https://github.com/bytecodealliance/wasmtime/pull/14357">PR #14357</a> from <code>HasanH47:pagemap-reset-complete-traversal</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p><code>reset_with_pagemap</code> collects dirty regions into a stack buffer of 32 and<br>
+treats the kernel's <code>walk_end</code> as the end of the memory it will ever reset<br>
+in place: everything after it is decommitted with <code>madvise(DONTNEED)</code>.</p>
+<p>Two consequences we hit running a QuickJS-based guest with a fresh<br>
+instance per request (pooling allocator, <code>memory_init_cow</code>, <code>pagemap_scan</code>):</p>
+<ol>
+<li>
+<p><strong>Throughput.</strong> A JS heap dirties far more than 32 disjoint runs, so<br>
+   the scan stopped early on every reset and the rest of the heap was<br>
+   decommitted. Each new instance then re-faulted its heap (95–315 minor<br>
+   faults per request measured with <code>perf stat</code>), and the <code>madvise</code> +<br>
+<code>mprotect</code> storm capped multi-core scaling with TLB-shootdown IPIs.<br>
+   Resuming the scan from <code>walk_end</code> whenever the buffer filled, and<br>
+   stopping early only when the <code>keep_resident</code> page budget is spent (which<br>
+   is what <code>walk_end</code> is for), brought a request from 2.1 ms to 1.0 ms on<br>
+   one core and ×5 at 16 concurrent instances on a 16-core host, with 0<br>
+   faults per request.</p>
+</li>
+<li>
+<p><strong>Freshness.</strong> The mask requires <code>PRESENT</code>. A dirty page the kernel has<br>
+   swapped out is <code>WRITTEN | SWAPPED</code>, not <code>PRESENT</code>; it is neither reset in<br>
+   place nor decommitted (it sits before <code>walk_end</code>), so the next instance in<br>
+   the slot reads the previous instance's bytes. We reproduced this with a<br>
+   swapfile and <code>MADV_PAGEOUT</code> between two instantiations of the same slot:<br>
+   the second instance observed the first's heap and trapped in the<br>
+   allocator. Requiring <code>WRITTEN</code> and not <code>PFNZERO</code>/<code>FILE</code> regardless of<br>
+   residency fixes it — resetting a swapped page pages it in and overwrites<br>
+   it, which is the cost of correctness. With 32 regions the accidental<br>
+   decommit of everything after <code>walk_end</code> hid most of this; with a complete<br>
+   traversal it would be exposed on every host with swap, so the two changes<br>
+   belong together.</p>
+</li>
+</ol>
+<p>The patch keeps the fixed stack buffer (64 regions) and loops the ioctl,<br>
+so there is still no allocation on the reset path. Unit tests in<br>
+<code>pagemap.rs</code> (they skip where <code>PAGEMAP_SCAN</code> is unavailable):</p>
+<ul>
+<li>
+<p><code>reset_resumes_past_the_region_buffer</code>: 200 disjoint dirty pages in a<br>
+  400-page mapping, <code>keep_resident</code> = everything — all 200 reset in place,<br>
+  nothing decommitted, the mapping reads zero;</p>
+</li>
+<li>
+<p><code>reset_stops_at_the_page_budget</code>: same mapping, <code>keep_resident</code> = 100<br>
+  pages — exactly 100 reset, the rest decommitted;</p>
+</li>
+<li>
+<p><code>reset_covers_dirty_pages_that_were_paged_out</code>: 64 dirty pages,<br>
+<code>MADV_PAGEOUT</code>, then the reset — every page reset (on a host with swap<br>
+  this fails with the old <code>PRESENT</code> mask; elsewhere it is the ordinary<br>
+  reset).</p>
+</li>
+</ul>
+</blockquote>
+
+
+
+<a name="625374475"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/625374475" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#625374475">(Sep 19 2026 at 02:38)</a>:</h4>
+<p>HasanH47 requested <a href="https://github.com/dicej">dicej</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14357">PR #14357</a>.</p>
+
+
+
+<a name="625374476"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/625374476" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#625374476">(Sep 19 2026 at 02:38)</a>:</h4>
+<p>HasanH47 requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14357">PR #14357</a>.</p>
+
+
+
+<a name="625375613"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/625375613" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#625375613">(Sep 19 2026 at 02:56)</a>:</h4>
+<p>HasanH47 updated <a href="https://github.com/bytecodealliance/wasmtime/pull/14357">PR #14357</a>.</p>
+
+
+
+<a name="625383384"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/625383384" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#625383384">(Sep 19 2026 at 04:46)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14357">PR #14357</a>.</p>
+
+
+
+<a name="625797942"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/625797942" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#625797942">(Sep 21 2026 at 16:42)</a>:</h4>
+<p>alexcrichton requested <a href="https://github.com/alexcrichton">alexcrichton</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14357">PR #14357</a>.</p>
+
+
+
+<a name="625797946"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/625797946" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#625797946">(Sep 21 2026 at 16:42)</a>:</h4>
+<p>alexcrichton unassigned dicej from <a href="https://github.com/bytecodealliance/wasmtime/pull/14357">PR #14357 pooling allocator: complete the pagemap scan past 32 regions, and reset dirty pages that are not present</a>.</p>
+
+
+
+<a name="625803242"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/625803242" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#625803242">(Sep 21 2026 at 17:05)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14357#pullrequestreview-5269418537">PR review</a>:</p>
+<blockquote>
+<p>Thanks for the PR! The performance boost and fix here both seem reasonable to me, and I've left some minor comments below. Leaking pages across instances is typically a CVE-worthy bug but in this case this requires an off-by-default option explicitly documented as not fully supported just yet, so it's fine to just do this as a bugfix.</p>
+</blockquote>
+
+
+
+<a name="625803243"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/625803243" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#625803243">(Sep 21 2026 at 17:05)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14357#discussion_r4064412521">PR review comment</a>:</p>
+<blockquote>
+<p>I believe this is a stray file that can be removed</p>
+</blockquote>
+
+
+
+<a name="625803244"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/625803244" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#625803244">(Sep 21 2026 at 17:05)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14357#discussion_r4064415154">PR review comment</a>:</p>
+<blockquote>
+<p>Could this documentation be updated as well now that the search is updated?</p>
+</blockquote>
+
+
+
+<a name="625803245"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/625803245" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#625803245">(Sep 21 2026 at 17:05)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14357#discussion_r4064426313">PR review comment</a>:</p>
+<blockquote>
+<p>Out of curiosity, have you played around with different sizes vs dynamically-allocated sizes? I originally figured 32 would be big enough for most usages, and failing that I was thinking there might be like a pool of buffers in the pooling allocator somewhere to pull from to amortize the cost of this over time. My other rough assumption was that looping ioctl calls would be relatively expensive, but in retrospect perhaps 64 * page_size memcpy's are slower than a syscall.</p>
+<p>Anyway I've no idea what's best here myself, and just doubling + a loop is totally fine for now, but I'm curious if you've played around with this to see if alternative strategies might be worth it</p>
+</blockquote>
+
+
+
+<a name="625803246"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/625803246" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#625803246">(Sep 21 2026 at 17:05)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14357#discussion_r4064448371">PR review comment</a>:</p>
+<blockquote>
+<p>Could this local be removed in favor of directly mutating <code>pages_found</code>?</p>
+</blockquote>
+
+
+
+<a name="625803247"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/625803247" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#625803247">(Sep 21 2026 at 17:05)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14357#discussion_r4064460641">PR review comment</a>:</p>
+<blockquote>
+<p>Could this be a mutable variable and replace <code>remaining_budget</code> plus <code>pages_found</code>?</p>
+<p>Overall I find this is introduced a good number of local variables that I was finding it slightly tough to keep in my head so I was hoping to try to reduce things a bit.</p>
+</blockquote>
+
+
+
+<a name="626178098"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/626178098" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#626178098">(Sep 22 2026 at 23:56)</a>:</h4>
+<p>HasanH47 updated <a href="https://github.com/bytecodealliance/wasmtime/pull/14357">PR #14357</a>.</p>
+
+
+
+<a name="626178199"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/626178199" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#626178199">(Sep 22 2026 at 23:58)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> HasanH47 created <a href="https://github.com/bytecodealliance/wasmtime/pull/14357#discussion_r4077749274">PR review comment</a>:</p>
+<blockquote>
+<p>Removed — it slipped in from a rebase, sorry about that.</p>
+</blockquote>
+
+
+
+<a name="626178200"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/626178200" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#626178200">(Sep 22 2026 at 23:58)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> HasanH47 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14357#pullrequestreview-5285324821">PR review</a>.</p>
+
+
+
+<a name="626178206"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/626178206" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#626178206">(Sep 22 2026 at 23:58)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> HasanH47 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14357#pullrequestreview-5285325041">PR review</a>.</p>
+
+
+
+<a name="626178207"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/626178207" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#626178207">(Sep 22 2026 at 23:58)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> HasanH47 created <a href="https://github.com/bytecodealliance/wasmtime/pull/14357#discussion_r4077749492">PR review comment</a>:</p>
+<blockquote>
+<p>Updated: the criteria list no longer claims <code>PRESENT</code>, and the <code>Categories::WRITTEN</code> bullet now carries why a dirty page that is not present still has to be handled (a swapped-out page holds the previous instance's contents), which also replaced the separate paragraph I had added further down.</p>
+</blockquote>
+
+
+
+<a name="626178208"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/626178208" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#626178208">(Sep 22 2026 at 23:58)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> HasanH47 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14357#pullrequestreview-5285325173">PR review</a>.</p>
+
+
+
+<a name="626178210"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/626178210" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#626178210">(Sep 22 2026 at 23:58)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> HasanH47 created <a href="https://github.com/bytecodealliance/wasmtime/pull/14357#discussion_r4077749591">PR review comment</a>:</p>
+<blockquote>
+<p>I had not, so I measured it after your question. Linux 6.18, 4 KiB pages, an 8 MiB region (the <code>keep_resident</code> we run with), timing a complete traversal at several buffer capacities against the cost of resetting the same bytes:</p>
+<table>
+<thead>
+<tr>
+<th>dirty set</th>
+<th>cap 16</th>
+<th>32</th>
+<th>64</th>
+<th>128</th>
+<th>512</th>
+<th>resetting the same pages</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2048 contiguous pages (1 region)</td>
+<td>1 ioctl, 76 µs</td>
+<td>1, 70 µs</td>
+<td>1, 70 µs</td>
+<td>1, 70 µs</td>
+<td>1, 75 µs</td>
+<td>420 µs</td>
+</tr>
+<tr>
+<td>every 2nd page (1024 regions)</td>
+<td>64 ioctl, 174 µs</td>
+<td>32, 95 µs</td>
+<td>16, 67 µs</td>
+<td>8, 53 µs</td>
+<td>2, 44 µs</td>
+<td>86 µs</td>
+</tr>
+<tr>
+<td>every 16th page (128 regions)</td>
+<td>8 ioctl, 26 µs</td>
+<td>4, 18 µs</td>
+<td>2, 14 µs</td>
+<td>1, 9 µs</td>
+<td>1, 14 µs</td>
+<td>9 µs</td>
+</tr>
+</tbody>
+</table>
+<p>So an ioctl costs ≈2 µs here, and the answer to "are 64 page-sized memcpys slower than a syscall" is yes, comfortably: a contiguous 8 MiB dirty set is one ioctl at any capacity and the scan is ~6× cheaper than the memcpy that resets it. Capacity only shows up when the dirty set is fragmented, and even at the pathological every-other-page extreme, 32 → 64 saves ~28 µs against 86 µs of resets, while 64 → 512 saves another ~22 µs for 12 KiB of stack (a <code>page_region</code> is 24 bytes, so 64 is 1.5 KiB).</p>
+<p>That is why I left it at a fixed stack buffer and a loop: with the resume the capacity is a throughput knob, not a correctness one, so a pool or a heap allocation would be buying the last ~20 µs of the worst case. Happy to raise the constant to 128 if you would rather have the fragmented case cheaper — it is a one-line change.</p>
+</blockquote>
+
+
+
+<a name="626178214"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/626178214" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#626178214">(Sep 22 2026 at 23:58)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> HasanH47 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14357#pullrequestreview-5285325459">PR review</a>.</p>
+
+
+
+<a name="626178223"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/626178223" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#626178223">(Sep 22 2026 at 23:58)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> HasanH47 created <a href="https://github.com/bytecodealliance/wasmtime/pull/14357#discussion_r4077749731">PR review comment</a>:</p>
+<blockquote>
+<p>Done — <code>found_this_round</code> is gone; the loop now spends the budget directly as each region is reset.</p>
+</blockquote>
+
+
+
+<a name="626178229"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/626178229" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#626178229">(Sep 22 2026 at 23:58)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> HasanH47 submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14357#pullrequestreview-5285325789">PR review</a>.</p>
+
+
+
+<a name="626178230"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/626178230" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#626178230">(Sep 22 2026 at 23:58)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> HasanH47 created <a href="https://github.com/bytecodealliance/wasmtime/pull/14357#discussion_r4077750100">PR review comment</a>:</p>
+<blockquote>
+<p>Done, and it reads better — thanks. There is now one <code>budget</code> local (pages that may still be reset in place); each reported region spends it, <code>while budget &gt; 0</code> replaces the early <code>break</code>, and the "did the scan stop because the buffer was full?" test is the only thing left at the bottom of the loop.</p>
+</blockquote>
+
+
+
+<a name="626180835"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/626180835" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#626180835">(Sep 23 2026 at 00:08)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14357#pullrequestreview-5285401061">PR review</a>.</p>
+
+
+
+<a name="626180836"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/626180836" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#626180836">(Sep 23 2026 at 00:08)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14357#discussion_r4077807373">PR review comment</a>:</p>
+<blockquote>
+<p>Thanks for measuring that! Sounds like a fixed 64 is reasonable enough for now, and we can always continue to tweak in the future as well should it become necessary.</p>
+</blockquote>
+
+
+
+<a name="626180856"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/626180856" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#626180856">(Sep 23 2026 at 00:08)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14357#pullrequestreview-5285401520">PR review</a>.</p>
+
+
+
+<a name="626180887"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/626180887" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#626180887">(Sep 23 2026 at 00:08)</a>:</h4>
+<p>alexcrichton added <a href="https://github.com/bytecodealliance/wasmtime/pull/14357">PR #14357 pooling allocator: complete the pagemap scan past 32 regions, and reset dirty pages that are not present</a> to the merge queue.</p>
+
+
+
+<a name="626184414"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/626184414" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#626184414">(Sep 23 2026 at 00:35)</a>:</h4>
+<p><span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span> alexcrichton merged <a href="https://github.com/bytecodealliance/wasmtime/pull/14357">PR #14357</a>.</p>
+
+
+
+<a name="626184416"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314357%20pooling%20allocator%3A%20complete%20the%20page.../near/626184416" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314357.20pooling.20allocator.3A.20complete.20the.20page.2E.2E.2E.html#626184416">(Sep 23 2026 at 00:35)</a>:</h4>
+<p>alexcrichton removed <a href="https://github.com/bytecodealliance/wasmtime/pull/14357">PR #14357 pooling allocator: complete the pagemap scan past 32 regions, and reset dirty pages that are not present</a> from the merge queue.</p>
+
+
+
+<hr><p>Last updated: Sep 26 2026 at 20:06 UTC</p>
+</html>

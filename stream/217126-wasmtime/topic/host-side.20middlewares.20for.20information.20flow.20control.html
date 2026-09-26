@@ -1,0 +1,64 @@
+<html>
+<head><meta charset="utf-8"><title>host-side middlewares for information flow control · wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/index.html">wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/host-side.20middlewares.20for.20information.20flow.20control.html">host-side middlewares for information flow control</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="626712474"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/host-side%20middlewares%20for%20information%20flow%20control/near/626712474" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luiz Ribeiro <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/host-side.20middlewares.20for.20information.20flow.20control.html#626712474">(Sep 24 2026 at 19:23)</a>:</h4>
+<p>Hi all! I'm somewhat new to wasm and wasmtime. I'm currently exploring information flow control for wasm plugins. The idea is to label data when a plugin reads it (e.g. a file, an HTTP response) and block it from reaching sinks it shouldn't (the network, stdout, other files).</p>
+<p>To see every source and sink, I've been building a middleware layer for wasmtime hosts. It's basically a chain of before/after hooks that run around every call crossing the host boundary (including the host's own imports, the component's exports and WASI p2/p3). Hooks can deny calls, and they also see the resource handles each call takes/returns, which lets a label follow data from, say, a file descriptor to the stream read from it.</p>
+<p>Since wasmtime has no hook for intercepting calls AFAICT, and a <code>Linker</code> can't hand back a definition to wrap, I register my own implementation of each interface instead, which runs the chain and then forwards to the original. For p3 streams, whose data moves outside of calls, the host swaps in its own stream and runs the chain on each chunk.</p>
+<p>Has anyone done something similar? Is this a terrible idea, or is there a better approach? I looked at composition (splicer, WASI-Virt), but if I understand correctly those can't reach host-provided imports, which is where most sources and sinks live.</p>
+
+
+
+<a name="626713151"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/host-side%20middlewares%20for%20information%20flow%20control/near/626713151" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> fitzgen (he/him) <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/host-side.20middlewares.20for.20information.20flow.20control.html#626713151">(Sep 24 2026 at 19:26)</a>:</h4>
+<p>I'd recommend looking into using component composition for this kind of thing</p>
+
+
+
+<a name="626772874"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/host-side%20middlewares%20for%20information%20flow%20control/near/626772874" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Justin Fagnani <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/host-side.20middlewares.20for.20information.20flow.20control.html#626772874">(Sep 25 2026 at 02:13)</a>:</h4>
+<p>Hi Luiz!</p>
+<p>I'm doing almost the exact same thing: Components are dynamically loaded into a host that uses Wasmtime. Every wasi: interface provided is a proxy to control and/or deny access, also for IFC (though my current system is very coarse-grained and probably not technically IFC yet). Users or workflow definitions (pre-configured graphs of components) can enable access to sensitive sinks with a permissions system.</p>
+<p>I'm curious in both the interface proxy implementations, and what you're using components and IFC for (I have a guess). Maybe we could connect off-forum on the IFC bits.</p>
+
+
+
+<a name="627032505"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/host-side%20middlewares%20for%20information%20flow%20control/near/627032505" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luiz Ribeiro <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/host-side.20middlewares.20for.20information.20flow.20control.html#627032505">(Sep 26 2026 at 02:47)</a>:</h4>
+<p><span class="user-mention" data-user-id="1074034">@Justin Fagnani</span> exciting to hear of others working on similar things! <span aria-label="slight smile" class="emoji emoji-1f642" role="img" title="slight smile">:slight_smile:</span></p>
+<p>At a high level I'm looking for ways to build applications that allow third-party plugins, where plugins need explicit user consent to access sensitive resources, and where data flows between the host and its plugins (and maybe between plugins) are tracked. Does that sound similar to your use case?</p>
+<p>So far I've tried three approaches for the layer that intercepts calls between plugins and the host:</p>
+<ul>
+<li><strong>Wasmtime hooks:</strong> grant only what the plugin needs up front, check outbound HTTP in the <code>send_request</code> hook, and gate my own host imports with the user's grants. It's simple, but each check is a one-off decision, so it can't follow data after a call. This is how my application works today, but it's not enough for IFC.</li>
+<li><strong>Host-side middleware:</strong> my own <code>add_to_linker</code> implementations that run a chain of before/after hooks and then forward to <code>wasmtime-wasi</code>'s. It sees every WASI call, its resource handles, and p3 stream chunks. It needs a wrapper per WASI function, and these are coupled to the traits <code>wasmtime-wasi</code> generates with <code>bindgen!</code>, which can change between Wasmtime releases even when WASI doesn't.</li>
+<li><strong>Composition:</strong> I built a rough prototype today, per <span class="user-mention" data-user-id="253990">@fitzgen (he/him)</span>'s suggestion above. It's a component composed in front of the plugin that re-exports the interfaces it imports and enforces policy inside the sandbox. On Wasmtime it worked well. It also needs a wrapper per function, and those wrappers have to wrap every resource and relay p3 streams. I ran into some challenges with other runtimes (jco), though.</li>
+</ul>
+<p>I also looked into <a href="https://github.com/ejrgilbert/splicer"><code>splicer</code></a>, but AFAICT it only inserts middleware on edges between components inside a composition, so it can't reach host imports.</p>
+<p>I'm leaning towards composition now, but haven't committed yet. Are your proxies hand-written per interface? And yes, I'd love to connect off-forum!</p>
+
+
+
+<a name="627033530"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/host-side%20middlewares%20for%20information%20flow%20control/near/627033530" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luiz Ribeiro <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/host-side.20middlewares.20for.20information.20flow.20control.html#627033530">(Sep 26 2026 at 03:01)</a>:</h4>
+<p><span class="user-mention" data-user-id="253990">@fitzgen (he/him)</span> thanks for the pointer! I prototyped the composition approach and it worked well on Wasmtime. Is there a reason beyond portability to prefer it over wrapping <code>wasmtime-wasi</code>'s implementations on the host? E.g. are its generated traits not meant to be used this way?</p>
+
+
+
+<a name="627033857"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/217126-wasmtime/topic/host-side%20middlewares%20for%20information%20flow%20control/near/627033857" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Luiz Ribeiro <a href="https://bytecodealliance.github.io/zulip-archive/stream/217126-wasmtime/topic/host-side.20middlewares.20for.20information.20flow.20control.html#627033857">(Sep 26 2026 at 03:05)</a>:</h4>
+<p>One component-model question I ran into, if anyone knows: to observe when a plugin closes a p3 stream (e.g. the one passed to <code>write-via-stream</code>), the wrapper has to relay its bytes after the sync call returns. I ended up with a second, long-running export that the host drives alongside the plugin's. Is there a more idiomatic way? (jco 1.35 doesn't seem to run two exports concurrently, so this part didn't work there)</p>
+<p>Thanks again for all your responses and help here!</p>
+
+
+
+<hr><p>Last updated: Sep 26 2026 at 20:06 UTC</p>
+</html>

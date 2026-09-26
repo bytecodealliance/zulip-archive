@@ -1,0 +1,204 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14413 pooling allocator: a way to relea... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314413.20pooling.20allocator.3A.20a.20way.20to.20relea.2E.2E.2E.html">wasmtime / issue #14413 pooling allocator: a way to relea...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="626722666"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314413%20pooling%20allocator%3A%20a%20way%20to%20relea.../near/626722666" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314413.20pooling.20allocator.3A.20a.20way.20to.20relea.2E.2E.2E.html#626722666">(Sep 24 2026 at 20:08)</a>:</h4>
+<p>HasanH47 opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14413">issue #14413</a>:</p>
+<blockquote>
+<h4>Feature</h4>
+<p>A way for an embedder to release the memory the pooling allocator keeps<br>
+resident for slots that are <strong>not in use</strong> (<code>*_keep_resident</code>), at a moment<br>
+the embedder chooses.</p>
+<p>Follow-up from #14357 , same embedder: one instance per application, a fresh<br>
+instance per request, so the pooling allocator is on the hot path.</p>
+<h4>Benefit</h4>
+<p>Resident memory follows the <strong>peak</strong> concurrency a process has ever seen<br>
+rather than its current load. We measure ~0.5 GiB of resident slots at c=64,<br>
+and it does not come back down when the burst ends - a box sized for a daily<br>
+peak carries that peak all night.</p>
+<p>This is not a leak; it is <code>linear_memory_keep_resident</code> doing exactly what it<br>
+is for. We set it to 8 MiB because letting those pages go costs about 2× the<br>
+CPU per request on one vCPU when the next instance faults them back in. That<br>
+is the right trade while slots are reused every few milliseconds, and the<br>
+wrong one for a slot nothing has touched for an hour. Today there is no way<br>
+to say "keep it while the load lasts".</p>
+<h4>Implementation</h4>
+<p>Something like:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">impl</span><span class="w"> </span><span class="n">Engine</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="sd">/// Releases memory the pooling allocator keeps resident for slots that</span>
+<span class="w">    </span><span class="sd">/// are not in use. The next instantiation in those slots re-faults the</span>
+<span class="w">    </span><span class="sd">/// pages. No effect on other allocators.</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">release_idle_pool_memory</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">usize</span><span class="p">;</span><span class="w"> </span><span class="c1">// bytes released</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>An embedder that already knows when it is idle needs no timer inside<br>
+wasmtime - we park our own watchdog when no instance is live, so one call<br>
+from that path is enough.</p>
+<h4>Alternatives</h4>
+<ul>
+<li>
+<p><strong><code>PoolingAllocationConfig::decommit_idle_slots_after(Duration)</code></strong> - puts<br>
+  the policy in wasmtime and needs a timer there. It solves our problem<br>
+  equally well; we have no preference and will follow whichever shape you<br>
+  prefer.</p>
+</li>
+<li>
+<p><strong><code>linear_memory_keep_resident = 0</code></strong> - expressible today, and costs the<br>
+  ~2× CPU per request above on every request, not just the first after a<br>
+  quiet period.</p>
+</li>
+<li>
+<p><strong>Doing it from outside wasmtime</strong> - we looked and could not: the region<br>
+  belongs to the pool, there is no handle to an idle slot's memory, and<br>
+<code>linear_memory_keep_resident</code> is fixed when the <code>Engine</code> is built.</p>
+</li>
+</ul>
+<p>Happy to do the before/after measurement (a burst, then idle, sampling<br>
+RSS/PSS) on whichever shape you pick.<br>
+</p>
+</blockquote>
+
+
+
+<a name="626723691"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314413%20pooling%20allocator%3A%20a%20way%20to%20relea.../near/626723691" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314413.20pooling.20allocator.3A.20a.20way.20to.20relea.2E.2E.2E.html#626723691">(Sep 24 2026 at 20:13)</a>:</h4>
+<p>HasanH47 edited <a href="https://github.com/bytecodealliance/wasmtime/issues/14413">issue #14413</a>:</p>
+<blockquote>
+<h4>Feature</h4>
+<p>A way for an embedder to release the memory the pooling allocator keeps resident for slots that are <strong>not in use</strong> (<code>*_keep_resident</code>), at a moment the embedder chooses.</p>
+<p>Follow-up from #14357 , same embedder: one instance per application, a fresh instance per request, so the pooling allocator is on the hot path.</p>
+<h4>Benefit</h4>
+<p>Resident memory follows the <strong>peak</strong> concurrency a process has ever seen rather than its current load. We measure ~0.5 GiB of resident slots at c=64, and it does not come back down when the burst ends - a box sized for a daily peak carries that peak all night.</p>
+<p>This is not a leak; it is <code>linear_memory_keep_resident</code> doing exactly what it is for. We set it to 8 MiB because letting those pages go costs about 2× the CPU per request on one vCPU when the next instance faults them back in. That is the right trade while slots are reused every few milliseconds, and the wrong one for a slot nothing has touched for an hour. Today there is no way to say "keep it while the load lasts".</p>
+<h4>Implementation</h4>
+<p>Something like:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">impl</span><span class="w"> </span><span class="n">Engine</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="sd">/// Releases memory the pooling allocator keeps resident for slots that</span>
+<span class="w">    </span><span class="sd">/// are not in use. The next instantiation in those slots re-faults the</span>
+<span class="w">    </span><span class="sd">/// pages. No effect on other allocators.</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">release_idle_pool_memory</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">usize</span><span class="p">;</span><span class="w"> </span><span class="c1">// bytes released</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>An embedder that already knows when it is idle needs no timer inside wasmtime - we park our own watchdog when no instance is live, so one call from that path is enough.</p>
+<h4>Alternatives</h4>
+<ul>
+<li><strong><code>PoolingAllocationConfig::decommit_idle_slots_after(Duration)</code></strong> — puts the policy in wasmtime and needs a timer there. It solves our problem equally well; we have no preference and will follow whichever shape you prefer.</li>
+<li><strong><code>linear_memory_keep_resident = 0</code></strong> — expressible today, and costs the ~2× CPU per request above on every request, not just the first after a quiet period.</li>
+<li><strong>Doing it from outside wasmtime</strong> — we looked and could not: the region belongs to the pool, there is no handle to an idle slot's memory, and <code>linear_memory_keep_resident</code> is fixed when the <code>Engine</code> is built.</li>
+</ul>
+<p>Happy to do the before/after measurement (a burst, then idle, sampling RSS/PSS) on whichever shape you pick.<br>
+</p>
+</blockquote>
+
+
+
+<a name="626723985"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314413%20pooling%20allocator%3A%20a%20way%20to%20relea.../near/626723985" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314413.20pooling.20allocator.3A.20a.20way.20to.20relea.2E.2E.2E.html#626723985">(Sep 24 2026 at 20:15)</a>:</h4>
+<p>HasanH47 edited <a href="https://github.com/bytecodealliance/wasmtime/issues/14413">issue #14413</a>:</p>
+<blockquote>
+<h4>Feature</h4>
+<p>A way for an embedder to release the memory the pooling allocator keeps resident for slots that are <strong>not in use</strong> (<code>*_keep_resident</code>), at a moment the embedder chooses.</p>
+<p>Follow-up from #14357 , same embedder: one instance per application, a fresh instance per request, so the pooling allocator is on the hot path.</p>
+<h4>Benefit</h4>
+<p>Resident memory follows the <strong>peak</strong> concurrency a process has ever seen rather than its current load. We measure ~0.5 GiB of resident slots at c=64, and it does not come back down when the burst ends - a box sized for a daily peak carries that peak all night.</p>
+<p>This is not a leak; it is <code>linear_memory_keep_resident</code> doing exactly what it is for. We set it to 8 MiB because letting those pages go costs about 2× the CPU per request on one vCPU when the next instance faults them back in. That is the right trade while slots are reused every few milliseconds, and the wrong one for a slot nothing has touched for an hour. Today there is no way to say "keep it while the load lasts".</p>
+<h4>Implementation</h4>
+<p>Something like:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">impl</span><span class="w"> </span><span class="n">Engine</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="sd">/// Releases memory the pooling allocator keeps resident for slots that</span>
+<span class="w">    </span><span class="sd">/// are not in use. The next instantiation in those slots re-faults the</span>
+<span class="w">    </span><span class="sd">/// pages. No effect on other allocators.</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">release_idle_pool_memory</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">usize</span><span class="p">;</span><span class="w"> </span><span class="c1">// bytes released</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>An embedder that already knows when it is idle needs no timer inside wasmtime - we park our own watchdog when no instance is live, so one call from that path is enough.</p>
+<h4>Alternatives</h4>
+<ul>
+<li><strong><code>PoolingAllocationConfig::decommit_idle_slots_after(Duration)</code></strong> - puts the policy in wasmtime and needs a timer there. It solves our problem equally well; we have no preference and will follow whichever shape you prefer.</li>
+<li><strong><code>linear_memory_keep_resident = 0</code></strong> - expressible today, and costs the ~2× CPU per request above on every request, not just the first after a quiet period.</li>
+<li><strong>Doing it from outside wasmtime</strong> - we looked and could not: the region belongs to the pool, there is no handle to an idle slot's memory, and <code>linear_memory_keep_resident</code> is fixed when the <code>Engine</code> is built.</li>
+</ul>
+<p>Happy to do the before/after measurement (a burst, then idle, sampling RSS/PSS) on whichever shape you pick.<br>
+</p>
+</blockquote>
+
+
+
+<a name="626734058"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314413%20pooling%20allocator%3A%20a%20way%20to%20relea.../near/626734058" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314413.20pooling.20allocator.3A.20a.20way.20to.20relea.2E.2E.2E.html#626734058">(Sep 24 2026 at 21:06)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/14413#issuecomment-5822249379">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14413">issue #14413</a>:</p>
+<blockquote>
+<p>This seems like a reasonable feature request to me and I don't think it'd be too too hard to implement (hopefully at least...). @HasanH47 would you be interested in trying your hand at making a PR for this?</p>
+</blockquote>
+
+
+
+<a name="626734075"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314413%20pooling%20allocator%3A%20a%20way%20to%20relea.../near/626734075" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314413.20pooling.20allocator.3A.20a.20way.20to.20relea.2E.2E.2E.html#626734075">(Sep 24 2026 at 21:06)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the enhancement label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14413">Issue #14413</a>.</p>
+
+
+
+<a name="626738341"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314413%20pooling%20allocator%3A%20a%20way%20to%20relea.../near/626738341" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314413.20pooling.20allocator.3A.20a.20way.20to.20relea.2E.2E.2E.html#626738341">(Sep 24 2026 at 21:32)</a>:</h4>
+<p>HasanH47 <a href="https://github.com/bytecodealliance/wasmtime/issues/14413#issuecomment-5822588888">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14413">issue #14413</a>:</p>
+<blockquote>
+<blockquote>
+<p>This seems like a reasonable feature request to me and I don't think it'd be too too hard to implement (hopefully at least...). <a href="https://github.com/HasanH47">@HasanH47</a> would you be interested in trying your hand at making a PR for this?</p>
+</blockquote>
+<p>Thanks @alexcrichton , yes I'd like to try. It may take a little while to find my way around pooling allocator, and I'll probaly come back with a question or two. I'll open it as a draft once I have something working, and bring the before/after RSS numbers with it</p>
+</blockquote>
+
+
+
+<a name="626741798"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314413%20pooling%20allocator%3A%20a%20way%20to%20relea.../near/626741798" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314413.20pooling.20allocator.3A.20a.20way.20to.20relea.2E.2E.2E.html#626741798">(Sep 24 2026 at 21:56)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/14413#issuecomment-5822893617">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14413">issue #14413</a>:</p>
+<blockquote>
+<p>Sounds good! Feel free to ask questions either here or on Zulip, happy to help!</p>
+</blockquote>
+
+
+
+<a name="627025520"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314413%20pooling%20allocator%3A%20a%20way%20to%20relea.../near/627025520" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314413.20pooling.20allocator.3A.20a.20way.20to.20relea.2E.2E.2E.html#627025520">(Sep 26 2026 at 01:24)</a>:</h4>
+<p>cfallin closed <a href="https://github.com/bytecodealliance/wasmtime/issues/14413">issue #14413</a>:</p>
+<blockquote>
+<h4>Feature</h4>
+<p>A way for an embedder to release the memory the pooling allocator keeps resident for slots that are <strong>not in use</strong> (<code>*_keep_resident</code>), at a moment the embedder chooses.</p>
+<p>Follow-up from #14357 , same embedder: one instance per application, a fresh instance per request, so the pooling allocator is on the hot path.</p>
+<h4>Benefit</h4>
+<p>Resident memory follows the <strong>peak</strong> concurrency a process has ever seen rather than its current load. We measure ~0.5 GiB of resident slots at c=64, and it does not come back down when the burst ends - a box sized for a daily peak carries that peak all night.</p>
+<p>This is not a leak; it is <code>linear_memory_keep_resident</code> doing exactly what it is for. We set it to 8 MiB because letting those pages go costs about 2× the CPU per request on one vCPU when the next instance faults them back in. That is the right trade while slots are reused every few milliseconds, and the wrong one for a slot nothing has touched for an hour. Today there is no way to say "keep it while the load lasts".</p>
+<h4>Implementation</h4>
+<p>Something like:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">impl</span><span class="w"> </span><span class="n">Engine</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="sd">/// Releases memory the pooling allocator keeps resident for slots that</span>
+<span class="w">    </span><span class="sd">/// are not in use. The next instantiation in those slots re-faults the</span>
+<span class="w">    </span><span class="sd">/// pages. No effect on other allocators.</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">release_idle_pool_memory</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">usize</span><span class="p">;</span><span class="w"> </span><span class="c1">// bytes released</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>An embedder that already knows when it is idle needs no timer inside wasmtime - we park our own watchdog when no instance is live, so one call from that path is enough.</p>
+<h4>Alternatives</h4>
+<ul>
+<li><strong><code>PoolingAllocationConfig::decommit_idle_slots_after(Duration)</code></strong> - puts the policy in wasmtime and needs a timer there. It solves our problem equally well; we have no preference and will follow whichever shape you prefer.</li>
+<li><strong><code>linear_memory_keep_resident = 0</code></strong> - expressible today, and costs the ~2× CPU per request above on every request, not just the first after a quiet period.</li>
+<li><strong>Doing it from outside wasmtime</strong> - we looked and could not: the region belongs to the pool, there is no handle to an idle slot's memory, and <code>linear_memory_keep_resident</code> is fixed when the <code>Engine</code> is built.</li>
+</ul>
+<p>Happy to do the before/after measurement (a burst, then idle, sampling RSS/PSS) on whichever shape you pick.<br>
+</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Sep 26 2026 at 20:06 UTC</p>
+</html>

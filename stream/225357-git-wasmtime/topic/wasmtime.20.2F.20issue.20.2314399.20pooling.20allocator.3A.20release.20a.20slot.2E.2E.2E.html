@@ -1,0 +1,159 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14399 pooling allocator: release a slot... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314399.20pooling.20allocator.3A.20release.20a.20slot.2E.2E.2E.html">wasmtime / issue #14399 pooling allocator: release a slot...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="626652057"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314399%20pooling%20allocator%3A%20release%20a%20slot.../near/626652057" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314399.20pooling.20allocator.3A.20release.20a.20slot.2E.2E.2E.html#626652057">(Sep 24 2026 at 15:17)</a>:</h4>
+<p>HasanH47 opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14399">issue #14399</a>:</p>
+<blockquote>
+<p>Follow-up from #14357 (merged 2026-09-23). Same embedder: a backend runtime that<br>
+instantiates one module per application and creates a fresh instance per unit of<br>
+work, so the pooling allocator is on the hot path for every request. All numbers<br>
+below are from that shape — one instance per application, slots reused every few<br>
+milliseconds under load and untouched between bursts.</p>
+<h2>What we see</h2>
+<p>Resident memory follows the <strong>peak</strong> concurrency a process has ever seen, not the<br>
+current load. In our qualification runs, ~0.5 GiB of resident slots at c=64<br>
+(against 143 MiB for a single Node process on the same workload), and ~4 MiB RSS<br>
+/ ~1.5 MiB PSS per slot ever touched. After the burst ends the memory stays: a<br>
+box sized for a daily peak carries that peak all night.</p>
+<p>This is not a leak — it is the documented behaviour of<br>
+<code>PoolingAllocationConfig::linear_memory_keep_resident</code>, which we set to 8 MiB<br>
+because faulting those pages back in costs about twice the CPU per request on<br>
+one vCPU (measured with the knob at 0). The trade is right while a slot is being<br>
+reused every few milliseconds. It is wrong for a slot nothing has touched for an<br>
+hour.</p>
+<h2>Why we cannot do it from outside</h2>
+<p>The kept-resident region is anonymous memory the pool <code>memset</code>s to zero on<br>
+deallocation (<code>memory_pool.rs</code>: *"This much memory will be <code>memset</code> to zero when<br>
+a linear memory is deallocated. Memory exceeding this amount … will be released<br>
+with <code>madvise</code>"*). So those pages hold zeros, not the module image; the image<br>
+arrives through the CoW mapping when the next instance starts.</p>
+<p>That makes the content question trivial: <code>MADV_DONTNEED</code> over that region gives<br>
+back zero-filled pages on the next touch, which is exactly what is there now.<br>
+Releasing it is a memory-for-page-faults trade with no correctness consequence.</p>
+<p>What an embedder does not have is the <strong>address</strong>. Slot memory belongs to the<br>
+pool, wasmtime exposes no handle to an idle slot's region, and reaching into the<br>
+mapping from outside would be writing against private bookkeeping (<code>ImageSlot</code>)<br>
+even when the bytes agree.</p>
+<p>Nor can the existing knob express it: <code>linear_memory_keep_resident</code> is fixed when<br>
+the <code>Engine</code> is built, so we can choose "always keep 8 MiB" or "never keep any",<br>
+but not "keep it while the load lasts".</p>
+<h2>Proposal</h2>
+<p>An explicit, embedder-driven release. An embedder that knows when it is idle (we<br>
+already park our watchdog and epoch ticker when no instance is live) needs no<br>
+timer inside wasmtime — only a way to act on what it already knows:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">impl</span><span class="w"> </span><span class="n">Engine</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="sd">/// Releases memory the pooling allocator is keeping resident for slots</span>
+<span class="w">    </span><span class="sd">/// that are not in use (`*_keep_resident`). The next instantiation in</span>
+<span class="w">    </span><span class="sd">/// those slots re-faults the pages. No effect on other allocators.</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">release_idle_pool_memory</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">usize</span><span class="p">;</span><span class="w"> </span><span class="c1">// bytes released</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>An alternative shape — <code>PoolingAllocationConfig::decommit_idle_slots_after(Duration)</code><br>
+— puts the policy in wasmtime and needs a timer there. The explicit call looks<br>
+smaller and more testable, and leaves the policy where the knowledge is, but we<br>
+have no strong opinion; either shape solves it for us.</p>
+<h2>What we would measure</h2>
+<p>A c=32 burst, then 300 s idle, sampling RSS/PSS. Today the curve is flat after<br>
+the burst; the change should bring it back toward the pre-burst plateau at the<br>
+cost of the first request after the quiet period. Our existing harness produces<br>
+exactly this shape, so before/after is a re-run rather than new tooling — happy<br>
+to report numbers on whichever shape you prefer.</p>
+<p>Context and the full write-up, including why the local workaround would be a<br>
+hack: <a href="https://github.com/gmedia/usai/blob/main/docs/upstream/wasmtime-idle-decommit.md">https://github.com/gmedia/usai/blob/main/docs/upstream/wasmtime-idle-decommit.md</a></p>
+</blockquote>
+
+
+
+<a name="626662474"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314399%20pooling%20allocator%3A%20release%20a%20slot.../near/626662474" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314399.20pooling.20allocator.3A.20release.20a.20slot.2E.2E.2E.html#626662474">(Sep 24 2026 at 15:56)</a>:</h4>
+<p>pchickey <a href="https://github.com/bytecodealliance/wasmtime/issues/14399#issuecomment-5817540295">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14399">issue #14399</a>:</p>
+<blockquote>
+<p>This issue doesn't appear to comply with our policy on tool-generated content, and requires additional justification for why it is valuable enough to the project for us to read it. Please see our developer policy on AI-generated contributions: <a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>
+</blockquote>
+
+
+
+<a name="626666718"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314399%20pooling%20allocator%3A%20release%20a%20slot.../near/626666718" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314399.20pooling.20allocator.3A.20release.20a.20slot.2E.2E.2E.html#626666718">(Sep 24 2026 at 16:12)</a>:</h4>
+<p>pchickey closed <a href="https://github.com/bytecodealliance/wasmtime/issues/14399">issue #14399</a>:</p>
+<blockquote>
+<p>Follow-up from #14357 (merged 2026-09-23). Same embedder: a backend runtime that<br>
+instantiates one module per application and creates a fresh instance per unit of<br>
+work, so the pooling allocator is on the hot path for every request. All numbers<br>
+below are from that shape — one instance per application, slots reused every few<br>
+milliseconds under load and untouched between bursts.</p>
+<h2>What we see</h2>
+<p>Resident memory follows the <strong>peak</strong> concurrency a process has ever seen, not the<br>
+current load. In our qualification runs, ~0.5 GiB of resident slots at c=64<br>
+(against 143 MiB for a single Node process on the same workload), and ~4 MiB RSS<br>
+/ ~1.5 MiB PSS per slot ever touched. After the burst ends the memory stays: a<br>
+box sized for a daily peak carries that peak all night.</p>
+<p>This is not a leak — it is the documented behaviour of<br>
+<code>PoolingAllocationConfig::linear_memory_keep_resident</code>, which we set to 8 MiB<br>
+because faulting those pages back in costs about twice the CPU per request on<br>
+one vCPU (measured with the knob at 0). The trade is right while a slot is being<br>
+reused every few milliseconds. It is wrong for a slot nothing has touched for an<br>
+hour.</p>
+<h2>Why we cannot do it from outside</h2>
+<p>The kept-resident region is anonymous memory the pool <code>memset</code>s to zero on<br>
+deallocation (<code>memory_pool.rs</code>: *"This much memory will be <code>memset</code> to zero when<br>
+a linear memory is deallocated. Memory exceeding this amount … will be released<br>
+with <code>madvise</code>"*). So those pages hold zeros, not the module image; the image<br>
+arrives through the CoW mapping when the next instance starts.</p>
+<p>That makes the content question trivial: <code>MADV_DONTNEED</code> over that region gives<br>
+back zero-filled pages on the next touch, which is exactly what is there now.<br>
+Releasing it is a memory-for-page-faults trade with no correctness consequence.</p>
+<p>What an embedder does not have is the <strong>address</strong>. Slot memory belongs to the<br>
+pool, wasmtime exposes no handle to an idle slot's region, and reaching into the<br>
+mapping from outside would be writing against private bookkeeping (<code>ImageSlot</code>)<br>
+even when the bytes agree.</p>
+<p>Nor can the existing knob express it: <code>linear_memory_keep_resident</code> is fixed when<br>
+the <code>Engine</code> is built, so we can choose "always keep 8 MiB" or "never keep any",<br>
+but not "keep it while the load lasts".</p>
+<h2>Proposal</h2>
+<p>An explicit, embedder-driven release. An embedder that knows when it is idle (we<br>
+already park our watchdog and epoch ticker when no instance is live) needs no<br>
+timer inside wasmtime — only a way to act on what it already knows:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">impl</span><span class="w"> </span><span class="n">Engine</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="sd">/// Releases memory the pooling allocator is keeping resident for slots</span>
+<span class="w">    </span><span class="sd">/// that are not in use (`*_keep_resident`). The next instantiation in</span>
+<span class="w">    </span><span class="sd">/// those slots re-faults the pages. No effect on other allocators.</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">release_idle_pool_memory</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">usize</span><span class="p">;</span><span class="w"> </span><span class="c1">// bytes released</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>An alternative shape — <code>PoolingAllocationConfig::decommit_idle_slots_after(Duration)</code><br>
+— puts the policy in wasmtime and needs a timer there. The explicit call looks<br>
+smaller and more testable, and leaves the policy where the knowledge is, but we<br>
+have no strong opinion; either shape solves it for us.</p>
+<h2>What we would measure</h2>
+<p>A c=32 burst, then 300 s idle, sampling RSS/PSS. Today the curve is flat after<br>
+the burst; the change should bring it back toward the pre-burst plateau at the<br>
+cost of the first request after the quiet period. Our existing harness produces<br>
+exactly this shape, so before/after is a re-run rather than new tooling — happy<br>
+to report numbers on whichever shape you prefer.</p>
+<p>Context and the full write-up, including why the local workaround would be a<br>
+hack: <a href="https://github.com/gmedia/usai/blob/main/docs/upstream/wasmtime-idle-decommit.md">https://github.com/gmedia/usai/blob/main/docs/upstream/wasmtime-idle-decommit.md</a></p>
+</blockquote>
+
+
+
+<a name="626666726"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314399%20pooling%20allocator%3A%20release%20a%20slot.../near/626666726" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314399.20pooling.20allocator.3A.20release.20a.20slot.2E.2E.2E.html#626666726">(Sep 24 2026 at 16:12)</a>:</h4>
+<p>pchickey <a href="https://github.com/bytecodealliance/wasmtime/issues/14399#issuecomment-5817798787">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14399">issue #14399</a>:</p>
+<blockquote>
+<p>If this is an issue you wish to report in a way that complies with our AI policy, please re-open as a new issue.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Sep 26 2026 at 20:06 UTC</p>
+</html>

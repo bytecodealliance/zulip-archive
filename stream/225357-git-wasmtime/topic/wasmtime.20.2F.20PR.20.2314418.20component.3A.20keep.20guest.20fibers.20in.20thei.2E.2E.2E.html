@@ -1,0 +1,189 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #14418 component: keep guest fibers in thei... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314418.20component.3A.20keep.20guest.20fibers.20in.20thei.2E.2E.2E.html">wasmtime / PR #14418 component: keep guest fibers in thei...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="626800374"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314418%20component%3A%20keep%20guest%20fibers%20in%20thei.../near/626800374" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314418.20component.3A.20keep.20guest.20fibers.20in.20thei.2E.2E.2E.html#626800374">(Sep 25 2026 at 06:10)</a>:</h4>
+<p>Byte-Naut opened <a href="https://github.com/bytecodealliance/wasmtime/pull/14418">PR #14418</a> from <code>Byte-Naut:issue-14241-2</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>Fixes #14241.</p>
+<p>This supersedes #14385 and follows @alexcrichton's <a href="https://github.com/bytecodealliance/wasmtime/pull/14385#issuecomment-5797545091">suggestion there</a>: rather than guarding each handoff, keep fibers at rest in the table and only take them out while they're being resumed.</p>
+<h2>Motivation</h2>
+<p>Several scheduler paths in <code>concurrent.rs</code> moved a live fiber out of store-owned state (into a <code>WaitMode</code>, a <code>WorkItem</code>, or a local) and then ran a fallible step before it reached its next owner. These only fail once an internal invariant is already broken, but when they do the unfinished fiber is dropped, <code>StoreFiber</code>'s <code>Drop</code> panics, and a trap or <code>bail_bug!</code> turns into a host panic or process abort. #14382 added two more such paths (<code>next_switch_item</code> in <code>YieldingToSubtask</code>, and the <code>other</code> arm in <code>subtask_cancel</code>).</p>
+<h2>Changes</h2>
+<ul>
+<li>Every resting guest fiber now lives in <code>GuestThreadState::Fiber { fiber, kind }</code>, and the reusable worker fiber stays in <code>ConcurrentState::worker</code>. <code>WaitMode::Fiber</code> and <code>WorkItem::ResumeFiber</code> no longer hold a fiber, so wait sets, work queues, <code>switch_item</code>, <code>next_switch_item</code>, and the saved switch items in the table only carry thread ids.</li>
+<li>A fiber is taken out of its thread only in <code>handle_work_item</code>, after checking the expected <code>kind</code>, and handed straight to <code>resume_fiber</code>. <code>resume_fiber</code> holds it together with the store in a small private guard until it is back in its thread or the worker slot, so a failed lookup, or dropping the future before it is polled, disposes of it through the store.</li>
+<li><code>take_fibers_and_futures</code> and <code>trace_fiber_roots</code> destructure <code>ConcurrentState</code> and match <code>GuestThreadState</code> exhaustively, as suggested in the #14146 review, so a new field or variant has to be handled there. Neither needs to look in wait sets or work items for fibers anymore.</li>
+<li>State transitions that would overwrite or delete a thread state still holding a fiber now <code>bail_bug!</code> instead. <code>restore_next_switch_item</code> does the same if <code>next_switch_item</code> was set again while the saved one was stashed, since overwriting it would silently lose that switch.</li>
+</ul>
+<p>No public API changes, no new locks, no per-suspension allocations, and no new <code>ConcurrentState</code> fields. About 270 of the added lines are tests.</p>
+<h2>Design</h2>
+<p><code>FiberKind</code> keeps the distinctions the thread intrinsics relied on when the fiber's location implied the state:</p>
+<table>
+<thead>
+<tr>
+<th>Before</th>
+<th>Fiber kept in</th>
+<th>Now</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Running</code>, blocked in a waitable set</td>
+<td><code>WaitMode::Fiber</code></td>
+<td><code>FiberKind::Waiting</code></td>
+</tr>
+<tr>
+<td><code>Running</code>, queued as <code>ResumeFiber</code> or yielding to a subtask</td>
+<td>work item / <code>next_switch_item</code></td>
+<td><code>FiberKind::Scheduled</code></td>
+</tr>
+<tr>
+<td><code>Suspended</code></td>
+<td>thread state</td>
+<td><code>FiberKind::Suspended</code></td>
+</tr>
+<tr>
+<td><code>Ready</code>, queued as <code>ResumeThread</code></td>
+<td>thread state</td>
+<td><code>FiberKind::Ready</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>GuestThreadState::can_resume</code> applies the same rules as before: only <code>Suspended</code> (or a not-yet-started explicit thread) can be resumed, and only <code>Ready</code> can be promoted. <code>Waiting</code> and <code>Scheduled</code> behave like <code>Running</code>. <code>resume_work_item_fiber</code> checks that a <code>ResumeFiber</code> item finds <code>Scheduled</code> and a <code>ResumeThread</code> item finds <code>Ready</code> before taking the fiber.</p>
+<p>Two things worth a look in review:</p>
+<ul>
+<li><code>set_thread_running</code> leaves a <code>Scheduled</code> or <code>Waiting</code> fiber in place. Before, that write set a thread whose fiber lived elsewhere to <code>Running</code>; now the fiber stays in the thread state, which already means "running" for the intrinsics.</li>
+<li>The guard in <code>resume_fiber</code> is the only place a guest fiber is outside the table, and it covers exactly the resume interval.</li>
+</ul>
+<h2>Testing</h2>
+<p><code>thread-wait-resume.wast</code> (new) blocks a thread in <code>waitable-set.wait</code> with no pending event, then calls <code>thread.resume-later</code> or <code>thread.suspend-then-resume</code> on it and expects <code>cannot resume thread which is not suspended</code>. It guards against a waiting thread being treated as suspended now that its fiber lives in the thread state.</p>
+<p>The unit tests in <code>concurrent.rs</code> (<code>fiber_ownership_tests</code>) set up broken states directly: invalid wait set, thread, or subtask handles when a fiber suspends; an invalid waiter in <code>mark_ready</code>; an occupied switch slot; <code>set_thread_running</code> and <code>cleanup_thread</code> on a thread that still owns a fiber; and dropping a resume future before it's polled. Each checks that the original error (or <code>bail_bug!</code> panic in debug builds) comes back and that the fiber is still owned by the store or has been disposed of. One more test checks the resume and promote rules for each <code>FiberKind</code>.</p>
+<div class="codehilite"><pre><span></span><code>cargo test -p wasmtime --lib fiber_ownership_tests
+cargo test --test wast -- component-model/async
+</code></pre></div>
+
+<p>Locally: fmt, clippy for <code>wasmtime</code>, the full <code>wasmtime</code> lib tests, the async component-model <code>.wast</code> tests on Cranelift and Winch, the <code>component_model</code> tests in <code>tests/all</code>, the focused tests with debug assertions disabled, and <code>no_std</code> / non-async builds all pass.</p>
+<p>Developed with assistance from Claude (Anthropic). Per the Bytecode Alliance AI Tool Use Policy, I'm the author and accountable for this change.</p>
+</blockquote>
+
+
+
+<a name="626800377"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314418%20component%3A%20keep%20guest%20fibers%20in%20thei.../near/626800377" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314418.20component.3A.20keep.20guest.20fibers.20in.20thei.2E.2E.2E.html#626800377">(Sep 25 2026 at 06:10)</a>:</h4>
+<p>Byte-Naut requested <a href="https://github.com/cfallin">cfallin</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14418">PR #14418</a>.</p>
+
+
+
+<a name="626800378"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314418%20component%3A%20keep%20guest%20fibers%20in%20thei.../near/626800378" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314418.20component.3A.20keep.20guest.20fibers.20in.20thei.2E.2E.2E.html#626800378">(Sep 25 2026 at 06:10)</a>:</h4>
+<p>Byte-Naut requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14418">PR #14418</a>.</p>
+
+
+
+<a name="626818437"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314418%20component%3A%20keep%20guest%20fibers%20in%20thei.../near/626818437" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314418.20component.3A.20keep.20guest.20fibers.20in.20thei.2E.2E.2E.html#626818437">(Sep 25 2026 at 07:48)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14418">PR #14418</a>.</p>
+
+
+
+<a name="627005576"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314418%20component%3A%20keep%20guest%20fibers%20in%20thei.../near/627005576" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314418.20component.3A.20keep.20guest.20fibers.20in.20thei.2E.2E.2E.html#627005576">(Sep 25 2026 at 22:11)</a>:</h4>
+<p>Byte-Naut edited <a href="https://github.com/bytecodealliance/wasmtime/pull/14418">PR #14418</a>:</p>
+<blockquote>
+<p>Fixes #14241.</p>
+<p>This supersedes #14385 and follows @alexcrichton's <a href="https://github.com/bytecodealliance/wasmtime/pull/14385#issuecomment-5797545091">suggestion there</a>: rather than guarding each handoff, keep fibers at rest in the table and only take them out while they're being resumed.</p>
+<h2>Motivation</h2>
+<p>Several scheduler paths in <code>concurrent.rs</code> moved a live fiber out of store-owned state (into a <code>WaitMode</code>, a <code>WorkItem</code>, or a local) and then ran a fallible step before it reached its next owner. These only fail once an internal invariant is already broken, but when they do the unfinished fiber is dropped, <code>StoreFiber</code>'s <code>Drop</code> panics, and a trap or <code>bail_bug!</code> turns into a host panic or process abort. #14382 added two more such paths (<code>next_switch_item</code> in <code>YieldingToSubtask</code>, and the <code>other</code> arm in <code>subtask_cancel</code>).</p>
+<h2>Changes</h2>
+<ul>
+<li>Every resting guest fiber now lives in <code>GuestThreadState::Fiber { fiber, kind }</code>, and the reusable worker fiber stays in <code>ConcurrentState::worker</code>. <code>WaitMode::Fiber</code> and <code>WorkItem::ResumeFiber</code> no longer hold a fiber, so wait sets, work queues, <code>switch_item</code>, <code>next_switch_item</code>, and the saved switch items in the table only carry thread ids.</li>
+<li>A fiber is taken out of its thread only in <code>handle_work_item</code>, after checking the expected <code>kind</code>, and handed straight to <code>resume_fiber</code>. <code>resume_fiber</code> holds it together with the store in a small private guard until it is back in its thread or the worker slot, so a failed lookup, or dropping the future before it is polled, disposes of it through the store.</li>
+<li><code>take_fibers_and_futures</code> and <code>trace_fiber_roots</code> destructure <code>ConcurrentState</code> and match <code>GuestThreadState</code> exhaustively, as suggested in the #14146 review, so a new field or variant has to be handled there. Neither needs to look in wait sets or work items for fibers anymore.</li>
+<li>State transitions that would overwrite or delete a thread state still holding a fiber now <code>bail_bug!</code> instead. <code>restore_next_switch_item</code> does the same if <code>next_switch_item</code> was set again while the saved one was stashed, since overwriting it would silently lose that switch.</li>
+</ul>
+<p>No public API changes, no new locks, no per-suspension allocations, and no new <code>ConcurrentState</code> fields. About 270 of the added lines are tests.</p>
+<h2>Design</h2>
+<p><code>FiberKind</code> keeps the distinctions the thread intrinsics relied on when the fiber's location implied the state:</p>
+<table>
+<thead>
+<tr>
+<th>Before</th>
+<th>Fiber kept in</th>
+<th>Now</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Running</code>, blocked in a waitable set</td>
+<td><code>WaitMode::Fiber</code></td>
+<td><code>FiberKind::Waiting</code></td>
+</tr>
+<tr>
+<td><code>Running</code>, queued as <code>ResumeFiber</code> or yielding to a subtask</td>
+<td>work item / <code>next_switch_item</code></td>
+<td><code>FiberKind::Scheduled</code></td>
+</tr>
+<tr>
+<td><code>Suspended</code></td>
+<td>thread state</td>
+<td><code>FiberKind::Suspended</code></td>
+</tr>
+<tr>
+<td><code>Ready</code>, queued as <code>ResumeThread</code></td>
+<td>thread state</td>
+<td><code>FiberKind::Ready</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>GuestThreadState::can_resume</code> applies the same rules as before: only <code>Suspended</code> (or a not-yet-started explicit thread) can be resumed, and only <code>Ready</code> can be promoted. <code>Waiting</code> and <code>Scheduled</code> behave like <code>Running</code>. <code>resume_work_item_fiber</code> checks that a <code>ResumeFiber</code> item finds <code>Scheduled</code> and a <code>ResumeThread</code> item finds <code>Ready</code> before taking the fiber.</p>
+<p>Two things worth a look in review:</p>
+<ul>
+<li><code>set_thread_running</code> leaves a <code>Scheduled</code> or <code>Waiting</code> fiber in place. Before, that write set a thread whose fiber lived elsewhere to <code>Running</code>; now the fiber stays in the thread state, which already means "running" for the intrinsics.</li>
+<li>The guard in <code>resume_fiber</code> is the only place a guest fiber is outside the table, and it covers exactly the resume interval.</li>
+</ul>
+<p>None of the details here are fixed. If other names for <code>FiberKind</code>'s variants, or fewer or differently placed tests, would be easier to review, I'm happy to rework it.</p>
+<h2>Testing</h2>
+<p><code>thread-wait-resume.wast</code> (new) blocks a thread in <code>waitable-set.wait</code> with no pending event, then calls <code>thread.resume-later</code> or <code>thread.suspend-then-resume</code> on it and expects <code>cannot resume thread which is not suspended</code>. It guards against a waiting thread being treated as suspended now that its fiber lives in the thread state.</p>
+<p>The unit tests in <code>concurrent.rs</code> (<code>fiber_ownership_tests</code>) set up broken states directly: invalid wait set, thread, or subtask handles when a fiber suspends; an invalid waiter in <code>mark_ready</code>; an occupied switch slot; <code>set_thread_running</code> and <code>cleanup_thread</code> on a thread that still owns a fiber; and dropping a resume future before it's polled. Each checks that the original error (or <code>bail_bug!</code> panic in debug builds) comes back and that the fiber is still owned by the store or has been disposed of. One more test checks the resume and promote rules for each <code>FiberKind</code>.</p>
+<div class="codehilite"><pre><span></span><code>cargo test -p wasmtime --lib fiber_ownership_tests
+cargo test --test wast -- component-model/async
+</code></pre></div>
+
+<p>Locally: fmt, clippy for <code>wasmtime</code>, the full <code>wasmtime</code> lib tests, the async component-model <code>.wast</code> tests on Cranelift and Winch, the <code>component_model</code> tests in <code>tests/all</code>, the focused tests with debug assertions disabled, and <code>no_std</code> / non-async builds all pass.</p>
+<p>Developed with assistance from Claude (Anthropic). Per the Bytecode Alliance AI Tool Use Policy, I'm the author and accountable for this change.</p>
+</blockquote>
+
+
+
+<a name="627020919"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314418%20component%3A%20keep%20guest%20fibers%20in%20thei.../near/627020919" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314418.20component.3A.20keep.20guest.20fibers.20in.20thei.2E.2E.2E.html#627020919">(Sep 26 2026 at 00:19)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/14418#issuecomment-5841429823">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14418">PR #14418</a>:</p>
+<blockquote>
+<p>I think I will pass the review baton to @alexcrichton on this one if that's OK -- I'm not familiar enough with the innards of <code>concurrent.rs</code> to be confident in reviewing this work. Thank you though!</p>
+</blockquote>
+
+
+
+<a name="627020923"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314418%20component%3A%20keep%20guest%20fibers%20in%20thei.../near/627020923" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314418.20component.3A.20keep.20guest.20fibers.20in.20thei.2E.2E.2E.html#627020923">(Sep 26 2026 at 00:19)</a>:</h4>
+<p>cfallin requested <a href="https://github.com/alexcrichton">alexcrichton</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14418">PR #14418</a>.</p>
+
+
+
+<a name="627020930"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314418%20component%3A%20keep%20guest%20fibers%20in%20thei.../near/627020930" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314418.20component.3A.20keep.20guest.20fibers.20in.20thei.2E.2E.2E.html#627020930">(Sep 26 2026 at 00:19)</a>:</h4>
+<p>cfallin unassigned cfallin from <a href="https://github.com/bytecodealliance/wasmtime/pull/14418">PR #14418 component: keep guest fibers in their thread state</a>.</p>
+
+
+
+<hr><p>Last updated: Sep 26 2026 at 20:06 UTC</p>
+</html>
