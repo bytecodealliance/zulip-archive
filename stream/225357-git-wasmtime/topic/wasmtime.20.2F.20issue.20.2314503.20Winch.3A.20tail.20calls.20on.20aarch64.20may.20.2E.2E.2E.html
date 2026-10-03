@@ -1,0 +1,203 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14503 Winch: tail calls on aarch64 may ... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314503.20Winch.3A.20tail.20calls.20on.20aarch64.20may.20.2E.2E.2E.html">wasmtime / issue #14503 Winch: tail calls on aarch64 may ...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="628787314"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314503%20Winch%3A%20tail%20calls%20on%20aarch64%20may%20.../near/628787314" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314503.20Winch.3A.20tail.20calls.20on.20aarch64.20may.20.2E.2E.2E.html#628787314">(Oct 02 2026 at 21:28)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14503">issue #14503</a>:</p>
+<blockquote>
+<p>The code generation here -- <a href="https://github.com/bytecodealliance/wasmtime/blob/3be934572ba647c8c925085480ae5670b6faa81f/winch/codegen/src/isa/aarch64/masm.rs#L528-L546">https://github.com/bytecodealliance/wasmtime/blob/3be934572ba647c8c925085480ae5670b6faa81f/winch/codegen/src/isa/aarch64/masm.rs#L528-L546</a> -- bumps <code>sp</code> to some number of bytes above <code>fp</code> but then afterwards it loads from <code>fp</code> which means that a load is performed on something beneath <code>sp</code>. Signal handlers and such can corrupt this region, however, so this is in theory a window for corruption of the stack.</p>
+<p>If helpful, an LLM report is</p>
+<p>&lt;details&gt;</p>
+<h1>Winch aarch64: tail call to a no-stack-arg callee reloads FP from below SP</h1>
+<ul>
+<li>
+<p>Commit: 249bdf8fca (main2), audited 2026-10-02. Introduced by c46ba02162<br>
+  "winch: support tail calls with callee cleanup" (#14349).</p>
+</li>
+<li>
+<p>Platform: Linux 7.0.0-31-generic x86_64 host, qemu-aarch64 9.1.2</p>
+</li>
+<li>Auditor: Claude Opus 5.5 (claude-opus-5-5); repro re-verified by coordinator</li>
+</ul>
+<p>Severity: medium-low. Winch on aarch64, default-enabled tail calls. Needs an<br>
+async signal (without <code>SA_ONSTACK</code>) to land in a 1-instruction window, but<br>
+the result is FP corruption that Winch (FP-relative stack args) and<br>
+Wasmtime's stack walking (traps, GC roots, exceptions) then follow.</p>
+<h2>Root cause</h2>
+<p><code>winch/codegen/src/isa/aarch64/masm.rs</code> <code>finish_tail_call_empty</code><br>
+(~513-547), the <code>TailCallFrameKind::EmptyCallee</code> path (tail-caller has stack<br>
+args, callee has none), emits (<code>wasmtime objdump</code>, coordinator-verified):</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">ldur</span><span class="w"> </span><span class="n">x28</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="n">x29</span><span class="p">,</span><span class="w"> </span><span class="p">#</span><span class="o">-</span><span class="mh">0x10</span><span class="p">]</span>
+<span class="n">ldur</span><span class="w"> </span><span class="n">x30</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="n">x29</span><span class="p">,</span><span class="w"> </span><span class="p">#</span><span class="mi">8</span><span class="p">]</span>
+<span class="n">add</span><span class="w">  </span><span class="n">sp</span><span class="p">,</span><span class="w"> </span><span class="n">x29</span><span class="p">,</span><span class="w"> </span><span class="p">#</span><span class="mh">0x40</span>
+<span class="n">ldur</span><span class="w"> </span><span class="n">x29</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="n">x29</span><span class="p">]</span><span class="w">        </span><span class="p">;</span><span class="w"> </span><span class="n">reads</span><span class="w"> </span><span class="mh">0x40</span><span class="w"> </span><span class="n">bytes</span><span class="w"> </span><span class="o">*</span><span class="n">below</span><span class="o">*</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">new</span><span class="w"> </span><span class="n">SP</span>
+<span class="n">b</span><span class="w">    </span><span class="o">&lt;</span><span class="n">callee</span><span class="o">&gt;</span>
+</code></pre></div>
+<p>AArch64 Linux has no red zone: a signal frame pushed between the <code>add</code> and<br>
+the <code>ldur</code> overwrites the saved-FP slot. The callee saves/restores the<br>
+garbage FP and the caller's caller resumes with a corrupted FP. x64 and the<br>
+resize path in the same commit load the old frame before moving SP<br>
+("finish all old-frame reads before advancing SP").</p>
+<h2>Repro</h2>
+<p>Rust crate in this directory: no-op <code>SIGALRM</code> handler (no <code>SA_ONSTACK</code>),<br>
+100us <code>setitimer</code>, loops a Winch function calling <code>$tc</code> (12 i32 params) which<br>
+<code>return_call</code>s <code>$leaf</code> (1 param).</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER</span><span class="o">=</span><span class="n">aarch64</span><span class="o">-</span><span class="n">linux</span><span class="o">-</span><span class="n">gnu</span><span class="o">-</span><span class="n">gcc</span><span class="w"> </span><span class="err">\</span>
+<span class="n">CARGO_TARGET_DIR</span><span class="o">=&lt;</span><span class="n">repo</span><span class="o">&gt;/</span><span class="n">target</span><span class="o">/</span><span class="n">audit</span><span class="o">-</span><span class="n">repro</span><span class="w"> </span><span class="err">\</span>
+<span class="w">  </span><span class="n">cargo</span><span class="w"> </span><span class="n">build</span><span class="w"> </span><span class="o">--</span><span class="n">release</span><span class="w"> </span><span class="o">--</span><span class="n">target</span><span class="w"> </span><span class="n">aarch64</span><span class="o">-</span><span class="n">unknown</span><span class="o">-</span><span class="n">linux</span><span class="o">-</span><span class="n">gnu</span>
+<span class="n">qemu</span><span class="o">-</span><span class="n">aarch64</span><span class="w"> </span><span class="o">-</span><span class="n">one</span><span class="o">-</span><span class="n">insn</span><span class="o">-</span><span class="n">per</span><span class="o">-</span><span class="n">tb</span><span class="w"> </span><span class="o">-</span><span class="n">cpu</span><span class="w"> </span><span class="n">max</span><span class="p">,</span><span class="n">sve</span><span class="o">-</span><span class="n">default</span><span class="o">-</span><span class="n">vector</span><span class="o">-</span><span class="n">length</span><span class="o">=</span><span class="mi">256</span><span class="w"> </span><span class="err">\</span>
+<span class="w">  </span><span class="o">-</span><span class="n">L</span><span class="w"> </span><span class="o">/</span><span class="n">usr</span><span class="o">/</span><span class="n">aarch64</span><span class="o">-</span><span class="n">linux</span><span class="o">-</span><span class="n">gnu</span><span class="w"> </span><span class="o">&lt;</span><span class="n">bin</span><span class="o">&gt;</span>
+</code></pre></div>
+<table>
+<thead>
+<tr>
+<th>config</th>
+<th>result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Winch + signals</td>
+<td><code>round 0: ok (6221 signals)</code> then <code>uncaught target signal 11 (Segmentation fault)</code> (3/3 runs incl. coordinator)</td>
+</tr>
+<tr>
+<td>Cranelift + signals (<code>CRANELIFT=1</code>)</td>
+<td>10M calls OK</td>
+</tr>
+<tr>
+<td>Winch, no signals (<code>NOSIG=1</code>)</td>
+<td>10M calls OK</td>
+</tr>
+<tr>
+<td>Winch + signals, default qemu CPU (small SVE)</td>
+<td>no crash (signal frame too small to reach slot)</td>
+</tr>
+</tbody>
+</table>
+<p>Faulting PC not captured; conclusion rests on disassembly + controls.<br>
+Darwin/Windows aarch64 write signal/exception context directly below SP<br>
+(Darwin 128-byte red zone), so callers with &gt;~112 bytes of stack args are<br>
+likely exposed there too (untested).</p>
+<h2>Suggested fix</h2>
+<p>Load <code>[x29]</code> (into x29 or a scratch) before <code>add sp, ...</code>, as the x64 code<br>
+and <code>with_tail_call_resize</code> already do.</p>
+<p>&lt;/details&gt;</p>
+<p>and an (unsuccessful so far I believe) theoretical repro is:</p>
+<p>&lt;details&gt;</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="sd">//! Winch/aarch64: `return_call` to a callee with no stack arguments, from a</span>
+<span class="sd">//! caller that has stack arguments, moves SP above the saved frame pointer</span>
+<span class="sd">//! before reloading it (`add sp, fp, #N ; ldr fp, [fp]`). An asynchronous</span>
+<span class="sd">//! signal delivered between those two instructions clobbers the saved FP.</span>
+<span class="sd">//!</span>
+<span class="sd">//! Run on aarch64 (e.g. `qemu-aarch64 -one-insn-per-tb`). See report.md.</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">sync</span><span class="p">::</span><span class="n">atomic</span><span class="p">::{</span><span class="n">AtomicU64</span><span class="p">,</span><span class="w"> </span><span class="n">Ordering</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">wasmtime</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
+
+<span class="k">static</span><span class="w"> </span><span class="n">SIGNALS</span><span class="p">:</span><span class="w"> </span><span class="nc">AtomicU64</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">AtomicU64</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+
+<span class="k">extern</span><span class="w"> </span><span class="s">"C"</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">on_alarm</span><span class="p">(</span><span class="n">_</span><span class="p">:</span><span class="w"> </span><span class="nc">libc</span><span class="p">::</span><span class="n">c_int</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">SIGNALS</span><span class="p">.</span><span class="n">fetch_add</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="n">Ordering</span><span class="p">::</span><span class="n">Relaxed</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="k">const</span><span class="w"> </span><span class="n">WAT</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="kt">str</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">r#"</span>
+<span class="s">(module</span>
+<span class="s">  ;; No stack arguments: only vmctx x2 + one i32 in registers.</span>
+<span class="s">  (func $leaf (param i32) (result i32)</span>
+<span class="s">    local.get 0)</span>
+<span class="s">  ;; 12 i32 params + 2 vmctx = 14 integer args &gt; 8 registers, so this</span>
+<span class="s">  ;; function has stack arguments; tail calling $leaf takes the</span>
+<span class="s">  ;; "EmptyCallee" path.</span>
+<span class="s">  (func $tc (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)</span>
+<span class="s">    local.get 0</span>
+<span class="s">    return_call $leaf)</span>
+<span class="s">  ;; `run` itself also has stack arguments, which Winch reads through FP.</span>
+<span class="s">  (func (export "run") (param $n i32) (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)</span>
+<span class="s">                       (result i32)</span>
+<span class="s">    (local $sum i32)</span>
+<span class="s">    loop</span>
+<span class="s">      ;; local 12 is a stack argument of `run`, addressed relative to FP.</span>
+<span class="s">      local.get 12</span>
+<span class="s">      i32.const 1 i32.const 2 i32.const 3 i32.const 4 i32.const 5 i32.const 6</span>
+<span class="s">      i32.const 7 i32.const 8 i32.const 9 i32.const 10 i32.const 11</span>
+<span class="s">      call $tc</span>
+<span class="s">      local.get $sum i32.add local.set $sum</span>
+<span class="s">      local.get $n i32.const 1 i32.sub local.tee $n</span>
+<span class="s">      br_if 0</span>
+<span class="s">    end</span>
+<span class="s">    local.get $sum)</span>
+<span class="s">)</span>
+<span class="s">"#</span><span class="p">;</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// Controls: `NOSIG=1` disables the timer signal, `CRANELIFT=1` uses</span>
+<span class="w">    </span><span class="c1">// Cranelift instead of Winch.</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">env</span><span class="p">::</span><span class="n">var_os</span><span class="p">(</span><span class="s">"NOSIG"</span><span class="p">).</span><span class="n">is_none</span><span class="p">()</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">unsafe</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">sa</span><span class="p">:</span><span class="w"> </span><span class="nc">libc</span><span class="p">::</span><span class="n">sigaction</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">mem</span><span class="p">::</span><span class="n">zeroed</span><span class="p">();</span>
+<span class="w">        </span><span class="n">sa</span><span class="p">.</span><span class="n">sa_sigaction</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">on_alarm</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">usize</span><span class="p">;</span>
+<span class="w">        </span><span class="n">sa</span><span class="p">.</span><span class="n">sa_flags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">libc</span><span class="p">::</span><span class="n">SA_RESTART</span><span class="p">;</span><span class="w"> </span><span class="c1">// NB: no SA_ONSTACK</span>
+<span class="w">        </span><span class="n">libc</span><span class="p">::</span><span class="n">sigemptyset</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">sa</span><span class="p">.</span><span class="n">sa_mask</span><span class="p">);</span>
+<span class="w">        </span><span class="fm">assert_eq!</span><span class="p">(</span><span class="n">libc</span><span class="p">::</span><span class="n">sigaction</span><span class="p">(</span><span class="n">libc</span><span class="p">::</span><span class="n">SIGALRM</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">sa</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">ptr</span><span class="p">::</span><span class="n">null_mut</span><span class="p">()),</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">it</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">libc</span><span class="p">::</span><span class="n">itimerval</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">it_interval</span><span class="p">:</span><span class="w"> </span><span class="nc">libc</span><span class="p">::</span><span class="n">timeval</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">tv_sec</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">tv_usec</span><span class="p">:</span><span class="w"> </span><span class="mi">100</span><span class="w"> </span><span class="p">},</span>
+<span class="w">            </span><span class="n">it_value</span><span class="p">:</span><span class="w"> </span><span class="nc">libc</span><span class="p">::</span><span class="n">timeval</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">tv_sec</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">tv_usec</span><span class="p">:</span><span class="w"> </span><span class="mi">100</span><span class="w"> </span><span class="p">},</span>
+<span class="w">        </span><span class="p">};</span>
+<span class="w">        </span><span class="fm">assert_eq!</span><span class="p">(</span><span class="n">libc</span><span class="p">::</span><span class="n">setitimer</span><span class="p">(</span><span class="n">libc</span><span class="p">::</span><span class="n">ITIMER_REAL</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">it</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">ptr</span><span class="p">::</span><span class="n">null_mut</span><span class="p">()),</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">config</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Config</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="w">    </span><span class="n">config</span><span class="p">.</span><span class="n">strategy</span><span class="p">(</span><span class="k">if</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">env</span><span class="p">::</span><span class="n">var_os</span><span class="p">(</span><span class="s">"CRANELIFT"</span><span class="p">).</span><span class="n">is_some</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">Strategy</span><span class="p">::</span><span class="n">Cranelift</span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">Strategy</span><span class="p">::</span><span class="n">Winch</span>
+<span class="w">    </span><span class="p">});</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">engine</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Engine</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">config</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">module</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Module</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span><span class="w"> </span><span class="n">WAT</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Store</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span><span class="w"> </span><span class="p">());</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">instance</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Instance</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">module</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="p">[])</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">instance</span><span class="p">.</span><span class="n">get_typed_func</span><span class="p">::</span><span class="o">&lt;</span>
+<span class="w">        </span><span class="p">(</span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="kt">i32</span><span class="p">),</span>
+<span class="w">        </span><span class="kt">i32</span><span class="p">,</span>
+<span class="w">    </span><span class="o">&gt;</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="s">"run"</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">iters</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2000</span><span class="p">;</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="n">round</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="mi">0</span><span class="o">..</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">got</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">run</span><span class="p">.</span><span class="n">call</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="n">iters</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span><span class="w"> </span><span class="mi">6</span><span class="p">,</span><span class="w"> </span><span class="mi">7</span><span class="p">,</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span><span class="w"> </span><span class="mi">9</span><span class="p">,</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span><span class="w"> </span><span class="mi">11</span><span class="p">,</span><span class="w"> </span><span class="mi">7</span><span class="p">))</span><span class="o">?</span><span class="p">;</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">want</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">iters</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">7</span><span class="p">;</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="n">got</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">want</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="fm">println!</span><span class="p">(</span>
+<span class="w">                </span><span class="s">"round {round}: MISMATCH got {got} want {want} (signals so far: {})"</span><span class="p">,</span>
+<span class="w">                </span><span class="n">SIGNALS</span><span class="p">.</span><span class="n">load</span><span class="p">(</span><span class="n">Ordering</span><span class="p">::</span><span class="n">Relaxed</span><span class="p">)</span>
+<span class="w">            </span><span class="p">);</span>
+<span class="w">            </span><span class="n">std</span><span class="p">::</span><span class="n">process</span><span class="p">::</span><span class="n">exit</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="n">round</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="mi">100</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="fm">println!</span><span class="p">(</span><span class="s">"round {round}: ok ({} signals)"</span><span class="p">,</span><span class="w"> </span><span class="n">SIGNALS</span><span class="p">.</span><span class="n">load</span><span class="p">(</span><span class="n">Ordering</span><span class="p">::</span><span class="n">Relaxed</span><span class="p">));</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="n">round</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">5000</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">break</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>&lt;/details&gt;</p>
+<p>cc @macovedj @saulecabrera </p>
+</blockquote>
+
+
+
+<a name="628787315"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314503%20Winch%3A%20tail%20calls%20on%20aarch64%20may%20.../near/628787315" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314503.20Winch.3A.20tail.20calls.20on.20aarch64.20may.20.2E.2E.2E.html#628787315">(Oct 02 2026 at 21:28)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the winch label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14503">Issue #14503</a>.</p>
+
+
+
+<hr><p>Last updated: Oct 03 2026 at 16:23 UTC</p>
+</html>

@@ -1,0 +1,62 @@
+[
+    {
+        "content": "<p>To the POSIX experts: I'm adding <a href=\"https://github.com/tokio-rs/mio/pull/1836\">WASIp2 support to <code>mio</code></a> and currently triaging some test failures.  Along the way, I've found and fixed a few bugs in <code>wasi-libc</code>, but am not sure how to address <a href=\"https://github.com/tokio-rs/mio/blob/66ac9fab79bf191218488c4f35c99d13935b7e12/tests/udp_socket.rs#L396\">this one</a>.</p>\n<p>That test creates and binds three <code>SOCK_DGRAM</code> sockets, then reconnects them to <em>different</em> addresses than they were bound to.  Then it uses the first socket to send a packet to the address which the third socket is bound to <em>but</em> <em>not</em> <em>connected</em> <em>to</em>, expecting the third socket to receive that packet.  On <code>wasi-libc</code> and <code>wasmtime-wasi</code>'s p2 implementation, this fails because the third socket only receives sockets from the address it was connected to, no the one it was bound to.  If I comment out <a href=\"https://github.com/tokio-rs/mio/blob/66ac9fab79bf191218488c4f35c99d13935b7e12/tests/udp_socket.rs#L409\">this line</a> (i.e. <em>not</em> connect the third socket), the test passes.</p>\n<p>The Linux man page for <code>connect(2)</code> says this:</p>\n<blockquote>\n<p>If the socket sockfd is of type SOCK_DGRAM, then addr is the address to which datagrams are sent by default, and the only address from which datagrams are received.</p>\n</blockquote>\n<p>...which seems to say that <code>wasi-libc</code>/<code>wasmtime-wasi</code>'s behavior is correct, and that the <code>mio</code> test is wrong.  However, the test <em>does</em> pass on native Linux (i.e. with no Wasm involved) regardless of whether I comment out that one line or not, so Linux seems to be behaving differently than the man page indicates, i.e. the socket is receiving packets for the address it was bound to, not the one it was connected to.</p>\n<p>Can anyone comment on what the correct behavior is here?  And maybe link to some authoritative document?</p>",
+        "id": 573803598,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1771006674
+    },
+    {
+        "content": "<p><a href=\"https://stackoverflow.com/a/9741966\">This random SO answer</a> seems to confirm the behavior I'm seeing on Linux, which is that <code>connect</code>ing an already-bound UDP socket only affects where packets are <em>sent</em> using that socket, while the address from which packets are <em>received</em> remains the one the socket was bound to.</p>",
+        "id": 573805833,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1771007129
+    },
+    {
+        "content": "<p><a href=\"https://pubs.opengroup.org/onlinepubs/9799919799/functions/V2_chap02.html#tag_16_10_06\">https://pubs.opengroup.org/onlinepubs/9799919799/functions/V2_chap02.html#tag_16_10_06</a> is authoritative IMO (POSIX standard)</p>",
+        "id": 573806605,
+        "sender_full_name": "David Lloyd",
+        "timestamp": 1771007297
+    },
+    {
+        "content": "<p>Ah, that's helpful, it reading <a href=\"https://pubs.opengroup.org/onlinepubs/9799919799/functions/connect.html\">this</a> helped me realize I was misreading the Linux man page:</p>\n<blockquote>\n<p>...and the only address from which datagrams are received.</p>\n</blockquote>\n<p>I read that as \"the address on which datagrams are received\", but now I see that's not what it's saying.  The <code>opengroup.org</code> page spells it out:</p>\n<blockquote>\n<p>For SOCK_DGRAM sockets, the peer address identifies where all datagrams are sent on subsequent <a href=\"https://pubs.opengroup.org/onlinepubs/9799919799/functions/send.html\">*send*()</a> functions, and limits the remote sender for subsequent <a href=\"https://pubs.opengroup.org/onlinepubs/9799919799/functions/recv.html\">*recv*()</a> functions</p>\n</blockquote>",
+        "id": 573807548,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1771007659
+    },
+    {
+        "content": "<p>I'm a bit confused on your interpretation of the test here Joel, you say that the test reconnects the sockets to different addresses, but the test is only connecting for the first time? The <code>socket3</code> is configured to only receive from <code>socket1</code>'s address which looks like it should work given the specified behavior of <code>connect</code>?</p>",
+        "id": 573807686,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1771007710
+    },
+    {
+        "content": "<p>in the test only <code>socket1</code> is reconnected but <code>socket2</code> and <code>socket3</code> stay connected to <code>socket1</code> the whole time and <code>socket1</code> then never receives anything</p>",
+        "id": 573807796,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1771007774
+    },
+    {
+        "content": "<p>Yeah, I misinterpreted the \"receive from\" as \"receive on\"; i.e. I confused the role of sender address and receiver address for incoming packets.</p>",
+        "id": 573807817,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1771007782
+    },
+    {
+        "content": "<p>In any case, <code>wasi-libc</code>/<code>wasmtime-wasi</code> are <em>not</em> doing the right thing, which clarifies the next steps.</p>",
+        "id": 573808062,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1771007898
+    },
+    {
+        "content": "<p>ok, this seems to be an issue with <code>wasmtime-wasi</code>.  I added some logging and discovered that, when you connect a UDP socket for the first time, its local address remains unchanged from what it was bound to.  However, when you connect it a second time, the local address changes, even though only the remote address should have changed.  On native Linux, the local address always remains the same.</p>\n<p>This seems to be related to the <code>wasmtime-wasi</code> code that proactively disconnects by calling <code>rustix::net::connect_unspec</code> before connecting to the new address.  This patch \"fixes\" it, although based on the surrounding comments I don't think it's the right solution:</p>\n<div class=\"codehilite\" data-code-language=\"Diff\"><pre><span></span><code><span class=\"gh\">diff --git a/crates/wasi/src/p2/host/udp.rs b/crates/wasi/src/p2/host/udp.rs</span>\n<span class=\"gh\">index 1ef8350399..5dd426e736 100644</span>\n<span class=\"gd\">--- a/crates/wasi/src/p2/host/udp.rs</span>\n<span class=\"gi\">+++ b/crates/wasi/src/p2/host/udp.rs</span>\n<span class=\"gu\">@@ -71,9 +71,9 @@ impl udp::HostUdpSocket for WasiSocketsCtxView&lt;'_&gt; {</span>\n<span class=\"w\"> </span>        //   if there isn't a disconnect in between.\n\n<span class=\"w\"> </span>        // Step #1: Disconnect\n<span class=\"gd\">-        if socket.is_connected() {</span>\n<span class=\"gd\">-            socket.disconnect()?;</span>\n<span class=\"gd\">-        }</span>\n<span class=\"gi\">+        // if socket.is_connected() {</span>\n<span class=\"gi\">+        //     socket.disconnect()?;</span>\n<span class=\"gi\">+        // }</span>\n\n<span class=\"w\"> </span>        // Step #2: (Re)connect\n<span class=\"w\"> </span>        if let Some(connect_addr) = remote_address {\n<span class=\"gh\">diff --git a/crates/wasi/src/sockets/udp.rs b/crates/wasi/src/sockets/udp.rs</span>\n<span class=\"gh\">index 482c6aa090..ba1e93f18d 100644</span>\n<span class=\"gd\">--- a/crates/wasi/src/sockets/udp.rs</span>\n<span class=\"gi\">+++ b/crates/wasi/src/sockets/udp.rs</span>\n<span class=\"gu\">@@ -162,10 +162,10 @@ impl UdpSocket {</span>\n<span class=\"w\"> </span>        //   if there isn't a disconnect in between.\n\n<span class=\"w\"> </span>        // Step #1: Disconnect\n<span class=\"gd\">-        if let UdpState::Connected(..) = self.udp_state {</span>\n<span class=\"gd\">-            udp_disconnect(&amp;self.socket)?;</span>\n<span class=\"gd\">-            self.udp_state = UdpState::Bound;</span>\n<span class=\"gd\">-        }</span>\n<span class=\"gi\">+        // if let UdpState::Connected(..) = self.udp_state {</span>\n<span class=\"gi\">+        //     udp_disconnect(&amp;self.socket)?;</span>\n<span class=\"gi\">+        //     self.udp_state = UdpState::Bound;</span>\n<span class=\"gi\">+        // }</span>\n<span class=\"w\"> </span>        // Step #2: (Re)connect\n<span class=\"w\"> </span>        connect(&amp;self.socket, &amp;addr).map_err(|error| match error {\n<span class=\"w\"> </span>            Errno::AFNOSUPPORT =&gt; ErrorCode::InvalidArgument, // See `udp_bind` implementation.\n</code></pre></div>",
+        "id": 573818617,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1771012516
+    },
+    {
+        "content": "<p>I'll go ahead and open a Wasmtime issue and we can continue there.</p>",
+        "id": 573818755,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1771012571
+    }
+]

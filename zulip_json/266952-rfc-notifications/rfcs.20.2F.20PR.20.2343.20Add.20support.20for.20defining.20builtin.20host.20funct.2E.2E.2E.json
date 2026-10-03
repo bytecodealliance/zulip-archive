@@ -1,0 +1,188 @@
+[
+    {
+        "content": "<p>fitzgen opened <a href=\"https://github.com/bytecodealliance/rfcs/pull/43\">PR #43</a> from <code>fitzgen:compile-time-builtins</code> to <code>bytecodealliance:main</code>:</p>\n<blockquote>\n<blockquote>\n<p>Add support for defining builtin host functions at compile-time. Because these functions are early-bound at compile-time -- rather than late-bound at instantiation-time, like regular imports -- the Wasm's compilation can be specialized for these exact imports, enabling inlining without just-in-time compilation, for example. This is the rough equivalent of the [js-string-builtins proposal][js-string-builtins] but for Wasmtime's API and Wasmtime embedding environments rather than JavaScript's <code>WebAssembly</code> API and JavaScript execution environments.</p>\n</blockquote>\n<p>[js-string-builtins]: <a href=\"https://github.com/WebAssembly/js-string-builtins/blob/main/proposals/js-string-builtins/Overview.md\">https://github.com/WebAssembly/js-string-builtins/blob/main/proposals/js-string-builtins/Overview.md</a></p>\n<h3><a href=\"https://github.com/fitzgen/rfcs-2/blob/compile-time-builtins/accepted/wasmtime-compile-time-builtins.md\">Rendered</a></h3>\n</blockquote>",
+        "id": 520989655,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1748474485
+    },
+    {
+        "content": "<p>cfallin <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#issuecomment-2918121755\">commented</a> on <a href=\"https://github.com/bytecodealliance/rfcs/pull/43\">PR #43</a>:</p>\n<blockquote>\n<p>Thanks for writing this up -- I think this will be a really powerful ability once we have it, and will be extremely important for certain kinds of applications!</p>\n<p>When I was originally mulling over this design space for the zero-copy buffer use-case, I had been imagining something like a raw CLIF interface, but I agree that that's got a lot of downsides and is pretty much fully subsumed by the other options. I'm happy to see we're moving toward the \"just define the logic in Wasm\" idea (and also not the \"special sublanguage\" idea, though I liked that when we talked about it too) -- this cleans up a lot of duplication.</p>\n<p>I think my input here comes in two major lines:</p>\n<ol>\n<li>\n<p>I suspect that the ability to make slow-path calls is going to be essential to many of the real use-cases we have imagined for this feature (certainly for zero-copy buffers: they have the \"append and maybe grow\" behavior that <code>Vec</code> does, so a mutable API will need this, and even read-only accessors will have more complex paths for e.g. moving to the next rope segment that may or may not be practical to write inline). So I think this</p>\n<blockquote>\n<p>Should we allow self-hosted Wasm to import and call non-intrinsic functions?</p>\n</blockquote>\n<p>might not be punt-able as</p>\n<blockquote>\n<p>I think this is something we will want eventually, but I'd like to get something basic working first before tackling this more-complicated use case.</p>\n</blockquote>\n<p>if we want to use the thing in our embedding.</p>\n</li>\n<li>\n<p>I find myself going back and forth on whether the compile-time-builtin Wasm module should be \"special\" (with constraints as this RFC describes) or more general and which is actually more in the spirit of the standards -- I'll address this one first as I think it addresses the first question if we resolve it another way.</p>\n</li>\n</ol>\n<p>Preliminarily: yes 100% to</p>\n<blockquote>\n<p>We must not deviate from the WebAssembly language semantics.</p>\n</blockquote>\n<p>and also to the more subjective \"let's not encourage people to use a nonstandard extension\" (and to clarify to any readers: yes that concern is still in scope even if we are literally standards-compliant by presenting function imports, because a sufficiently tempting set of function imports can become a de-facto standard).</p>\n<p>However I find myself wondering whether we shouldn't do something a little more general and provide</p>\n<ol>\n<li>The load/store imports this RFC defines, and</li>\n<li>The ability to fix a module import (of any general Wasm module) while compiling another Wasm module, and implement some (simple one-level?) inlining from that module, with none of the other restrictions this RFC names.</li>\n</ol>\n<p>I'll call this the \"privileged adapter module\" approach.</p>\n<hr>\n<p>On the \"negative motivation\" side first (against special Wasm subset for \"self-hosted Wasm\"): defining restrictions on which subset of Wasm modules is acceptable for a compile-time-builtin module could be seen as restricting/subsetting the standard somewhat. I can absolutely see the logic for it (as the RFC says, discouraging general use, but also in particular: it's simpler if we don't have a VMContext for the special module that is separate from the module that is using it) but isn't it also defining a \"Wasm-prime\" in the other direction?</p>\n<p>On the \"positive side\" now (for fully general Wasm for \"self-hosted Wasm\"): the spirit of virtualization and precedent elsewhere (e.g., WASI virtualization, and also places that we talk about adapter modules, such as the debug RFC) suggests to me at least that there isn't too much danger in defining a more privileged interface (here: \"load/store host memory\") and then allowing any general Wasm module to be an adapter module that provides a higher-level \"safe\" service on top of it. (In fact we know of folks doing this in production with components.) It is still standard Wasm -- it just has a particular API available to it, and one that the embedder must enable for a specific module. If someone wanted to implement this \"peek/poke API\" today as ordinary host functions, they could; we are saying that we recognize the need for it because we want to move more logic into Wasm for inlinability. Philosophically, I think the notion that we can never have privileged interfaces imported into a Wasm module (because someone might write Wasm that always requires the privileged interfaces and misuse the specialized environment as a general environment) sits less well with me: it says that Wasm is somehow not universal, and can't be used to implement some parts of the system.</p>\n<p>Said another way: \"root privilege\" (arbitrary load/store) then virtualization is more or less directly aligned, I think, with how capability systems are supposed to work. The idea is that the danger is in plumbing the wrong capabilities to the wrong modules, and safety requires us to put the right access-filtering or -subsetting modules inline with powerful capabilities. But this is already true, and we already trust our embedders to \"wire things up right\" because one can write arbitrary hostcall implementations or grant the wrong pre-opens or whatnot. Right now in Wasmtime I think we haven't seen this situation much because we have host-native filtering of most of the privileges we grant (e.g. WASI APIs) but I think there's nothing fundamental about that.</p>\n<hr>\n<p>And finally, if we restrict ourselves to (i) these load/store intrinsics, provided when configured to a privileged adapter module, and (ii) early binding of this adapter module in a way that enables inlining, then all of the open design questions are addressed, as far as I can tell:</p>\n<ul>\n<li>\n<p>It addresses the \"should we allow self-hosted Wasm to {call non-intrinsic functions, have tables for indirect calls, have memories, ...}\" questions definitely: yes, it's Wasm, so it has function calls, tables, memories, etc. (As an <em>optimization</em>, if it has none of these, perhaps it doesn't need its own VMContext?)</p>\n</li>\n<li>\n<p>It addresses the question of how to encapsulate \"slow-path functions\" and which functions are available: they can be ordinary imports to the adapter module, and not provided to the main module.</p>\n</li>\n<li>\n<p>It potentially addresses the Winch question: Winch can compile the adapter module normally (no inlining needed); we only need to implement the intrinsics or provide polyfills as imported hostcalls.</p>\n</li>\n</ul>\n<hr>\n<p>Anyway -- all strong opinions, relatively weakly held -- happy to discuss further!<br>\n</p>\n</blockquote>",
+        "id": 521010959,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1748488729
+    },
+    {
+        "content": "<p>abrown <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#issuecomment-2946837857\">commented</a> on <a href=\"https://github.com/bytecodealliance/rfcs/pull/43\">PR #43</a>:</p>\n<blockquote>\n<p>I don't have a strong opinion on whether we need two-level inlining (intrinsics -&gt; self-hosted -&gt; component) or just a single level (intrinsics -&gt; component) &mdash; @cfallin is already saying some of the things I was thinking. But I do want to point out how much inlining we're doing and make a plug for making that easier. In either case, we want to inline some CLIF instructions for each intrinsic, right? I'm not sure I caught where the intrinsics were to be specified (are they proposed additions to the component model?) but, in any case, I was imagining there would be some compiler code that converted a call to these special imports into some CLIF, like we currently do for CM built-ins and trampolines (?). And this is what I was hoping could become easier: I know you were kind of discarding the first idea, \"exposing CLIF\", but it seems helpful for this kind of problem: we tell the compiler \"here are the CLIF instructions for calls to this import\". I understood from your RFC the danger of misuse, so perhaps it should not be a public, embedder-accessible API, but just having an easy way to inline intrinsics could make it easier to pursue the self-hosted functions?</p>\n</blockquote>",
+        "id": 522681611,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1749165299
+    },
+    {
+        "content": "<p>saulecabrera submitted <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#pullrequestreview-2921397307\">PR review</a>.</p>",
+        "id": 523766530,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1749737572
+    },
+    {
+        "content": "<p>saulecabrera created <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#discussion_r2142883135\">PR review comment</a>:</p>\n<blockquote>\n<p>I believe the Winch topic was (briefly?) discussed during the <a href=\"https://github.com/bytecodealliance/meetings/pull/618\">Wasmtime 06-05 meeting</a>. However, I wanted to mention that I agree with the no-inlining direction for Winch; even though I believe that some sort of inlining is feasible, especially for the types of functions outlined in this RFC, I'm also very confident that doing so, has the potential to against Winch's simplicity and compilation performance design principles. </p>\n</blockquote>",
+        "id": 523766531,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1749737572
+    },
+    {
+        "content": "<p>fitzgen submitted <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#pullrequestreview-2926059103\">PR review</a>.</p>",
+        "id": 524000252,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1749841465
+    },
+    {
+        "content": "<p>fitzgen created <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#discussion_r2145897602\">PR review comment</a>:</p>\n<blockquote>\n<p>Makes total sense, thanks for weighing in.</p>\n</blockquote>",
+        "id": 524000254,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1749841465
+    },
+    {
+        "content": "<p>fitzgen <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#issuecomment-2971400164\">commented</a> on <a href=\"https://github.com/bytecodealliance/rfcs/pull/43\">PR #43</a>:</p>\n<blockquote>\n<p>@abrown </p>\n<blockquote>\n<p>I don't have a strong opinion on whether we need two-level inlining (intrinsics -&gt; self-hosted -&gt; component) or just a single level (intrinsics -&gt; component) — @cfallin is already saying some of the things I was thinking. But I do want to point out how much inlining we're doing and make a plug for making that easier. In either case, we want to inline some CLIF instructions for each intrinsic, right? I'm not sure I caught where the intrinsics were to be specified (are they proposed additions to the component model?) but, in any case, I was imagining there would be some compiler code that converted a call to these special imports into some CLIF, like we currently do for CM built-ins and trampolines (?). And this is what I was hoping could become easier: I know you were kind of discarding the first idea, \"exposing CLIF\", but it seems helpful for this kind of problem: we tell the compiler \"here are the CLIF instructions for calls to this import\". I understood from your RFC the danger of misuse, so perhaps it should not be a public, embedder-accessible API, but just having an easy way to inline intrinsics could make it easier to pursue the self-hosted functions?</p>\n</blockquote>\n<p>Yes, there will be two kinds of inlining:</p>\n<ol>\n<li>The compile-time builtins need access to intrinsics for reading/writing native memory, and these instrinsics need to be inlined to meet our performance goals. This will happen with a very ham-fisted approach during Wasm-to-CLIF translation where we immediately turn calls to these intrinsics into the relevant CLIF instrucitons.</li>\n<li>We need to inline the compile-time builtins into the Wasm application that imports them. Depending on the approach we take, and the constraints we put on the shape of compile-time builtins, this <em>could</em> be done with the same ham-fisted approach used for (1). My thinking recently, reflected in the last Wasmtime meeting's discussion but not yet in this RFC, has been to instead make a more general inliner-as-a-library kind of thing for Cranelift that still allows Cranelift embedders to drive overall compilation like they do today but provides hooks for them to do inlining and use their own inlining heuristics. This would allow us to also do things like inlining calls across components and their fused adapters.</li>\n</ol>\n</blockquote>",
+        "id": 524001655,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1749842221
+    },
+    {
+        "content": "<p>saulecabrera edited <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#discussion_r2142883135\">PR review comment</a>.</p>",
+        "id": 524004251,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1749843575
+    },
+    {
+        "content": "<p>fitzgen updated <a href=\"https://github.com/bytecodealliance/rfcs/pull/43\">PR #43</a>.</p>",
+        "id": 531681851,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1753816471
+    },
+    {
+        "content": "<p>fitzgen <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#issuecomment-3133763450\">commented</a> on <a href=\"https://github.com/bytecodealliance/rfcs/pull/43\">PR #43</a>:</p>\n<blockquote>\n<p>Heads up: I've updated this RFC with a more-concrete proposal after the discussion in this issue and at various Cranelift and Wasmtime meetings.</p>\n<p>I've also implemented general function inlining for Wasmtime in <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11283\">https://github.com/bytecodealliance/wasmtime/pull/11283</a>. Right now, that is useful for inlining calls between components (including their generated adapters) but with compile-time builtins can also be reused to inline the definitions of compile-time builtins into their callers. And we shouldn't really have to do anything special to get that inlining, it should just happen For Free when inlining is enabled. (I do expect we will need to tweak the inlining heuristics as time goes on, but that is a separate discussion.)</p>\n<p>I think there is just one last open question we need to resolve before moving forward: exactly how to implement the <code>resource.address</code> intrinsic (or something similar / equally powerful).</p>\n<p>Please take a look at the updated RFC and let me know what you think and any ideas you have for that last open question!</p>\n</blockquote>",
+        "id": 531683185,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1753817018
+    },
+    {
+        "content": "<p>programmerjake submitted <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#pullrequestreview-3069176328\">PR review</a>.</p>",
+        "id": 531695978,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1753821942
+    },
+    {
+        "content": "<p>programmerjake created <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#discussion_r2240983207\">PR review comment</a>:</p>\n<blockquote>\n<p>you could use LLVM intrinsics as inspiration and have the import's name tell you which type and resources to use, e.g. have <code>resource.address.t1</code> for a resource in table <code>1</code> or something.</p>\n</blockquote>",
+        "id": 531695979,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1753821943
+    },
+    {
+        "content": "<p>fitzgen <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#issuecomment-3137229896\">commented</a> on <a href=\"https://github.com/bytecodealliance/rfcs/pull/43\">PR #43</a>:</p>\n<blockquote>\n<p>Okay so I actually had flawed assumptions with the way that resources work in the component model, and this nicely nullifies that last open question.</p>\n<p>The resource-definer gets to use an arbitrary <code>u32</code> as their internal representation of a resource. Resource tables are only involved for <em>other</em> components, and their handles to that resource. The resource-definer always gets access to their <code>u32</code> representation directly.</p>\n<p>So given all that, the <code>u32</code> resource representation can be an index into some embedder-defined table in the <code>T</code> in a <code>Store&lt;T&gt;</code> and compile-time builtins can inline accesses to those embedder-defined tables if we give them an intrinsic like <code>store.data_address</code> that returns a <code>*mut T</code> (and the embedder's <code>T</code> is <code>repr(C)</code>).</p>\n<p>Will update the RFC shortly.</p>\n</blockquote>",
+        "id": 531893903,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1753896415
+    },
+    {
+        "content": "<p>fitzgen updated <a href=\"https://github.com/bytecodealliance/rfcs/pull/43\">PR #43</a>.</p>",
+        "id": 531903410,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1753899767
+    },
+    {
+        "content": "<p>fitzgen <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#issuecomment-3137402690\">commented</a> on <a href=\"https://github.com/bytecodealliance/rfcs/pull/43\">PR #43</a>:</p>\n<blockquote>\n<blockquote>\n<p>Will update the RFC shortly.</p>\n</blockquote>\n<p>RFC updated accordingly.</p>\n<p>I think that resolves all open questions for this RFC. I will give it a little bit of time for some more discussion before officially starting the motion to merge, just to give people an extra chance to read the updated RFC first and provide feedback.</p>\n</blockquote>",
+        "id": 531903722,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1753899899
+    },
+    {
+        "content": "<p>alexcrichton submitted <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#pullrequestreview-3073163098\">PR review</a>.</p>",
+        "id": 531921388,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1753906217
+    },
+    {
+        "content": "<p>programmerjake submitted <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#pullrequestreview-3073568988\">PR review</a>.</p>",
+        "id": 531946890,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1753916361
+    },
+    {
+        "content": "<p>programmerjake created <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#discussion_r2244019411\">PR review comment</a>:</p>\n<blockquote>\n<p>you also have to watch out for primitive type alignment changing offsets, e.g. in <code>#[repr(C)] struct S(u8, f64)</code> the <code>f64</code> field is at offset <code>4</code> on <code>i686-unknown-linux-gnu</code> but at offset <code>8</code> on <code>x86_64-unknown-linux-gnu</code></p>\n</blockquote>",
+        "id": 531946892,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1753916361
+    },
+    {
+        "content": "<p>fitzgen submitted <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#pullrequestreview-3089575691\">PR review</a>.</p>",
+        "id": 532983258,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1754424567
+    },
+    {
+        "content": "<p>fitzgen created <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#discussion_r2255237762\">PR review comment</a>:</p>\n<blockquote>\n<p>That's true and I expect we will need to add some wording to our documentation for this feature around what exactly the safety conditions will need to be, such that the compile-time builtins can portably access the host data. My plan right now is to document these things in detail as I prototype and dog-food the feature.</p>\n</blockquote>",
+        "id": 532983260,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1754424567
+    },
+    {
+        "content": "<p>fitzgen <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#issuecomment-3156488513\">commented</a> on <a href=\"https://github.com/bytecodealliance/rfcs/pull/43\">PR #43</a>:</p>\n<blockquote>\n<p>Okay, I think this is ready and we've had a bit of time for folks to look it over, so let's officially start the process.</p>\n<h1>Motion to Finalize</h1>\n<p><strong>Disposition: Merge</strong></p>\n<hr>\n<p>As always, details on the RFC process can be found here: <a href=\"https://github.com/bytecodealliance/rfcs/blob/main/accepted/rfc-process.md#making-a-decision-merge-or-close\">https://github.com/bytecodealliance/rfcs/blob/main/accepted/rfc-process.md#making-a-decision-merge-or-close</a></p>\n</blockquote>",
+        "id": 532983393,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1754424633
+    },
+    {
+        "content": "<p>alexcrichton <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#issuecomment-3156980887\">commented</a> on <a href=\"https://github.com/bytecodealliance/rfcs/pull/43\">PR #43</a>:</p>\n<blockquote>\n<p>I second! (don't think I can re-approve)</p>\n</blockquote>",
+        "id": 533004702,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1754438774
+    },
+    {
+        "content": "<p>fitzgen <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#issuecomment-3161256085\">commented</a> on <a href=\"https://github.com/bytecodealliance/rfcs/pull/43\">PR #43</a>:</p>\n<blockquote>\n<p>As there has been sign-off from representatives of two different BA stakeholder organizations, this RFC is now entering its 10-day</p>\n<h1>Final Comment Period</h1>\n<p>and the last day to raise concerns before this RFC merges is 2025-08-16.</p>\n<p>Thanks everyone!</p>\n</blockquote>",
+        "id": 533163025,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1754506759
+    },
+    {
+        "content": "<p>cfallin submitted <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#pullrequestreview-3111889344\">PR review</a>:</p>\n<blockquote>\n<p>LGTM!</p>\n</blockquote>",
+        "id": 534021645,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1755017903
+    },
+    {
+        "content": "<p>cfallin created <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#discussion_r2270566295\">PR review comment</a>:</p>\n<blockquote>\n<p>This seems to be in conflict with the later section describing intrinsics as always taking <code>u64</code> addresses (and ignoring the upper 32 bits on 32-bit targets). I like the latter a lot more and it seems nice to provide this portability boon, so perhaps this is just outdated text?</p>\n</blockquote>",
+        "id": 534021646,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1755017903
+    },
+    {
+        "content": "<p>fitzgen submitted <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#pullrequestreview-3111967923\">PR review</a>.</p>",
+        "id": 534025501,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1755019488
+    },
+    {
+        "content": "<p>fitzgen created <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#discussion_r2270624774\">PR review comment</a>:</p>\n<blockquote>\n<p>Ah yes, sorry this is outdated text, will update momentarily.</p>\n</blockquote>",
+        "id": 534025502,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1755019488
+    },
+    {
+        "content": "<p>fitzgen updated <a href=\"https://github.com/bytecodealliance/rfcs/pull/43\">PR #43</a>.</p>",
+        "id": 534057514,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1755033586
+    },
+    {
+        "content": "<p>fitzgen <a href=\"https://github.com/bytecodealliance/rfcs/pull/43#issuecomment-3197518278\">commented</a> on <a href=\"https://github.com/bytecodealliance/rfcs/pull/43\">PR #43</a>:</p>\n<blockquote>\n<p>The final comment period has passed without any concerns being raised, so I will go ahead and merge this. Thanks again, everyone!</p>\n</blockquote>",
+        "id": 534981474,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1755532874
+    },
+    {
+        "content": "<p>fitzgen merged <a href=\"https://github.com/bytecodealliance/rfcs/pull/43\">PR #43</a>.</p>",
+        "id": 534981495,
+        "sender_full_name": "RFC notifications bot",
+        "timestamp": 1755532879
+    }
+]

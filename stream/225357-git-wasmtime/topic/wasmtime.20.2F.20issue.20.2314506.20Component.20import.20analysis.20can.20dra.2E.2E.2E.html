@@ -1,0 +1,104 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14506 Component import analysis can dra... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314506.20Component.20import.20analysis.20can.20dra.2E.2E.2E.html">wasmtime / issue #14506 Component import analysis can dra...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="628800705"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314506%20Component%20import%20analysis%20can%20dra.../near/628800705" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314506.20Component.20import.20analysis.20can.20dra.2E.2E.2E.html#628800705">(Oct 02 2026 at 23:17)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14506">issue #14506</a>:</p>
+<blockquote>
+<p><a href="https://gist.github.com/alexcrichton/1c76c83df6b1d0b449b74748a95221b3">This component</a>  takes ~4s to compile on <code>main</code> locally for me, but commenting out the <a href="https://github.com/bytecodealliance/wasmtime/blob/3be934572ba647c8c925085480ae5670b6faa81f/crates/environ/src/component/translate.rs#L547-L552">two import analyses here</a> drops the compile time to ~0.2s.</p>
+<p>An LLM analysis, if useful, is:</p>
+<p>&lt;details&gt;</p>
+<h1>Component compile time is O(N^2 K^2) in re-export chains (same-vmctx analysis)</h1>
+<ul>
+<li>Commit: 249bdf8fca (main2), audited 2026-10-02</li>
+<li>Platform: Linux 7.0.0-31-generic x86_64</li>
+<li>Auditor: Claude Opus 5.5 (claude-opus-5-5)</li>
+</ul>
+<p>Severity: low/medium (compile-time CPU DoS on untrusted components). Default<br>
+config; any compiler; <code>Component::new</code> / <code>wasmtime compile</code>.</p>
+<h2>Root cause</h2>
+<p><code>crates/environ/src/component/same_vmctx.rs</code> (#14411): <code>vmctx_key</code> is<br>
+evaluated for every function import of every instantiation and walks the<br>
+full re-export chain back to the defining instance with no memoization; each<br>
+step calls <code>Module::import_position</code> (<code>crates/environ/src/module.rs:542</code>),<br>
+a linear scan of the module's imports.</p>
+<p>The same pattern pre-exists in <code>resolve_core_export</code><br>
+(<code>crates/environ/src/component/translate.rs:1991</code>, #14115, 2026-08-19); the<br>
+new analysis adds a second copy. <code>perf</code> splits time ~51%<br>
+<code>resolve_core_export</code> / ~48% <code>same_vmctx::observe_instantiation</code>.</p>
+<h2>Repro</h2>
+<p>Module M imports N functions and re-exports them all; the component<br>
+instantiates M K times in a chain, each instance fed the previous one. Each<br>
+extra instantiation costs a few bytes. <code>gen_chain.py N K</code> generates it.</p>
+<table>
+<thead>
+<tr>
+<th>input</th>
+<th>size</th>
+<th><code>wasmtime compile</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>100x100</td>
+<td></td>
+<td>0.03s</td>
+</tr>
+<tr>
+<td>100x400</td>
+<td></td>
+<td>0.33-0.55s</td>
+</tr>
+<tr>
+<td><code>chain-400x400.wat</code></td>
+<td>16KB binary</td>
+<td>4.8-6.2s</td>
+</tr>
+<tr>
+<td>200x800</td>
+<td>71KB text</td>
+<td>6.75s</td>
+</tr>
+<tr>
+<td><code>big.wasm</code> (1000x1000)</td>
+<td>41KB</td>
+<td>281s, 93MB peak</td>
+</tr>
+</tbody>
+</table>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">target</span><span class="o">/</span><span class="n">release</span><span class="o">/</span><span class="n">wasmtime</span><span class="w"> </span><span class="n">compile</span><span class="w"> </span><span class="n">chain</span><span class="o">-</span><span class="mi">400</span><span class="n">x400</span><span class="p">.</span><span class="n">wat</span><span class="w"> </span><span class="o">-</span><span class="n">o</span><span class="w"> </span><span class="o">/</span><span class="n">dev</span><span class="o">/</span><span class="n">null</span>
+<span class="n">target</span><span class="o">/</span><span class="n">release</span><span class="o">/</span><span class="n">wasmtime</span><span class="w"> </span><span class="n">compile</span><span class="w"> </span><span class="n">big</span><span class="p">.</span><span class="n">wasm</span><span class="w"> </span><span class="o">-</span><span class="n">o</span><span class="w"> </span><span class="o">/</span><span class="n">dev</span><span class="o">/</span><span class="n">null</span>
+</code></pre></div>
+<h2>Suggested fix</h2>
+<p>Compute each instance's import keys once in DFG order (arguments always come<br>
+from earlier instances) and cache per (instance, import); same for<br>
+<code>resolve_core_export</code>. Replace the linear <code>import_position</code> scan with a<br>
+precomputed map.</p>
+<p>&lt;/details&gt;</p>
+<p>cc @fitzgen </p>
+</blockquote>
+
+
+
+<a name="628800707"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314506%20Component%20import%20analysis%20can%20dra.../near/628800707" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314506.20Component.20import.20analysis.20can.20dra.2E.2E.2E.html#628800707">(Oct 02 2026 at 23:17)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the cranelift<span aria-label="goal" class="emoji emoji-1f945" role="img" title="goal">:goal:</span>compile-time label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14506">Issue #14506</a>.</p>
+
+
+
+<a name="628800709"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314506%20Component%20import%20analysis%20can%20dra.../near/628800709" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314506.20Component.20import.20analysis.20can.20dra.2E.2E.2E.html#628800709">(Oct 02 2026 at 23:17)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasm-proposal:component-model label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14506">Issue #14506</a>.</p>
+
+
+
+<hr><p>Last updated: Oct 03 2026 at 16:23 UTC</p>
+</html>

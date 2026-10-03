@@ -1,0 +1,152 @@
+[
+    {
+        "content": "<p><span class=\"user-mention\" data-user-id=\"254389\">@Chris Fallin</span> <span class=\"user-mention\" data-user-id=\"253990\">@fitzgen (he/him)</span> Regarding the OOM handling topic in today's meeting: I'm curious how you anticipate OOM errors will be handled.  I imagine there are roughly three scenarios:</p>\n<ol>\n<li>Just propagate it to the caller like other errors, e.g. <code>vec.try_push(foo)?</code></li>\n<li>Handle it internally in Wasmtime by taking a different code path which presumably requires less or no allocation (and/or freeing up some other allocation) but still allows the operation to succeed</li>\n<li>Propagate it to the embedder to deal with, presumably by dropping the store and returning a 500 error, or whatever is appropriate</li>\n</ol>\n<p>I'm naively imagining #1 and #3 will be quite common and #2 will be rare.  If that's true, then letting allocation failures panic, catching such panics at public API boundaries, and \"poisoning\" the store so it can't be used again could be a valid alternative approach.  For the rare #2 cases, the same approach could be used at a finer-grained level: catch the panic, drop any half-formed state, and try the fallback code path.</p>\n<p>I mentioned something like this last time it was brought up, but I don't recall if there were objections, and if so, what they were.</p>",
+        "id": 558503499,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1763663979
+    },
+    {
+        "content": "<p>Yes mostly 1 and 3 but the problem with panics is that they internally allocate I am pretty sure and also they run destructors which if those attempt to allocate will lead to panic in panic which aborts</p>",
+        "id": 558503781,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1763664077
+    },
+    {
+        "content": "<p>But also our nostd doesn’t support panic unwinding</p>",
+        "id": 558503840,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1763664099
+    },
+    {
+        "content": "<p>Presumably propagating errors with <code>?</code> will also run destructors.</p>",
+        "id": 558503892,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1763664117
+    },
+    {
+        "content": "<p>but yeah, I see how it avoids the double panic</p>",
+        "id": 558503973,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1763664143
+    },
+    {
+        "content": "<p>True but if allocations return a result then you shouldn’t just unwrap that in drop</p>",
+        "id": 558504012,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1763664157
+    },
+    {
+        "content": "<p>yeah, either way you need to have well-behaved<code>Drop</code> implementations</p>",
+        "id": 558504099,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1763664199
+    },
+    {
+        "content": "<p>I think what you describe is possible but feels a bit hackier / doesn’t match my sense of style as much. Having a hard time putting it into words</p>",
+        "id": 558504117,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1763664208
+    },
+    {
+        "content": "<p>I guess I like that results don’t hide the error condition</p>",
+        "id": 558504196,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1763664244
+    },
+    {
+        "content": "<p>If we are going to actually handle it, then we should be explicit about that</p>",
+        "id": 558504224,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1763664257
+    },
+    {
+        "content": "<p>I'm not necessarily advocating for it: just feeling out the solution space, inspired a bit by Erlang-style supervision trees</p>",
+        "id": 558504263,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1763664275
+    },
+    {
+        "content": "<p>If vec push doesn’t return a result, then why not use it in drop? But that’s a foot gun.</p>",
+        "id": 558504327,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1763664300
+    },
+    {
+        "content": "<p>I do like the idea of poisoning stores and creating well defined boundaries</p>",
+        "id": 558504404,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1763664327
+    },
+    {
+        "content": "<p>One other thing that throws the wrench into \"catch the panic\" is that we build with panic=abort right now because we don't have libunwind in our no-std environment. So this whole branch is out I think</p>",
+        "id": 558504462,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763664347
+    },
+    {
+        "content": "<p>in general I don't like DWARF being load-bearing here either</p>",
+        "id": 558504497,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763664360
+    },
+    {
+        "content": "<p>Yeah we would also have to unwind over wasm</p>",
+        "id": 558504564,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1763664381
+    },
+    {
+        "content": "<p>indeed</p>",
+        "id": 558504672,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763664424
+    },
+    {
+        "content": "<p>There's also the aspect that I don't know we've tested/audited for correct disentangling of state via destructors at all possible failure points -- maybe? but there's a reason that e.g. mutexes get poisoned on panics, and there is cross-store state too (e.g. global module registry and the like)</p>",
+        "id": 558504826,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763664478
+    },
+    {
+        "content": "<p>We would sort of test that indirectly via the oom testing but yeah</p>",
+        "id": 558504928,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1763664510
+    },
+    {
+        "content": "<p>Right, I guess I'm saying we need to eat the frog either way, so we might as well do it via \"normal\" control flow</p>",
+        "id": 558504985,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1763664531
+    },
+    {
+        "content": "<p>While I agree that panicking in no_std is hard...</p>\n<blockquote>\n<p>Yeah we would also have to unwind over wasm</p>\n</blockquote>\n<p>this at least you don't have to deal with, we catch all panics in wasmtime at the wasm boundary, use a trap to unwind wasm, and then resume the panic on the other end</p>",
+        "id": 558525906,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1763671697
+    },
+    {
+        "content": "<p>The unwinding crate can be used with no_std. Though you do need nightly to be able to set the personality function that libstd would otherwise set.</p>",
+        "id": 558613843,
+        "sender_full_name": "bjorn3",
+        "timestamp": 1763717238
+    },
+    {
+        "content": "<p>we talked about deserialization of cwasm's yesterday, and I just remembered that <a href=\"https://github.com/jamesmunns/postcard\">Postcard</a> might be useful for that</p>\n<div class=\"message_embed\"><a class=\"message_embed_image\" href=\"https://github.com/jamesmunns/postcard\" style=\"background-image: url(&quot;https://uploads.zulipusercontent.net/9ab65b8ac45404a6f84eab8624e684430f08bc9c/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f313734653065353034363434316562346163343566333063313965376630663537353939636166373366613935636630653461646538346465306130373863342f6a616d65736d756e6e732f706f737463617264&quot;)\"></a><div class=\"data-container\"><div class=\"message_embed_title\"><a href=\"https://github.com/jamesmunns/postcard\" title=\"GitHub - jamesmunns/postcard: A no_std + serde compatible message library for Rust\">GitHub - jamesmunns/postcard: A no_std + serde compatible message library for Rust</a></div><div class=\"message_embed_description\">A no_std + serde compatible message library for Rust - jamesmunns/postcard</div></div></div>",
+        "id": 558703109,
+        "sender_full_name": "Till Schneidereit",
+        "timestamp": 1763742599
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"234973\">Till Schneidereit</span> <a href=\"#narrow/channel/217126-wasmtime/topic/OOM.20handling.20in.20.28parts.20of.29.20Wasmtime/near/558703109\">said</a>:</p>\n<blockquote>\n<p>we talked about deserialization of cwasm's yesterday, and I just remembered that <a href=\"https://github.com/jamesmunns/postcard\">Postcard</a> might be useful for that</p>\n</blockquote>\n<p>we already use <code>postcard</code> today in fact: <a href=\"https://github.com/search?q=repo%3Abytecodealliance%2Fwasmtime%20postcard&amp;type=code\">https://github.com/search?q=repo%3Abytecodealliance%2Fwasmtime%20postcard&amp;type=code</a></p>\n<p>but I have not figured out if it supports OOM-handling or not from a very quick glance at its docs. I do know that it reuses the serde traits, and I don't know if those interfaces are going to constrain us here</p>\n<div class=\"message_embed\"><a class=\"message_embed_image\" href=\"https://github.com/search?q=repo%3Abytecodealliance%2Fwasmtime%20postcard&amp;type=code\" style=\"background-image: url(&quot;https://uploads.zulipusercontent.net/33bfd30bde61bfd938502e4c1fdeaa24486f1e2b/68747470733a2f2f6769746875622e6769746875626173736574732e636f6d2f6173736574732f6769746875622d6f63746f6361742d3133633836623862333336642e706e67&quot;)\"></a><div class=\"data-container\"><div class=\"message_embed_title\"><a href=\"https://github.com/search?q=repo%3Abytecodealliance%2Fwasmtime%20postcard&amp;type=code\" title=\"Build software better, together\">Build software better, together</a></div><div class=\"message_embed_description\">GitHub is where people build software. More than 150 million people use GitHub to discover, fork, and contribute to over 420 million projects.</div></div></div>",
+        "id": 558722001,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1763748082
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"253990\">fitzgen (he/him)</span> <a href=\"#narrow/channel/217126-wasmtime/topic/OOM.20handling.20in.20.28parts.20of.29.20Wasmtime/near/558722001\">said</a>:</p>\n<blockquote>\n<p>but I have not figured out if it supports OOM-handling or not from a very quick glance at its docs. I do know that it reuses the serde traits, and I don't know if those interfaces are going to constrain us here</p>\n</blockquote>\n<p>so I looked into this a little more and I think we can make it work <strong><em>if</em></strong> we create new collection types (eg <code>wasmtime_collections::Vec</code>) for our OOM-handling collections rather than do extension traits for <code>std</code>/<code>alloc</code> types.[^0] this is because we need a separate implementation of <code>serde::Deserialize</code> that does OOM handling, but there can only be one implementation of <code>serde::Deserialize</code> for one type.</p>\n<p>[^0]: or alternatively use newtypes only within the things we want to deserialize with postcard/serde but if we are doing newtypes for this we might as well do it for all use sites</p>",
+        "id": 558731412,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1763751260
+    }
+]

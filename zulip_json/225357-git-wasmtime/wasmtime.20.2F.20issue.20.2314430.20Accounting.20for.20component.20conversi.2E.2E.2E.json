@@ -1,0 +1,50 @@
+[
+    {
+        "content": "<p>wilfreddenton opened <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14430\">issue #14430</a>:</p>\n<blockquote>\n<p>I run Wasmtime components in an embedding where guest instructions and host work share an execution fuel budget. Guest-to-host lifting consumes <code>hostcall_fuel</code>, but that allowance starts over for each lift and does not reduce <code>Store::get_fuel()</code>. I need repeated conversions to count against the execution budget, including work done before a conversion fails.</p>\n<p>I can see two possible approaches:</p>\n<ol>\n<li>Wasmtime could optionally charge Store fuel as lifting consumes its existing allowance, at a configurable price.</li>\n<li>Wasmtime could expose allowance consumption, including partial consumption on errors, and provide reliable points for the embedding to set a limit from remaining fuel before each lift and settle the cost before execution continues. A hook might help, but I am not sure the current hooks cover all those points.</li>\n</ol>\n<p>Would you recommend either approach, or a different API for this?<br>\n</p>\n</blockquote>",
+        "id": 627007846,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790375573
+    },
+    {
+        "content": "<p><a href=\"https://github.com/alexcrichton\">alexcrichton</a> added the wasmtime:fuel label to <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14430\">Issue #14430</a>.</p>",
+        "id": 627603215,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790645927
+    },
+    {
+        "content": "<p>alexcrichton <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14430#issuecomment-5882009990\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14430\">issue #14430</a>:</p>\n<blockquote>\n<p>It seems reasonable to me to go ahead and discount the fuel from the store fuel, if enabled, as well on successful lifts/lowers if it doesn't add too much overhead. Perhaps a <code>Drop</code> for the <code>LiftContext</code> might be the best place to put that, but I'm not entirely sure. I agree that adding hooks is probably going to be a bit messy, so just automatically doing this is probably the way to go</p>\n</blockquote>",
+        "id": 627603408,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790646022
+    },
+    {
+        "content": "<p>wilfreddenton <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14430#issuecomment-5897095904\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14430\">issue #14430</a>:</p>\n<blockquote>\n<p>Thanks, Alex. Settling in <code>LiftContext::Drop</code> would account for work after completion, but we need to enforce the shared fuel budget before the work occurs. Would you be open to opt-in Store fuel deduction at the existing <code>LiftContext::consume_fuel</code> checks?</p>\n<p>I'd also like equivalent accounting for lowering, covering host-side conversion and copying. Would you prefer to include lowering initially or address it separately?</p>\n</blockquote>",
+        "id": 627882753,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790709858
+    },
+    {
+        "content": "<p>alexcrichton <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14430#issuecomment-5899116833\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14430\">issue #14430</a>:</p>\n<blockquote>\n<p>If it's not too bad to add this to <code>consume_fuel</code> that seems ok yeah. For lowering I'm hesitant to have fuel worm its way so so deeply into everywhere in Wasmtime so I'm tempted to leave that up to embedders to do since the hook isn't already there. Is it difficult though on the embedder side to account for the work the host is doing in fuel?</p>\n</blockquote>",
+        "id": 627907121,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790716721
+    },
+    {
+        "content": "<p>wilfreddenton <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14430#issuecomment-5918291444\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14430\">issue #14430</a>:</p>\n<blockquote>\n<p>Lowering accounting turned out to be manageable on the embedder side. My strategy was to charge at two points:</p>\n<p><strong>Host-function results returned to the guest.</strong> <code>wasmtime</code> lowers these after the registered callback returns. I wrapped linker registration so each callback runs the host function, calculates a lowering charge from its result, deducts Store fuel, and then returns the result. If charging fails, lowering never starts. I used bindgen’s <code>wasmtime_crate</code> option to route generated registrations through the same wrapper.</p>\n<p><strong>Arguments passed into guest exports.</strong> I accumulated their lowering cost during the existing argument-construction traversal, then deducted it before calling Wasmtime.</p>\n<p>Leaving lowering to embedders looks workable. Do you see any improvements to this embedder-side approach? Deducting Store fuel directly in lifting’s existing <code>consume_fuel</code> checks should address the remaining gap.</p>\n</blockquote>",
+        "id": 628181143,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790796913
+    },
+    {
+        "content": "<p>alexcrichton <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14430#issuecomment-5919828675\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14430\">issue #14430</a>:</p>\n<blockquote>\n<p>That sounds reasonable enough to me yeah</p>\n</blockquote>",
+        "id": 628201110,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790802777
+    },
+    {
+        "content": "<p>carsonfarmer <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14430#issuecomment-5957579576\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14430\">issue #14430</a>:</p>\n<blockquote>\n<p>A data point from an embedder: in <code>wasmtime-wasi-http</code> 49, <code>fields.from-list</code> lifts the whole <code>list&lt;tuple&lt;string, list&lt;u8&gt;&gt;&gt;</code> before its 128 KiB field-size check runs, so a call that will be refused can still allocate up to the hostcall-fuel budget first. I use epoch deadlines rather than Store fuel, so for me the per-call budget is the only bound, and I've lowered it to 32 MiB with <code>set_hostcall_fuel</code>. It might be worth a line in the <code>wasmtime-wasi-http</code> docs suggesting embedders do the same.<br>\n</p>\n</blockquote>",
+        "id": 628734668,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790961512
+    }
+]
