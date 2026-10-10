@@ -1,0 +1,323 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14571 Debug tags on `try_call` are drop... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314571.20Debug.20tags.20on.20.60try_call.60.20are.20drop.2E.2E.2E.html">wasmtime / issue #14571 Debug tags on `try_call` are drop...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="629575838"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314571%20Debug%20tags%20on%20%60try_call%60%20are%20drop.../near/629575838" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314571.20Debug.20tags.20on.20.60try_call.60.20are.20drop.2E.2E.2E.html#629575838">(Oct 06 2026 at 15:08)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/14571#issuecomment-6019219210">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14571">issue #14571</a>:</p>
+<blockquote>
+<p>&lt;details&gt;&lt;summary&gt;Full LLM report&lt;/summary&gt;</p>
+<h1>Debug tags on <code>try_call</code> are dropped in lowering; with inlining, guest-debug breakpoints fire unrequested and frames are lost</h1>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Date</td>
+<td>2026-10-05</td>
+</tr>
+<tr>
+<td>Wasmtime commit</td>
+<td><code>73b04cff3317d1e308866eb24359483ac6116669</code> (<code>main</code>)</td>
+</tr>
+<tr>
+<td>Host</td>
+<td>macOS 15.8.1 (Darwin 24.6.0), <code>aarch64-apple-darwin</code></td>
+</tr>
+<tr>
+<td>Model</td>
+<td>Claude Opus 5.5 (<code>claude-opus-5-5</code>)</td>
+</tr>
+<tr>
+<td>Component</td>
+<td><code>cranelift/codegen/src/machinst/lower.rs</code> (root cause); made visible by <code>cranelift/codegen/src/inline.rs</code> exception-table fixups</td>
+</tr>
+<tr>
+<td>Features</td>
+<td><code>Config::guest_debug(true)</code> + <code>Config::compiler_inlining(..)</code> + exceptions (a combination Wasmtime allows and tests in <code>tests/all/debug.rs::breakpoints_in_inlined_code</code>)</td>
+</tr>
+<tr>
+<td>Severity</td>
+<td>Low to medium. The debugger receives breakpoint events nobody requested and loses frames and locals. There is no sandbox impact.</td>
+</tr>
+</tbody>
+</table>
+<h2>Summary</h2>
+<p>The CLIF verifier accepts debug tags on any call, <code>try_call</code> included<br>
+(<code>cranelift/codegen/src/verifier/mod.rs:2058-2071</code>). Lowering, however, only<br>
+forwards them to VCode for non-branch instructions (<code>lower.rs:993-1001</code>, in<br>
+the per-block instruction loop). The branch path (<code>lower.rs:~1274-1296</code>)<br>
+forwards a <code>try_call</code>'s user stack-map entries (<code>:1284</code>) but never its<br>
+<code>debug_tags</code>. Tags on a <code>try_call</code> are therefore silently dropped before they<br>
+reach the <code>MachBuffer</code>.</p>
+<p>Without inlining, Wasmtime's guest-debug breakpoint hooks are always plain<br>
+patchable <code>call</code>s (<code>crates/cranelift/src/func_environ.rs:5307-5311</code>), so they<br>
+keep their tags. Wasm calls inside <code>try_table</code> do become tagged <code>try_call</code>s<br>
+through <code>attach_tags</code> (<code>func_environ.rs:~2613</code>), and those tags are dropped<br>
+too. No visible symptom from that alone was found; see the scope note below.</p>
+<p>Inlining is what makes the bug visible. When a callee is inlined at a<br>
+<code>try_call</code> site (a call inside <code>try_table</code>),<br>
+<code>fixup_inlined_call_exception_tables</code> (<code>inline.rs:672-702</code>) rewrites every<br>
+inlined <code>call</code> into a <code>try_call</code> that carries the caller's handlers. That<br>
+includes the callee's patchable breakpoint calls. Their tags are then lost,<br>
+which causes two problems.</p>
+<p><code>CompiledFunction::finalize_breakpoints</code><br>
+(<code>crates/cranelift/src/compiled_function.rs:100-137</code>) pairs patchable call<br>
+sites with debug tags to produce breakpoint patch records. The untagged sites<br>
+get no record, so <code>compiler.rs:~800-820</code> never turns them into NOPs:</p>
+<ul>
+<li>They stay live <code>bl wasmtime_patchable_builtin_breakpoint</code> instructions.</li>
+<li>They fire on every execution, even when no breakpoint is set.</li>
+</ul>
+<p>They also get no frame-table program point. Frame inspection at, or below,<br>
+these sites falls back to a neighbouring program point. The inlined callee's<br>
+virtual frame and its locals disappear.</p>
+<p><code>wasmtime objdump</code> of a guest-debug + inlining build confirms this. The inlined<br>
+breakpoint calls are <code>bl</code> to the breakpoint builtin with exception-handler<br>
+annotations, but have no "breakpoint patch" or "debug frame state"<br>
+annotation. Every non-inlined breakpoint site is a <code>nop</code> with a patch record.</p>
+<h2>Reproduction</h2>
+<h3>Cranelift level</h3>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">target</span><span class="o">/</span><span class="n">debug</span><span class="o">/</span><span class="n">clif</span><span class="o">-</span><span class="n">util</span><span class="w"> </span><span class="n">test</span><span class="w"> </span><span class="n">reports</span><span class="o">/</span><span class="mi">020</span><span class="o">-</span><span class="n">trycall</span><span class="o">-</span><span class="n">debug</span><span class="o">-</span><span class="n">tags</span><span class="o">-</span><span class="n">dropped</span><span class="o">/</span><span class="n">tags</span><span class="p">.</span><span class="n">clif</span>
+<span class="w">    </span><span class="o">&gt;</span><span class="w">   </span><span class="p">;</span><span class="w"> </span><span class="o">^--</span><span class="w"> </span><span class="n">debug</span><span class="w"> </span><span class="o">@</span><span class="w"> </span><span class="n">Post</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="n">StackSlot</span><span class="p">(</span><span class="n">ss0</span><span class="p">),</span><span class="w"> </span><span class="n">User</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span><span class="w"> </span><span class="n">User</span><span class="p">(</span><span class="mi">2</span><span class="p">)]</span><span class="w">      </span><span class="o">&lt;-</span><span class="w"> </span><span class="n">plain</span><span class="w"> </span><span class="err">`</span><span class="n">call</span><span class="err">`</span><span class="p">:</span><span class="w"> </span><span class="nc">tags</span><span class="w"> </span><span class="n">kept</span>
+<span class="w">    </span><span class="n">Matched</span><span class="w"> </span><span class="p">#</span><span class="mi">0</span><span class="p">:</span><span class="w"> </span><span class="o">..</span><span class="p">.</span>
+<span class="w">    </span><span class="n">Missed</span><span class="w"> </span><span class="p">#</span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="err">\</span><span class="n">bdebug</span><span class="w"> </span><span class="o">@</span><span class="w"> </span><span class="n">Post</span><span class="p">:</span><span class="w"> </span><span class="err">\</span><span class="p">[</span><span class="n">StackSlot</span><span class="err">\</span><span class="p">(</span><span class="n">ss0</span><span class="err">\</span><span class="p">),</span><span class="w"> </span><span class="n">User</span><span class="err">\</span><span class="p">(</span><span class="mi">3</span><span class="err">\</span><span class="p">),</span><span class="w"> </span><span class="n">User</span><span class="err">\</span><span class="p">(</span><span class="mi">4</span><span class="err">\</span><span class="p">)</span><span class="err">\</span><span class="p">]</span><span class="w">   </span><span class="o">&lt;-</span><span class="w"> </span><span class="err">`</span><span class="n">try_call</span><span class="err">`</span><span class="p">:</span><span class="w"> </span><span class="nc">tags</span><span class="w"> </span><span class="n">dropped</span>
+<span class="n">Error</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="n">failure</span>
+</code></pre></div>
+<p><code>tags.clif</code> makes two calls to the same patchable callee:<br>
+<code>&lt;ss0, 1, 2&gt; call</code> and <code>&lt;ss0, 3, 4&gt; try_call</code>.</p>
+<h3>Wasmtime level</h3>
+<p><code>wasm-repro/</code> is a Rust crate using the public API. It enables<br>
+<code>guest_debug(true)</code> and exceptions, installs a <code>DebugHandler</code> that logs every<br>
+event plus the locals of each frame, and sets <strong>no</strong> breakpoints. It then runs<br>
+the module below twice: with <code>Inlining::No</code>, and with <code>Inlining::Yes</code> and<br>
+aggressive thresholds.</p>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="err">tag</span> <span class="nv">$t</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span><span class="p">))</span>
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"main"</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="p">(</span><span class="k">block</span> <span class="nv">$b</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span>
+      <span class="p">(</span><span class="err">try_</span><span class="k">table</span> <span class="p">(</span><span class="err">catch</span> <span class="nv">$t</span> <span class="nv">$b</span><span class="p">)</span> <span class="nb">call</span> <span class="nv">$thrower</span><span class="p">)</span>
+      <span class="nb">i32.const</span> <span class="mi">0</span><span class="p">))</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$thrower</span> <span class="p">(</span><span class="k">local</span> <span class="nv">$i</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="p">(</span><span class="nb">local.set</span> <span class="nv">$i</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mf">100</span><span class="p">))</span>
+    <span class="p">(</span><span class="err">throw</span> <span class="nv">$t</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">42</span><span class="p">))))</span>
+</code></pre></div>
+<p>(The crate's module also exports <code>plain</code> and <code>trycatch</code>, so function indices<br>
+below refer to that larger module.)</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">cargo</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="o">--</span><span class="n">manifest</span><span class="o">-</span><span class="n">path</span><span class="w"> </span><span class="n">reports</span><span class="o">/</span><span class="mi">020</span><span class="o">-</span><span class="n">trycall</span><span class="o">-</span><span class="n">debug</span><span class="o">-</span><span class="n">tags</span><span class="o">-</span><span class="n">dropped</span><span class="o">/</span><span class="n">wasm</span><span class="o">-</span><span class="n">repro</span><span class="o">/</span><span class="n">Cargo</span><span class="p">.</span><span class="n">toml</span>
+<span class="n">No</span><span class="p">:</span><span class="w"> </span><span class="nc">result</span><span class="o">=</span><span class="mi">42</span>
+<span class="w">  </span><span class="n">Exception</span><span class="w"> </span><span class="o">@</span><span class="n">func4</span><span class="w"> </span><span class="n">pc</span><span class="o">=</span><span class="mh">0x7f</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">frame</span><span class="w"> </span><span class="n">locals</span><span class="o">=</span><span class="p">[</span><span class="s">"I32(100)"</span><span class="p">]</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">frame</span><span class="w"> </span><span class="n">locals</span><span class="o">=</span><span class="p">[]</span>
+<span class="n">Yes</span><span class="p">:</span><span class="w"> </span><span class="nc">result</span><span class="o">=</span><span class="mi">42</span>
+<span class="w">  </span><span class="n">Breakpoint</span><span class="w"> </span><span class="o">@</span><span class="n">func0</span><span class="w"> </span><span class="n">pc</span><span class="o">=</span><span class="mh">0x4d</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">frame</span><span class="w"> </span><span class="n">locals</span><span class="o">=</span><span class="p">[]</span>
+<span class="w">  </span><span class="n">Breakpoint</span><span class="w"> </span><span class="o">@</span><span class="n">func0</span><span class="w"> </span><span class="n">pc</span><span class="o">=</span><span class="mh">0x4d</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">frame</span><span class="w"> </span><span class="n">locals</span><span class="o">=</span><span class="p">[]</span>
+<span class="w">  </span><span class="n">Breakpoint</span><span class="w"> </span><span class="o">@</span><span class="n">func0</span><span class="w"> </span><span class="n">pc</span><span class="o">=</span><span class="mh">0x4d</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">frame</span><span class="w"> </span><span class="n">locals</span><span class="o">=</span><span class="p">[]</span>
+<span class="w">  </span><span class="n">Breakpoint</span><span class="w"> </span><span class="o">@</span><span class="n">func0</span><span class="w"> </span><span class="n">pc</span><span class="o">=</span><span class="mh">0x4d</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">frame</span><span class="w"> </span><span class="n">locals</span><span class="o">=</span><span class="p">[]</span>
+<span class="w">  </span><span class="n">Exception</span><span class="w"> </span><span class="o">@</span><span class="n">func0</span><span class="w"> </span><span class="n">pc</span><span class="o">=</span><span class="mh">0x4d</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">frame</span><span class="w"> </span><span class="n">locals</span><span class="o">=</span><span class="p">[]</span>
+</code></pre></div>
+<p>What changes when inlining is on:</p>
+<ul>
+<li><strong>Spurious events:</strong> four <code>Breakpoint</code> events fire that nobody requested.</li>
+<li><strong>Lost frame:</strong> the <code>Exception</code> event no longer shows <code>$thrower</code>'s frame,<br>
+  so its <code>$i = 100</code> is gone.</li>
+</ul>
+<p><code>FUNC=trycatch</code> is a non-throwing variant. It also produces four spurious<br>
+<code>Breakpoint</code> events with inlining and none without.</p>
+<p>The expected behaviour is the same events as without inlining: one<br>
+<code>Exception</code>, with an inlined virtual frame for <code>$thrower</code>.<br>
+<code>breakpoints_in_inlined_code</code> shows that inlined virtual frames work for<br>
+plain <code>call</code> sites.</p>
+<p>The in-tree test <code>tests/all/debug.rs::caught_exception_events</code> fails<br>
+("Incorrect event") for the same reason when the default <code>Tunables</code> force<br>
+aggressive inlining.</p>
+<h2>Suggested fix</h2>
+<ul>
+<li>
+<p><strong>Primary:</strong> in the branch-lowering path of <code>lower.rs</code> (next to the<br>
+  stack-map forwarding at <code>:1284</code>), forward <code>self.f.debug_tags.get(branch)</code> to<br>
+  the emitted VCode instruction the same way the non-branch path does. Then<br>
+<code>try_call</code> tags reach the <code>MachBuffer</code>, and patch records and frame-table<br>
+  entries are produced.</p>
+</li>
+<li>
+<p><strong>Additionally, optionally:</strong> have <code>fixup_inlined_call_exception_tables</code><br>
+  leave <code>patchable</code> calls as plain <code>call</code>s. The breakpoint trampoline never<br>
+  throws into Wasm handlers, so it does not need an exception table.</p>
+</li>
+<li>
+<p><strong>Tests:</strong> add a <code>test compile</code> filetest with tags on a <code>try_call</code>, and a<br>
+<code>caught_exception_events</code> variant with <code>Inlining::Yes</code> to<br>
+<code>tests/all/debug.rs</code>.</p>
+</li>
+</ul>
+<h2>Scope note</h2>
+<p>The tags are dropped for every tagged <code>try_call</code>, including non-inlined Wasm<br>
+calls inside <code>try_table</code>. A single-step probe of that case<br>
+(<code>reports/2026-10-05-audit/inlining/dbg2/</code>) still showed a correct parent PC<br>
+and operand stack. The neighbouring breakpoint <code>call</code>'s program point covers<br>
+the return address there. So no visible symptom was found without inlining,<br>
+though correctness in that case depends on that coincidence.</p>
+<p>&lt;/details&gt;</p>
+</blockquote>
+
+
+
+<a name="629576091"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314571%20Debug%20tags%20on%20%60try_call%60%20are%20drop.../near/629576091" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314571.20Debug.20tags.20on.20.60try_call.60.20are.20drop.2E.2E.2E.html#629576091">(Oct 06 2026 at 15:09)</a>:</h4>
+<p>fitzgen opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14571">issue #14571</a>:</p>
+<blockquote>
+<p><code>Lower</code> copies an instruction's debug tags to VCode only for non-branch<br>
+instructions. The branch path forwards a <code>try_call</code>'s user stack maps but not<br>
+its debug tags, so the tags are silently dropped.</p>
+<p>This becomes visible with guest debugging plus inlining. Inlining a callee<br>
+into a call inside <code>try_table</code> turns the callee's patchable breakpoint calls<br>
+into <code>try_call</code>s. Those calls lose their tags, so they get no breakpoint<br>
+patch record and are never NOP'd out. As a result:</p>
+<ul>
+<li><code>Breakpoint</code> events fire even though no breakpoint was set;</li>
+<li>the inlined callee's frame is missing from the debugger's view.</li>
+</ul>
+<h3>Test Case</h3>
+<p><code>.clif</code>:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">test</span><span class="w"> </span><span class="n">compile</span>
+<span class="n">target</span><span class="w"> </span><span class="n">aarch64</span>
+
+<span class="n">function</span><span class="w"> </span><span class="o">%</span><span class="n">f</span><span class="p">(</span><span class="kt">i64</span><span class="p">)</span><span class="w"> </span><span class="n">tail</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">ss0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">explicit_slot</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span><span class="w"> </span><span class="n">key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">    </span><span class="n">sig0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">i64</span><span class="p">)</span><span class="w"> </span><span class="n">preserve_all</span>
+<span class="w">    </span><span class="n">fn0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">colocated</span><span class="w"> </span><span class="n">patchable</span><span class="w"> </span><span class="o">%</span><span class="n">bp</span><span class="w"> </span><span class="n">sig0</span>
+<span class="n">block0</span><span class="p">(</span><span class="n">v0</span><span class="p">:</span><span class="w"> </span><span class="kt">i64</span><span class="p">):</span>
+<span class="w">    </span><span class="o">&lt;</span><span class="n">ss0</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="o">&gt;</span><span class="w"> </span><span class="n">call</span><span class="w"> </span><span class="n">fn0</span><span class="p">(</span><span class="n">v0</span><span class="p">)</span>
+<span class="w">    </span><span class="o">&lt;</span><span class="n">ss0</span><span class="p">,</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="mi">4</span><span class="o">&gt;</span><span class="w"> </span><span class="n">try_call</span><span class="w"> </span><span class="n">fn0</span><span class="p">(</span><span class="n">v0</span><span class="p">),</span><span class="w"> </span><span class="n">sig0</span><span class="p">,</span><span class="w"> </span><span class="n">block1</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="w"> </span><span class="n">default</span><span class="p">:</span><span class="w"> </span><span class="nc">block2</span><span class="w"> </span><span class="p">]</span>
+<span class="n">block1</span><span class="p">:</span>
+<span class="w">    </span><span class="nc">return</span>
+<span class="n">block2</span><span class="p">:</span>
+<span class="w">    </span><span class="nc">return</span>
+<span class="p">}</span>
+<span class="p">;</span><span class="w"> </span><span class="n">check</span><span class="p">:</span><span class="w"> </span><span class="nc">debug</span><span class="w"> </span><span class="o">@</span><span class="w"> </span><span class="n">Post</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="n">StackSlot</span><span class="p">(</span><span class="n">ss0</span><span class="p">),</span><span class="w"> </span><span class="n">User</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span><span class="w"> </span><span class="n">User</span><span class="p">(</span><span class="mi">2</span><span class="p">)]</span>
+<span class="p">;</span><span class="w"> </span><span class="n">check</span><span class="p">:</span><span class="w"> </span><span class="nc">debug</span><span class="w"> </span><span class="o">@</span><span class="w"> </span><span class="n">Post</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="n">StackSlot</span><span class="p">(</span><span class="n">ss0</span><span class="p">),</span><span class="w"> </span><span class="n">User</span><span class="p">(</span><span class="mi">3</span><span class="p">),</span><span class="w"> </span><span class="n">User</span><span class="p">(</span><span class="mi">4</span><span class="p">)]</span>
+</code></pre></div>
+<p>Wasmtime embedding:</p>
+<p>&lt;details&gt;</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#[tokio::test]</span>
+<span class="cp">#[cfg_attr(miri, ignore)]</span>
+<span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">no_spurious_breakpoints_in_inlined_try_table_callee</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">wasmtime</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="cp">#[derive(Clone)]</span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">Recorder</span><span class="p">(</span><span class="n">Arc</span><span class="o">&lt;</span><span class="n">Mutex</span><span class="o">&lt;</span><span class="nb">Vec</span><span class="o">&lt;&amp;'</span><span class="nb">static</span><span class="w"> </span><span class="kt">str</span><span class="o">&gt;&gt;&gt;</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">impl</span><span class="w"> </span><span class="n">DebugHandler</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">Recorder</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">type</span><span class="w"> </span><span class="nc">Data</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">();</span>
+<span class="w">        </span><span class="k">fn</span><span class="w"> </span><span class="nf">handle</span><span class="p">(</span>
+<span class="w">            </span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span>
+<span class="w">            </span><span class="n">_store</span><span class="p">:</span><span class="w"> </span><span class="nc">StoreContextMut</span><span class="o">&lt;'</span><span class="nb">_</span><span class="p">,</span><span class="w"> </span><span class="p">()</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="w">            </span><span class="n">event</span><span class="p">:</span><span class="w"> </span><span class="nc">DebugEvent</span><span class="o">&lt;'</span><span class="nb">_</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="w">        </span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">impl</span><span class="w"> </span><span class="n">Future</span><span class="o">&lt;</span><span class="n">Output</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nb">Send</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="bp">self</span><span class="p">.</span><span class="mf">0.</span><span class="n">lock</span><span class="p">().</span><span class="n">unwrap</span><span class="p">().</span><span class="n">push</span><span class="p">(</span><span class="k">match</span><span class="w"> </span><span class="n">event</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="n">DebugEvent</span><span class="p">::</span><span class="n">Breakpoint</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="s">"breakpoint"</span><span class="p">,</span>
+<span class="w">                </span><span class="n">DebugEvent</span><span class="p">::</span><span class="n">Exception</span><span class="p">(</span><span class="n">_</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="s">"exception"</span><span class="p">,</span>
+<span class="w">                </span><span class="n">_</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="s">"other"</span><span class="p">,</span>
+<span class="w">            </span><span class="p">});</span>
+<span class="w">            </span><span class="k">async</span><span class="w"> </span><span class="p">{}</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">config</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Config</span><span class="p">::</span><span class="n">default</span><span class="p">();</span>
+<span class="w">    </span><span class="n">config</span>
+<span class="w">        </span><span class="p">.</span><span class="n">guest_debug</span><span class="p">(</span><span class="kc">true</span><span class="p">)</span>
+<span class="w">        </span><span class="p">.</span><span class="n">wasm_exceptions</span><span class="p">(</span><span class="kc">true</span><span class="p">)</span>
+<span class="w">        </span><span class="p">.</span><span class="n">compiler_inlining</span><span class="p">(</span><span class="n">Inlining</span><span class="p">::</span><span class="n">Yes</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">engine</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Engine</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">config</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">module</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Module</span><span class="p">::</span><span class="n">new</span><span class="p">(</span>
+<span class="w">        </span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span>
+<span class="w">        </span><span class="s">r#"</span>
+<span class="s">            (module</span>
+<span class="s">              (tag $t (param i32))</span>
+<span class="s">              (func (export "main") (result i32)</span>
+<span class="s">                (block $b (result i32)</span>
+<span class="s">                  (try_table (catch $t $b) call $thrower)</span>
+<span class="s">                  i32.const 0))</span>
+<span class="s">              (func $thrower</span>
+<span class="s">                (throw $t (i32.const 42))))</span>
+<span class="s">        "#</span><span class="p">,</span>
+<span class="w">    </span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Store</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span><span class="w"> </span><span class="p">());</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">events</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Arc</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">Mutex</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="fm">vec!</span><span class="p">[]));</span>
+<span class="w">    </span><span class="n">store</span><span class="p">.</span><span class="n">set_debug_handler</span><span class="p">(</span><span class="n">Recorder</span><span class="p">(</span><span class="n">events</span><span class="p">.</span><span class="n">clone</span><span class="p">()));</span>
+
+<span class="w">    </span><span class="c1">// No breakpoints are set, so only the exception should be reported.</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">instance</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Instance</span><span class="p">::</span><span class="n">new_async</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">module</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="p">[]).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">main</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">instance</span><span class="p">.</span><span class="n">get_typed_func</span><span class="p">::</span><span class="o">&lt;</span><span class="p">(),</span><span class="w"> </span><span class="kt">i32</span><span class="o">&gt;</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="s">"main"</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="fm">assert_eq!</span><span class="p">(</span><span class="n">main</span><span class="p">.</span><span class="n">call_async</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="p">()).</span><span class="k">await</span><span class="o">?</span><span class="p">,</span><span class="w"> </span><span class="mi">42</span><span class="p">);</span>
+<span class="w">    </span><span class="fm">assert_eq!</span><span class="p">(</span><span class="o">*</span><span class="n">events</span><span class="p">.</span><span class="n">lock</span><span class="p">().</span><span class="n">unwrap</span><span class="p">(),</span><span class="w"> </span><span class="p">[</span><span class="s">"exception"</span><span class="p">]);</span>
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>&lt;/details&gt;</p>
+<h3>Steps to Reproduce</h3>
+<ul>
+<li><code>clif-util test test.clif</code></li>
+<li>Add the Rust test to <code>tests/all/debug.rs</code>, then run<br>
+<code>cargo test --test all -- no_spurious_breakpoints_in_inlined_try_table_callee</code></li>
+</ul>
+<h3>Expected Results</h3>
+<ul>
+<li><strong><code>.clif</code>:</strong> both checks match, i.e. the <code>try_call</code> keeps its tags.</li>
+<li><strong>Rust:</strong> the test passes. With no breakpoints set, only the exception<br>
+  event is reported, as when inlining is disabled.</li>
+</ul>
+<h3>Actual Results</h3>
+<ul>
+<li>
+<p><strong><code>.clif</code>:</strong></p>
+<p><code>
+Missed #1: \bdebug @ Post: \[StackSlot\(ss0\), User\(3\), User\(4\)\]
+</code></p>
+</li>
+<li>
+<p><strong>Rust:</strong> two <code>Breakpoint</code> events fire even though no breakpoints were set:</p>
+<p><code>
+assertion `left == right` failed
+  left: ["breakpoint", "breakpoint", "exception"]
+ right: ["exception"]
+</code></p>
+</li>
+</ul>
+<h3>Versions and Environment</h3>
+<p>Wasmtime version or commit: <code>73b04cff33</code></p>
+<p>Operating system: macOS 15.8.1</p>
+<p>Architecture: aarch64<br>
+</p>
+</blockquote>
+
+
+
+<a name="629576095"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314571%20Debug%20tags%20on%20%60try_call%60%20are%20drop.../near/629576095" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314571.20Debug.20tags.20on.20.60try_call.60.20are.20drop.2E.2E.2E.html#629576095">(Oct 06 2026 at 15:09)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14571">Issue #14571</a>.</p>
+
+
+
+<a name="629576096"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314571%20Debug%20tags%20on%20%60try_call%60%20are%20drop.../near/629576096" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314571.20Debug.20tags.20on.20.60try_call.60.20are.20drop.2E.2E.2E.html#629576096">(Oct 06 2026 at 15:09)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the wasmtime:debugging label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14571">Issue #14571</a>.</p>
+
+
+
+<a name="629576097"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314571%20Debug%20tags%20on%20%60try_call%60%20are%20drop.../near/629576097" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314571.20Debug.20tags.20on.20.60try_call.60.20are.20drop.2E.2E.2E.html#629576097">(Oct 06 2026 at 15:09)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the cranelift:area:clif label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14571">Issue #14571</a>.</p>
+
+
+
+<hr><p>Last updated: Oct 10 2026 at 17:07 UTC</p>
+</html>

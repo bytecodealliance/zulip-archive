@@ -1,0 +1,168 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14451 Winch typed select can omit a liv... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314451.20Winch.20typed.20select.20can.20omit.20a.20liv.2E.2E.2E.html">wasmtime / issue #14451 Winch typed select can omit a liv...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="627952108"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314451%20Winch%20typed%20select%20can%20omit%20a%20liv.../near/627952108" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314451.20Winch.20typed.20select.20can.20omit.20a.20liv.2E.2E.2E.html#627952108">(Sep 30 2026 at 02:21)</a>:</h4>
+<p>smaeljaish771 opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14451">issue #14451</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p>When Winch compiles a typed <code>select</code> whose result is a GC reference, the result's shadow type can incorrectly come from the second operand rather than the declared result type.</p>
+<p>If the first operand is a non-null <code>externref</code>, the second operand is <code>ref.null extern</code>, and the condition selects the first operand, the runtime value is a real GC reference but its shadow type becomes <code>I32</code>.</p>
+<p>At a later call site this causes the reference to be omitted from the stack map. With the copying collector, the referenced object can then be reclaimed or relocated without the stack copy being updated.</p>
+<p>This was reproduced on the latest commit.</p>
+<h2>Technical Details</h2>
+<p>The missing check is the shadow-type filter used to decide whether a value needs a stack map. <code>needs_stack_map</code> (<code>winch/codegen/src/stack.rs:315-327</code>) is unconditionally false for <code>I32</code>, so a live GC reference whose shadow type is <code>I32</code> neither increments <code>gc_ref_count</code> nor satisfies the collection condition in <code>CodeGenContext::calculate_stack_map_offsets</code> (<code>winch/codegen/src/codegen/context.rs:663-695</code>).</p>
+<p>Because that function then returns an empty table, <code>FnCall::emit</code> (<code>winch/codegen/src/codegen/call.rs:108-113</code>) skips emitting any stack map.</p>
+<p>The relevant data flow is:</p>
+<ul>
+<li><code>visit_ref_null</code> (<code>winch/codegen/src/visitor.rs:2232-2252</code>) pushes <code>ref.null extern</code>/<code>exn</code> as <code>Val::i32(0)</code>.</li>
+<li><code>visit_typed_select</code> (<code>winch/codegen/src/visitor.rs:2228-2230</code>) ignores the instruction's declared result type <code>_ty</code> and dispatches to <code>visit_select</code>.</li>
+<li><code>visit_select</code> (<code>winch/codegen/src/visitor.rs:2208-2226</code>) pushes the result using the shadow type of the second operand (<code>stack.push(val2.into())</code>).</li>
+<li>When operand 1 is a real GC reference, operand 2 is <code>ref.null</code>, and the condition is non-zero, the runtime result is the reference but its shadow type is <code>I32</code>.</li>
+<li>At the next call, <code>FnCall::emit</code> spills the value, but <code>calculate_stack_map_offsets</code> returns an empty table, so no stack map is emitted.</li>
+<li>During collection, <code>Store::trace_wasm_stack_frame</code> (<code>crates/wasmtime/src/runtime/store/gc.rs:771-786</code>) only treats slots present in the stack map as Wasm stack roots.</li>
+</ul>
+<h2>Reproduction</h2>
+<p>Tested at commit:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>ff7896b6d97a424aed430a48a186773fd163667f
+</code></pre></div>
+<p>The reproducer uses the public embedding API with Winch and compares a normal reference path with the typed-select path.</p>
+<p>Guest input:</p>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">import</span> <span class="s2">""</span> <span class="s2">"make"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$make</span> <span class="p">(</span><span class="k">result</span> <span class="err">externref</span><span class="p">)))</span>
+  <span class="p">(</span><span class="k">import</span> <span class="s2">""</span> <span class="s2">"gc"</span>   <span class="p">(</span><span class="k">func</span> <span class="nv">$gc</span><span class="p">))</span>
+
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"control"</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="err">externref</span><span class="p">)</span>
+    <span class="nb">call</span> <span class="nv">$make</span>
+    <span class="nb">call</span> <span class="nv">$gc</span><span class="p">)</span>
+
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"bug"</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="err">externref</span><span class="p">)</span>
+    <span class="nb">call</span> <span class="nv">$make</span>
+    <span class="err">ref.null</span> <span class="err">extern</span>
+    <span class="nb">i32.const</span> <span class="mi">1</span>
+    <span class="nb">select</span> <span class="p">(</span><span class="k">result</span> <span class="err">externref</span><span class="p">)</span>
+    <span class="nb">call</span> <span class="nv">$gc</span><span class="p">)</span>
+<span class="p">)</span>
+</code></pre></div>
+<p>With the null collector, both cases survive.</p>
+<p>With the copying collector, the control case survives while the typed-select case loses the referenced object:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>collector=null
+  [control] data=Ok(0xdecaf)  SURVIVED
+  [bug] data=Ok(0xdecaf)  SURVIVED
+
+collector=copying
+  [control] data=Ok(0xdecaf)  SURVIVED
+  [bug] data=Err(BUG: invalid `ExternRefHostDataId`)  HOST-DATA-SWEPT
+
+SUMMARY null_bug=Survived copying_control=Survived copying_bug=Swept
+PROBE_RESULT: reproduced
+</code></pre></div>
+<p>The two cases differ only in whether the reference passes through the typed <code>select</code>, which appears to isolate the problem to the shadow type used for the select result.</p>
+<h2>Suggested Fix</h2>
+<p><code>visit_typed_select</code> (<code>winch/codegen/src/visitor.rs:2228-2230</code>) should honor the instruction's declared result type instead of discarding <code>_ty</code>.</p>
+<p><code>visit_select</code> (<code>winch/codegen/src/visitor.rs:2208-2226</code>) should not derive the pushed shadow type from the second operand when the declared result is a reference type. The pushed value needs to retain a reference shadow type so that <code>needs_stack_map</code> returns true and the live reference is included in the call-site stack map.</p>
+</blockquote>
+
+
+
+<a name="627952110"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314451%20Winch%20typed%20select%20can%20omit%20a%20liv.../near/627952110" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314451.20Winch.20typed.20select.20can.20omit.20a.20liv.2E.2E.2E.html#627952110">(Sep 30 2026 at 02:21)</a>:</h4>
+<p><a href="https://github.com/smaeljaish771">smaeljaish771</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14451">Issue #14451</a>.</p>
+
+
+
+<a name="628105843"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314451%20Winch%20typed%20select%20can%20omit%20a%20liv.../near/628105843" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314451.20Winch.20typed.20select.20can.20omit.20a.20liv.2E.2E.2E.html#628105843">(Sep 30 2026 at 14:37)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/14451#issuecomment-5913484379">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14451">issue #14451</a>:</p>
+<blockquote>
+<p>cc @saulecabrera @macovedj </p>
+</blockquote>
+
+
+
+<a name="628105887"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314451%20Winch%20typed%20select%20can%20omit%20a%20liv.../near/628105887" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314451.20Winch.20typed.20select.20can.20omit.20a.20liv.2E.2E.2E.html#628105887">(Sep 30 2026 at 14:37)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasm-proposal:gc label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14451">Issue #14451</a>.</p>
+
+
+
+<a name="628105888"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314451%20Winch%20typed%20select%20can%20omit%20a%20liv.../near/628105888" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314451.20Winch.20typed.20select.20can.20omit.20a.20liv.2E.2E.2E.html#628105888">(Sep 30 2026 at 14:37)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the winch label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14451">Issue #14451</a>.</p>
+
+
+
+<a name="628454769"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314451%20Winch%20typed%20select%20can%20omit%20a%20liv.../near/628454769" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314451.20Winch.20typed.20select.20can.20omit.20a.20liv.2E.2E.2E.html#628454769">(Oct 01 2026 at 17:59)</a>:</h4>
+<p>saulecabrera closed <a href="https://github.com/bytecodealliance/wasmtime/issues/14451">issue #14451</a>:</p>
+<blockquote>
+<h2>Summary</h2>
+<p>When Winch compiles a typed <code>select</code> whose result is a GC reference, the result's shadow type can incorrectly come from the second operand rather than the declared result type.</p>
+<p>If the first operand is a non-null <code>externref</code>, the second operand is <code>ref.null extern</code>, and the condition selects the first operand, the runtime value is a real GC reference but its shadow type becomes <code>I32</code>.</p>
+<p>At a later call site this causes the reference to be omitted from the stack map. With the copying collector, the referenced object can then be reclaimed or relocated without the stack copy being updated.</p>
+<p>This was reproduced on the latest commit.</p>
+<h2>Technical Details</h2>
+<p>The missing check is the shadow-type filter used to decide whether a value needs a stack map. <code>needs_stack_map</code> (<code>winch/codegen/src/stack.rs:315-327</code>) is unconditionally false for <code>I32</code>, so a live GC reference whose shadow type is <code>I32</code> neither increments <code>gc_ref_count</code> nor satisfies the collection condition in <code>CodeGenContext::calculate_stack_map_offsets</code> (<code>winch/codegen/src/codegen/context.rs:663-695</code>).</p>
+<p>Because that function then returns an empty table, <code>FnCall::emit</code> (<code>winch/codegen/src/codegen/call.rs:108-113</code>) skips emitting any stack map.</p>
+<p>The relevant data flow is:</p>
+<ul>
+<li><code>visit_ref_null</code> (<code>winch/codegen/src/visitor.rs:2232-2252</code>) pushes <code>ref.null extern</code>/<code>exn</code> as <code>Val::i32(0)</code>.</li>
+<li><code>visit_typed_select</code> (<code>winch/codegen/src/visitor.rs:2228-2230</code>) ignores the instruction's declared result type <code>_ty</code> and dispatches to <code>visit_select</code>.</li>
+<li><code>visit_select</code> (<code>winch/codegen/src/visitor.rs:2208-2226</code>) pushes the result using the shadow type of the second operand (<code>stack.push(val2.into())</code>).</li>
+<li>When operand 1 is a real GC reference, operand 2 is <code>ref.null</code>, and the condition is non-zero, the runtime result is the reference but its shadow type is <code>I32</code>.</li>
+<li>At the next call, <code>FnCall::emit</code> spills the value, but <code>calculate_stack_map_offsets</code> returns an empty table, so no stack map is emitted.</li>
+<li>During collection, <code>Store::trace_wasm_stack_frame</code> (<code>crates/wasmtime/src/runtime/store/gc.rs:771-786</code>) only treats slots present in the stack map as Wasm stack roots.</li>
+</ul>
+<h2>Reproduction</h2>
+<p>Tested at commit:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>ff7896b6d97a424aed430a48a186773fd163667f
+</code></pre></div>
+<p>The reproducer uses the public embedding API with Winch and compares a normal reference path with the typed-select path.</p>
+<p>Guest input:</p>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">import</span> <span class="s2">""</span> <span class="s2">"make"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$make</span> <span class="p">(</span><span class="k">result</span> <span class="err">externref</span><span class="p">)))</span>
+  <span class="p">(</span><span class="k">import</span> <span class="s2">""</span> <span class="s2">"gc"</span>   <span class="p">(</span><span class="k">func</span> <span class="nv">$gc</span><span class="p">))</span>
+
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"control"</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="err">externref</span><span class="p">)</span>
+    <span class="nb">call</span> <span class="nv">$make</span>
+    <span class="nb">call</span> <span class="nv">$gc</span><span class="p">)</span>
+
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"bug"</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="err">externref</span><span class="p">)</span>
+    <span class="nb">call</span> <span class="nv">$make</span>
+    <span class="err">ref.null</span> <span class="err">extern</span>
+    <span class="nb">i32.const</span> <span class="mi">1</span>
+    <span class="nb">select</span> <span class="p">(</span><span class="k">result</span> <span class="err">externref</span><span class="p">)</span>
+    <span class="nb">call</span> <span class="nv">$gc</span><span class="p">)</span>
+<span class="p">)</span>
+</code></pre></div>
+<p>With the null collector, both cases survive.</p>
+<p>With the copying collector, the control case survives while the typed-select case loses the referenced object:</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>collector=null
+  [control] data=Ok(0xdecaf)  SURVIVED
+  [bug] data=Ok(0xdecaf)  SURVIVED
+
+collector=copying
+  [control] data=Ok(0xdecaf)  SURVIVED
+  [bug] data=Err(BUG: invalid `ExternRefHostDataId`)  HOST-DATA-SWEPT
+
+SUMMARY null_bug=Survived copying_control=Survived copying_bug=Swept
+PROBE_RESULT: reproduced
+</code></pre></div>
+<p>The two cases differ only in whether the reference passes through the typed <code>select</code>, which appears to isolate the problem to the shadow type used for the select result.</p>
+<h2>Suggested Fix</h2>
+<p><code>visit_typed_select</code> (<code>winch/codegen/src/visitor.rs:2228-2230</code>) should honor the instruction's declared result type instead of discarding <code>_ty</code>.</p>
+<p><code>visit_select</code> (<code>winch/codegen/src/visitor.rs:2208-2226</code>) should not derive the pushed shadow type from the second operand when the declared result is a reference type. The pushed value needs to retain a reference shadow type so that <code>needs_stack_map</code> returns true and the live reference is included in the call-site stack map.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Oct 10 2026 at 17:07 UTC</p>
+</html>

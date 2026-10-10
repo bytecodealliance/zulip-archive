@@ -1,0 +1,170 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14568 Cranelift: interpreter traps on `... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314568.20Cranelift.3A.20interpreter.20traps.20on.20.60.2E.2E.2E.html">wasmtime / issue #14568 Cranelift: interpreter traps on `...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="629573968"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314568%20Cranelift%3A%20interpreter%20traps%20on%20%60.../near/629573968" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314568.20Cranelift.3A.20interpreter.20traps.20on.20.60.2E.2E.2E.html#629573968">(Oct 06 2026 at 15:02)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/14568#issuecomment-6019102709">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14568">issue #14568</a>:</p>
+<blockquote>
+<p>&lt;details&gt;&lt;summary&gt;Full LLM report&lt;/summary&gt;</p>
+<h1>Cranelift interpreter traps on <code>srem INT_MIN, -1</code> instead of returning 0</h1>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Date</td>
+<td>2026-10-05</td>
+</tr>
+<tr>
+<td>Wasmtime commit</td>
+<td><code>73b04cff3317d1e308866eb24359483ac6116669</code> (<code>main</code>)</td>
+</tr>
+<tr>
+<td>Host</td>
+<td>macOS 15.8.1 (Darwin 24.6.0), <code>aarch64-apple-darwin</code></td>
+</tr>
+<tr>
+<td>Model</td>
+<td>Claude Opus 5.5 (<code>claude-opus-5-5</code>)</td>
+</tr>
+<tr>
+<td>Component</td>
+<td><code>cranelift/interpreter/src/value.rs</code> (<code>DataValue::srem</code>)</td>
+</tr>
+<tr>
+<td>Class</td>
+<td>Wrong semantics in the differential-testing oracle (same class as report 011)</td>
+</tr>
+<tr>
+<td>Severity</td>
+<td>Low for production; it causes false positives in any interpreter-vs-native harness</td>
+</tr>
+</tbody>
+</table>
+<h2>Summary</h2>
+<p><code>DataValue::srem</code> (<code>cranelift/interpreter/src/value.rs:630-637</code>) returns<br>
+<code>ValueError::IntegerOverflow</code> when the dividend is <code>INT_MIN</code> and the divisor is<br>
+<code>-1</code>. <code>step.rs:182</code> turns that into an <code>int_ovf</code> user trap (<code>TrapCode(252)</code>):</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">fn</span><span class="w"> </span><span class="nf">srem</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">other</span><span class="p">:</span><span class="w"> </span><span class="nc">Self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">ValueResult</span><span class="o">&lt;</span><span class="bp">Self</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="o">..</span><span class="p">.</span>
+<span class="w">    </span><span class="c1">// Check if we are dividing INT_MIN / -1. This causes an integer overflow trap.</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="bp">self</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">min</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">denominator</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="o">-</span><span class="mi">1</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nb">Err</span><span class="p">(</span><span class="n">ValueError</span><span class="p">::</span><span class="n">IntegerOverflow</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+</code></pre></div>
+<p>That check is right for <code>sdiv</code> and wrong for <code>srem</code>. The case is mathematically<br>
+well defined and has remainder 0, and everything else in the system agrees:</p>
+<ul>
+<li>
+<p>The CLIF definition of <code>srem</code><br>
+  (<code>cranelift/codegen/meta/src/shared/instructions.rs:1857-1862</code>) says only<br>
+  "This operation traps if the divisor is zero."</p>
+</li>
+<li>
+<p>Native code on aarch64 and pulley64 returns 0, as does every backend's<br>
+  lowering. Each one special-cases <code>-1</code> to avoid the hardware fault on x86.</p>
+</li>
+<li>
+<p>The mid-end rule <code>srem x, (iconst -1) =&gt; 0</code><br>
+  (<code>cranelift/codegen/src/opts/arithmetic.isle:132</code>) already encodes 0.</p>
+</li>
+<li>
+<p>Wasm's <code>i32.rem_s</code> / <code>i64.rem_s</code> are specified to return 0.</p>
+</li>
+</ul>
+<p>So the interpreter, Cranelift's reference oracle, disagrees with compiled code<br>
+on a valid input. The check was added in <code>3f6b889067</code> (2021, "Prevent panics<br>
+when dividing INT_MIN / -1 in interpreter"), which applied the <code>sdiv</code> overflow<br>
+rule to both operations.</p>
+<p><code>cranelift-fuzzgen</code> happens to mask this. Its <code>int_divz</code> pass<br>
+(<code>cranelift/fuzzgen/src/passes/int_divz.rs:51-65</code>) rewrites the divisor<br>
+whenever <code>lhs == INT_MIN &amp;&amp; rhs == -1</code> for <code>srem</code> as well as <code>sdiv</code>, which is<br>
+itself unnecessary for <code>srem</code>. Any other differential harness, including<br>
+filetests that combine <code>test interpret</code> with <code>test run</code>, hits a spurious<br>
+mismatch. This audit's mid-end differential harness hit exactly that.</p>
+<h2>Reproduction</h2>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">target</span><span class="o">/</span><span class="n">debug</span><span class="o">/</span><span class="n">clif</span><span class="o">-</span><span class="n">util</span><span class="w"> </span><span class="n">test</span><span class="w"> </span><span class="n">reports</span><span class="o">/</span><span class="mi">017</span><span class="o">-</span><span class="n">interpreter</span><span class="o">-</span><span class="n">srem</span><span class="o">-</span><span class="n">int</span><span class="o">-</span><span class="n">min</span><span class="o">-</span><span class="n">traps</span><span class="o">/</span><span class="n">srem</span><span class="p">.</span><span class="n">clif</span>
+<span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">cranelift</span><span class="o">/</span><span class="n">filetests</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">test_interpret</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">111</span><span class="p">:</span><span class="mi">29</span><span class="p">:</span>
+<span class="nc">Unexpected</span><span class="w"> </span><span class="n">returned</span><span class="w"> </span><span class="n">control</span><span class="w"> </span><span class="n">flow</span><span class="p">:</span><span class="w"> </span><span class="nc">Trap</span><span class="p">(</span><span class="n">User</span><span class="p">(</span><span class="n">TrapCode</span><span class="p">(</span><span class="mi">252</span><span class="p">)))</span>
+
+<span class="cp">$</span><span class="w"> </span><span class="n">target</span><span class="o">/</span><span class="n">debug</span><span class="o">/</span><span class="n">clif</span><span class="o">-</span><span class="n">util</span><span class="w"> </span><span class="n">test</span><span class="w"> </span><span class="n">reports</span><span class="o">/</span><span class="mi">017</span><span class="o">-</span><span class="n">interpreter</span><span class="o">-</span><span class="n">srem</span><span class="o">-</span><span class="n">int</span><span class="o">-</span><span class="n">min</span><span class="o">-</span><span class="n">traps</span><span class="o">/</span><span class="n">srem</span><span class="o">-</span><span class="n">run</span><span class="o">-</span><span class="n">only</span><span class="p">.</span><span class="n">clif</span>
+<span class="mi">1</span><span class="w"> </span><span class="n">tests</span><span class="w">          </span><span class="p">#</span><span class="w"> </span><span class="n">native</span><span class="w"> </span><span class="n">aarch64</span><span class="w"> </span><span class="n">and</span><span class="w"> </span><span class="n">pulley64</span><span class="p">:</span><span class="w"> </span><span class="nc">all</span><span class="w"> </span><span class="n">three</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span>
+</code></pre></div>
+<p><code>srem.clif</code> checks <code>srem INT_MIN, -1 == 0</code> at i8, i32 and i64, under both<br>
+<code>test interpret</code> and <code>test run</code> (<code>target aarch64</code>, <code>target pulley64</code>).<br>
+<code>srem-run-only.clif</code> holds the same functions with only <code>test run</code>.</p>
+<h2>Suggested fix</h2>
+<p>In <code>DataValue::srem</code>, drop the <code>IntegerOverflow</code> check. Then compute the<br>
+result with <code>wrapping_rem</code>, or return 0 directly when the divisor is <code>-1</code>, so<br>
+Rust's <code>%</code> does not panic on <code>MIN % -1</code>. Keep the check in <code>sdiv</code>.</p>
+<p>Optionally, narrow fuzzgen's <code>int_divz</code> rewrite to apply the <code>INT_MIN / -1</code><br>
+guard only to <code>sdiv</code>, so the fuzzer covers this case again.</p>
+<p>&lt;/details&gt;</p>
+</blockquote>
+
+
+
+<a name="629574259"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314568%20Cranelift%3A%20interpreter%20traps%20on%20%60.../near/629574259" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314568.20Cranelift.3A.20interpreter.20traps.20on.20.60.2E.2E.2E.html#629574259">(Oct 06 2026 at 15:03)</a>:</h4>
+<p>fitzgen opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14568">issue #14568</a>:</p>
+<blockquote>
+<p><code>srem</code> only traps on a zero divisor, and <code>srem INT_MIN, -1</code> is 0. Native<br>
+code agrees, and so does the mid-end rule <code>srem x, -1 =&gt; 0</code>. The<br>
+interpreter's <code>DataValue::srem</code>, however, copies <code>sdiv</code>'s overflow check and<br>
+traps with <code>int_ovf</code>.</p>
+<h3><code>.clif</code> Test Case</h3>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">test</span><span class="w"> </span><span class="n">interpret</span>
+<span class="n">test</span><span class="w"> </span><span class="n">run</span>
+<span class="n">target</span><span class="w"> </span><span class="n">aarch64</span>
+
+<span class="n">function</span><span class="w"> </span><span class="o">%</span><span class="n">f</span><span class="p">(</span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="kt">i32</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">i32</span><span class="w"> </span><span class="p">{</span>
+<span class="n">block0</span><span class="p">(</span><span class="n">v0</span><span class="p">:</span><span class="w"> </span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="n">v1</span><span class="p">:</span><span class="w"> </span><span class="kt">i32</span><span class="p">):</span>
+<span class="w">    </span><span class="nc">v2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">srem</span><span class="w"> </span><span class="n">v0</span><span class="p">,</span><span class="w"> </span><span class="n">v1</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">v2</span>
+<span class="p">}</span>
+<span class="p">;</span><span class="w"> </span><span class="n">run</span><span class="p">:</span><span class="w"> </span><span class="o">%</span><span class="n">f</span><span class="p">(</span><span class="mh">0x80000000</span><span class="p">,</span><span class="w"> </span><span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span>
+</code></pre></div>
+<h3>Steps to Reproduce</h3>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">clif</span><span class="o">-</span><span class="n">util</span><span class="w"> </span><span class="n">test</span><span class="w"> </span><span class="n">test</span><span class="p">.</span><span class="n">clif</span>
+</code></pre></div>
+<h3>Expected Results</h3>
+<p>Both <code>test interpret</code> and <code>test run</code> pass.</p>
+<h3>Actual Results</h3>
+<p><code>test run</code> passes. <code>test interpret</code> fails:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">Unexpected</span><span class="w"> </span><span class="n">returned</span><span class="w"> </span><span class="n">control</span><span class="w"> </span><span class="n">flow</span><span class="p">:</span><span class="w"> </span><span class="nc">Trap</span><span class="p">(</span><span class="n">User</span><span class="p">(</span><span class="n">TrapCode</span><span class="p">(</span><span class="mi">252</span><span class="p">)))</span>
+</code></pre></div>
+<h3>Versions and Environment</h3>
+<p>Cranelift version or commit: <code>73b04cff33</code></p>
+<p>Operating system: macOS 15.8.1</p>
+<p>Architecture: aarch64<br>
+</p>
+</blockquote>
+
+
+
+<a name="629574262"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314568%20Cranelift%3A%20interpreter%20traps%20on%20%60.../near/629574262" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314568.20Cranelift.3A.20interpreter.20traps.20on.20.60.2E.2E.2E.html#629574262">(Oct 06 2026 at 15:03)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14568">Issue #14568</a>.</p>
+
+
+
+<a name="629574263"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314568%20Cranelift%3A%20interpreter%20traps%20on%20%60.../near/629574263" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314568.20Cranelift.3A.20interpreter.20traps.20on.20.60.2E.2E.2E.html#629574263">(Oct 06 2026 at 15:03)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the cranelift:area:interpreter label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14568">Issue #14568</a>.</p>
+
+
+
+<hr><p>Last updated: Oct 10 2026 at 17:07 UTC</p>
+</html>

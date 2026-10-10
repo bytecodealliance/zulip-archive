@@ -1,0 +1,62 @@
+[
+    {
+        "content": "<p>Hi everyone!</p>\n<p>I'm currently working on running Wasmtime using the new Pulley bytecode interpreter on a Raspberry Pi Pico 2.<br>\nI've successfully built a <code>no_std</code> host that runs a component precompiled to <code>pulley32</code>. The guest uses a custom SPI WIT to read a BME280 sensor and display data on an OLED screen. (<a href=\"https://github.com/idlab-discover/masters-wasi-spi\">https://github.com/idlab-discover/masters-wasi-spi</a>)</p>\n<p>While I've got a single component running successfully, I'm hitting a hard wall regarding linear memory management and the strict constraints of an MMU-less device. After digging into the memory behavior these are the memory roadblocks i came across:</p>\n<ul>\n<li>\n<p><strong>64KiB Page Size:</strong> Standard 64KiB pages are very big for the Pico 2's 512KiB RAM. I tried the 1-byte custom page proposal using <code>-C link-arg=--page-size=1</code>,  but it seemed the guest totally ignored this.</p>\n</li>\n<li>\n<p><strong>Forced <code>memory.grow</code>:</strong> Compiling to <code>wasm32-unknown-unknown</code> makes the default allocator treat all initial memory as the Wasm image. It immediately calls <code>memory.grow</code> to get heap space, forcing a minimum of 2 pages (128KiB) for any component handling dynamic data. (source: <a href=\"https://github.com/wasm-bindgen/wasm-bindgen/issues/1389#issuecomment-476224477\">https://github.com/wasm-bindgen/wasm-bindgen/issues/1389#issuecomment-476224477</a>)</p>\n</li>\n<li>\n<p><strong>No-MMU Reallocation Overhead:</strong> without virtual memory, linear memory must be physically contiguous. Growing from 1 to 2 pages requires the host to allocate 2 <em>new</em> pages before copying the original, temporarily spiking the memory requirement to 3 pages.</p>\n</li>\n<li>\n<p><strong><code>wac</code> Multiplier:</strong> When gluing components with <code>wac</code>, they retain separate linear memories. This means the overheads mentioned above multiply for <em>every</em> internal sub-component.</p>\n</li>\n</ul>\n<p>This is my first project with wasmtime and embedded systems so I'd appreciate any insights, workarounds, or pointers to Wasmtime configuration flags I might have missed! Thanks! :D</p>",
+        "id": 579467377,
+        "sender_full_name": "Lukas Barragan Torres",
+        "timestamp": 1773519008
+    },
+    {
+        "content": "<p>this is a GREAT project, <span class=\"user-mention\" data-user-id=\"1003778\">@Lukas Barragan Torres</span>, and we're thrilled you're chewing on it. I'll leave these questions to the engineers here, but I note about the \"wac multiplier\": yes, that's a feature -- unless you do not want it.</p>",
+        "id": 579569358,
+        "sender_full_name": "Ralph",
+        "timestamp": 1773602157
+    },
+    {
+        "content": "<p>for the seriously embedded use case, you'd only want a new sandbox to encapsulate code you do not want the entire component to access freely. If you're going to make the assumption that the component boundary -- that is, the parent component that wasmtime started -- is the boundary, then you would have the ability to compile all code together.</p>",
+        "id": 579569456,
+        "sender_full_name": "Ralph",
+        "timestamp": 1773602251
+    },
+    {
+        "content": "<p>if there's a situation in which you MUST use different languages, for example, then the sandbox between those two things are going to be there, regardless whether they're components or modules.</p>",
+        "id": 579569502,
+        "sender_full_name": "Ralph",
+        "timestamp": 1773602305
+    },
+    {
+        "content": "<p>so that one's a choice to make. If you trust your parent sandbox boundary as THE boundary, then just compile all the code together. The only issue is if for some reason you cannot.</p>",
+        "id": 579569558,
+        "sender_full_name": "Ralph",
+        "timestamp": 1773602362
+    },
+    {
+        "content": "<p>I would <strong>imagine</strong> that typically in a pico sized scenario, you'd control the components executing, right? If you're not, then you'd need the security boundary in any case.....</p>",
+        "id": 579569602,
+        "sender_full_name": "Ralph",
+        "timestamp": 1773602410
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"268586\">Ralph</span> <a href=\"#narrow/channel/438936-SIG-Embedded/topic/Running.20Wasmtime.20on.20Pico.202.3A.20Overcoming.20Memory.20issues/near/579569502\">said</a>:</p>\n<blockquote>\n<p>if there's a situation in which you MUST use different languages, for example, then the sandbox between those two things are going to be there, regardless whether they're components or modules.</p>\n</blockquote>\n<p>I have developed a way to mix languages inside the <em>same</em> sandbox using WIT between the boundaries. See <a href=\"https://github.com/cpetig/wit-bindgen\">https://github.com/cpetig/wit-bindgen</a> and <a href=\"https://wasmcon24.sched.com/event/1qvIG/component-model-in-software-defined-vehicles-christof-petig-aptiv\">https://wasmcon24.sched.com/event/1qvIG/component-model-in-software-defined-vehicles-christof-petig-aptiv</a> , I should really make it an official variant (mostly documentation is missing) and support more languages, but it works well and can be exchanged for the canonical ABI without changing the source code.</p>",
+        "id": 579807235,
+        "sender_full_name": "Christof Petig",
+        "timestamp": 1773698290
+    },
+    {
+        "content": "<p>there you go: a solution that casts all code into one sandbox -- which implies all code is trusted within that sandbox. <span class=\"user-mention\" data-user-id=\"590366\">@Christof Petig</span> you really should make that official.</p>",
+        "id": 579812824,
+        "sender_full_name": "Ralph",
+        "timestamp": 1773700861
+    },
+    {
+        "content": "<p>Thanks Ralph and Christof!</p>\n<p><span class=\"user-mention\" data-user-id=\"268586\">@Ralph</span>  I'm compiling everything together right now, which works okay for my current setup. However, it still feels a bit suboptimal compared to the broader Wasm philosophy, where you should be able to just plug and play with pre-compiled driver Wasm blobs using WIT.</p>\n<p><span class=\"user-mention\" data-user-id=\"590366\">@Christof Petig</span> Just to make sure I understand: does your fork essentially generate standard, statically linkable bindings from the WIT file instead of the usual Component Model Canonical ABI bindings? Meaning it lets us use WIT purely as an interface design tool, but under the hood, everything still compiles down into one single Wasm module with a shared memory?</p>\n<p>For now I'll stick to keeping it all compiled together until I can find a way to keep the memory overhead and individual component usage down on the Pulley/Wasmtime side. Thanks again for the pointers!</p>",
+        "id": 580400225,
+        "sender_full_name": "Lukas Barragan Torres",
+        "timestamp": 1773919122
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"1003778\">Lukas Barragan Torres</span> <a href=\"#narrow/channel/438936-SIG-Embedded/topic/Running.20Wasmtime.20on.20Pico.202.3A.20Overcoming.20Memory.20issues/near/580400225\">said</a>:</p>\n<blockquote>\n<p><span class=\"user-mention silent\" data-user-id=\"590366\">Christof Petig</span> Just to make sure I understand: does your fork essentially generate standard, statically linkable bindings from the WIT file instead of the usual Component Model Canonical ABI bindings? Meaning it lets us use WIT purely as an interface design tool, but under the hood, everything still compiles down into one single Wasm module with a shared memory?</p>\n</blockquote>\n<p>Yes, exactly. We use it to compile native applications with a single memory instance, thus no sandbox between components.</p>",
+        "id": 580885575,
+        "sender_full_name": "Christof Petig",
+        "timestamp": 1774154736
+    }
+]

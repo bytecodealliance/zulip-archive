@@ -1,0 +1,195 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14570 Cranelift: inliner does not remap... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314570.20Cranelift.3A.20inliner.20does.20not.20remap.2E.2E.2E.html">wasmtime / issue #14570 Cranelift: inliner does not remap...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="629575197"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314570%20Cranelift%3A%20inliner%20does%20not%20remap.../near/629575197" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314570.20Cranelift.3A.20inliner.20does.20not.20remap.2E.2E.2E.html#629575197">(Oct 06 2026 at 15:06)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/14570#issuecomment-6019175276">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14570">issue #14570</a>:</p>
+<blockquote>
+<p>&lt;details&gt;&lt;summary&gt;Full LLM report&lt;/summary&gt;</p>
+<h1>Cranelift inliner does not remap user external names in <code>symbol</code> global values</h1>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Date</td>
+<td>2026-10-05</td>
+</tr>
+<tr>
+<td>Wasmtime commit</td>
+<td><code>73b04cff3317d1e308866eb24359483ac6116669</code> (<code>main</code>)</td>
+</tr>
+<tr>
+<td>Host</td>
+<td>macOS 15.8.1 (Darwin 24.6.0), <code>aarch64-apple-darwin</code></td>
+</tr>
+<tr>
+<td>Model</td>
+<td>Claude Opus 5.5 (<code>claude-opus-5-5</code>)</td>
+</tr>
+<tr>
+<td>Component</td>
+<td><code>cranelift/codegen/src/inline.rs</code> (<code>create_global_values</code>)</td>
+</tr>
+<tr>
+<td>Class</td>
+<td>Miscompile: an inlined <code>symbol_value</code> relocates against the wrong symbol</td>
+</tr>
+<tr>
+<td>Severity</td>
+<td>Medium for Cranelift embedders using <code>Context::inline</code> with <code>symbol</code> global values. Wasmtime does not emit <code>symbol</code> global values.</td>
+</tr>
+</tbody>
+</table>
+<h2>Summary</h2>
+<p><code>create_global_values</code> (<code>cranelift/codegen/src/inline.rs:1470-1474</code>) copies<br>
+the callee's <code>GlobalValueData::Symbol</code> verbatim:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="c1">// These kinds of global values do not reference other global</span>
+<span class="c1">// values, so we can just clone them.</span>
+<span class="n">ir</span><span class="p">::</span><span class="n">GlobalValueData</span><span class="p">::</span><span class="n">VMContext</span>
+<span class="o">|</span><span class="w"> </span><span class="n">ir</span><span class="p">::</span><span class="n">GlobalValueData</span><span class="p">::</span><span class="n">Symbol</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="o">..</span><span class="w"> </span><span class="p">}</span>
+<span class="o">|</span><span class="w"> </span><span class="n">ir</span><span class="p">::</span><span class="n">GlobalValueData</span><span class="p">::</span><span class="n">DynScaleTargetConst</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="o">..</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">gv</span><span class="p">.</span><span class="n">clone</span><span class="p">(),</span>
+</code></pre></div>
+<p>A <code>Symbol</code> whose name is <code>ExternalName::User(r)</code> does reference another<br>
+per-function entity. <code>r</code> is a <code>UserExternalNameRef</code>, an index into the<br>
+<em>callee's</em> <code>params.user_named_funcs</code> table. <code>create_func_refs</code> translates the<br>
+same kind of reference through <code>allocs.user_external_name_refs</code>. The<br>
+global-value path does not translate it. It also could not: <code>create_entities</code><br>
+calls <code>create_user_external_name_refs</code> (<code>inline.rs:1369</code>) <em>after</em><br>
+<code>create_global_values</code> (<code>:1367</code>).</p>
+<p>After inlining, the global value therefore names whichever user name the<br>
+<em>caller</em> has at the callee's index:</p>
+<ul>
+<li>
+<p><strong>The index exists in the caller:</strong> the inlined <code>symbol_value</code> silently<br>
+  produces the address of an unrelated symbol. This is a wrong address at<br>
+  link or relocation time, with no diagnostic.</p>
+</li>
+<li>
+<p><strong>The index does not exist in the caller:</strong> the inlined code panics later<br>
+  in compilation.</p>
+</li>
+</ul>
+<h2>Reproduction</h2>
+<p><code>repro.clif</code> has two functions:</p>
+<ul>
+<li>the callee: <code>gv0 = symbol colocated u7:7</code> and returns <code>symbol_value gv0</code>;</li>
+<li>the caller: its own <code>gv0 = symbol colocated u1:1</code>, plus a call to the<br>
+  callee.</li>
+</ul>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">target</span><span class="o">/</span><span class="n">debug</span><span class="o">/</span><span class="n">clif</span><span class="o">-</span><span class="n">util</span><span class="w"> </span><span class="n">test</span><span class="w"> </span><span class="n">reports</span><span class="o">/</span><span class="mi">019</span><span class="o">-</span><span class="n">inline</span><span class="o">-</span><span class="n">symbol</span><span class="o">-</span><span class="n">user</span><span class="o">-</span><span class="n">name</span><span class="o">/</span><span class="n">repro</span><span class="p">.</span><span class="n">clif</span>
+<span class="w">    </span><span class="p">#</span><span class="mi">0</span><span class="w"> </span><span class="n">check</span><span class="p">:</span><span class="w"> </span><span class="nc">gv1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">symbol</span><span class="w"> </span><span class="n">colocated</span><span class="w"> </span><span class="n">userextname1</span>
+<span class="w">    </span><span class="n">Missed</span><span class="w"> </span><span class="p">#</span><span class="mi">0</span><span class="p">:</span><span class="w"> </span><span class="o">..</span><span class="p">.</span>
+<span class="w">    </span><span class="o">&gt;</span><span class="w">     </span><span class="n">gv0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">symbol</span><span class="w"> </span><span class="n">colocated</span><span class="w"> </span><span class="n">userextname0</span>
+<span class="w">    </span><span class="o">&gt;</span><span class="w">     </span><span class="n">gv1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">symbol</span><span class="w"> </span><span class="n">colocated</span><span class="w"> </span><span class="n">userextname0</span><span class="w">      </span><span class="o">&lt;--</span><span class="w"> </span><span class="n">callee</span><span class="o">'</span><span class="na">s</span><span class="w"> </span><span class="n">u7</span><span class="p">:</span><span class="mi">7</span><span class="w"> </span><span class="n">became</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">caller</span><span class="o">'</span><span class="na">s</span><span class="w"> </span><span class="n">u1</span><span class="p">:</span><span class="mi">1</span>
+<span class="n">Error</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="n">failure</span>
+</code></pre></div>
+<p>Compiling it end to end with report 018's harness shows the wrong relocation:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">cargo</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="o">--</span><span class="n">manifest</span><span class="o">-</span><span class="n">path</span><span class="w"> </span><span class="n">reports</span><span class="o">/</span><span class="mi">018</span><span class="o">-</span><span class="n">inline</span><span class="o">-</span><span class="n">dynamic</span><span class="o">-</span><span class="k">type</span><span class="o">-</span><span class="n">offset</span><span class="o">/</span><span class="n">harness</span><span class="o">/</span><span class="n">Cargo</span><span class="p">.</span><span class="n">toml</span><span class="w"> </span><span class="o">--</span><span class="w"> </span><span class="err">\</span>
+<span class="w">      </span><span class="n">reports</span><span class="o">/</span><span class="mi">019</span><span class="o">-</span><span class="n">inline</span><span class="o">-</span><span class="n">symbol</span><span class="o">-</span><span class="n">user</span><span class="o">-</span><span class="n">name</span><span class="o">/</span><span class="n">repro</span><span class="p">.</span><span class="n">clif</span>
+<span class="n">compiled</span><span class="w"> </span><span class="o">%</span><span class="n">callee</span>
+<span class="w">  </span><span class="n">reloc</span><span class="w"> </span><span class="n">Aarch64AdrPrelPgHi21</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="mh">0x0</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">u7</span><span class="p">:</span><span class="mi">7</span>
+<span class="w">  </span><span class="n">reloc</span><span class="w"> </span><span class="n">Aarch64AddAbsLo12Nc</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="mh">0x4</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">u7</span><span class="p">:</span><span class="mi">7</span>
+<span class="n">compiled</span><span class="w"> </span><span class="o">%</span><span class="n">caller</span><span class="w">            </span><span class="p">(</span><span class="n">with</span><span class="w"> </span><span class="o">%</span><span class="n">callee</span><span class="w"> </span><span class="n">inlined</span><span class="p">)</span>
+<span class="w">  </span><span class="n">reloc</span><span class="w"> </span><span class="n">Aarch64AdrPrelPgHi21</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="mh">0x0</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">u1</span><span class="p">:</span><span class="mi">1</span><span class="w">      </span><span class="o">&lt;--</span><span class="w"> </span><span class="n">expected</span><span class="w"> </span><span class="n">u7</span><span class="p">:</span><span class="mi">7</span>
+<span class="w">  </span><span class="n">reloc</span><span class="w"> </span><span class="n">Aarch64AddAbsLo12Nc</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="mh">0x4</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">u1</span><span class="p">:</span><span class="mi">1</span>
+</code></pre></div>
+<h2>Suggested fix</h2>
+<ol>
+<li>
+<p>In <code>create_entities</code>, call <code>create_user_external_name_refs</code> before<br>
+<code>create_global_values</code>.</p>
+</li>
+<li>
+<p>In <code>create_global_values</code>, map<br>
+<code>GlobalValueData::Symbol { name: ExternalName::User(r), .. }</code> through<br>
+<code>allocs.user_external_name_refs[r]</code>, the same way <code>create_func_refs</code><br>
+   does.</p>
+</li>
+<li>
+<p>Add a <code>test inline</code> filetest whose caller and callee each declare<br>
+   different user names.</p>
+</li>
+</ol>
+<p>&lt;/details&gt;</p>
+</blockquote>
+
+
+
+<a name="629577020"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314570%20Cranelift%3A%20inliner%20does%20not%20remap.../near/629577020" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314570.20Cranelift.3A.20inliner.20does.20not.20remap.2E.2E.2E.html#629577020">(Oct 06 2026 at 15:12)</a>:</h4>
+<p>fitzgen opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14570">issue #14570</a>:</p>
+<blockquote>
+<p><code>create_global_values</code> in <code>cranelift/codegen/src/inline.rs</code> clones<br>
+<code>GlobalValueData::Symbol { name: ExternalName::User(r), .. }</code> verbatim. <code>r</code><br>
+is an index into the callee's <code>user_named_funcs</code>, but it is never translated<br>
+into the caller's index space. (<code>create_func_refs</code> does translate these<br>
+indices.) The inlined <code>symbol_value</code> therefore relocates against whatever<br>
+user name the caller has at that index.</p>
+<h3><code>.clif</code> Test Case</h3>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">test</span><span class="w"> </span><span class="n">inline</span>
+<span class="n">target</span><span class="w"> </span><span class="n">aarch64</span>
+
+<span class="n">function</span><span class="w"> </span><span class="o">%</span><span class="n">callee</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">i64</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">gv0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">symbol</span><span class="w"> </span><span class="n">colocated</span><span class="w"> </span><span class="n">u7</span><span class="p">:</span><span class="mi">7</span>
+<span class="n">block0</span><span class="p">:</span>
+<span class="w">    </span><span class="nc">v0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">symbol_value</span><span class="p">.</span><span class="kt">i64</span><span class="w"> </span><span class="n">gv0</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">v0</span>
+<span class="p">}</span>
+
+<span class="n">function</span><span class="w"> </span><span class="o">%</span><span class="n">caller</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">i64</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">gv0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">symbol</span><span class="w"> </span><span class="n">colocated</span><span class="w"> </span><span class="n">u1</span><span class="p">:</span><span class="mi">1</span>
+<span class="w">    </span><span class="n">fn0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">%</span><span class="n">callee</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">i64</span>
+<span class="nc">block0</span><span class="p">:</span>
+<span class="w">    </span><span class="nc">v0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">call</span><span class="w"> </span><span class="n">fn0</span><span class="p">()</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">v0</span>
+<span class="p">}</span>
+<span class="p">;</span><span class="w"> </span><span class="n">check</span><span class="p">:</span><span class="w"> </span><span class="nc">gv1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">symbol</span><span class="w"> </span><span class="n">colocated</span><span class="w"> </span><span class="n">userextname1</span>
+</code></pre></div>
+<h3>Steps to Reproduce</h3>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">clif</span><span class="o">-</span><span class="n">util</span><span class="w"> </span><span class="n">test</span><span class="w"> </span><span class="n">test</span><span class="p">.</span><span class="n">clif</span>
+</code></pre></div>
+<h3>Expected Results</h3>
+<p>The inlined global value refers to the callee's <code>u7:7</code>, which is<br>
+<code>userextname1</code> in the caller.</p>
+<h3>Actual Results</h3>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="w">    </span><span class="n">Missed</span><span class="w"> </span><span class="p">#</span><span class="mi">0</span><span class="p">:</span><span class="w"> </span><span class="err">\</span><span class="n">bgv1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">symbol</span><span class="w"> </span><span class="n">colocated</span><span class="w"> </span><span class="n">userextname1</span><span class="err">\</span><span class="n">b</span>
+<span class="w">    </span><span class="o">&gt;</span><span class="w">     </span><span class="n">gv0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">symbol</span><span class="w"> </span><span class="n">colocated</span><span class="w"> </span><span class="n">userextname0</span>
+<span class="w">    </span><span class="o">&gt;</span><span class="w">     </span><span class="n">gv1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">symbol</span><span class="w"> </span><span class="n">colocated</span><span class="w"> </span><span class="n">userextname0</span>
+</code></pre></div>
+<p>The inlined code relocates against <code>u1:1</code> instead of <code>u7:7</code>.</p>
+<h3>Versions and Environment</h3>
+<p>Cranelift version or commit: <code>73b04cff33</code></p>
+<p>Operating system: macOS 15.8.1</p>
+<p>Architecture: aarch64<br>
+</p>
+</blockquote>
+
+
+
+<a name="629577023"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314570%20Cranelift%3A%20inliner%20does%20not%20remap.../near/629577023" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314570.20Cranelift.3A.20inliner.20does.20not.20remap.2E.2E.2E.html#629577023">(Oct 06 2026 at 15:12)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14570">Issue #14570</a>.</p>
+
+
+
+<a name="629577028"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314570%20Cranelift%3A%20inliner%20does%20not%20remap.../near/629577028" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314570.20Cranelift.3A.20inliner.20does.20not.20remap.2E.2E.2E.html#629577028">(Oct 06 2026 at 15:12)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the cranelift label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14570">Issue #14570</a>.</p>
+
+
+
+<hr><p>Last updated: Oct 10 2026 at 17:07 UTC</p>
+</html>

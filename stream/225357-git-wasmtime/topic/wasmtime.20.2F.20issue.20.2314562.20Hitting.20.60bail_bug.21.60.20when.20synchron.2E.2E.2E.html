@@ -1,0 +1,537 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14562 Hitting `bail_bug!` when synchron... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314562.20Hitting.20.60bail_bug.21.60.20when.20synchron.2E.2E.2E.html">wasmtime / issue #14562 Hitting `bail_bug!` when synchron...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="629561613"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314562%20Hitting%20%60bail_bug%21%60%20when%20synchron.../near/629561613" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314562.20Hitting.20.60bail_bug.21.60.20when.20synchron.2E.2E.2E.html#629561613">(Oct 06 2026 at 14:23)</a>:</h4>
+<p>alexcrichton opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14562">issue #14562</a>:</p>
+<blockquote>
+<p>This input triggers a <code>bail_bug!</code> on <code>main</code>:</p>
+<div class="codehilite" data-code-language="wasm"><pre><span></span><code>(component
+  (core module $shim
+    (table (export "funcs") 1 1 funcref)
+    (func (export "export") (result i32)
+      (call_indirect (result i32) (i32.const 0))))
+  (core instance $shim (instantiate $shim))
+  (func $shim-export (result u32) (canon lift (core func $shim "export")))
+
+  (component $X
+    (import "import" (func $import (result u32)))
+    (core func $import (canon lower (func $import)))
+    (core func $waitable-set.new (canon waitable-set.new))
+    (core func $waitable-set.drop (canon waitable-set.drop))
+    (core func $task.return (canon task.return))
+    (core module $m
+      (import "" "import" (func $import (result i32)))
+      (import "" "waitable-set.new" (func $waitable-set.new (result i32)))
+      (import "" "waitable-set.drop" (func $waitable-set.drop (param i32)))
+      (import "" "task.return" (func $task.return))
+      (func (export "s") (result i32) (call $import))
+      (func (export "h") (result i32)
+        (call $waitable-set.drop (call $waitable-set.new))
+        (i32.const 7))
+      (func (export "y") (result i32) (i32.const 1 (; YIELD ;)))
+      (func (export "y-cb") (param i32 i32 i32) (result i32)
+        (call $task.return)
+        (i32.const 0 (; EXIT ;)))
+      (func (export "z") (result i32)
+        (call $task.return) (i32.const 0 (; EXIT ;))))
+    (core instance $i (instantiate $m
+      (with "" (instance
+        (export "import" (func $import))
+        (export "waitable-set.new" (func $waitable-set.new))
+        (export "waitable-set.drop" (func $waitable-set.drop))
+        (export "task.return" (func $task.return))))))
+    (func (export "s") (result u32) (canon lift (core func $i "s")))
+    (func (export "h") async (result u32) (canon lift (core func $i "h")))
+    (func (export "y") async
+      (canon lift (core func $i "y") async
+        (callback (core func $i "y-cb"))))
+    (func (export "z") async
+      (canon lift (core func $i "z") async
+        (callback (core func $i "y-cb")))))
+  (instance $x (instantiate $X (with "import" (func $shim-export))))
+
+  (core func $x-h (canon lower (func $x "h")))
+  (core module $donut
+    (import "" "funcs" (table 1 1 funcref))
+    (import "" "h" (func $h (result i32)))
+    (func $guest-export (result i32) (call $h))
+    (elem declare func $guest-export)
+    (func $start (table.set (i32.const 0) (ref.func $guest-export)))
+    (start $start))
+  (core instance $donut (instantiate $donut
+    (with "" (instance
+      (export "h" (func $x-h))
+      (export "funcs" (table $shim "funcs"))))))
+
+  (component $D
+    (import "x" (instance $x
+      (export "s" (func (result u32)))
+      (export "y" (func async))
+      (export "z" (func async))))
+    (core func $s (canon lower (func $x "s")))
+    (core func $y (canon lower (func $x "y") async))
+    (core func $z (canon lower (func $x "z") async))
+    (core func $task.return (canon task.return (result u32)))
+    (core module $d
+      (import "" "s" (func $s (result i32)))
+      (import "" "y" (func $y (result i32)))
+      (import "" "z" (func $z (result i32)))
+      (import "" "task.return" (func $task.return (param i32)))
+      (func (export "run") (result i32)
+        (drop (call $y))
+        (drop (call $s))
+        (call $task.return (call $z))
+        (i32.const 0 (; EXIT ;)))
+      (func (export "run-cb") (param i32 i32 i32) (result i32) unreachable))
+    (core instance $d (instantiate $d (with "" (instance
+      (export "s" (func $s))
+      (export "y" (func $y))
+      (export "z" (func $z))
+      (export "task.return" (func $task.return))))))
+    (func (export "run") async (result u32)
+      (canon lift (core func $d "run") async
+        (callback (core func $d "run-cb")))))
+  (instance $d (instantiate $D (with "x" (instance $x))))
+  (export "run" (func $d "run"))
+)
+
+(assert_return (invoke "run") (u32.const 2 (; RETURNED ;)))
+</code></pre></div>
+<p>as does this:</p>
+<div class="codehilite" data-code-language="wasm"><pre><span></span><code>(component
+  (component $F
+    (core func $waitable-set.new (canon waitable-set.new))
+    (core func $waitable-set.drop (canon waitable-set.drop))
+    (core func $task.return (canon task.return))
+    (core module $m
+      (import "" "waitable-set.new" (func $waitable-set.new (result i32)))
+      (import "" "waitable-set.drop" (func $waitable-set.drop (param i32)))
+      (import "" "task.return" (func $task.return))
+      (func (export "g") (result i32)
+        (call $waitable-set.drop (call $waitable-set.new))
+        (i32.const 7))
+      (func (export "k") (result i32) (call $task.return) (i32.const 0))
+      (func (export "cb") (param i32 i32 i32) (result i32) unreachable))
+    (core instance $i (instantiate $m
+      (with "" (instance
+        (export "waitable-set.new" (func $waitable-set.new))
+        (export "waitable-set.drop" (func $waitable-set.drop))
+        (export "task.return" (func $task.return))))))
+    (func (export "g") (result u32) (canon lift (core func $i "g")))
+    (func (export "k") async
+      (canon lift (core func $i "k") async
+        (callback (core func $i "cb")))))
+  (instance $f (instantiate $F))
+
+  (component $E
+    (import "f" (instance $f
+      (export "g" (func (result u32)))
+      (export "k" (func async))))
+    (core func $g (canon lower (func $f "g")))
+    (core func $k (canon lower (func $f "k") async))
+    (core func $task.return (canon task.return))
+    (core module $m
+      (import "" "g" (func $g (result i32)))
+      (import "" "k" (func $k (result i32)))
+      (import "" "task.return" (func $task.return))
+      (func (export "run") (result i32)
+        (drop (call $g))
+        (drop (call $k)) (call $task.return)
+        (i32.const 0))
+      (func (export "cb") (param i32 i32 i32) (result i32) unreachable))
+    (core instance $i (instantiate $m (with "" (instance
+      (export "g" (func $g))
+      (export "k" (func $k))
+      (export "task.return" (func $task.return))))))
+    (func (export "run") async
+      (canon lift (core func $i "run") async (callback (core func $i "cb")))))
+  (instance $e (instantiate $E (with "f" (instance $f))))
+
+  (component $D
+    (import "run" (func $run async))
+    (core func $run (canon lower (func $run) async))
+    (core func $task.return (canon task.return (result u32)))
+    (core module $m
+      (import "" "run" (func $run (result i32)))
+      (import "" "task.return" (func $task.return (param i32)))
+      (func (export "run") (result i32)
+        (call $task.return (call $run))
+        (i32.const 0))
+      (func (export "cb") (param i32 i32 i32) (result i32) unreachable))
+    (core instance $i (instantiate $m (with "" (instance
+      (export "run" (func $run))
+      (export "task.return" (func $task.return))))))
+    (func (export "run") async (result u32)
+      (canon lift (core func $i "run") async (callback (core func $i "cb")))))
+  (instance $d (instantiate $D (with "run" (func $e "run"))))
+  (export "run" (func $d "run"))
+)
+(assert_return (invoke "run") (u32.const 2))
+</code></pre></div>
+<p>This is a smaller version which doesn't <code>bail_bug!</code> but currently traps:</p>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="err">component</span>
+  <span class="p">(</span><span class="err">core</span> <span class="k">module</span> <span class="nv">$shim</span>
+    <span class="p">(</span><span class="k">table</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"funcs"</span><span class="p">)</span> <span class="mf">1 1</span> <span class="k">funcref</span><span class="p">)</span>
+    <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"export"</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span>
+      <span class="p">(</span><span class="nb">call_indirect</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">0</span><span class="p">))))</span>
+  <span class="p">(</span><span class="err">core</span> <span class="err">instance</span> <span class="nv">$shim</span> <span class="p">(</span><span class="err">instantiate</span> <span class="nv">$shim</span><span class="p">))</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$shim-export</span> <span class="p">(</span><span class="k">result</span> <span class="err">u</span><span class="mi">32</span><span class="p">)</span> <span class="p">(</span><span class="err">canon</span> <span class="err">l</span><span class="nb">if</span><span class="err">t</span> <span class="p">(</span><span class="err">core</span> <span class="k">func</span> <span class="nv">$shim</span> <span class="s2">"export"</span><span class="p">)))</span>
+
+  <span class="p">(</span><span class="err">component</span> <span class="nv">$X</span>
+    <span class="p">(</span><span class="k">import</span> <span class="s2">"import"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$import</span> <span class="p">(</span><span class="k">result</span> <span class="err">u</span><span class="mi">32</span><span class="p">)))</span>
+    <span class="p">(</span><span class="err">core</span> <span class="k">func</span> <span class="nv">$import</span> <span class="p">(</span><span class="err">canon</span> <span class="err">lower</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$import</span><span class="p">)))</span>
+    <span class="p">(</span><span class="err">core</span> <span class="k">func</span> <span class="nv">$waitable-set.new</span> <span class="p">(</span><span class="err">canon</span> <span class="err">wai</span><span class="k">table</span><span class="err">-set.new</span><span class="p">))</span>
+    <span class="p">(</span><span class="err">core</span> <span class="k">func</span> <span class="nv">$waitable-set.drop</span> <span class="p">(</span><span class="err">canon</span> <span class="err">wai</span><span class="k">table</span><span class="err">-set.</span><span class="nb">drop</span><span class="p">))</span>
+    <span class="p">(</span><span class="err">core</span> <span class="k">module</span> <span class="nv">$m</span>
+      <span class="p">(</span><span class="k">import</span> <span class="s2">""</span> <span class="s2">"import"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$import</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)))</span>
+      <span class="p">(</span><span class="k">import</span> <span class="s2">""</span> <span class="s2">"waitable-set.new"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$waitable-set.new</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)))</span>
+      <span class="p">(</span><span class="k">import</span> <span class="s2">""</span> <span class="s2">"waitable-set.drop"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$waitable-set.drop</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span><span class="p">)))</span>
+      <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"s"</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="nb">call</span> <span class="nv">$import</span><span class="p">))</span>
+      <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"h"</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span>
+        <span class="c1">;; any intrinsic that forces materialization of the deferred</span>
+        <span class="c1">;; sync-&gt;sync thread chain</span>
+        <span class="p">(</span><span class="nb">call</span> <span class="nv">$waitable-set.drop</span> <span class="p">(</span><span class="nb">call</span> <span class="nv">$waitable-set.new</span><span class="p">))</span>
+        <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">7</span><span class="p">)))</span>
+    <span class="p">(</span><span class="err">core</span> <span class="err">instance</span> <span class="nv">$i</span> <span class="p">(</span><span class="err">instantiate</span> <span class="nv">$m</span>
+      <span class="p">(</span><span class="err">with</span> <span class="s2">""</span> <span class="p">(</span><span class="err">instance</span>
+        <span class="p">(</span><span class="k">export</span> <span class="s2">"import"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$import</span><span class="p">))</span>
+        <span class="p">(</span><span class="k">export</span> <span class="s2">"waitable-set.new"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$waitable-set.new</span><span class="p">))</span>
+        <span class="p">(</span><span class="k">export</span> <span class="s2">"waitable-set.drop"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$waitable-set.drop</span><span class="p">))))))</span>
+    <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"s"</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="err">u</span><span class="mi">32</span><span class="p">)</span> <span class="p">(</span><span class="err">canon</span> <span class="err">l</span><span class="nb">if</span><span class="err">t</span> <span class="p">(</span><span class="err">core</span> <span class="k">func</span> <span class="nv">$i</span> <span class="s2">"s"</span><span class="p">)))</span>
+    <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"h"</span><span class="p">)</span> <span class="err">async</span> <span class="p">(</span><span class="k">result</span> <span class="err">u</span><span class="mi">32</span><span class="p">)</span> <span class="p">(</span><span class="err">canon</span> <span class="err">l</span><span class="nb">if</span><span class="err">t</span> <span class="p">(</span><span class="err">core</span> <span class="k">func</span> <span class="nv">$i</span> <span class="s2">"h"</span><span class="p">))))</span>
+  <span class="p">(</span><span class="err">instance</span> <span class="nv">$x</span> <span class="p">(</span><span class="err">instantiate</span> <span class="nv">$X</span> <span class="p">(</span><span class="err">with</span> <span class="s2">"import"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$shim-export</span><span class="p">))))</span>
+
+  <span class="p">(</span><span class="err">core</span> <span class="k">func</span> <span class="nv">$x-h</span> <span class="p">(</span><span class="err">canon</span> <span class="err">lower</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$x</span> <span class="s2">"h"</span><span class="p">)))</span>
+  <span class="p">(</span><span class="err">core</span> <span class="k">module</span> <span class="nv">$donut</span>
+    <span class="p">(</span><span class="k">import</span> <span class="s2">""</span> <span class="s2">"funcs"</span> <span class="p">(</span><span class="k">table</span> <span class="mf">1 1</span> <span class="k">funcref</span><span class="p">))</span>
+    <span class="p">(</span><span class="k">import</span> <span class="s2">""</span> <span class="s2">"h"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$h</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)))</span>
+    <span class="p">(</span><span class="k">func</span> <span class="nv">$guest-export</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="nb">call</span> <span class="nv">$h</span><span class="p">))</span>
+    <span class="p">(</span><span class="k">elem</span> <span class="err">declare</span> <span class="k">func</span> <span class="nv">$guest-export</span><span class="p">)</span>
+    <span class="p">(</span><span class="k">func</span> <span class="nv">$start</span> <span class="p">(</span><span class="err">table.set</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="err">ref.</span><span class="k">func</span> <span class="nv">$guest-export</span><span class="p">)))</span>
+    <span class="p">(</span><span class="k">start</span> <span class="nv">$start</span><span class="p">))</span>
+  <span class="p">(</span><span class="err">core</span> <span class="err">instance</span> <span class="nv">$donut</span> <span class="p">(</span><span class="err">instantiate</span> <span class="nv">$donut</span>
+    <span class="p">(</span><span class="err">with</span> <span class="s2">""</span> <span class="p">(</span><span class="err">instance</span>
+      <span class="p">(</span><span class="k">export</span> <span class="s2">"h"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$x-h</span><span class="p">))</span>
+      <span class="p">(</span><span class="k">export</span> <span class="s2">"funcs"</span> <span class="p">(</span><span class="k">table</span> <span class="nv">$shim</span> <span class="s2">"funcs"</span><span class="p">))))))</span>
+  <span class="p">(</span><span class="k">export</span> <span class="s2">"s"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$x</span> <span class="s2">"s"</span><span class="p">))</span>
+<span class="p">)</span>
+
+<span class="p">(</span><span class="err">assert_</span><span class="nb">return</span> <span class="p">(</span><span class="err">invoke</span> <span class="s2">"s"</span><span class="p">)</span> <span class="p">(</span><span class="err">u</span><span class="mi">32</span><span class="err">.const</span> <span class="mi">7</span><span class="p">))</span>
+</code></pre></div>
+<p>An LLM claims this fixes things:</p>
+<p>&lt;details&gt;</p>
+<p><div class="codehilite" data-code-language="Diff"><pre><span></span><code><span class="gh">diff --git a/crates/wasmtime/src/runtime/component/concurrent.rs b/crates/wasmtime/src/runtime/component/concurrent.rs</span>
+<span class="gh">index 15d2bd7699..5e3b2dd0ba 100644</span>
+<span class="gd">--- a/crates/wasmtime/src/runtime/component/concurrent.rs</span>
+<span class="gi">+++ b/crates/wasmtime/src/runtime/component/concurrent.rs</span>
+<span class="gu">@@ -1999,14 +1999,12 @@ impl StoreOpaque {</span>
+
+<span class="w"> </span>        log::trace!("exit sync-lifted call {instance:?}");
+
+<span class="gd">-        if async_typed {</span>
+<span class="gd">-            // If we're async-typed, returning control to our caller won't help</span>
+<span class="gd">-            // resolve any outstanding sync-typed call which might be in</span>
+<span class="gd">-            // progress, so we may need to switch or trap before exiting this</span>
+<span class="gd">-            // thread:</span>
+<span class="gd">-            self.switch_or_trap_if_may_not_suspend(instance)?;</span>
+<span class="gd">-        }</span>
+<span class="gd">-</span>
+<span class="gi">+        // Note that, unlike other places where a thread</span>
+[message truncated]
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="629561615"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314562%20Hitting%20%60bail_bug%21%60%20when%20synchron.../near/629561615" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314562.20Hitting.20.60bail_bug.21.60.20when.20synchron.2E.2E.2E.html#629561615">(Oct 06 2026 at 14:23)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasm-proposal:component-model-async label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14562">Issue #14562</a>.</p>
+
+
+
+<a name="629565339"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314562%20Hitting%20%60bail_bug%21%60%20when%20synchron.../near/629565339" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314562.20Hitting.20.60bail_bug.21.60.20when.20synchron.2E.2E.2E.html#629565339">(Oct 06 2026 at 14:34)</a>:</h4>
+<p>dicej assigned dicej to <a href="https://github.com/bytecodealliance/wasmtime/issues/14562">issue #14562</a>.</p>
+
+
+
+<a name="630290490"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314562%20Hitting%20%60bail_bug%21%60%20when%20synchron.../near/630290490" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314562.20Hitting.20.60bail_bug.21.60.20when.20synchron.2E.2E.2E.html#630290490">(Oct 08 2026 at 23:59)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/14562#issuecomment-6071430080">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14562">issue #14562</a>:</p>
+<blockquote>
+<p>In addition to the above tests, <a href="https://gist.github.com/alexcrichton/fb2af8436ac19825e7039b7e1049100c">https://gist.github.com/alexcrichton/fb2af8436ac19825e7039b7e1049100c</a> contains some more tests which I believe boil down to the same issue here. The behavior here ranges from "probably incorrect w.r.t." the spec to panics to crashes to blocked forever.</p>
+</blockquote>
+
+
+
+<a name="630297847"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314562%20Hitting%20%60bail_bug%21%60%20when%20synchron.../near/630297847" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314562.20Hitting.20.60bail_bug.21.60.20when.20synchron.2E.2E.2E.html#630297847">(Oct 09 2026 at 01:02)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14562">Issue #14562</a>.</p>
+
+
+
+<a name="630462681"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314562%20Hitting%20%60bail_bug%21%60%20when%20synchron.../near/630462681" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314562.20Hitting.20.60bail_bug.21.60.20when.20synchron.2E.2E.2E.html#630462681">(Oct 09 2026 at 15:42)</a>:</h4>
+<p>dicej <a href="https://github.com/bytecodealliance/wasmtime/issues/14562#issuecomment-6084200383">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14562">issue #14562</a>:</p>
+<blockquote>
+<p>I've got a patch that fixes all 6 of the tests posted here.  Will open a PR shortly.</p>
+</blockquote>
+
+
+
+<a name="630490234"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314562%20Hitting%20%60bail_bug%21%60%20when%20synchron.../near/630490234" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314562.20Hitting.20.60bail_bug.21.60.20when.20synchron.2E.2E.2E.html#630490234">(Oct 09 2026 at 17:39)</a>:</h4>
+<p>dicej closed <a href="https://github.com/bytecodealliance/wasmtime/issues/14562">issue #14562</a>:</p>
+<blockquote>
+<p>This input triggers a <code>bail_bug!</code> on <code>main</code>:</p>
+<div class="codehilite" data-code-language="wasm"><pre><span></span><code>(component
+  (core module $shim
+    (table (export "funcs") 1 1 funcref)
+    (func (export "export") (result i32)
+      (call_indirect (result i32) (i32.const 0))))
+  (core instance $shim (instantiate $shim))
+  (func $shim-export (result u32) (canon lift (core func $shim "export")))
+
+  (component $X
+    (import "import" (func $import (result u32)))
+    (core func $import (canon lower (func $import)))
+    (core func $waitable-set.new (canon waitable-set.new))
+    (core func $waitable-set.drop (canon waitable-set.drop))
+    (core func $task.return (canon task.return))
+    (core module $m
+      (import "" "import" (func $import (result i32)))
+      (import "" "waitable-set.new" (func $waitable-set.new (result i32)))
+      (import "" "waitable-set.drop" (func $waitable-set.drop (param i32)))
+      (import "" "task.return" (func $task.return))
+      (func (export "s") (result i32) (call $import))
+      (func (export "h") (result i32)
+        (call $waitable-set.drop (call $waitable-set.new))
+        (i32.const 7))
+      (func (export "y") (result i32) (i32.const 1 (; YIELD ;)))
+      (func (export "y-cb") (param i32 i32 i32) (result i32)
+        (call $task.return)
+        (i32.const 0 (; EXIT ;)))
+      (func (export "z") (result i32)
+        (call $task.return) (i32.const 0 (; EXIT ;))))
+    (core instance $i (instantiate $m
+      (with "" (instance
+        (export "import" (func $import))
+        (export "waitable-set.new" (func $waitable-set.new))
+        (export "waitable-set.drop" (func $waitable-set.drop))
+        (export "task.return" (func $task.return))))))
+    (func (export "s") (result u32) (canon lift (core func $i "s")))
+    (func (export "h") async (result u32) (canon lift (core func $i "h")))
+    (func (export "y") async
+      (canon lift (core func $i "y") async
+        (callback (core func $i "y-cb"))))
+    (func (export "z") async
+      (canon lift (core func $i "z") async
+        (callback (core func $i "y-cb")))))
+  (instance $x (instantiate $X (with "import" (func $shim-export))))
+
+  (core func $x-h (canon lower (func $x "h")))
+  (core module $donut
+    (import "" "funcs" (table 1 1 funcref))
+    (import "" "h" (func $h (result i32)))
+    (func $guest-export (result i32) (call $h))
+    (elem declare func $guest-export)
+    (func $start (table.set (i32.const 0) (ref.func $guest-export)))
+    (start $start))
+  (core instance $donut (instantiate $donut
+    (with "" (instance
+      (export "h" (func $x-h))
+      (export "funcs" (table $shim "funcs"))))))
+
+  (component $D
+    (import "x" (instance $x
+      (export "s" (func (result u32)))
+      (export "y" (func async))
+      (export "z" (func async))))
+    (core func $s (canon lower (func $x "s")))
+    (core func $y (canon lower (func $x "y") async))
+    (core func $z (canon lower (func $x "z") async))
+    (core func $task.return (canon task.return (result u32)))
+    (core module $d
+      (import "" "s" (func $s (result i32)))
+      (import "" "y" (func $y (result i32)))
+      (import "" "z" (func $z (result i32)))
+      (import "" "task.return" (func $task.return (param i32)))
+      (func (export "run") (result i32)
+        (drop (call $y))
+        (drop (call $s))
+        (call $task.return (call $z))
+        (i32.const 0 (; EXIT ;)))
+      (func (export "run-cb") (param i32 i32 i32) (result i32) unreachable))
+    (core instance $d (instantiate $d (with "" (instance
+      (export "s" (func $s))
+      (export "y" (func $y))
+      (export "z" (func $z))
+      (export "task.return" (func $task.return))))))
+    (func (export "run") async (result u32)
+      (canon lift (core func $d "run") async
+        (callback (core func $d "run-cb")))))
+  (instance $d (instantiate $D (with "x" (instance $x))))
+  (export "run" (func $d "run"))
+)
+
+(assert_return (invoke "run") (u32.const 2 (; RETURNED ;)))
+</code></pre></div>
+<p>as does this:</p>
+<div class="codehilite" data-code-language="wasm"><pre><span></span><code>(component
+  (component $F
+    (core func $waitable-set.new (canon waitable-set.new))
+    (core func $waitable-set.drop (canon waitable-set.drop))
+    (core func $task.return (canon task.return))
+    (core module $m
+      (import "" "waitable-set.new" (func $waitable-set.new (result i32)))
+      (import "" "waitable-set.drop" (func $waitable-set.drop (param i32)))
+      (import "" "task.return" (func $task.return))
+      (func (export "g") (result i32)
+        (call $waitable-set.drop (call $waitable-set.new))
+        (i32.const 7))
+      (func (export "k") (result i32) (call $task.return) (i32.const 0))
+      (func (export "cb") (param i32 i32 i32) (result i32) unreachable))
+    (core instance $i (instantiate $m
+      (with "" (instance
+        (export "waitable-set.new" (func $waitable-set.new))
+        (export "waitable-set.drop" (func $waitable-set.drop))
+        (export "task.return" (func $task.return))))))
+    (func (export "g") (result u32) (canon lift (core func $i "g")))
+    (func (export "k") async
+      (canon lift (core func $i "k") async
+        (callback (core func $i "cb")))))
+  (instance $f (instantiate $F))
+
+  (component $E
+    (import "f" (instance $f
+      (export "g" (func (result u32)))
+      (export "k" (func async))))
+    (core func $g (canon lower (func $f "g")))
+    (core func $k (canon lower (func $f "k") async))
+    (core func $task.return (canon task.return))
+    (core module $m
+      (import "" "g" (func $g (result i32)))
+      (import "" "k" (func $k (result i32)))
+      (import "" "task.return" (func $task.return))
+      (func (export "run") (result i32)
+        (drop (call $g))
+        (drop (call $k)) (call $task.return)
+        (i32.const 0))
+      (func (export "cb") (param i32 i32 i32) (result i32) unreachable))
+    (core instance $i (instantiate $m (with "" (instance
+      (export "g" (func $g))
+      (export "k" (func $k))
+      (export "task.return" (func $task.return))))))
+    (func (export "run") async
+      (canon lift (core func $i "run") async (callback (core func $i "cb")))))
+  (instance $e (instantiate $E (with "f" (instance $f))))
+
+  (component $D
+    (import "run" (func $run async))
+    (core func $run (canon lower (func $run) async))
+    (core func $task.return (canon task.return (result u32)))
+    (core module $m
+      (import "" "run" (func $run (result i32)))
+      (import "" "task.return" (func $task.return (param i32)))
+      (func (export "run") (result i32)
+        (call $task.return (call $run))
+        (i32.const 0))
+      (func (export "cb") (param i32 i32 i32) (result i32) unreachable))
+    (core instance $i (instantiate $m (with "" (instance
+      (export "run" (func $run))
+      (export "task.return" (func $task.return))))))
+    (func (export "run") async (result u32)
+      (canon lift (core func $i "run") async (callback (core func $i "cb")))))
+  (instance $d (instantiate $D (with "run" (func $e "run"))))
+  (export "run" (func $d "run"))
+)
+(assert_return (invoke "run") (u32.const 2))
+</code></pre></div>
+<p>This is a smaller version which doesn't <code>bail_bug!</code> but currently traps:</p>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="err">component</span>
+  <span class="p">(</span><span class="err">core</span> <span class="k">module</span> <span class="nv">$shim</span>
+    <span class="p">(</span><span class="k">table</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"funcs"</span><span class="p">)</span> <span class="mf">1 1</span> <span class="k">funcref</span><span class="p">)</span>
+    <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"export"</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span>
+      <span class="p">(</span><span class="nb">call_indirect</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">0</span><span class="p">))))</span>
+  <span class="p">(</span><span class="err">core</span> <span class="err">instance</span> <span class="nv">$shim</span> <span class="p">(</span><span class="err">instantiate</span> <span class="nv">$shim</span><span class="p">))</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$shim-export</span> <span class="p">(</span><span class="k">result</span> <span class="err">u</span><span class="mi">32</span><span class="p">)</span> <span class="p">(</span><span class="err">canon</span> <span class="err">l</span><span class="nb">if</span><span class="err">t</span> <span class="p">(</span><span class="err">core</span> <span class="k">func</span> <span class="nv">$shim</span> <span class="s2">"export"</span><span class="p">)))</span>
+
+  <span class="p">(</span><span class="err">component</span> <span class="nv">$X</span>
+    <span class="p">(</span><span class="k">import</span> <span class="s2">"import"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$import</span> <span class="p">(</span><span class="k">result</span> <span class="err">u</span><span class="mi">32</span><span class="p">)))</span>
+    <span class="p">(</span><span class="err">core</span> <span class="k">func</span> <span class="nv">$import</span> <span class="p">(</span><span class="err">canon</span> <span class="err">lower</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$import</span><span class="p">)))</span>
+    <span class="p">(</span><span class="err">core</span> <span class="k">func</span> <span class="nv">$waitable-set.new</span> <span class="p">(</span><span class="err">canon</span> <span class="err">wai</span><span class="k">table</span><span class="err">-set.new</span><span class="p">))</span>
+    <span class="p">(</span><span class="err">core</span> <span class="k">func</span> <span class="nv">$waitable-set.drop</span> <span class="p">(</span><span class="err">canon</span> <span class="err">wai</span><span class="k">table</span><span class="err">-set.</span><span class="nb">drop</span><span class="p">))</span>
+    <span class="p">(</span><span class="err">core</span> <span class="k">module</span> <span class="nv">$m</span>
+      <span class="p">(</span><span class="k">import</span> <span class="s2">""</span> <span class="s2">"import"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$import</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)))</span>
+      <span class="p">(</span><span class="k">import</span> <span class="s2">""</span> <span class="s2">"waitable-set.new"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$waitable-set.new</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)))</span>
+      <span class="p">(</span><span class="k">import</span> <span class="s2">""</span> <span class="s2">"waitable-set.drop"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$waitable-set.drop</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span><span class="p">)))</span>
+      <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"s"</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="nb">call</span> <span class="nv">$import</span><span class="p">))</span>
+      <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"h"</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span>
+        <span class="c1">;; any intrinsic that forces materialization of the deferred</span>
+        <span class="c1">;; sync-&gt;sync thread chain</span>
+        <span class="p">(</span><span class="nb">call</span> <span class="nv">$waitable-set.drop</span> <span class="p">(</span><span class="nb">call</span> <span class="nv">$waitable-set.new</span><span class="p">))</span>
+        <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">7</span><span class="p">)))</span>
+    <span class="p">(</span><span class="err">core</span> <span class="err">instance</span> <span class="nv">$i</span> <span class="p">(</span><span class="err">instantiate</span> <span class="nv">$m</span>
+      <span class="p">(</span><span class="err">with</span> <span class="s2">""</span> <span class="p">(</span><span class="err">instance</span>
+        <span class="p">(</span><span class="k">export</span> <span class="s2">"import"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$import</span><span class="p">))</span>
+        <span class="p">(</span><span class="k">export</span> <span class="s2">"waitable-set.new"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$waitable-set.new</span><span class="p">))</span>
+        <span class="p">(</span><span class="k">export</span> <span class="s2">"waitable-set.drop"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$waitable-set.drop</span><span class="p">))))))</span>
+    <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"s"</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="err">u</span><span class="mi">32</span><span class="p">)</span> <span class="p">(</span><span class="err">canon</span> <span class="err">l</span><span class="nb">if</span><span class="err">t</span> <span class="p">(</span><span class="err">core</span> <span class="k">func</span> <span class="nv">$i</span> <span class="s2">"s"</span><span class="p">)))</span>
+    <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"h"</span><span class="p">)</span> <span class="err">async</span> <span class="p">(</span><span class="k">result</span> <span class="err">u</span><span class="mi">32</span><span class="p">)</span> <span class="p">(</span><span class="err">canon</span> <span class="err">l</span><span class="nb">if</span><span class="err">t</span> <span class="p">(</span><span class="err">core</span> <span class="k">func</span> <span class="nv">$i</span> <span class="s2">"h"</span><span class="p">))))</span>
+  <span class="p">(</span><span class="err">instance</span> <span class="nv">$x</span> <span class="p">(</span><span class="err">instantiate</span> <span class="nv">$X</span> <span class="p">(</span><span class="err">with</span> <span class="s2">"import"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$shim-export</span><span class="p">))))</span>
+
+  <span class="p">(</span><span class="err">core</span> <span class="k">func</span> <span class="nv">$x-h</span> <span class="p">(</span><span class="err">canon</span> <span class="err">lower</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$x</span> <span class="s2">"h"</span><span class="p">)))</span>
+  <span class="p">(</span><span class="err">core</span> <span class="k">module</span> <span class="nv">$donut</span>
+    <span class="p">(</span><span class="k">import</span> <span class="s2">""</span> <span class="s2">"funcs"</span> <span class="p">(</span><span class="k">table</span> <span class="mf">1 1</span> <span class="k">funcref</span><span class="p">))</span>
+    <span class="p">(</span><span class="k">import</span> <span class="s2">""</span> <span class="s2">"h"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$h</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)))</span>
+    <span class="p">(</span><span class="k">func</span> <span class="nv">$guest-export</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="nb">call</span> <span class="nv">$h</span><span class="p">))</span>
+    <span class="p">(</span><span class="k">elem</span> <span class="err">declare</span> <span class="k">func</span> <span class="nv">$guest-export</span><span class="p">)</span>
+    <span class="p">(</span><span class="k">func</span> <span class="nv">$start</span> <span class="p">(</span><span class="err">table.set</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">0</span><span class="p">)</span> <span class="p">(</span><span class="err">ref.</span><span class="k">func</span> <span class="nv">$guest-export</span><span class="p">)))</span>
+    <span class="p">(</span><span class="k">start</span> <span class="nv">$start</span><span class="p">))</span>
+  <span class="p">(</span><span class="err">core</span> <span class="err">instance</span> <span class="nv">$donut</span> <span class="p">(</span><span class="err">instantiate</span> <span class="nv">$donut</span>
+    <span class="p">(</span><span class="err">with</span> <span class="s2">""</span> <span class="p">(</span><span class="err">instance</span>
+      <span class="p">(</span><span class="k">export</span> <span class="s2">"h"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$x-h</span><span class="p">))</span>
+      <span class="p">(</span><span class="k">export</span> <span class="s2">"funcs"</span> <span class="p">(</span><span class="k">table</span> <span class="nv">$shim</span> <span class="s2">"funcs"</span><span class="p">))))))</span>
+  <span class="p">(</span><span class="k">export</span> <span class="s2">"s"</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$x</span> <span class="s2">"s"</span><span class="p">))</span>
+<span class="p">)</span>
+
+<span class="p">(</span><span class="err">assert_</span><span class="nb">return</span> <span class="p">(</span><span class="err">invoke</span> <span class="s2">"s"</span><span class="p">)</span> <span class="p">(</span><span class="err">u</span><span class="mi">32</span><span class="err">.const</span> <span class="mi">7</span><span class="p">))</span>
+</code></pre></div>
+<p>An LLM claims this fixes things:</p>
+<p>&lt;details&gt;</p>
+<p><div class="codehilite" data-code-language="Diff"><pre><span></span><code><span class="gh">diff --git a/crates/wasmtime/src/runtime/component/concurrent.rs b/crates/wasmtime/src/runtime/component/concurrent.rs</span>
+<span class="gh">index 15d2bd7699..5e3b2dd0ba 100644</span>
+<span class="gd">--- a/crates/wasmtime/src/runtime/component/concurrent.rs</span>
+<span class="gi">+++ b/crates/wasmtime/src/runtime/component/concurrent.rs</span>
+<span class="gu">@@ -1999,14 +1999,12 @@ impl StoreOpaque {</span>
+
+<span class="w"> </span>        log::trace!("exit sync-lifted call {instance:?}");
+
+<span class="gd">-        if async_typed {</span>
+<span class="gd">-            // If we're async-typed, returning control to our caller won't help</span>
+<span class="gd">-            // resolve any outstanding sync-typed call which might be in</span>
+<span class="gd">-            // progress, so we may need to switch or trap before exiting this</span>
+<span class="gd">-            // thread:</span>
+<span class="gd">-            self.switch_or_trap_if_may_not_suspend(instance)?;</span>
+<span class="gd">-        }</span>
+<span class="gd">-</span>
+<span class="gi">+        // Note that, unlike other places where a thread exits,</span>
+[message truncated]
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Oct 10 2026 at 17:07 UTC</p>
+</html>

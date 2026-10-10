@@ -1,0 +1,258 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14565 DRC leaks the array when `ArrayRe... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314565.20DRC.20leaks.20the.20array.20when.20.60ArrayRe.2E.2E.2E.html">wasmtime / issue #14565 DRC leaks the array when `ArrayRe...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="629572505"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314565%20DRC%20leaks%20the%20array%20when%20%60ArrayRe.../near/629572505" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314565.20DRC.20leaks.20the.20array.20when.20.60ArrayRe.2E.2E.2E.html#629572505">(Oct 06 2026 at 14:57)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/14565#issuecomment-6019016688">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14565">issue #14565</a>:</p>
+<blockquote>
+<p>&lt;details&gt; &lt;summary&gt;Full LLM report&lt;/summary&gt;</p>
+<h1>DRC permanently leaks the array when <code>ArrayRef::new</code> / <code>new_fixed</code> fails its element type check</h1>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Date</td>
+<td>2026-10-05</td>
+</tr>
+<tr>
+<td>Wasmtime commit</td>
+<td><code>73b04cff3317d1e308866eb24359483ac6116669</code> (<code>main</code>)</td>
+</tr>
+<tr>
+<td>Host</td>
+<td>macOS 15.8.1 (Darwin 24.6.0), <code>aarch64-apple-darwin</code></td>
+</tr>
+<tr>
+<td>Model</td>
+<td>Claude Opus 5.5 (<code>claude-opus-5-5</code>)</td>
+</tr>
+<tr>
+<td>Features</td>
+<td>Wasm GC, <code>DeferredReferenceCounting</code> collector (<code>gc-drc</code>)</td>
+</tr>
+<tr>
+<td>Class</td>
+<td>GC-heap leak through the public host API (DoS of a bounded heap)</td>
+</tr>
+</tbody>
+</table>
+<h2>Summary</h2>
+<p><code>ArrayRef::new_from_iter</code> (<code>crates/wasmtime/src/runtime/gc/enabled/arrayref.rs:390-438</code>),<br>
+which backs <code>ArrayRef::new</code>, <code>new_async</code>, <code>new_fixed</code> and <code>new_fixed_async</code><br>
+(called through <code>retry_after_gc_async</code>), allocates the<br>
+array <em>before</em> it type-checks the elements:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="n">arrayref</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">store</span><span class="p">.</span><span class="n">require_gc_store_mut</span><span class="p">()</span><span class="o">?</span>
+<span class="w">    </span><span class="p">.</span><span class="n">alloc_uninit_array</span><span class="p">(</span><span class="n">allocator</span><span class="p">.</span><span class="n">type_index</span><span class="p">(),</span><span class="w"> </span><span class="n">len</span><span class="p">,</span><span class="w"> </span><span class="n">allocator</span><span class="p">.</span><span class="n">layout</span><span class="p">())</span><span class="w">  </span><span class="c1">// :404-408</span>
+<span class="w">    </span><span class="o">..</span><span class="p">.;</span>
+<span class="k">for</span><span class="w"> </span><span class="n">elem</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">elems</span><span class="p">.</span><span class="n">clone</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">elem</span><span class="p">.</span><span class="n">ensure_matches_ty</span><span class="p">(</span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="n">allocator</span><span class="p">.</span><span class="n">ty</span><span class="p">.</span><span class="n">element_type</span><span class="p">().</span><span class="n">unpack</span><span class="p">())</span>
+<span class="w">        </span><span class="p">.</span><span class="n">context</span><span class="p">(</span><span class="s">"element type mismatch"</span><span class="p">)</span><span class="o">?</span><span class="p">;</span><span class="w">                              </span><span class="c1">// :411-414</span>
+<span class="p">}</span>
+<span class="c1">// "From this point on, if we get any errors ... eagerly deallocate it"</span>
+</code></pre></div>
+<p>A type mismatch returns through the <code>?</code> at line 413. That is before the<br>
+<code>dealloc_uninit_array</code> error path at lines 431-434. The uninitialized array is<br>
+never rooted, initialized, or freed:</p>
+<ul>
+<li>
+<p><strong>DRC:</strong> the block is unreachable, but DRC only frees objects whose<br>
+  refcount drops to zero, and this object was never on the over-approximated<br>
+  roots list. So <code>Store::gc</code> never reclaims it, and the space is lost for the<br>
+  life of the store.</p>
+</li>
+<li>
+<p><strong>Copying collector:</strong> unaffected, because the unreachable object is simply<br>
+  not copied.</p>
+</li>
+<li>
+<p><strong>Null collector:</strong> never frees anything anyway.</p>
+</li>
+</ul>
+<p><code>StructRef::new</code> (<code>structref.rs:295</code> before the <code>:346</code> allocation) and<br>
+<code>ExnRef::new</code> (<code>exnref.rs:280</code> before <code>:343</code>) type-check <em>before</em> allocating.<br>
+Only the array path has the wrong order.</p>
+<p>Each failing call leaks <code>len * elem_size</code> plus the header. A host that builds<br>
+arrays from guest- or user-supplied <code>Val</code>s, where a wrong type is an ordinary<br>
+recoverable error, exhausts a bounded GC heap after a few hundred failures.</p>
+<h2>Reproduction</h2>
+<p><code>crate/src/bin/array_typecheck_leak.rs</code> sets up:</p>
+<ul>
+<li>
+<p>a 1 MiB fixed GC heap (<code>gc_heap_initial_size</code> = <code>gc_heap_reservation</code> =<br>
+  1 MiB, <code>gc_heap_may_move(false)</code>);</p>
+</li>
+<li>
+<p>an <code>(array (mut i32))</code> type.</p>
+</li>
+</ul>
+<p>Each iteration then does three things:</p>
+<ol>
+<li>
+<p>Calls <code>ArrayRef::new_fixed</code>/<code>ArrayRef::new</code> with <code>Val::I64</code> elements and<br>
+   asserts the "type mismatch" error.</p>
+</li>
+<li>
+<p>Runs a full <code>store.gc(None)</code>.</p>
+</li>
+<li>Allocates a correctly typed 1000-element array inside a <code>RootScope</code>.</li>
+</ol>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">cd</span><span class="w"> </span><span class="n">reports</span><span class="o">/</span><span class="mi">015</span><span class="o">-</span><span class="n">arrayref</span><span class="o">-</span><span class="n">typecheck</span><span class="o">-</span><span class="n">leak</span><span class="o">/</span><span class="k">crate</span>
+<span class="cp">$</span><span class="w"> </span><span class="n">cargo</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="o">--</span><span class="n">bin</span><span class="w"> </span><span class="n">array_typecheck_leak</span><span class="w">            </span><span class="p">#</span><span class="w"> </span><span class="n">same</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="o">--</span><span class="n">release</span>
+<span class="w">  </span><span class="n">DeferredReferenceCounting</span><span class="p">:</span><span class="w"> </span><span class="nc">good</span><span class="w"> </span><span class="n">allocation</span><span class="w"> </span><span class="n">failed</span><span class="w"> </span><span class="n">after</span><span class="w"> </span><span class="mi">259</span><span class="w"> </span><span class="n">failed</span><span class="w"> </span><span class="n">ones</span><span class="p">:</span><span class="w"> </span><span class="nc">GC</span><span class="w"> </span><span class="n">heap</span><span class="w"> </span><span class="n">out</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">memory</span><span class="p">:</span><span class="w"> </span><span class="nc">no</span><span class="w"> </span><span class="n">capacity</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">allocation</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="mi">4028</span><span class="w"> </span><span class="n">bytes</span>
+<span class="w">  </span><span class="n">Copying</span><span class="p">:</span><span class="w"> </span><span class="mi">10000</span><span class="w"> </span><span class="n">iterations</span><span class="w"> </span><span class="n">ok</span>
+</code></pre></div>
+<p>Expected: every iteration succeeds, as it does for the copying collector.</p>
+<h2>Suggested fix</h2>
+<p>Hoist the element type-check loop above <code>alloc_uninit_array</code>, matching<br>
+<code>StructRef::new</code> and <code>ExnRef::new</code>. Alternatively, move it inside the closure<br>
+whose error arm calls <code>dealloc_uninit_array</code>.</p>
+<p>&lt;/details&gt;</p>
+</blockquote>
+
+
+
+<a name="629573088"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314565%20DRC%20leaks%20the%20array%20when%20%60ArrayRe.../near/629573088" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314565.20DRC.20leaks.20the.20array.20when.20.60ArrayRe.2E.2E.2E.html#629573088">(Oct 06 2026 at 14:59)</a>:</h4>
+<p>fitzgen opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14565">issue #14565</a>:</p>
+<blockquote>
+<p><code>ArrayRef::new_from_iter</code> allocates the array before it type-checks the<br>
+elements. If the check fails, the function returns before reaching the code<br>
+that deallocates the uninitialized array. The DRC collector never reclaims<br>
+that block, not even after <code>Store::gc</code>. <code>ArrayRef::new</code>, <code>new_async</code>,<br>
+<code>new_fixed</code> and <code>new_fixed_async</code> are all affected. <code>StructRef::new</code> and<br>
+<code>ExnRef::new</code> type-check before allocating, so they don't leak.</p>
+<h3>Test Case</h3>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#[test]</span>
+<span class="cp">#[cfg_attr(miri, ignore)]</span>
+<span class="k">fn</span><span class="w"> </span><span class="nf">drc_array_new_type_mismatch_does_not_leak</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">config</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Config</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="w">    </span><span class="n">config</span><span class="p">.</span><span class="n">collector</span><span class="p">(</span><span class="n">Collector</span><span class="p">::</span><span class="n">DeferredReferenceCounting</span><span class="p">);</span>
+<span class="w">    </span><span class="n">config</span><span class="p">.</span><span class="n">gc_heap_initial_size</span><span class="p">(</span><span class="mi">1</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="mi">20</span><span class="p">);</span>
+<span class="w">    </span><span class="n">config</span><span class="p">.</span><span class="n">gc_heap_reservation</span><span class="p">(</span><span class="mi">1</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="mi">20</span><span class="p">);</span>
+<span class="w">    </span><span class="n">config</span><span class="p">.</span><span class="n">gc_heap_may_move</span><span class="p">(</span><span class="kc">false</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">engine</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Engine</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">config</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Store</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span><span class="w"> </span><span class="p">());</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">ty</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ArrayType</span><span class="p">::</span><span class="n">new</span><span class="p">(</span>
+<span class="w">        </span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span>
+<span class="w">        </span><span class="n">FieldType</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">Mutability</span><span class="p">::</span><span class="n">Var</span><span class="p">,</span><span class="w"> </span><span class="n">StorageType</span><span class="p">::</span><span class="n">ValType</span><span class="p">(</span><span class="n">ValType</span><span class="p">::</span><span class="n">I32</span><span class="p">)),</span>
+<span class="w">    </span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">pre</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ArrayRefPre</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="n">ty</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="mi">0</span><span class="o">..</span><span class="mi">1000</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// Wrong element type: fails with "element type mismatch", as expected.</span>
+<span class="w">        </span><span class="fm">assert!</span><span class="p">(</span><span class="n">ArrayRef</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">pre</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">Val</span><span class="p">::</span><span class="n">I64</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span><span class="w"> </span><span class="mi">1000</span><span class="p">).</span><span class="n">is_err</span><span class="p">());</span>
+<span class="w">        </span><span class="n">store</span><span class="p">.</span><span class="n">gc</span><span class="p">(</span><span class="nb">None</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">        </span><span class="c1">// A well-typed, immediately-dropped allocation should always fit.</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">scope</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">RootScope</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">);</span>
+<span class="w">        </span><span class="n">ArrayRef</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">scope</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">pre</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">Val</span><span class="p">::</span><span class="n">I32</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span><span class="w"> </span><span class="mi">1000</span><span class="p">)</span>
+<span class="w">            </span><span class="p">.</span><span class="n">map_err</span><span class="p">(</span><span class="o">|</span><span class="n">e</span><span class="o">|</span><span class="w"> </span><span class="n">e</span><span class="p">.</span><span class="n">context</span><span class="p">(</span><span class="fm">format!</span><span class="p">(</span><span class="s">"iteration {i}"</span><span class="p">)))</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3>Steps to Reproduce</h3>
+<p>Add the test above to <code>tests/all/gc.rs</code>, then run:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">cargo</span><span class="w"> </span><span class="n">test</span><span class="w"> </span><span class="o">--</span><span class="n">test</span><span class="w"> </span><span class="n">all</span><span class="w"> </span><span class="o">--</span><span class="w"> </span><span class="n">drc_array_new_type_mismatch_does_not_leak</span>
+</code></pre></div>
+<h3>Expected Results</h3>
+<p>The test passes.</p>
+<h3>Actual Results</h3>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">Error</span><span class="p">:</span><span class="w"> </span><span class="nc">iteration</span><span class="w"> </span><span class="mi">259</span>
+
+<span class="n">Caused</span><span class="w"> </span><span class="n">by</span><span class="p">:</span>
+<span class="w">    </span><span class="nc">GC</span><span class="w"> </span><span class="n">heap</span><span class="w"> </span><span class="n">out</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">memory</span><span class="p">:</span><span class="w"> </span><span class="nc">no</span><span class="w"> </span><span class="n">capacity</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">allocation</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="mi">4028</span><span class="w"> </span><span class="n">bytes</span>
+</code></pre></div>
+<h3>Versions and Environment</h3>
+<p>Wasmtime version or commit: <code>73b04cff33</code></p>
+<p>Operating system: macOS 15.8.1</p>
+<p>Architecture: aarch64<br>
+</p>
+</blockquote>
+
+
+
+<a name="629573090"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314565%20DRC%20leaks%20the%20array%20when%20%60ArrayRe.../near/629573090" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314565.20DRC.20leaks.20the.20array.20when.20.60ArrayRe.2E.2E.2E.html#629573090">(Oct 06 2026 at 14:59)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the wasm-proposal:gc label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14565">Issue #14565</a>.</p>
+
+
+
+<a name="629690889"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314565%20DRC%20leaks%20the%20array%20when%20%60ArrayRe.../near/629690889" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314565.20DRC.20leaks.20the.20array.20when.20.60ArrayRe.2E.2E.2E.html#629690889">(Oct 06 2026 at 23:19)</a>:</h4>
+<p>alexcrichton closed <a href="https://github.com/bytecodealliance/wasmtime/issues/14565">issue #14565</a>:</p>
+<blockquote>
+<p><code>ArrayRef::new_from_iter</code> allocates the array before it type-checks the<br>
+elements. If the check fails, the function returns before reaching the code<br>
+that deallocates the uninitialized array. The DRC collector never reclaims<br>
+that block, not even after <code>Store::gc</code>. <code>ArrayRef::new</code>, <code>new_async</code>,<br>
+<code>new_fixed</code> and <code>new_fixed_async</code> are all affected. <code>StructRef::new</code> and<br>
+<code>ExnRef::new</code> type-check before allocating, so they don't leak.</p>
+<h3>Test Case</h3>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#[test]</span>
+<span class="cp">#[cfg_attr(miri, ignore)]</span>
+<span class="k">fn</span><span class="w"> </span><span class="nf">drc_array_new_type_mismatch_does_not_leak</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">config</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Config</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="w">    </span><span class="n">config</span><span class="p">.</span><span class="n">collector</span><span class="p">(</span><span class="n">Collector</span><span class="p">::</span><span class="n">DeferredReferenceCounting</span><span class="p">);</span>
+<span class="w">    </span><span class="n">config</span><span class="p">.</span><span class="n">gc_heap_initial_size</span><span class="p">(</span><span class="mi">1</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="mi">20</span><span class="p">);</span>
+<span class="w">    </span><span class="n">config</span><span class="p">.</span><span class="n">gc_heap_reservation</span><span class="p">(</span><span class="mi">1</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="mi">20</span><span class="p">);</span>
+<span class="w">    </span><span class="n">config</span><span class="p">.</span><span class="n">gc_heap_may_move</span><span class="p">(</span><span class="kc">false</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">engine</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Engine</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">config</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Store</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span><span class="w"> </span><span class="p">());</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">ty</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ArrayType</span><span class="p">::</span><span class="n">new</span><span class="p">(</span>
+<span class="w">        </span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span>
+<span class="w">        </span><span class="n">FieldType</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">Mutability</span><span class="p">::</span><span class="n">Var</span><span class="p">,</span><span class="w"> </span><span class="n">StorageType</span><span class="p">::</span><span class="n">ValType</span><span class="p">(</span><span class="n">ValType</span><span class="p">::</span><span class="n">I32</span><span class="p">)),</span>
+<span class="w">    </span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">pre</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ArrayRefPre</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="n">ty</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="mi">0</span><span class="o">..</span><span class="mi">1000</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// Wrong element type: fails with "element type mismatch", as expected.</span>
+<span class="w">        </span><span class="fm">assert!</span><span class="p">(</span><span class="n">ArrayRef</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">pre</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">Val</span><span class="p">::</span><span class="n">I64</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span><span class="w"> </span><span class="mi">1000</span><span class="p">).</span><span class="n">is_err</span><span class="p">());</span>
+<span class="w">        </span><span class="n">store</span><span class="p">.</span><span class="n">gc</span><span class="p">(</span><span class="nb">None</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+
+<span class="w">        </span><span class="c1">// A well-typed, immediately-dropped allocation should always fit.</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">scope</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">RootScope</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">store</span><span class="p">);</span>
+<span class="w">        </span><span class="n">ArrayRef</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">scope</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">pre</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">Val</span><span class="p">::</span><span class="n">I32</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span><span class="w"> </span><span class="mi">1000</span><span class="p">)</span>
+<span class="w">            </span><span class="p">.</span><span class="n">map_err</span><span class="p">(</span><span class="o">|</span><span class="n">e</span><span class="o">|</span><span class="w"> </span><span class="n">e</span><span class="p">.</span><span class="n">context</span><span class="p">(</span><span class="fm">format!</span><span class="p">(</span><span class="s">"iteration {i}"</span><span class="p">)))</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3>Steps to Reproduce</h3>
+<p>Add the test above to <code>tests/all/gc.rs</code>, then run:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">cargo</span><span class="w"> </span><span class="n">test</span><span class="w"> </span><span class="o">--</span><span class="n">test</span><span class="w"> </span><span class="n">all</span><span class="w"> </span><span class="o">--</span><span class="w"> </span><span class="n">drc_array_new_type_mismatch_does_not_leak</span>
+</code></pre></div>
+<h3>Expected Results</h3>
+<p>The test passes.</p>
+<h3>Actual Results</h3>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">Error</span><span class="p">:</span><span class="w"> </span><span class="nc">iteration</span><span class="w"> </span><span class="mi">259</span>
+
+<span class="n">Caused</span><span class="w"> </span><span class="n">by</span><span class="p">:</span>
+<span class="w">    </span><span class="nc">GC</span><span class="w"> </span><span class="n">heap</span><span class="w"> </span><span class="n">out</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">memory</span><span class="p">:</span><span class="w"> </span><span class="nc">no</span><span class="w"> </span><span class="n">capacity</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">allocation</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="mi">4028</span><span class="w"> </span><span class="n">bytes</span>
+</code></pre></div>
+<h3>Versions and Environment</h3>
+<p>Wasmtime version or commit: <code>73b04cff33</code></p>
+<p>Operating system: macOS 15.8.1</p>
+<p>Architecture: aarch64<br>
+</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Oct 10 2026 at 17:07 UTC</p>
+</html>

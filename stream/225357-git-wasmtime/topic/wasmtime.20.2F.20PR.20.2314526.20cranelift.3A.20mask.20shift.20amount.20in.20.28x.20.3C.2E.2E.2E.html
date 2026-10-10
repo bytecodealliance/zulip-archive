@@ -1,0 +1,160 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #14526 cranelift: mask shift amount in (x &lt;... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314526.20cranelift.3A.20mask.20shift.20amount.20in.20.28x.20.3C.2E.2E.2E.html">wasmtime / PR #14526 cranelift: mask shift amount in (x &lt;...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="629060550"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314526%20cranelift%3A%20mask%20shift%20amount%20in%20%28x%20%3C.../near/629060550" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314526.20cranelift.3A.20mask.20shift.20amount.20in.20.28x.20.3C.2E.2E.2E.html#629060550">(Oct 04 2026 at 18:09)</a>:</h4>
+<p>kevaundray opened <a href="https://github.com/bytecodealliance/wasmtime/pull/14526">PR #14526</a> from <code>kevaundray:fix-shifts-ishl-shr-out-of-range</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<blockquote>
+<p>Like the other PR, this PR description and commits was generated using AI. Feel free to take the test case and apply a different fix </p>
+</blockquote>
+<h2>Bug</h2>
+<p>In <code>cranelift/codegen/src/opts/shifts.isle</code>, the two rules after <code>;; (x &lt;&lt; N) &gt;&gt; N == x as T_SMALL as T_LARGE</code> compute the narrow type as <code>ty_bits(ty) - N</code> from the <strong>raw</strong> shift constant. CLIF shift amounts are taken modulo the bit width of the shifted type, so <code>iconst.i64 -8</code> shifts an <code>i8</code> by 0, but <code>8 - 0xffff_ffff_ffff_fff8</code> wraps to <code>16</code>. <code>shift_amt_to_type</code> then returns <code>i16</code>, and the rule builds <code>sextend.i8 (ireduce.i16 v0)</code> with <code>v0: i8</code>, which is ill-typed. With <code>opt_level=speed</code> compilation aborts in the verifier, even though the original expression is just <code>v0</code>.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">function</span><span class="w"> </span><span class="o">%</span><span class="n">sshr_ishl_neg8</span><span class="p">(</span><span class="kt">i8</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">i8</span><span class="w"> </span><span class="p">{</span>
+<span class="n">block0</span><span class="p">(</span><span class="n">v0</span><span class="p">:</span><span class="w"> </span><span class="kt">i8</span><span class="p">):</span>
+<span class="w">    </span><span class="nc">v1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">iconst</span><span class="p">.</span><span class="kt">i64</span><span class="w"> </span><span class="o">-</span><span class="mi">8</span>
+<span class="w">    </span><span class="n">v2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ishl</span><span class="w"> </span><span class="n">v0</span><span class="p">,</span><span class="w"> </span><span class="n">v1</span>
+<span class="w">    </span><span class="n">v3</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">sshr</span><span class="w"> </span><span class="n">v2</span><span class="p">,</span><span class="w"> </span><span class="n">v1</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">v3</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The bug affects every target because it's in the mid-end. Other affected amounts: <code>-24</code> on <code>i8</code> (picks <code>i32</code>) and <code>-16</code> on <code>i16</code> (picks <code>i32</code>). The <code>ushr</code> rule builds the same ill-typed <code>uextend (ireduce ..)</code> node. In the tests here, elaboration happens to pick <code>v0</code> from the same e-class, so the bad node never reaches the verifier.</p>
+<h2>Before (commit 1, without the fix)</h2>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">clif</span><span class="o">-</span><span class="n">util</span><span class="w"> </span><span class="n">test</span><span class="w"> </span><span class="n">cranelift</span><span class="o">/</span><span class="n">filetests</span><span class="o">/</span><span class="n">filetests</span><span class="o">/</span><span class="n">egraph</span><span class="o">/</span><span class="n">shifts</span><span class="p">.</span><span class="n">clif</span><span class="w"> </span><span class="n">cranelift</span><span class="o">/</span><span class="n">filetests</span><span class="o">/</span><span class="n">filetests</span><span class="o">/</span><span class="n">runtests</span><span class="o">/</span><span class="n">shift</span><span class="o">-</span><span class="n">left</span><span class="o">-</span><span class="n">right</span><span class="o">-</span><span class="n">same</span><span class="o">-</span><span class="n">amount</span><span class="p">.</span><span class="n">clif</span>
+<span class="n">FAIL</span><span class="w"> </span><span class="n">cranelift</span><span class="o">/</span><span class="n">filetests</span><span class="o">/</span><span class="n">filetests</span><span class="o">/</span><span class="n">egraph</span><span class="o">/</span><span class="n">shifts</span><span class="p">.</span><span class="n">clif</span><span class="p">:</span><span class="w"> </span><span class="nc">optimize</span>
+
+<span class="n">Caused</span><span class="w"> </span><span class="n">by</span><span class="p">:</span>
+<span class="w">    </span><span class="nc">function</span><span class="w"> </span><span class="o">%</span><span class="n">i8_shl_sshr_neg8</span><span class="p">(</span><span class="kt">i8</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">i8</span><span class="w"> </span><span class="nc">fast</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">block0</span><span class="p">(</span><span class="n">v0</span><span class="p">:</span><span class="w"> </span><span class="kt">i8</span><span class="p">):</span>
+<span class="w">        </span><span class="nc">v7</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ireduce</span><span class="p">.</span><span class="kt">i16</span><span class="w"> </span><span class="n">v0</span>
+<span class="w">    </span><span class="p">;</span><span class="w">   </span><span class="o">^~~~~~~~~~~~~~~~~~~</span>
+<span class="w">    </span><span class="p">;</span><span class="w"> </span><span class="n">error</span><span class="p">:</span><span class="w"> </span><span class="nc">inst6</span><span class="w"> </span><span class="p">(</span><span class="n">v7</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ireduce</span><span class="p">.</span><span class="kt">i16</span><span class="w"> </span><span class="n">v0</span><span class="p">):</span><span class="w"> </span><span class="nc">arg</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">(</span><span class="n">v0</span><span class="p">)</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="k">type</span><span class="w"> </span><span class="kt">i8</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">satisfy</span><span class="w"> </span><span class="k">type</span><span class="w"> </span><span class="nc">set</span><span class="w"> </span><span class="n">ValueTypeSet</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="o">..</span><span class="p">.</span><span class="w"> </span><span class="p">}</span>
+
+<span class="w">        </span><span class="n">v8</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">sextend</span><span class="p">.</span><span class="kt">i8</span><span class="w"> </span><span class="n">v7</span>
+<span class="w">    </span><span class="p">;</span><span class="w">   </span><span class="o">^~~~~~~~~~~~~~~~~~</span>
+<span class="w">    </span><span class="p">;</span><span class="w"> </span><span class="n">error</span><span class="p">:</span><span class="w"> </span><span class="nc">inst7</span><span class="w"> </span><span class="p">(</span><span class="n">v8</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">sextend</span><span class="p">.</span><span class="kt">i8</span><span class="w"> </span><span class="n">v7</span><span class="p">):</span><span class="w"> </span><span class="nc">arg</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">(</span><span class="n">v7</span><span class="p">)</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="k">type</span><span class="w"> </span><span class="kt">i16</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">satisfy</span><span class="w"> </span><span class="k">type</span><span class="w"> </span><span class="nc">set</span><span class="w"> </span><span class="n">ValueTypeSet</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="o">..</span><span class="p">.</span><span class="w"> </span><span class="p">}</span>
+
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">v8</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="p">;</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="n">verifier</span><span class="w"> </span><span class="n">errors</span><span class="w"> </span><span class="n">detected</span><span class="w"> </span><span class="p">(</span><span class="n">see</span><span class="w"> </span><span class="n">above</span><span class="p">).</span><span class="w"> </span><span class="n">Compilation</span><span class="w"> </span><span class="n">aborted</span><span class="p">.</span>
+
+<span class="n">FAIL</span><span class="w"> </span><span class="n">cranelift</span><span class="o">/</span><span class="n">filetests</span><span class="o">/</span><span class="n">filetests</span><span class="o">/</span><span class="n">runtests</span><span class="o">/</span><span class="n">shift</span><span class="o">-</span><span class="n">left</span><span class="o">-</span><span class="n">right</span><span class="o">-</span><span class="n">same</span><span class="o">-</span><span class="n">amount</span><span class="p">.</span><span class="n">clif</span><span class="p">:</span><span class="w"> </span><span class="nc">Compilation</span><span class="w"> </span><span class="n">error</span><span class="p">:</span><span class="w"> </span><span class="nc">Verifier</span><span class="w"> </span><span class="n">errors</span>
+
+<span class="n">Caused</span><span class="w"> </span><span class="n">by</span><span class="p">:</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">:</span><span class="w"> </span><span class="nc">Verifier</span><span class="w"> </span><span class="n">errors</span>
+<span class="w">    </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">inst6</span><span class="w"> </span><span class="p">(</span><span class="n">v7</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ireduce</span><span class="p">.</span><span class="kt">i16</span><span class="w"> </span><span class="n">v0</span><span class="p">):</span><span class="w"> </span><span class="nc">arg</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">(</span><span class="n">v0</span><span class="p">)</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="k">type</span><span class="w"> </span><span class="kt">i8</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">satisfy</span><span class="w"> </span><span class="k">type</span><span class="w"> </span><span class="nc">set</span><span class="w"> </span><span class="o">..</span><span class="p">.</span>
+
+<span class="w">       </span><span class="o">-</span><span class="w"> </span><span class="n">inst7</span><span class="w"> </span><span class="p">(</span><span class="n">v8</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">sextend</span><span class="p">.</span><span class="kt">i8</span><span class="w"> </span><span class="n">v7</span><span class="p">):</span><span class="w"> </span><span class="nc">arg</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">(</span><span class="n">v7</span><span class="p">)</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="k">type</span><span class="w"> </span><span class="kt">i16</span><span class="w"> </span><span class="nc">failed</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">satisfy</span><span class="w"> </span><span class="k">type</span><span class="w"> </span><span class="nc">set</span><span class="w"> </span><span class="o">..</span><span class="p">.</span>
+
+<span class="mi">2</span><span class="w"> </span><span class="n">tests</span>
+<span class="n">Error</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="n">failures</span>
+</code></pre></div>
+<p>When each <code>sshr</code> function is run on its own, they fail the same way: <code>-24</code>/<code>i8</code> builds <code>ireduce.i32 v0</code> / <code>sextend.i8</code>, and <code>-16</code>/<code>i16</code> builds <code>ireduce.i32 v0</code> / <code>sextend.i16</code>.</p>
+<h2>After (commit 2)</h2>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">cargo</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="o">-</span><span class="n">p</span><span class="w"> </span><span class="n">cranelift</span><span class="o">-</span><span class="n">tools</span><span class="w"> </span><span class="o">--</span><span class="w"> </span><span class="n">test</span><span class="w"> </span><span class="n">cranelift</span><span class="o">/</span><span class="n">filetests</span><span class="o">/</span><span class="n">filetests</span><span class="o">/</span><span class="n">egraph</span><span class="o">/</span><span class="w"> </span><span class="n">cranelift</span><span class="o">/</span><span class="n">filetests</span><span class="o">/</span><span class="n">filetests</span><span class="o">/</span><span class="n">runtests</span><span class="o">/</span><span class="n">shift</span><span class="o">-</span><span class="n">left</span><span class="o">-</span><span class="n">right</span><span class="o">-</span><span class="n">same</span><span class="o">-</span><span class="n">amount</span><span class="p">.</span><span class="n">clif</span>
+<span class="mi">78</span><span class="w"> </span><span class="n">tests</span>
+
+<span class="cp">$</span><span class="w"> </span><span class="n">clif</span><span class="o">-</span><span class="n">util</span><span class="w"> </span><span class="n">test</span><span class="w"> </span><span class="n">cranelift</span><span class="o">/</span><span class="n">filetests</span><span class="o">/</span><span class="n">filetests</span>
+<span class="mi">1322</span><span class="w"> </span><span class="n">tests</span>
+
+<span class="cp">$</span><span class="w"> </span><span class="n">cargo</span><span class="w"> </span><span class="n">test</span><span class="w"> </span><span class="o">-</span><span class="n">p</span><span class="w"> </span><span class="n">cranelift</span><span class="o">-</span><span class="n">codegen</span>
+<span class="n">test</span><span class="w"> </span><span class="n">result</span><span class="p">:</span><span class="w"> </span><span class="nc">ok</span><span class="p">.</span><span class="w"> </span><span class="mi">201</span><span class="w"> </span><span class="n">passed</span><span class="p">;</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="n">failed</span><span class="p">;</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="n">ignored</span>
+<span class="n">test</span><span class="w"> </span><span class="n">result</span><span class="p">:</span><span class="w"> </span><span class="nc">ok</span><span class="p">.</span><span class="w"> </span><span class="mi">22</span><span class="w"> </span><span class="n">passed</span><span class="p">;</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="n">failed</span><span class="p">;</span><span class="w"> </span><span class="mi">4</span><span class="w"> </span><span class="n">ignored</span>
+</code></pre></div>
+<p>All of these pass on x86_64. The runtest runs natively on x86_64, on the pulley targets and in the interpreter. After the fix, the <code>ushr</code> cases optimize to <code>return v0</code>. The <code>sshr</code> cases leave the shifts by <code>0</code> in place: there is no <code>sshr x, 0</code> simplification, which is a separate issue.<br>
+</p>
+</blockquote>
+
+
+
+<a name="629080154"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314526%20cranelift%3A%20mask%20shift%20amount%20in%20%28x%20%3C.../near/629080154" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314526.20cranelift.3A.20mask.20shift.20amount.20in.20.28x.20.3C.2E.2E.2E.html#629080154">(Oct 04 2026 at 21:16)</a>:</h4>
+<p>github-actions[bot] added the label <code>isle</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14526">PR #14526</a>.</p>
+
+
+
+<a name="629080155"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314526%20cranelift%3A%20mask%20shift%20amount%20in%20%28x%20%3C.../near/629080155" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314526.20cranelift.3A.20mask.20shift.20amount.20in.20.28x.20.3C.2E.2E.2E.html#629080155">(Oct 04 2026 at 21:16)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14526">PR #14526</a>.</p>
+
+
+
+<a name="629080213"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314526%20cranelift%3A%20mask%20shift%20amount%20in%20%28x%20%3C.../near/629080213" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314526.20cranelift.3A.20mask.20shift.20amount.20in.20.28x.20.3C.2E.2E.2E.html#629080213">(Oct 04 2026 at 21:17)</a>:</h4>
+<p>github-actions[bot] <a href="https://github.com/bytecodealliance/wasmtime/pull/14526#issuecomment-5984474997">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14526">PR #14526</a>:</p>
+<blockquote>
+<h4>Subscribe to Label Action</h4>
+<p>cc @avanhatt, @cfallin, @fitzgen, @mmcloughlin</p>
+<p>&lt;details&gt;<br>
+This issue or pull request has been labeled: "cranelift", "isle"</p>
+<p>Thus the following users have been cc'd because of the following labels:</p>
+<ul>
+<li>avanhatt: isle</li>
+<li>cfallin: isle</li>
+<li>fitzgen: isle</li>
+<li>mmcloughlin: isle</li>
+</ul>
+<p>To subscribe or unsubscribe from this label, edit the &lt;code&gt;.github/subscribe-to-label.json&lt;/code&gt; configuration file.</p>
+<p><a href="https://github.com/bytecodealliance/subscribe-to-label-action">Learn more.</a><br>
+&lt;/details&gt;</p>
+</blockquote>
+
+
+
+<a name="629083904"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314526%20cranelift%3A%20mask%20shift%20amount%20in%20%28x%20%3C.../near/629083904" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314526.20cranelift.3A.20mask.20shift.20amount.20in.20.28x.20.3C.2E.2E.2E.html#629083904">(Oct 04 2026 at 21:59)</a>:</h4>
+<p>kevaundray has marked <a href="https://github.com/bytecodealliance/wasmtime/pull/14526">PR #14526</a> as ready for review.</p>
+
+
+
+<a name="629083908"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314526%20cranelift%3A%20mask%20shift%20amount%20in%20%28x%20%3C.../near/629083908" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314526.20cranelift.3A.20mask.20shift.20amount.20in.20.28x.20.3C.2E.2E.2E.html#629083908">(Oct 04 2026 at 21:59)</a>:</h4>
+<p>kevaundray requested <a href="https://github.com/alexcrichton">alexcrichton</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14526">PR #14526</a>.</p>
+
+
+
+<a name="629083910"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314526%20cranelift%3A%20mask%20shift%20amount%20in%20%28x%20%3C.../near/629083910" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314526.20cranelift.3A.20mask.20shift.20amount.20in.20.28x.20.3C.2E.2E.2E.html#629083910">(Oct 04 2026 at 21:59)</a>:</h4>
+<p>kevaundray requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14526">PR #14526</a>.</p>
+
+
+
+<a name="629090658"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314526%20cranelift%3A%20mask%20shift%20amount%20in%20%28x%20%3C.../near/629090658" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314526.20cranelift.3A.20mask.20shift.20amount.20in.20.28x.20.3C.2E.2E.2E.html#629090658">(Oct 04 2026 at 23:22)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14526#pullrequestreview-5408711541">PR review</a>:</p>
+<blockquote>
+<p>Thanks!</p>
+<p>cc @avanhatt and @mmcloughlin for an ISLE opt bug which wasn't caught through verification</p>
+</blockquote>
+
+
+
+<a name="629090675"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314526%20cranelift%3A%20mask%20shift%20amount%20in%20%28x%20%3C.../near/629090675" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314526.20cranelift.3A.20mask.20shift.20amount.20in.20.28x.20.3C.2E.2E.2E.html#629090675">(Oct 04 2026 at 23:22)</a>:</h4>
+<p>alexcrichton added <a href="https://github.com/bytecodealliance/wasmtime/pull/14526">PR #14526 cranelift: mask shift amount in (x &lt;&lt; k) &gt;&gt; k mid-end rules</a> to the merge queue.</p>
+
+
+
+<a name="629092901"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314526%20cranelift%3A%20mask%20shift%20amount%20in%20%28x%20%3C.../near/629092901" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314526.20cranelift.3A.20mask.20shift.20amount.20in.20.28x.20.3C.2E.2E.2E.html#629092901">(Oct 04 2026 at 23:51)</a>:</h4>
+<p><span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span> alexcrichton merged <a href="https://github.com/bytecodealliance/wasmtime/pull/14526">PR #14526</a>.</p>
+
+
+
+<a name="629092904"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314526%20cranelift%3A%20mask%20shift%20amount%20in%20%28x%20%3C.../near/629092904" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314526.20cranelift.3A.20mask.20shift.20amount.20in.20.28x.20.3C.2E.2E.2E.html#629092904">(Oct 04 2026 at 23:51)</a>:</h4>
+<p>alexcrichton removed <a href="https://github.com/bytecodealliance/wasmtime/pull/14526">PR #14526 cranelift: mask shift amount in (x &lt;&lt; k) &gt;&gt; k mid-end rules</a> from the merge queue.</p>
+
+
+
+<hr><p>Last updated: Oct 10 2026 at 17:07 UTC</p>
+</html>

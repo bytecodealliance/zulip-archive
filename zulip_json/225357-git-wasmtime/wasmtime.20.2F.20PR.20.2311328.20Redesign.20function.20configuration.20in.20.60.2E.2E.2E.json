@@ -1,0 +1,122 @@
+[
+    {
+        "content": "<p>alexcrichton opened <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328\">PR #11328</a> from <code>alexcrichton:refactor-bindgen</code> to <code>bytecodealliance:main</code>:</p>\n<blockquote>\n<p>This commit is a redesign of how function-level configuration works in<br>\nWasmtime's <code>bindgen!</code> macro. The main goal of this redesign is to<br>\nbetter support WASIp3 and component model async functions. Prior to this<br>\nredesign there was a mish mash of mechanisms to configure behavior of<br>\nimports/exports:</p>\n<ul>\n<li>\n<p>The <code>async</code> configuration could turn everything async, nothing async,<br>\n  only some imports async, or everything except some imports async.</p>\n</li>\n<li>\n<p>The <code>concurrent_{imports,exports}</code> keys were required to explicitly<br>\n  opt-in to component model async signatures and applied to all<br>\n  imports/exports.</p>\n</li>\n<li>\n<p>The <code>trappable_imports</code> configuration would indicate a list of imports<br>\n  allowed to trap and it had special configuration for everything,<br>\n  nothing, and only a certain list.</p>\n</li>\n<li>\n<p>The <code>tracing</code> and <code>verbose_tracing</code> keys could be applied to either<br>\n  nothing or all functions.</p>\n</li>\n</ul>\n<p>Overall the previous state of configuration in <code>bindgen!</code> was clearly a<br>\nhodgepodge of systems that organically grew over time. In my personal<br>\nopinion it was in dire need of a refresh to take into account how<br>\ncomponent-model-async ended up being implemented as well as<br>\nconsolidating the one-off systems amongst all of these configuration<br>\nkeys. A major motivation of this redesign, for example, was to inherit<br>\nbehavior from WIT files by default. An <code>async</code> function in WIT should<br>\nnot require <code>concurrent_*</code> keys to be configured, but rather it should<br>\ngenerate correct bindings by default.</p>\n<p>In this commit, all of the above keys were removed. All keys have been<br>\nreplaced with <code>imports</code> and <code>exports</code> configuration keys. Each behaves<br>\nthe same way and looks like so:</p>\n<div class=\"codehilite\"><pre><span></span><code>bindgen!({\n    // ...\n    imports: {\n        // enable tracing for just this function\n        &quot;my:local/interface/func&quot;: tracing,\n\n        // enable verbose tracing for just this function\n        &quot;my:local/interface/other-func&quot;: tracing | verbose_tracing,\n\n        // this is blocking in WIT, but generate async bindings for\n        // it\n        &quot;my:local/interface/[method]io.block&quot;: async,\n\n        // like above, but use &quot;concurrent&quot; bindings which have\n        // access to the store.\n        &quot;my:local/interface/[method]io.block-again&quot;: async | store,\n\n        // everything else is, by default, trappable\n        default: trappable,\n    },\n});\n</code></pre></div>\n\n<p>Effectively all the function-level configuration items are now bitflags.<br>\nThese bitflags are by default inherited from the WIT files itself (e.g.<br>\n<code>async</code> functions are <code>async | store</code> by default). Further configuration<br>\nis then layered on top at the desires of the embedder. Supported keys are:</p>\n<ul>\n<li>\n<p><code>async</code> - this means that a Rust-level <code>async</code> function should be<br>\n  generated. This is either <code>CallStyle::Async</code> or<br>\n<code>CallStyle::Concurrent</code> as it was prior, depending on ...</p>\n</li>\n<li>\n<p><code>store</code> - this means that the generated function will have access to<br>\n  the store on the host. This is only implemented right now for <code>async |\n  store</code> functions which map to <code>CallStyle::Concurrent</code>. In the future<br>\n  I'd like to support just-<code>store</code> functions which means that you could<br>\n  define a synchronous function with access to the store in addition to<br>\n  an asynchronous function.</p>\n</li>\n<li>\n<p><code>trappable</code> - this means that the function returns a<br>\n<code>wasmtime::Result&lt;TheWitBindingType&gt;</code>. If <code>trappable_errors</code> is<br>\n  applicable then it means just a <code>Result&lt;TheWitOkType,\n  TrappableErrorType&gt;</code> is returned (like before)</p>\n</li>\n<li>\n<p><code>tracing</code> - this enables <code>tracing!</code> integration for this function.</p>\n</li>\n<li>\n<p><code>verbose_tracing</code> - this logs all argument values for this function<br>\n  (including lists).</p>\n</li>\n<li>\n<p><code>ignore_wit</code> - this ignores the WIT-level defaults of the function<br>\n  (e.g. ignoring WIT <code>async</code>).</p>\n</li>\n</ul>\n<p>The way this then works is all modeled is that for any WIT function<br>\nbeing generated there are a set of flags associated with that function.<br>\nTo calculate the flags the algorithm looks like:</p>\n<ol>\n<li>\n<p>Find the first matching rule in the <code>imports</code> or <code>exports</code> map<br>\n   depending on if the function is imported or exported. If there is no<br>\n   matching rule then use the <code>default</code> rule if present. This is the<br>\n   initial set of flags for the function (or empty if nothing was<br>\n   found).</p>\n</li>\n<li>\n<p>If <code>ignore_wit</code> is present, return the flags from step 1. Otherwise<br>\n   add in <code>async | store</code> if the function is <code>async</code> in WIT.</p>\n</li>\n</ol>\n<p>The resulting set of flags are then used to control how everything is<br>\ngenerated. For example the same split traits of today are still<br>\ngenerated and it's controlled based on the flags. Note though that the<br>\nprevious <code>HostConcurrent</code> trait was renamed to <code>HostWithStore</code> to make<br>\nspace for synchronous functions in this trait in the future too.</p>\n<p>The end result of all these changes is that configuring imports/exports<br>\nnow uses the exact same selection system as the <code>with</code> replacement map,<br>\nmeaning there's only one system of selecting functions instead of 3.<br>\nWIT-level <code>async</code> is now respected by default meaning that bindings work<br>\nby default without further need to configure anything (unless more<br>\nfunctionality is desired).</p>\n<p>One final minor change made here as well is that auto-generated<br>\n<code>instantiate</code> methods are now always synchronous and an<br>\n<code>instantiate_async</code> method is unconditionally generated for async mode.<br>\nThis means that bindings always generate both functions and it's up to<br>\nthe embedder to choose the appropriate one.</p>\n<p>Closes <a href=\"https://github.com/bytecodealliance/wasmtime/issues/11246\">https://github.com/bytecodealliance/wasmtime/issues/11246</a><br>\nCloses <a href=\"https://github.com/bytecodealliance/wasmtime/issues/11247\">https://github.com/bytecodealliance/wasmtime/issues/11247</a></p>\n</blockquote>",
+        "id": 531004161,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753564112
+    },
+    {
+        "content": "<p><strong>alexcrichton</strong> requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-wasi-reviewers\">wasmtime-wasi-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328\">PR #11328</a>.</p>",
+        "id": 531004162,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753564112
+    },
+    {
+        "content": "<p><strong>alexcrichton</strong> requested <a href=\"https://github.com/pchickey\">pchickey</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328\">PR #11328</a>.</p>",
+        "id": 531004165,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753564113
+    },
+    {
+        "content": "<p><strong>alexcrichton</strong> requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers\">wasmtime-core-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328\">PR #11328</a>.</p>",
+        "id": 531004166,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753564113
+    },
+    {
+        "content": "<p><strong>alexcrichton</strong> requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-default-reviewers\">wasmtime-default-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328\">PR #11328</a>.</p>",
+        "id": 531004169,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753564114
+    },
+    {
+        "content": "<p>alexcrichton updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328\">PR #11328</a>.</p>",
+        "id": 531399409,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753716643
+    },
+    {
+        "content": "<p>alexcrichton <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328#issuecomment-3127779611\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328\">PR #11328</a>:</p>\n<blockquote>\n<p>One other large-ish change now here, <code>*WithStore</code> is always generated no matter what. That'll make the generated docs slightly more confusing but I think it's worth the tradeoff of enabling bindings to always assume the trait is there.</p>\n</blockquote>",
+        "id": 531399552,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753716682
+    },
+    {
+        "content": "<p>pchickey submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328#pullrequestreview-3063821967\">PR review</a>:</p>\n<blockquote>\n<p>Thanks, this is a nice improvement!</p>\n</blockquote>",
+        "id": 531417572,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753722272
+    },
+    {
+        "content": "<p>pchickey submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328#pullrequestreview-3063821967\">PR review</a>:</p>\n<blockquote>\n<p>Thanks, this is a nice improvement! In the future I'd probably like it to be <code>tracing</code> or <code>tracing(verbose)</code> instead of another keyword for verbose_tracing, but its not necessary to do that now.</p>\n</blockquote>",
+        "id": 531417801,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753722349
+    },
+    {
+        "content": "<p>dicej submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328#pullrequestreview-3063811303\">PR review</a>.</p>",
+        "id": 531419351,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753722858
+    },
+    {
+        "content": "<p>dicej created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328#discussion_r2237290144\">PR review comment</a>:</p>\n<blockquote>\n<p>Why is this one commented out?</p>\n</blockquote>",
+        "id": 531419353,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753722859
+    },
+    {
+        "content": "<p>dicej created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328#discussion_r2237324791\">PR review comment</a>:</p>\n<blockquote>\n<p>Did you intend to keep this comment-ed out code fragment?</p>\n</blockquote>",
+        "id": 531419354,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753722859
+    },
+    {
+        "content": "<p>dicej created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328#discussion_r2237320174\">PR review comment</a>:</p>\n<blockquote>\n<p><div class=\"codehilite\" data-code-language=\"suggestion\"><pre><span></span><code>        // it's otherwise not necessary to implement it manually.\n</code></pre></div><br>\n</p>\n</blockquote>",
+        "id": 531419355,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753722859
+    },
+    {
+        "content": "<p>alexcrichton submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328#pullrequestreview-3064078611\">PR review</a>.</p>",
+        "id": 531428969,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753725967
+    },
+    {
+        "content": "<p>alexcrichton created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328#discussion_r2237480757\">PR review comment</a>:</p>\n<blockquote>\n<p>Oops, meant to come back and dig in, but it's just unused so needed to be deleted.</p>\n</blockquote>",
+        "id": 531428970,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753725967
+    },
+    {
+        "content": "<p>alexcrichton updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328\">PR #11328</a>.</p>",
+        "id": 531429046,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753725999
+    },
+    {
+        "content": "<p>alexcrichton submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328#pullrequestreview-3064080610\">PR review</a>.</p>",
+        "id": 531429065,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753726006
+    },
+    {
+        "content": "<p>alexcrichton created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328#discussion_r2237481968\">PR review comment</a>:</p>\n<blockquote>\n<p>Oops nah just a forgotten deletion.</p>\n</blockquote>",
+        "id": 531429068,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753726006
+    },
+    {
+        "content": "<p>alexcrichton has enabled auto merge for <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328\">PR #11328</a>.</p>",
+        "id": 531429087,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753726015
+    },
+    {
+        "content": "<p>alexcrichton merged <a href=\"https://github.com/bytecodealliance/wasmtime/pull/11328\">PR #11328</a>.</p>",
+        "id": 531437024,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1753728916
+    }
+]

@@ -1,0 +1,216 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14563 Guest-debug GC root tracing treat... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314563.20Guest-debug.20GC.20root.20tracing.20treat.2E.2E.2E.html">wasmtime / issue #14563 Guest-debug GC root tracing treat...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="629564958"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314563%20Guest-debug%20GC%20root%20tracing%20treat.../near/629564958" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314563.20Guest-debug.20GC.20root.20tracing.20treat.2E.2E.2E.html#629564958">(Oct 06 2026 at 14:33)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/issues/14563#issuecomment-6018561173">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14563">issue #14563</a>:</p>
+<blockquote>
+<p>&lt;details&gt; &lt;summary&gt;Full LLM report&lt;/summary&gt;</p>
+<h1>Guest-debug GC root tracing treats <code>module_start</code>'s stack words as GC roots</h1>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Date</td>
+<td>2026-10-05</td>
+</tr>
+<tr>
+<td>Wasmtime commit</td>
+<td><code>73b04cff3317d1e308866eb24359483ac6116669</code> (<code>main</code>)</td>
+</tr>
+<tr>
+<td>Host</td>
+<td>macOS 15.8.1 (Darwin 24.6.0), <code>aarch64-apple-darwin</code></td>
+</tr>
+<tr>
+<td>Model</td>
+<td>Claude Opus 5.5 (<code>claude-opus-5-5</code>)</td>
+</tr>
+<tr>
+<td>Features</td>
+<td><code>Config::guest_debug(true)</code> / <code>-D guest-debug=y</code>, plus Wasm GC with the <code>copying</code> (default) or <code>drc</code> collector</td>
+</tr>
+<tr>
+<td>Class</td>
+<td>Wrong GC roots: stack corruption (copying), bogus refcount traffic (DRC)</td>
+</tr>
+</tbody>
+</table>
+<h2>Summary</h2>
+<p>When guest debugging is enabled, root tracing asks the guest-debug frame table<br>
+which locals and operand-stack slots of each Wasm frame hold GC refs<br>
+(<code>crates/wasmtime/src/runtime/store/gc.rs:796-803</code> -&gt;<br>
+<code>crate::debug::gc_refs_in_frame</code>, <code>crates/wasmtime/src/runtime/debug.rs:838</code>).<br>
+That lookup goes through <code>FrameTable::find_program_point</code><br>
+(<code>crates/environ/src/frame_table.rs:178-193</code>):</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="n">index</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">match</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">progpoint_pcs</span><span class="p">.</span><span class="n">binary_search_by_key</span><span class="p">(</span><span class="o">&amp;</span><span class="n">key</span><span class="p">,</span><span class="w"> </span><span class="o">..</span><span class="p">.)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(</span><span class="n">idx</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">idx</span><span class="p">,</span>
+<span class="w">    </span><span class="nb">Err</span><span class="p">(</span><span class="n">idx</span><span class="p">)</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">idx</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">idx</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w">   </span><span class="c1">// nearest preceding program point</span>
+<span class="w">    </span><span class="nb">Err</span><span class="p">(</span><span class="n">_</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="nb">None</span><span class="p">,</span>
+<span class="p">};</span>
+</code></pre></div>
+<p>The <code>Err(idx) =&gt; idx - 1</code> fallback never checks that the preceding program<br>
+point belongs to the same function as <code>pc</code>. The compiled <code>module_start</code><br>
+function has no guest-debug program points of its own. It runs global<br>
+initializers, element-segment setup and the start function. So it inherits<br>
+the descriptor of whichever function precedes it in the text section.<br>
+<code>wasmtime objdump --frame-tables</code> shows this.</p>
+<p>When a GC happens while <code>module_start</code> is on the stack, for example when an<br>
+<code>array.new_default</code> in a global initializer exhausts the heap,<br>
+<code>gc_refs_in_frame</code> decodes that unrelated descriptor. It then hands the<br>
+collector FP-relative slots in <code>module_start</code>'s frame that hold arbitrary<br>
+words:</p>
+<ul>
+<li>
+<p><strong>Copying collector (the default):</strong> forwards those words and writes the<br>
+  "new" address back into the native stack, corrupting live state of compiled<br>
+  code.</p>
+</li>
+<li>
+<p><strong>DRC:</strong> treats them as refs and reads or marks whatever object the garbage<br>
+  index names.</p>
+</li>
+</ul>
+<p><code>VirtualFrame::decode</code> (<code>debug.rs:684</code>) uses the same lookup, so the debugger<br>
+API (<code>FrameHandle</code> locals) reports wrong frames and values for these frames<br>
+too.</p>
+<p>No GC-heap corruption or unsafe API is needed. A valid module, a public<br>
+<code>Config</code> option, and <code>Instance::new</code> are enough.</p>
+<h2>Reproduction</h2>
+<p><code>repro.wast</code>: three globals each initialized with a 100000-byte<br>
+<code>array.new_default</code>, and a preceding function with 32 <code>externref</code> locals so<br>
+the borrowed descriptor names many slots.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">target</span><span class="o">/</span><span class="n">debug</span><span class="o">/</span><span class="n">wasmtime</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">W</span><span class="w"> </span><span class="n">gc</span><span class="o">=</span><span class="n">y</span><span class="w"> </span><span class="o">-</span><span class="n">C</span><span class="w"> </span><span class="n">collector</span><span class="o">=</span><span class="n">copying</span><span class="w"> </span><span class="o">-</span><span class="n">D</span><span class="w"> </span><span class="n">guest</span><span class="o">-</span><span class="n">debug</span><span class="o">=</span><span class="n">y</span><span class="w"> </span><span class="n">reports</span><span class="o">/</span><span class="mi">014</span><span class="o">-</span><span class="n">guest</span><span class="o">-</span><span class="n">debug</span><span class="o">-</span><span class="n">stale</span><span class="o">-</span><span class="n">frame</span><span class="o">-</span><span class="n">roots</span><span class="o">/</span><span class="n">repro</span><span class="p">.</span><span class="n">wast</span>
+<span class="n">thread</span><span class="w"> </span><span class="o">'</span><span class="na">main</span><span class="o">'</span><span class="w"> </span><span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">crates</span><span class="o">/</span><span class="n">wasmtime</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">runtime</span><span class="o">/</span><span class="n">vm</span><span class="o">/</span><span class="n">gc</span><span class="o">/</span><span class="n">enabled</span><span class="o">/</span><span class="n">copying</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">1044</span><span class="p">:</span><span class="mi">13</span><span class="p">:</span>
+<span class="nc">assertion</span><span class="w"> </span><span class="n">failed</span><span class="p">:</span><span class="w"> </span><span class="nc">self</span><span class="p">.</span><span class="n">heap</span><span class="p">.</span><span class="n">is_in_idle_space</span><span class="p">(</span><span class="n">old_index</span><span class="p">)</span>
+
+<span class="cp">$</span><span class="w"> </span><span class="n">target</span><span class="o">/</span><span class="n">debug</span><span class="o">/</span><span class="n">wasmtime</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">W</span><span class="w"> </span><span class="n">gc</span><span class="o">=</span><span class="n">y</span><span class="w"> </span><span class="o">-</span><span class="n">C</span><span class="w"> </span><span class="n">collector</span><span class="o">=</span><span class="n">drc</span><span class="w"> </span><span class="o">-</span><span class="n">D</span><span class="w"> </span><span class="n">guest</span><span class="o">-</span><span class="n">debug</span><span class="o">=</span><span class="n">y</span><span class="w"> </span><span class="n">reports</span><span class="o">/</span><span class="mi">014</span><span class="o">-</span><span class="n">guest</span><span class="o">-</span><span class="n">debug</span><span class="o">-</span><span class="n">stale</span><span class="o">-</span><span class="n">frame</span><span class="o">-</span><span class="n">roots</span><span class="o">/</span><span class="n">repro</span><span class="p">.</span><span class="n">wast</span>
+<span class="n">thread</span><span class="w"> </span><span class="o">'</span><span class="na">main</span><span class="o">'</span><span class="w"> </span><span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">crates</span><span class="o">/</span><span class="n">wasmtime</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">runtime</span><span class="o">/</span><span class="n">vm</span><span class="o">/</span><span class="n">gc</span><span class="o">/</span><span class="n">enabled</span><span class="o">/</span><span class="n">drc</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">567</span><span class="p">:</span><span class="mi">13</span><span class="p">:</span>
+<span class="nc">every</span><span class="w"> </span><span class="n">on</span><span class="o">-</span><span class="n">stack</span><span class="w"> </span><span class="n">gc</span><span class="w"> </span><span class="k">ref</span><span class="w"> </span><span class="n">inside</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="n">Wasm</span><span class="w"> </span><span class="n">frame</span><span class="w"> </span><span class="n">should</span><span class="w"> </span><span class="n">have</span><span class="w"> </span><span class="n">be</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">our</span><span class="w"> </span><span class="n">over</span><span class="o">-</span><span class="n">approximated</span>
+<span class="n">stack</span><span class="w"> </span><span class="n">roots</span><span class="w"> </span><span class="n">set</span><span class="p">,</span><span class="w"> </span><span class="n">but</span><span class="w"> </span><span class="mh">0xa8000000</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="n">not</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">set</span>
+</code></pre></div>
+<ul>
+<li>Both commands pass without <code>-D guest-debug=y</code>.</li>
+<li>The null collector passes with or without it, because it never collects.</li>
+<li>The in-tree <code>tests/misc_testsuite/gc/issue-13247.wast</code> fails the same way<br>
+  under <code>-D guest-debug=y</code> with <code>--wasmtime-builtins</code>.</li>
+</ul>
+<p>Rust API (<code>crate/</code>, binary <code>guest_debug_roots</code>), which shows the release-build<br>
+behaviour:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">$</span><span class="w"> </span><span class="n">cd</span><span class="w"> </span><span class="n">reports</span><span class="o">/</span><span class="mi">014</span><span class="o">-</span><span class="n">guest</span><span class="o">-</span><span class="n">debug</span><span class="o">-</span><span class="n">stale</span><span class="o">-</span><span class="n">frame</span><span class="o">-</span><span class="n">roots</span><span class="o">/</span><span class="k">crate</span>
+<span class="cp">$</span><span class="w"> </span><span class="n">cargo</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="o">--</span><span class="n">release</span><span class="w"> </span><span class="o">--</span><span class="n">bin</span><span class="w"> </span><span class="n">guest_debug_roots</span><span class="w"> </span><span class="n">copying</span>
+<span class="n">collector</span><span class="o">=</span><span class="n">Copying</span><span class="w"> </span><span class="n">guest_debug</span><span class="o">=</span><span class="kc">false</span><span class="p">:</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(</span><span class="nb">Ok</span><span class="p">(()))</span>
+<span class="n">collector</span><span class="o">=</span><span class="n">Copying</span><span class="w"> </span><span class="n">guest_debug</span><span class="o">=</span><span class="kc">true</span><span class="p">:</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(</span><span class="nb">Err</span><span class="p">(</span><span class="n">BUG</span><span class="p">:</span><span class="w"> </span><span class="nc">gc</span><span class="w"> </span><span class="n">object</span><span class="w"> </span><span class="n">and</span><span class="o">/</span><span class="n">or</span><span class="w"> </span><span class="n">heap</span><span class="w"> </span><span class="n">misaligned</span><span class="w"> </span><span class="o">..</span><span class="p">.))</span>
+<span class="cp">$</span><span class="w"> </span><span class="n">cargo</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="o">--</span><span class="n">release</span><span class="w"> </span><span class="o">--</span><span class="n">bin</span><span class="w"> </span><span class="n">guest_debug_roots</span><span class="w"> </span><span class="n">drc</span>
+<span class="n">thread</span><span class="w"> </span><span class="o">'</span><span class="na">main</span><span class="o">'</span><span class="w"> </span><span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">crates</span><span class="o">/</span><span class="n">wasmtime</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">runtime</span><span class="o">/</span><span class="n">vm</span><span class="o">/</span><span class="n">gc</span><span class="o">/</span><span class="n">gc_runtime</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">517</span><span class="p">:</span><span class="mi">9</span><span class="p">:</span>
+<span class="nc">collector</span><span class="o">=</span><span class="n">DeferredReferenceCounting</span><span class="w"> </span><span class="n">guest_debug</span><span class="o">=</span><span class="kc">true</span><span class="p">:</span><span class="w"> </span><span class="nb">Err</span><span class="p">(</span><span class="n">Any</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="o">..</span><span class="w"> </span><span class="p">})</span>
+</code></pre></div>
+<p>The release results depend on which stray words happen to be on the stack.<br>
+These two were stable here. Before the collector notices anything, the<br>
+copying collector has already written to the stray stack slots it accepted<br>
+as roots.</p>
+<p><code>observed.txt</code> records the full matrix.</p>
+<h2>Suggested fix</h2>
+<p>Make the frame-table lookup function-boundary aware:</p>
+<ul>
+<li>
+<p>Record each function's text range in the frame table, or check that the<br>
+  matched program point lies inside the function that contains <code>pc</code>.</p>
+</li>
+<li>
+<p>Return no slots for functions that have no program points, such as<br>
+<code>module_start</code> and trampolines.</p>
+</li>
+<li>
+<p>Make <code>VirtualFrame::decode</code> report zero virtual frames for such functions<br>
+  instead of borrowing a neighbour's.</p>
+</li>
+</ul>
+<p>Run the GC <code>misc_testsuite</code> with <code>guest_debug</code> enabled in CI to catch this<br>
+class of bug.</p>
+<p>&lt;/details&gt;</p>
+</blockquote>
+
+
+
+<a name="629565632"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314563%20Guest-debug%20GC%20root%20tracing%20treat.../near/629565632" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314563.20Guest-debug.20GC.20root.20tracing.20treat.2E.2E.2E.html#629565632">(Oct 06 2026 at 14:35)</a>:</h4>
+<p>fitzgen opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14563">issue #14563</a>:</p>
+<blockquote>
+<p>With <code>-D guest-debug=y</code>, GC root tracing looks up frame descriptors via<br>
+<code>FrameTable::find_program_point</code>. When a PC has no exact match, that lookup<br>
+falls back to the previous program point without checking whether it belongs<br>
+to the same function. Functions with no program points of their own, such as<br>
+the compiled <code>module_start</code>, inherit a neighbour's descriptor. A GC during<br>
+global initialization then hands arbitrary stack words to the collector as<br>
+roots, and the copying collector rewrites those stack slots.</p>
+<h3>Test Case</h3>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">type</span> <span class="nv">$a</span> <span class="p">(</span><span class="err">array</span> <span class="p">(</span><span class="k">mut</span> <span class="err">i</span><span class="mi">8</span><span class="p">)))</span>
+  <span class="p">(</span><span class="k">global</span> <span class="nv">$g1</span> <span class="p">(</span><span class="err">ref</span> <span class="nv">$a</span><span class="p">)</span> <span class="p">(</span><span class="err">array.new_default</span> <span class="nv">$a</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mf">100000</span><span class="p">)))</span>
+  <span class="p">(</span><span class="k">global</span> <span class="nv">$g2</span> <span class="p">(</span><span class="err">ref</span> <span class="nv">$a</span><span class="p">)</span> <span class="p">(</span><span class="err">array.new_default</span> <span class="nv">$a</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mf">100000</span><span class="p">)))</span>
+  <span class="p">(</span><span class="k">global</span> <span class="nv">$g3</span> <span class="p">(</span><span class="err">ref</span> <span class="nv">$a</span><span class="p">)</span> <span class="p">(</span><span class="err">array.new_default</span> <span class="nv">$a</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mf">100000</span><span class="p">)))</span>
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">local</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span>
+               <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span>
+               <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span>
+               <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span> <span class="err">externref</span><span class="p">))</span>
+<span class="p">)</span>
+</code></pre></div>
+<h3>Steps to Reproduce</h3>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">wasmtime</span><span class="w"> </span><span class="n">wast</span><span class="w"> </span><span class="o">-</span><span class="n">W</span><span class="w"> </span><span class="n">gc</span><span class="o">=</span><span class="n">y</span><span class="w"> </span><span class="o">-</span><span class="n">C</span><span class="w"> </span><span class="n">collector</span><span class="o">=</span><span class="n">copying</span><span class="w"> </span><span class="o">-</span><span class="n">D</span><span class="w"> </span><span class="n">guest</span><span class="o">-</span><span class="n">debug</span><span class="o">=</span><span class="n">y</span><span class="w"> </span><span class="n">test</span><span class="p">.</span><span class="n">wast</span>
+</code></pre></div>
+<h3>Expected Results</h3>
+<p>The module instantiates successfully, just as it does without<br>
+<code>-D guest-debug=y</code>.</p>
+<h3>Actual Results</h3>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">thread</span><span class="w"> </span><span class="o">'</span><span class="na">main</span><span class="o">'</span><span class="w"> </span><span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">crates</span><span class="o">/</span><span class="n">wasmtime</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">runtime</span><span class="o">/</span><span class="n">vm</span><span class="o">/</span><span class="n">gc</span><span class="o">/</span><span class="n">enabled</span><span class="o">/</span><span class="n">copying</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">1044</span><span class="p">:</span><span class="mi">13</span><span class="p">:</span>
+<span class="nc">assertion</span><span class="w"> </span><span class="n">failed</span><span class="p">:</span><span class="w"> </span><span class="nc">self</span><span class="p">.</span><span class="n">heap</span><span class="p">.</span><span class="n">is_in_idle_space</span><span class="p">(</span><span class="n">old_index</span><span class="p">)</span>
+</code></pre></div>
+<p>With <code>-C collector=drc</code>:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">thread</span><span class="w"> </span><span class="o">'</span><span class="na">main</span><span class="o">'</span><span class="w"> </span><span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">crates</span><span class="o">/</span><span class="n">wasmtime</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">runtime</span><span class="o">/</span><span class="n">vm</span><span class="o">/</span><span class="n">gc</span><span class="o">/</span><span class="n">enabled</span><span class="o">/</span><span class="n">drc</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">567</span><span class="p">:</span><span class="mi">13</span><span class="p">:</span>
+<span class="nc">every</span><span class="w"> </span><span class="n">on</span><span class="o">-</span><span class="n">stack</span><span class="w"> </span><span class="n">gc</span><span class="w"> </span><span class="k">ref</span><span class="w"> </span><span class="n">inside</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="n">Wasm</span><span class="w"> </span><span class="n">frame</span><span class="w"> </span><span class="n">should</span><span class="w"> </span><span class="n">have</span><span class="w"> </span><span class="n">be</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">our</span><span class="w"> </span><span class="n">over</span><span class="o">-</span><span class="n">approximated</span><span class="w"> </span><span class="n">stack</span><span class="w"> </span><span class="n">roots</span><span class="w"> </span><span class="n">set</span><span class="p">,</span><span class="w"> </span><span class="n">but</span><span class="w"> </span><span class="mh">0xa8000000</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="n">not</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">set</span>
+</code></pre></div>
+<p>Release builds give <code>BUG: gc object and/or heap misaligned</code> with the copying<br>
+collector, and panic in <code>GcHeap::index_mut</code> with DRC.</p>
+<h3>Versions and Environment</h3>
+<p>Wasmtime version or commit: <code>73b04cff33</code></p>
+<p>Operating system: macOS 15.8.1</p>
+<p>Architecture: aarch64<br>
+</p>
+</blockquote>
+
+
+
+<a name="629565641"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314563%20Guest-debug%20GC%20root%20tracing%20treat.../near/629565641" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314563.20Guest-debug.20GC.20root.20tracing.20treat.2E.2E.2E.html#629565641">(Oct 06 2026 at 14:35)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the wasmtime:debugging label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14563">Issue #14563</a>.</p>
+
+
+
+<a name="629565643"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314563%20Guest-debug%20GC%20root%20tracing%20treat.../near/629565643" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314563.20Guest-debug.20GC.20root.20tracing.20treat.2E.2E.2E.html#629565643">(Oct 06 2026 at 14:35)</a>:</h4>
+<p><a href="https://github.com/fitzgen">fitzgen</a> added the wasm-proposal:gc label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14563">Issue #14563</a>.</p>
+
+
+
+<a name="630297852"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314563%20Guest-debug%20GC%20root%20tracing%20treat.../near/630297852" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314563.20Guest-debug.20GC.20root.20tracing.20treat.2E.2E.2E.html#630297852">(Oct 09 2026 at 01:02)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14563">Issue #14563</a>.</p>
+
+
+
+<hr><p>Last updated: Oct 10 2026 at 17:07 UTC</p>
+</html>
