@@ -1,0 +1,98 @@
+[
+    {
+        "content": "<p>I'm working on streaming file contents read from wasi:fs and passed out to wasi:http and I noticed that the throughput was pretty slow even though by forwarding the WASI stream, my guest code shouldn't be in the byte-serving path. I was getting about 261 MB/s on my server vs 3.4 GB/s for Python serving a random 64 MB file.</p>\n<p>It seems like the issue might be the 8k DEFAULT_BUFFER_CAPACITY. I had an agent run a benchmark against different values, and got these results:</p>\n<table>\n<thead>\n<tr>\n<th>read size</th>\n<th>64 MB</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td>8 KiB (stock)</td>\n<td>245 ms</td>\n</tr>\n<tr>\n<td>64 KiB</td>\n<td>31 ms</td>\n</tr>\n<tr>\n<td>128 KiB</td>\n<td>23 ms</td>\n</tr>\n<tr>\n<td>256 KiB</td>\n<td>16 ms</td>\n</tr>\n<tr>\n<td>512 KiB</td>\n<td>13 ms</td>\n</tr>\n<tr>\n<td>1 MiB</td>\n<td>11.5 ms</td>\n</tr>\n</tbody>\n</table>\n<p>There's not currently a way for an embedder to directly change the buffer size, but you can accomplish that by overriding <code>read-via-stream</code> (as an agent did for me here: <a href=\"https://github.com/elematic/zena/pull/324\">https://github.com/elematic/zena/pull/324</a>).</p>\n<p>Would it be worth a way to allow an embedder to easily change this, and/or increasing the default value?</p>\n<p>I'd also be interesting in a way to set buffer sizes from guest code, but that would be a WASI question.</p>",
+        "id": 631392758,
+        "sender_full_name": "Justin Fagnani",
+        "timestamp": 1791911544
+    },
+    {
+        "content": "<p>I would be pretty skeptical of letting a guest set its own buffer sizes, as the guest is inherently untrusted</p>\n<p>that said, I don't see any reason not to the embedder to customize this, but also the WASI implementation is the area of the codebase that I am least familiar with. perhaps <span class=\"user-mention\" data-user-id=\"253992\">@Pat Hickey</span> could say more</p>",
+        "id": 631401195,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1791913517
+    },
+    {
+        "content": "<p>Thats the p3 implementation which I'm actually not familiar with, will have to pass that off to <span class=\"user-mention\" data-user-id=\"484032\">@Roman Volosatovs</span> or <span class=\"user-mention\" data-user-id=\"447400\">@Adam Bratschi-Kaye (he)</span></p>",
+        "id": 631402173,
+        "sender_full_name": "Pat Hickey",
+        "timestamp": 1791913715
+    },
+    {
+        "content": "<p>we have made some attempt to make those buffer limits settable by the embedder elsewhere, but we may have done an imperfect job, and in general we are open to letting the host set that</p>",
+        "id": 631402373,
+        "sender_full_name": "Pat Hickey",
+        "timestamp": 1791913758
+    },
+    {
+        "content": "<p>basically the trade off is how much host space a guest can consume, which can be a DoS vector, so theres not really a one size fits all</p>",
+        "id": 631402546,
+        "sender_full_name": "Pat Hickey",
+        "timestamp": 1791913798
+    },
+    {
+        "content": "<p>Could the guest possibly supply a hint? The guest might have some idea of the type of workload it's dealing with.  I settled on 256 KB for my embedder, but I don't have reason to think that's a universally good setting.</p>",
+        "id": 631407770,
+        "sender_full_name": "Justin Fagnani",
+        "timestamp": 1791914889
+    },
+    {
+        "content": "<p>the host can permit up to any size, and the guest can opt into using as much as it wants to, so idk what a hint could do here</p>",
+        "id": 631413123,
+        "sender_full_name": "Pat Hickey",
+        "timestamp": 1791916013
+    },
+    {
+        "content": "<p>The guest can't request a specific buffer size yet, so that would be the hint. It'd be a hint if the host doesn't promise to use that size.</p>",
+        "id": 631416923,
+        "sender_full_name": "Justin Fagnani",
+        "timestamp": 1791916930
+    },
+    {
+        "content": "<p>Something like:</p>\n<div class=\"codehilite\" data-code-language=\"wit\"><pre><span></span><code>read-via-stream: func(offset: filesize, buffer-size: option&lt;u32&gt;) -&gt; tuple&lt;stream&lt;u8&gt;, future&lt;result&lt;_, error-code&gt;&gt;&gt;;\n</code></pre></div>",
+        "id": 631418401,
+        "sender_full_name": "Justin Fagnani",
+        "timestamp": 1791917298
+    },
+    {
+        "content": "<p>That would need to be proposed as a change to the WASI interface which would be trickier. It seems to me that it's more natural for the embedder to control the buffer size anyway, especially because it can be aware of what else is going on in the system and how the stream is being read. For your use case, why is guest configuration preferable to embedder configuration?</p>",
+        "id": 631422613,
+        "sender_full_name": "Adam Bratschi-Kaye (he)",
+        "timestamp": 1791918373
+    },
+    {
+        "content": "<p>Because the guest might know the size of files it's typically dealing in. You don't need a 1MB buffer for small files.</p>",
+        "id": 631424346,
+        "sender_full_name": "Justin Fagnani",
+        "timestamp": 1791918803
+    },
+    {
+        "content": "<p>True, but the host also knows the actual file size, right?</p>",
+        "id": 631424645,
+        "sender_full_name": "Adam Bratschi-Kaye (he)",
+        "timestamp": 1791918884
+    },
+    {
+        "content": "<p>fwiw I also think that we should do something meaningfully larger than 8kb here: I've run into this as a meaningful perf issue as well.</p>\n<p>Ideally we'd let the guest set buffer sizes, but make it easy to enforce overall memory limits that capture host allocations together with guest memory + table sizes and all that</p>",
+        "id": 631442982,
+        "sender_full_name": "Till Schneidereit",
+        "timestamp": 1791923591
+    },
+    {
+        "content": "<p>I agree though that auto-sizing buffers on the host works in many cases, including files, but also http bodies if <code>content-length</code> is set</p>",
+        "id": 631443174,
+        "sender_full_name": "Till Schneidereit",
+        "timestamp": 1791923643
+    },
+    {
+        "content": "<p>Should I file an issue, and can I make a starter PR to make DEFAULT_BUFFER_CAPACITY override-able by embedders?</p>",
+        "id": 631676130,
+        "sender_full_name": "Justin Fagnani",
+        "timestamp": 1791989393
+    },
+    {
+        "content": "<p>Making <code>DEFAULT_BUFFER_CAPACITY</code> configurable by embedders definitely makes sense to me, and I think it would be the lowest-hanging fruit providing the biggest immediate benefit.</p>\n<p>If I understand this correctly, we're in the host&lt;-&gt;host case, where the <code>wasi:filesystem</code> producer is streamed to a <code>wasi:http</code> consumer. If the other side were the guest, the host would know the guest's buffer capacity and could do what's optimal, however in this case the buffer is preallocated using <code>DEFAULT_BUFFER_CAPACITY</code>, so ultimately I think we want the consumer to be able to say how many elements it needs, rather than having the producer use an arbitrary value. In some sense I think we want this to behave more like <a href=\"https://docs.rs/tokio/latest/tokio/io/trait.AsyncRead.html\">https://docs.rs/tokio/latest/tokio/io/trait.AsyncRead.html</a></p>\n<p>In other words, we'd need <a href=\"https://github.com/bytecodealliance/wasmtime/blob/3c4c9651687c4c9abd1ad6333a1b0416c0ac76fc/crates/wasmtime/src/runtime/component/concurrent/futures_and_streams.rs#L399-L417\">https://github.com/bytecodealliance/wasmtime/blob/3c4c9651687c4c9abd1ad6333a1b0416c0ac76fc/crates/wasmtime/src/runtime/component/concurrent/futures_and_streams.rs#L399-L417</a> to return a value for host consumers as well, although I'm not sure we'd want to structure the API that way</p>\n<p>Long term, I think we want to make <code>DEFAULT_BUFFER_CAPACITY</code> redundant altogether in this case (although we'd still want a configurable cap)</p>\n<p>IIRC we actually discussed this a while back with <span class=\"user-mention\" data-user-id=\"509936\">@Joel Dice</span></p>",
+        "id": 632325724,
+        "sender_full_name": "Roman Volosatovs",
+        "timestamp": 1792170799
+    }
+]

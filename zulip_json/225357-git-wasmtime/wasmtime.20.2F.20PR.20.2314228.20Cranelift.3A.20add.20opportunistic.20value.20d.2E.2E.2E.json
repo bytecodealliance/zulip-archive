@@ -1,0 +1,278 @@
+[
+    {
+        "content": "<p>cfallin opened <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a> from <code>cfallin:opportunistic-value-defs</code> to <code>bytecodealliance:main</code>:</p>\n<blockquote>\n<p>Add a new lowering primitive, an \"opportunistic def\", which allows a lowering that incidentally computes another value to register that value for possible later use. When the backward scan reaches the value's actual definition, if the use-count has not grown (no further uses appeared while scanning up), the definition can be skipped entirely and the value aliased to the opportunistically-computed regs.</p>\n<p>Also add a <code>value_used</code> helper that reports whether a value still has uses, allowing skipping of some part of a lowering when not needed.</p>\n<p>With these two features available in the lowering environment, this PR then adds new lowerings for brif-of-<code>uadd_overflow</code>, and bare <code>uadd_overflow</code>, on x86-64 and aarch64:</p>\n<ul>\n<li>\n<p>When <code>uadd_overflow</code>'s overflow flag is used as a branch condition, the branch directly uses flags produced by the <code>add</code> instruction, skipping (slow and verbose) materialization of the bool overflow flag into a GPR.</p>\n<p>If the sum is only used past the branch, then this <code>add</code> also produces that value; so only one <code>add</code> is ever emitted. Thus a <code>add; SETcc; test; jnz</code> sequence turns into (x64) <code>add; jb</code> / (aarch64) <code>adds; b.hs</code>.</p>\n<p>If the sum is used below the <code>uadd_overflow</code> but above the branch, another <code>add</code> is <em>also</em> emitted. That's fine: adds are cheap; cheaper certainly than materializing flags with <code>SETcc</code> or <code>CSET</code>.</p>\n<p>But to optimize that case further...</p>\n</li>\n<li>\n<p>...when <code>uadd_overflow</code> is <em>only</em> used for its sum, and not its overflow flag, we now emit an <code>add</code> without a <code>SETcc</code>.</p>\n</li>\n</ul>\n<p>As a result of these lowerings, the case <code>v1, v2 = uadd_overflow ...; brif v2, ...</code> lowers to <code>add; jb</code>, and the case <code>v1, v2 = uadd_overflow ...; (use v1); brif v2, ...</code> lowers to <code>add; (use sum); add; jb</code>. The <em>only</em> remaining case where we use a slow <code>SETcc</code> is when the bool result is actually materialized and used as an integer value; or if the add and branch are pushed into separate blocks.</p>\n<p>This resolves the same issue as #13919, following discussion in that PR and the Cranelift weekly meeting. In particular, (i) we do not build an ad-hoc separate scan (this mechanism works as part of the main lowering/instruction-selection scan); and (ii) we are resilient to instructions placed between the <code>uadd_overflow</code> and branch, which is likely to happen due to egraph demand-based elaboration, and which foils a simpler peephole-based approach.</p>\n<p>&lt;!--<br>\nPlease make sure you include the following information:</p>\n<ul>\n<li>\n<p>If this work has been discussed elsewhere, please include a link to that<br>\n  conversation. If it was discussed in an issue, just mention \"issue #...\".</p>\n</li>\n<li>\n<p>Explain why this change is needed. If the details are in an issue already,<br>\n  this can be brief.</p>\n</li>\n</ul>\n<p>Our development process is documented in the Wasmtime book:<br>\n<a href=\"https://docs.wasmtime.dev/contributing-development-process.html\">https://docs.wasmtime.dev/contributing-development-process.html</a></p>\n<p>Please review the Bytecode Alliance's AI tool usage policy at<br>\n<a href=\"https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md\">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>\n<p>Please ensure all communication follows the code of conduct:<br>\n<a href=\"https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md\">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>\n--&gt;</p>\n</blockquote>",
+        "id": 619888374,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787949268
+    },
+    {
+        "content": "<p>cfallin requested <a href=\"https://github.com/alexcrichton\">alexcrichton</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>.</p>",
+        "id": 619888377,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787949269
+    },
+    {
+        "content": "<p>cfallin requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers\">wasmtime-compiler-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>.</p>",
+        "id": 619888379,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787949269
+    },
+    {
+        "content": "<p>cfallin <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#issuecomment-5457488344\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>:</p>\n<blockquote>\n<p>(This has been on my TODO list for a long time; sorry about the delay, @playX18, but hopefully this addresses your use-case!)</p>\n</blockquote>",
+        "id": 619888457,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787949304
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> alexcrichton submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#pullrequestreview-5055002893\">PR review</a>:</p>\n<blockquote>\n<p>Seems reasonable to me! Question on this: would it be possible to somehow determine, before fusing this into a branch, if the opportunistic def is going to be thrown away and re-calculated? For something like an addition it seems probably fine to always duplicate that, but for something like a multiplication it might be better to never duplicate that given its latency. (maybe? unsure). Basically it seems to me like a reasonable heuristic here would be to only fuse into branches where the opportunistic def actually works as the def, and in all other cases fall back to materializing the flag and then testing it later. </p>\n<p>Although now that I actually write this down what I'm going for is to put the onus on CLIF producers to make sure the flag-and-branch are close together such that the opportunistic def always matches. In some sense that's no different from this PR as-is where it's still on them to do that to avoid the double-translate if it matters... Anyway, still curious on the question at least as a data point</p>\n</blockquote>",
+        "id": 619893095,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787951224
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> alexcrichton created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#discussion_r3883972785\">PR review comment</a>:</p>\n<blockquote>\n<p>Would it be possible to fold this into <code>is_nonzero_cmp</code> instead of having a rule specifically for <code>brif</code>? That'd then additionally handle the condition flowing intp a <code>trapz</code>, <code>trapnz</code>, and <code>select</code> all at the same time. If this does work, could this be done for x64 too?</p>\n</blockquote>",
+        "id": 619893096,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787951224
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> alexcrichton created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#discussion_r3883980619\">PR review comment</a>:</p>\n<blockquote>\n<p>Is this rule needed for the codegen tests that were added, or was this opportunistically added mostly to prove this out?</p>\n<p>Additionally, could this skip using <code>adds</code> and just use <code>add</code> instead? If so I think the <code>ConsumesFlagsNop</code> infrastructure can be removed.</p>\n</blockquote>",
+        "id": 619893097,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787951224
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> alexcrichton created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#discussion_r3884024946\">PR review comment</a>:</p>\n<blockquote>\n<p>Additionally, since we might want to use this for a number of other things, could a new helper like <code>produces_flags_with_opportunistic_def</code> be added? That'd internally then use <code>produces_flags_get_reg</code>, call <code>opportunistic_def</code>, and then return a <code>ProducesFlags</code> created with <code>produces_flags_ignore</code>. Basically factoring out the boilerplate-y parts of this if possible</p>\n</blockquote>",
+        "id": 619893098,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787951224
+    },
+    {
+        "content": "<p>cfallin requested <a href=\"https://github.com/pchickey\">pchickey</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>.</p>",
+        "id": 619898074,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787953547
+    },
+    {
+        "content": "<p>cfallin requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers\">wasmtime-core-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>.</p>",
+        "id": 619898075,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787953547
+    },
+    {
+        "content": "<p>cfallin updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>.</p>",
+        "id": 619898076,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787953548
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> cfallin submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#pullrequestreview-5055330765\">PR review</a>.</p>",
+        "id": 619898083,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787953553
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> cfallin created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#discussion_r3884253519\">PR review comment</a>:</p>\n<blockquote>\n<p>Yes, this is what handles the \"intermediate user\" case (and removes the unused <code>SETcc</code>). But yeah great point, I dunno why I kept that bit (copy+paste I guess); this is really just a plain old add. Updated!</p>\n</blockquote>",
+        "id": 619898084,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787953554
+    },
+    {
+        "content": "<p>cfallin <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#issuecomment-5458109640\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>:</p>\n<blockquote>\n<blockquote>\n<p>Seems reasonable to me! Question on this: would it be possible to somehow determine, before fusing this into a branch, if the opportunistic def is going to be thrown away and re-calculated? For something like an addition it seems probably fine to always duplicate that, but for something like a multiplication it might be better to never duplicate that given its latency. (maybe? unsure). Basically it seems to me like a reasonable heuristic here would be to only fuse into branches where the opportunistic def actually works as the def, and in all other cases fall back to materializing the flag and then testing it later.</p>\n<p>Although now that I actually write this down what I'm going for is to put the onus on CLIF producers to make sure the flag-and-branch are close together such that the opportunistic def always matches. In some sense that's no different from this PR as-is where it's still on them to do that to avoid the double-translate if it matters... Anyway, still curious on the question at least as a data point</p>\n</blockquote>\n<p>Unfortunately we can't really know \"the future\" during the backward lowering scan (or, well, we could, but that would be a separate scan). The conclusion I came to is that it's way simpler to build this opportunistic mechanism and just let the lowering fire twice if there is actually a user in the block in between the add and branch.</p>\n<p>I also address this with \"If the sum is used below the uadd_overflow but above the branch, another add is also emitted. That's fine: adds are cheap; cheaper certainly than materializing flags with SETcc or CSET.\", I think: what we get here is actually still cheaper than what you're asking for (strictly one fewer instruction -- <code>add; add; branch</code> rather than <code>add; setcc; test; branch</code>; and the <code>setcc</code> is slow).</p>\n</blockquote>",
+        "id": 619898354,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787953690
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> cfallin submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#pullrequestreview-5055497496\">PR review</a>.</p>",
+        "id": 619902236,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787955516
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> cfallin created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#discussion_r3884403344\">PR review comment</a>:</p>\n<blockquote>\n<p>I played with this a bit, but IMHO it's not really that much simpler to fold this into <code>ProducesFlags</code>. It requires pulling apart all the pieces from the original inst anyway and stuffing them into the <code>ProducesFlags</code> (the other result value, the emitted result from the <code>adds</code>) and requires thinking about the emission combinations with various <code>ConsumesFlags</code>. Arguably more brittle, and distributes the logic over a larger area. In other words I don't think it actually avoids any boilerplate, it just explodes it into shards of boiler iron embedded in the walls...</p>\n</blockquote>",
+        "id": 619902238,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787955517
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> cfallin submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#pullrequestreview-5055501688\">PR review</a>.</p>",
+        "id": 619902324,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787955574
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> cfallin created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#discussion_r3884407153\">PR review comment</a>:</p>\n<blockquote>\n<p>(Happy to tackle this or see someone else tackle this in a followup of course if there are more ideas here -- but maybe good to get the building blocks in first regardless?)</p>\n</blockquote>",
+        "id": 619902326,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787955574
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>cranelift</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>.</p>",
+        "id": 619911467,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787960677
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>cranelift:area:machinst</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>.</p>",
+        "id": 619911468,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787960678
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>cranelift:area:aarch64</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>.</p>",
+        "id": 619911469,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787960678
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>cranelift:area:x64</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>.</p>",
+        "id": 619911470,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787960678
+    },
+    {
+        "content": "<p>alexcrichton <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#issuecomment-5479880532\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>:</p>\n<blockquote>\n<blockquote>\n<p>but for something like a multiplication it might be better to never duplicate that given its latency</p>\n</blockquote>\n<p>Do you have thoughts on this?</p>\n<p>Also something else I was thinking of recently, if an  operation is loop-invariant we'd previously calculate it once outside of a loop and then reuse the flags/result within the loop, but now this'll force the arguments to the opertion to stay live for the entire loop. That in theory could add to register pressure which could have knock-on effects beyond the cost of the operation itself.</p>\n<p>Maybe a heuristic that could be added is that the brif folding only happens when the flag brif is consuming was defined in the same basic block as the brif itself? That doesn't fully eliminate the double-translation but might help ward off pathological loop-like cases and I believe should also be pretty easy to implement.</p>\n</blockquote>",
+        "id": 620337674,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788186864
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> alexcrichton submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#pullrequestreview-5067758333\">PR review</a>.</p>",
+        "id": 620339346,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788187180
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> alexcrichton created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#discussion_r3895468487\">PR review comment</a>:</p>\n<blockquote>\n<p>Sorry but to clarify, which comment are you responding to of mine? The <code>is_nonzero_cmp</code> part or the <code>produces_flags_with_opportunistic_def</code> part?</p>\n<p>For the helper part, to clarify I'm not asking for what I believe is anything too invovled, brittle, or fancy here. I'm envisioning:</p>\n<div class=\"codehilite\" data-code-language=\"Diff\"><pre><span></span><code><span class=\"gh\">diff --git a/cranelift/codegen/src/isa/aarch64/lower.isle b/cranelift/codegen/src/isa/aarch64/lower.isle</span>\n<span class=\"gh\">index 10a1f01c31..aca4ee5e12 100644</span>\n<span class=\"gd\">--- a/cranelift/codegen/src/isa/aarch64/lower.isle</span>\n<span class=\"gi\">+++ b/cranelift/codegen/src/isa/aarch64/lower.isle</span>\n<span class=\"gu\">@@ -3170,10 +3170,14 @@</span>\n<span class=\"w\"> </span>                       (second_result\n<span class=\"w\"> </span>                        uadd_inst @ (uadd_overflow (ty_32_or_64 ty) x y)) _ _) (two_targets taken not_taken))\n<span class=\"w\"> </span>        (if-let (first_result v1) uadd_inst)\n<span class=\"gd\">-        (let ((producer ProducesFlags (alu_rrr_with_flags_paired ty x y (ALUOp.AddS)))</span>\n<span class=\"gd\">-              (sum Reg (produces_flags_get_reg producer))</span>\n<span class=\"gd\">-              (_ Unit (opportunistic_def v1 sum)))</span>\n<span class=\"gd\">-          (emit_side_effect (br_cond_result (CondResult.Cond (produces_flags_ignore producer) (Cond.Hs)) taken not_taken))))</span>\n<span class=\"gi\">+        (let ((producer ProducesFlags (alu_rrr_with_flags_paired ty x y (ALUOp.AddS))))</span>\n<span class=\"gi\">+          (emit_side_effect (br_cond_result (CondResult.Cond (produces_flags_with_opportunistic_def v1 producer) (Cond.Hs)) taken not_taken))))</span>\n<span class=\"gi\">+</span>\n<span class=\"gi\">+(decl produces_flags_with_opportunistic_def (Value ProducesFlags) ProducesFlags)</span>\n<span class=\"gi\">+(rule (produces_flags_with_opportunistic_def val producer)</span>\n<span class=\"gi\">+  (let ((def Reg (produces_flags_get_reg producer))</span>\n<span class=\"gi\">+         (_ Unit (opportunistic_def val def)))</span>\n<span class=\"gi\">+    (produces_flags_ignore producer)))</span>\n\n<span class=\"w\"> </span>;; Helper to emit a branching instruction based on  a `CondResult`\n<span class=\"w\"> </span>(decl br_cond_result (CondResult MachLabel MachLabel) SideEffectNoResult)\n</code></pre></div>\n<p>Personally I think a helper like that when other instances of this are added for subtract-with-overflow and multiply-with-overflow as it's less to juggle and duplicate across rules.</p>\n</blockquote>",
+        "id": 620339349,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788187180
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> cfallin submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#pullrequestreview-5068128902\">PR review</a>.</p>",
+        "id": 620353864,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788189588
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> cfallin created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#discussion_r3895783791\">PR review comment</a>:</p>\n<blockquote>\n<p>Ah, OK, I was trying to push the side-effects all to the <code>with_flags</code> emitter; so the opportunistic def itself would occur only when used. Cleaner in some sense but also exploded in complexity. I'll try to push this direction instead, thanks!</p>\n</blockquote>",
+        "id": 620353868,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788189588
+    },
+    {
+        "content": "<p>cfallin <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#issuecomment-5480450651\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>:</p>\n<blockquote>\n<blockquote>\n<blockquote>\n<p>but for something like a multiplication it might be better to never duplicate that given its latency</p>\n</blockquote>\n<p>Do you have thoughts on this?</p>\n</blockquote>\n<p>Yep, agreed; this PR doesn't do the thing for multiply-with-overflow and IMHO it's probably good to keep it that way.</p>\n<blockquote>\n<p>Also something else I was thinking of recently, if an operation is loop-invariant we'd previously calculate it once outside of a loop and then reuse the flags/result within the loop, but now this'll force the arguments to the opertion to stay live for the entire loop. That in theory could add to register pressure which could have knock-on effects beyond the cost of the operation itself.</p>\n<p>Maybe a heuristic that could be added is that the brif folding only happens when the flag brif is consuming was defined in the same basic block as the brif itself? That doesn't fully eliminate the double-translation but might help ward off pathological loop-like cases and I believe should also be pretty easy to implement.</p>\n</blockquote>\n<p>Yeah, this is an interesting tradeoff space, and unfortunately is NP-hard. Basically what you're asking is can we combine instruction selection and regalloc to be aware of each other with their cost heuristics, i.e. don't fuse or choose different instructions if it would result in register pressure; there are PhD theses on this (see e.g. <a href=\"https://www.csd.cs.cmu.edu/sites/default/files/phd-thesis/CMU-CS-09-157.pdf\">David Koes from CMU</a>).</p>\n<p>What I would say is that example-driven thinking I think will not necessarily lead us to a globally optimal place here; for any heuristic we come up with, we can come up with a counterexample. (For example: the same-block-only heuristic is brittle in the face of code motion or CFG edits that might otherwise be totally reasonable: GVN hoisting a common add that occurs in two sub-branches; or, a CLIF-level edge splitting that a producer might do; or ...)</p>\n<p>I think that if we want to relitigate instruction fusion in general, we should have the discussion at a high level and evaluate it objectively. Experience has shown so far that a \"maximal\" instruction fusion approach generally results in better code and perf. Someone else is welcome to run experiments changing these heuristics globally and see what it does on Sightglass; naively I'd expect some negative movement but we'd have to see.</p>\n</blockquote>",
+        "id": 620353935,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788189599
+    },
+    {
+        "content": "<p>cfallin edited a <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#issuecomment-5480450651\">comment</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>:</p>\n<blockquote>\n<blockquote>\n<blockquote>\n<p>but for something like a multiplication it might be better to never duplicate that given its latency</p>\n</blockquote>\n<p>Do you have thoughts on this?</p>\n</blockquote>\n<p>Yes -- this PR doesn't do the thing for multiply-with-overflow and IMHO it's probably good to keep it that way.</p>\n<blockquote>\n<p>Also something else I was thinking of recently, if an operation is loop-invariant we'd previously calculate it once outside of a loop and then reuse the flags/result within the loop, but now this'll force the arguments to the opertion to stay live for the entire loop. That in theory could add to register pressure which could have knock-on effects beyond the cost of the operation itself.</p>\n<p>Maybe a heuristic that could be added is that the brif folding only happens when the flag brif is consuming was defined in the same basic block as the brif itself? That doesn't fully eliminate the double-translation but might help ward off pathological loop-like cases and I believe should also be pretty easy to implement.</p>\n</blockquote>\n<p>Yeah, this is an interesting tradeoff space, and unfortunately is NP-hard. Basically what you're asking is can we combine instruction selection and regalloc to be aware of each other with their cost heuristics, i.e. don't fuse or choose different instructions if it would result in register pressure; there are PhD theses on this (see e.g. <a href=\"https://www.csd.cs.cmu.edu/sites/default/files/phd-thesis/CMU-CS-09-157.pdf\">David Koes from CMU</a>).</p>\n<p>What I would say is that example-driven thinking I think will not necessarily lead us to a globally optimal place here; for any heuristic we come up with, we can come up with a counterexample. (For example: the same-block-only heuristic is brittle in the face of code motion or CFG edits that might otherwise be totally reasonable: GVN hoisting a common add that occurs in two sub-branches; or, a CLIF-level edge splitting that a producer might do; or ...)</p>\n<p>I think that if we want to relitigate instruction fusion in general, we should have the discussion at a high level and evaluate it objectively. Experience has shown so far that a \"maximal\" instruction fusion approach generally results in better code and perf. Someone else is welcome to run experiments changing these heuristics globally and see what it does on Sightglass; naively I'd expect some negative movement but we'd have to see.</p>\n</blockquote>",
+        "id": 620354076,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788189618
+    },
+    {
+        "content": "<p>alexcrichton <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#issuecomment-5480725750\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>:</p>\n<blockquote>\n<p>Sorry I think I'm being misinterpreted, I'm not asking for intertwining regalloc and instruction selection as I'm familiar with how you've said a number of times historically that it's basically not practical. I'm additionally not asking to relitigate anything here.</p>\n<p>What I'm trying to poke at is that this change isn't being made in isolation, but I view this as a solution to the problem of fusing oveflow-producing things with conditional branches. This is one of a possible number of ways to solve this, and in reviewing this I'm pointing out how I don't believe that this is a universal solution as-is. For example I understand you're not proposing adding multiplication here, and nor am I proposing that multiplication be added here. Despite that though I want to point out that I'm not sure it would make sense to use this infrastructure to add multiplication handling because of the risk of duplicating instructions and the latency of multiplication.</p>\n<p>In terms of evaluation, the original PR <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13919\">https://github.com/bytecodealliance/wasmtime/pull/13919</a> here points to <a href=\"#narrow/channel/217117-cranelift/topic/Overflow.20flag.20is.20not.20used.20for.20branches.3F/with/553870163\">this zulip conversation</a> which was specifically about multiplication overflow for example. In the spirit of objective evaluation, should this perhaps be benchmarked in the context of the original project to see how much this helps things? Not by you @cfallin but @playX18 would you be able to help out benchmarking this change? I'd be surprised if Sightglass were set up to take advantage of these new lowering rules since wasm doesn't really use <code>*_overflow</code> instructions.</p>\n<p>In the absence of benchmarks I agree I don't know how best to evaluate this -- is duplication of the <code>add</code> always the right option, or are there edge cases that would push the heursitics in a different direction? Is the same-block-definition rule too brittle to miss out on enough optimizations, or does it cover most of the intended use cases? I'm not sure myself...</p>\n</blockquote>",
+        "id": 620361161,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788190912
+    },
+    {
+        "content": "<p>cfallin <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#issuecomment-5480893602\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>:</p>\n<blockquote>\n<blockquote>\n<p>In the absence of benchmarks I agree I don't know how best to evaluate this -- is duplication of the add always the right option, or are there edge cases that would push the heursitics in a different direction? Is the same-block-definition rule too brittle to miss out on enough optimizations, or does it cover most of the intended use cases? I'm not sure myself...</p>\n</blockquote>\n<p>Right, and I'm claiming that this is itself relitigating our consensus on instruction fusion (whether or not you mean to). It's true in <em>far more</em> cases than just here that fusing producer instructions into consumers can extend liveranges.[^1] We've accepted this, and we've generally seen better code as a result.</p>\n<p>The unique bit here is that we potentially codegen <code>add</code> twice (as we do for other kinds of flag producers, too, BTW -- every use of an <code>icmp</code> that fuses will codegen a <code>cmp</code>, which uses the same ALU as <code>add</code>). But that's already addressed by the argument above that the dynamic instruction path length is actually shorter with this PR: <code>add; add; jo</code> for the case with use-in-the-middle is <em>strictly better</em> than <code>add; seto; test; jnz</code>.</p>\n<blockquote>\n<p>I don't believe that this is a universal solution as-is.</p>\n</blockquote>\n<p>Nothing is, I believe; that's the frustrating bit about compilers! :-)</p>\n<hr>\n<p>[^1]: For a simple example: on aarch64, we can fuse shifts and extends into addressing modes. If someone else <em>also</em> uses the result of the shift/extend directly, we'll <em>also</em> codegen that op separately. That's fine; ALU ops are cheap; doing better is (again) an NP-hard weighted-set-cover problem. The idea of \"maximal munch\" (Muchnick book's term) is that it's a pretty good heuristic on average.</p>\n</blockquote>",
+        "id": 620365328,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788191743
+    },
+    {
+        "content": "<p>alexcrichton <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#issuecomment-5481184973\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>:</p>\n<blockquote>\n<p>Ok I see what you mean yeah, and I think it's fine to set aside the double-translation issue. I'd still like to see if it's possible to integrate with <code>is_nonzero_cmp</code>, though, and poking through the genesis of the feature request shows that this may not actually solve the original request as it was via multiplication, but that doesn't mean that this can't land separately. (although the point about maybe-lowering-two-<code>mul</code>-is-net-worse I feel is still open)</p>\n</blockquote>",
+        "id": 620372344,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788193180
+    },
+    {
+        "content": "<p>cfallin <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#issuecomment-5481424728\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>:</p>\n<blockquote>\n<blockquote>\n<p>this may not actually solve the original request as it was via multiplication</p>\n</blockquote>\n<p>FWIW, thinking about it some more, we <em>could</em> include <code>*mul_overflow</code> too, with the following reasoning: it's a separate opcode, so it's allowed to have a separate cost profile. And \"will be exactly as cheap as a normal multiply <em>as long as</em> you don't also use it between the op and the branch-on-overflow\" seems like a reasonable rule. Keeping in mind that the not-fused case has a cost on the materialized overflow path as well, the matrix is:</p>\n<ul>\n<li>no fusion, no in-the-middle use of product output: 4 insts, 6 cycles (<code>mul; seto; test; jnz</code>)</li>\n<li>no fusion, in-the-middle use of product output: 4 insts, 6 cycles min, partial register stall(*) (<code>mul; seto; ...; test; jnz</code>)</li>\n<li>fusion, no in-the-middle use of product output: 2 insts, 4 cycles (<code>mul; jo</code>)</li>\n<li>fusion, in-the-middle use of product output: 3 insts, 7 cycles (<code>mul; ...; mul; jo</code>)</li>\n</ul>\n<p>(*) partial register stall: <code>seto %al</code> (or any 8-bit reg) has an input dependency on whatever was previously in that register, since the upper 56 bits are unchanged; so it potentially waits longer in the OoO scheduling for that previous producer to finish, even though it's unused by the <code>test %al, %al</code> later.</p>\n<p>So it seems <em>almost always</em> better to me to do the fusion; (i) the producer can know the cost profile, (ii) it's a big win in the good case, (iii) it's 1 cycle penalty in the bad case, still avoids the unknown partial-register stall penalty, and it's still statically shorter code.</p>\n</blockquote>",
+        "id": 620377716,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788194399
+    },
+    {
+        "content": "<p>alexcrichton <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#issuecomment-5482199595\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>:</p>\n<blockquote>\n<p>Oh I sort of naively expected multiplication to be 50-100 cycles, if it's just 3 then it seems fine to me to lump it in the same bucket as adds</p>\n</blockquote>",
+        "id": 620395630,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788198298
+    },
+    {
+        "content": "<p>cfallin updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>.</p>",
+        "id": 620468728,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788216555
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> cfallin submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#pullrequestreview-5072151371\">PR review</a>.</p>",
+        "id": 620469215,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788216721
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> cfallin created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#discussion_r3899124204\">PR review comment</a>:</p>\n<blockquote>\n<p>OK, pushed it all to the produces/consumes-flags mechanism, including the side-effect itself (emitted by <code>with_flags</code>), which turns out to be needed to make the nice folding work with a flags consumer that also consumes the other value (e.g., <code>uadd_overflow</code> + <code>select</code> -- hypothetically useful for a saturating add?), because of the ordering of the opportunistic def + processing of args in the outermost consumer.</p>\n</blockquote>",
+        "id": 620469217,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788216721
+    },
+    {
+        "content": "<p>cfallin <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#issuecomment-5485860687\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>:</p>\n<blockquote>\n<p>Updated all, but I'll push a <code>umul</code>/<code>smul</code> case too.</p>\n<p>Also the deeper surgery to <code>ProducesFlags</code> from review feedback meant I had to go (one-level-)recursive, and now I need to fix verification -- TBD, hopefully not too bad.</p>\n</blockquote>",
+        "id": 620469480,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788216815
+    },
+    {
+        "content": "<p>cfallin updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>.</p>",
+        "id": 620471896,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788217608
+    },
+    {
+        "content": "<p><span aria-label=\"thumbs up\" class=\"emoji emoji-1f44d\" role=\"img\" title=\"thumbs up\">:thumbs_up:</span> alexcrichton submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#pullrequestreview-5072273772\">PR review</a>:</p>\n<blockquote>\n<p>Oh I'd be fine with what I sketched to avoid more <code>ProducesFlags</code> variants, but if you feel this is better that seems ok too</p>\n</blockquote>",
+        "id": 620472831,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788217924
+    },
+    {
+        "content": "<p>cfallin <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#issuecomment-5486044258\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>:</p>\n<blockquote>\n<p>Yeah, I went further with putting the effect inside <code>with_flags</code> once I saw the <code>uadd_overflow</code> + <code>select</code> case have an extra <code>add</code>; we really should be able to do that (and now we do). It's a one-time cost and the proper framework solution so I'm fine with it now that it's done :-)</p>\n</blockquote>",
+        "id": 620473206,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788218052
+    },
+    {
+        "content": "<p>cfallin <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228#issuecomment-5486331375\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>:</p>\n<blockquote>\n<p>OK, actually I'll do muls in a separate PR -- they're getting kind of nontrivial (new variants since the sequences are not just a <code>mul</code> + branch). I'll go ahead and merge this now on your r+ -- thanks!</p>\n</blockquote>",
+        "id": 620477753,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788219706
+    },
+    {
+        "content": "<p>cfallin has enabled auto merge for <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>.</p>",
+        "id": 620477760,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788219708
+    },
+    {
+        "content": "<p>cfallin added <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228 Cranelift: add opportunistic value defs, use for <code>uadd_overflow</code> + <code>brif</code> folds.</a> to the merge queue</p>",
+        "id": 620477957,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788219777
+    },
+    {
+        "content": "<p><span aria-label=\"check\" class=\"emoji emoji-2705\" role=\"img\" title=\"check\">:check:</span> cfallin merged <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228</a>.</p>",
+        "id": 620525094,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788237358
+    },
+    {
+        "content": "<p>cfallin removed <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14228\">PR #14228 Cranelift: add opportunistic value defs, use for <code>uadd_overflow</code> + <code>brif</code> folds.</a> from the merge queue</p>",
+        "id": 620525096,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788237358
+    }
+]

@@ -1,0 +1,110 @@
+[
+    {
+        "content": "<p>adamrk opened <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14633\">PR #14633</a> from <code>adamrk:abk/http-tokio-task-ownership</code> to <code>bytecodealliance:main</code>:</p>\n<blockquote>\n<p>Cancel tokio tasked spawned by <code>wasi-http</code> after the corresponding <code>Store</code> is dropped (with a 10 second configurable grace period). Otherwise tokio would keep handling these connections indefinitely in the background with no way to stop them and reclaim the resources.<br>\n</p>\n</blockquote>",
+        "id": 630503606,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1791571000
+    },
+    {
+        "content": "<p>adamrk requested <a href=\"https://github.com/rvolosatovs\">rvolosatovs</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14633\">PR #14633</a>.</p>",
+        "id": 630503610,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1791571001
+    },
+    {
+        "content": "<p>adamrk requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-wasi-reviewers\">wasmtime-wasi-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14633\">PR #14633</a>.</p>",
+        "id": 630503611,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1791571001
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> rvolosatovs submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14633#pullrequestreview-5507929329\">PR review</a>:</p>\n<blockquote>\n<p>Thanks for working on this! Making sure tasks don't outlive their <code>Store</code> makes sense to me, but I think the current structure is heavier than it needs to be. Each request now goes through <code>wasmtime_wasi::runtime::AbortOnDropJoinHandle</code>, <code>DelayedAbortOnDropHandle</code>, a oneshot, a timer task that is always spawned, and a <code>Store</code>-spawned future, plus the <code>Arc&lt;AbortOnDropHandle&gt;</code> references.</p>\n<p>Could we use plain tokio types instead, and spawn the timer only when the <code>Store</code> is actually dropped while the task is still running? Something like (LLM-generated):</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"k\">struct</span><span class=\"w\"> </span><span class=\"nc\">StoreDropGuard</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">    </span><span class=\"n\">abort</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">AbortHandle</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"n\">grace</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">Duration</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"n\">rt</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">tokio</span><span class=\"p\">::</span><span class=\"n\">runtime</span><span class=\"p\">::</span><span class=\"n\">Handle</span><span class=\"p\">,</span>\n<span class=\"p\">}</span>\n\n<span class=\"k\">impl</span><span class=\"w\"> </span><span class=\"nb\">Drop</span><span class=\"w\"> </span><span class=\"k\">for</span><span class=\"w\"> </span><span class=\"n\">StoreDropGuard</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">    </span><span class=\"k\">fn</span><span class=\"w\"> </span><span class=\"nf\">drop</span><span class=\"p\">(</span><span class=\"o\">&amp;</span><span class=\"k\">mut</span><span class=\"w\"> </span><span class=\"bp\">self</span><span class=\"p\">)</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">        </span><span class=\"k\">if</span><span class=\"w\"> </span><span class=\"bp\">self</span><span class=\"p\">.</span><span class=\"n\">abort</span><span class=\"p\">.</span><span class=\"n\">is_finished</span><span class=\"p\">()</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">            </span><span class=\"k\">return</span><span class=\"p\">;</span>\n<span class=\"w\">        </span><span class=\"p\">}</span>\n<span class=\"w\">        </span><span class=\"k\">if</span><span class=\"w\"> </span><span class=\"bp\">self</span><span class=\"p\">.</span><span class=\"n\">grace</span><span class=\"p\">.</span><span class=\"n\">is_zero</span><span class=\"p\">()</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">            </span><span class=\"bp\">self</span><span class=\"p\">.</span><span class=\"n\">abort</span><span class=\"p\">.</span><span class=\"n\">abort</span><span class=\"p\">();</span>\n<span class=\"w\">            </span><span class=\"k\">return</span><span class=\"p\">;</span>\n<span class=\"w\">        </span><span class=\"p\">}</span>\n<span class=\"w\">        </span><span class=\"kd\">let</span><span class=\"w\"> </span><span class=\"n\">abort</span><span class=\"w\"> </span><span class=\"o\">=</span><span class=\"w\"> </span><span class=\"bp\">self</span><span class=\"p\">.</span><span class=\"n\">abort</span><span class=\"p\">.</span><span class=\"n\">clone</span><span class=\"p\">();</span>\n<span class=\"w\">        </span><span class=\"kd\">let</span><span class=\"w\"> </span><span class=\"n\">grace</span><span class=\"w\"> </span><span class=\"o\">=</span><span class=\"w\"> </span><span class=\"bp\">self</span><span class=\"p\">.</span><span class=\"n\">grace</span><span class=\"p\">;</span>\n<span class=\"w\">        </span><span class=\"bp\">self</span><span class=\"p\">.</span><span class=\"n\">rt</span><span class=\"p\">.</span><span class=\"n\">spawn</span><span class=\"p\">(</span><span class=\"k\">async</span><span class=\"w\"> </span><span class=\"k\">move</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">            </span><span class=\"n\">tokio</span><span class=\"p\">::</span><span class=\"n\">time</span><span class=\"p\">::</span><span class=\"n\">sleep</span><span class=\"p\">(</span><span class=\"n\">grace</span><span class=\"p\">).</span><span class=\"k\">await</span><span class=\"p\">;</span>\n<span class=\"w\">            </span><span class=\"n\">abort</span><span class=\"p\">.</span><span class=\"n\">abort</span><span class=\"p\">();</span>\n<span class=\"w\">        </span><span class=\"p\">});</span>\n<span class=\"w\">    </span><span class=\"p\">}</span>\n<span class=\"p\">}</span>\n\n<span class=\"kd\">let</span><span class=\"w\"> </span><span class=\"n\">task</span><span class=\"w\"> </span><span class=\"o\">=</span><span class=\"w\"> </span><span class=\"n\">tokio</span><span class=\"p\">::</span><span class=\"n\">task</span><span class=\"p\">::</span><span class=\"n\">spawn</span><span class=\"p\">(</span><span class=\"k\">async</span><span class=\"w\"> </span><span class=\"k\">move</span><span class=\"w\"> </span><span class=\"p\">{</span><span class=\"w\"> </span><span class=\"cm\">/* … */</span><span class=\"w\"> </span><span class=\"p\">});</span>\n<span class=\"kd\">let</span><span class=\"w\"> </span><span class=\"n\">abort</span><span class=\"w\"> </span><span class=\"o\">=</span><span class=\"w\"> </span><span class=\"n\">task</span><span class=\"p\">.</span><span class=\"n\">abort_handle</span><span class=\"p\">();</span>\n<span class=\"kd\">let</span><span class=\"w\"> </span><span class=\"n\">io</span><span class=\"w\"> </span><span class=\"o\">=</span><span class=\"w\"> </span><span class=\"n\">Arc</span><span class=\"p\">::</span><span class=\"n\">new</span><span class=\"p\">(</span><span class=\"n\">AbortOnDropHandle</span><span class=\"p\">(</span><span class=\"n\">abort</span><span class=\"p\">.</span><span class=\"n\">clone</span><span class=\"p\">()));</span>\n<span class=\"kd\">let</span><span class=\"w\"> </span><span class=\"n\">guard</span><span class=\"w\"> </span><span class=\"o\">=</span><span class=\"w\"> </span><span class=\"n\">StoreDropGuard</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">    </span><span class=\"n\">abort</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">abort</span><span class=\"p\">.</span><span class=\"n\">clone</span><span class=\"p\">(),</span>\n<span class=\"w\">    </span><span class=\"n\">grace</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"n\">rt</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">tokio</span><span class=\"p\">::</span><span class=\"n\">runtime</span><span class=\"p\">::</span><span class=\"n\">Handle</span><span class=\"p\">::</span><span class=\"n\">current</span><span class=\"p\">(),</span>\n<span class=\"p\">};</span>\n<span class=\"n\">store</span>\n<span class=\"w\">    </span><span class=\"p\">.</span><span class=\"n\">spawn</span><span class=\"p\">(</span><span class=\"k\">async</span><span class=\"w\"> </span><span class=\"k\">move</span><span class=\"w\"> </span><span class=\"o\">|</span><span class=\"n\">_</span><span class=\"o\">|</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">        </span><span class=\"kd\">let</span><span class=\"w\"> </span><span class=\"n\">_guard</span><span class=\"w\"> </span><span class=\"o\">=</span><span class=\"w\"> </span><span class=\"n\">guard</span><span class=\"p\">;</span>\n<span class=\"w\">        </span><span class=\"k\">if</span><span class=\"w\"> </span><span class=\"kd\">let</span><span class=\"w\"> </span><span class=\"nb\">Err</span><span class=\"p\">(</span><span class=\"n\">e</span><span class=\"p\">)</span><span class=\"w\"> </span><span class=\"o\">=</span><span class=\"w\"> </span><span class=\"n\">task</span><span class=\"p\">.</span><span class=\"k\">await</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">            </span><span class=\"k\">if</span><span class=\"w\"> </span><span class=\"o\">!</span><span class=\"n\">e</span><span class=\"p\">.</span><span class=\"n\">is_cancelled</span><span class=\"p\">()</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">                </span><span class=\"n\">debug</span><span class=\"o\">!</span><span class=\"p\">(</span><span class=\"o\">?</span><span class=\"n\">e</span><span class=\"p\">,</span><span class=\"w\"> </span><span class=\"s\">\"`send_request` I/O task panicked\"</span><span class=\"p\">);</span>\n<span class=\"w\">            </span><span class=\"p\">}</span>\n<span class=\"w\">        </span><span class=\"p\">}</span>\n<span class=\"w\">        </span><span class=\"nb\">Ok</span><span class=\"p\">(())</span>\n<span class=\"w\">    </span><span class=\"p\">})</span>\n<span class=\"w\">    </span><span class=\"p\">.</span><span class=\"n\">map_err</span><span class=\"p\">(</span><span class=\"o\">|</span><span class=\"n\">e</span><span class=\"o\">|</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">        </span><span class=\"n\">abort</span><span class=\"p\">.</span><span class=\"n\">abort</span><span class=\"p\">();</span>\n<span class=\"w\">        </span><span class=\"n\">HttpError</span><span class=\"p\">::</span><span class=\"n\">trap</span><span class=\"p\">(</span><span class=\"n\">e</span><span class=\"p\">)</span>\n<span class=\"w\">    </span><span class=\"p\">})</span><span class=\"o\">?</span><span class=\"p\">;</span>\n</code></pre></div>\n<p>This would:</p>\n<ul>\n<li>remove the timer task and oneshot that are currently created for every request,</li>\n<li>avoid the panic on cancellation, since we never poll the WASI <code>AbortOnDropJoinHandle</code> wrapper,</li>\n<li>abort immediately if <code>store.spawn</code> fails,</li>\n<li>capture the runtime <code>Handle</code> up front, since the <code>Store</code> may be dropped outside of a Tokio context.</li>\n</ul>\n<p>This still does not address the issue with guest forwarding the body back to the host, though, so it seems like we have to add a way to opt-out of this mechanism for that particular case.</p>\n</blockquote>",
+        "id": 631419221,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1791917490
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> rvolosatovs created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14633#discussion_r4262396344\">PR review comment</a>:</p>\n<blockquote>\n<p>I think that plain <code>tokio::spawn</code> was a better fit here, since it avoids the panic</p>\n</blockquote>",
+        "id": 631419223,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1791917491
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> rvolosatovs created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14633#discussion_r4262277352\">PR review comment</a>:</p>\n<blockquote>\n<p>I don't think this is necessary, since this code would always run in Tokio anyway</p>\n</blockquote>",
+        "id": 631419224,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1791917491
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> rvolosatovs created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14633#discussion_r4262451001\">PR review comment</a>:</p>\n<blockquote>\n<p>This is probably too long for a unit test, could we shorten the outer timeout and use the <code>set_spawned_task_shutdown_grace_period</code> with something smaller than 10s ?</p>\n</blockquote>",
+        "id": 631419225,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1791917491
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> rvolosatovs created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14633#discussion_r4262336602\">PR review comment</a>:</p>\n<blockquote>\n<p>this may panic if the task is cancelled, because of this line <a href=\"https://github.com/bytecodealliance/wasmtime/blob/3d5851be67f079041331b27f492ed6f561c7976e/crates/wasi/src/runtime.rs#L81\">https://github.com/bytecodealliance/wasmtime/blob/3d5851be67f079041331b27f492ed6f561c7976e/crates/wasi/src/runtime.rs#L81</a></p>\n<p>We should probably await the inner handle here instead</p>\n</blockquote>",
+        "id": 631419226,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1791917491
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> rvolosatovs created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14633#discussion_r4262414901\">PR review comment</a>:</p>\n<blockquote>\n<p>if <code>store.spawn</code> fails, then the task keeps running for <code>shutdown_timeout</code>, since it's already spawned at L243, which is probably not what we want.</p>\n</blockquote>",
+        "id": 631419227,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1791917491
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> rvolosatovs created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14633#discussion_r4262441290\">PR review comment</a>:</p>\n<blockquote>\n<p>could we get that already on L171 avoiding a repeated <code>store.with</code>?</p>\n</blockquote>",
+        "id": 631419228,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1791917491
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> rvolosatovs created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14633#discussion_r4262381774\">PR review comment</a>:</p>\n<blockquote>\n<p>This would crash the whole store, meaning all instances using this store would be aborted - I don't think that's what we want.</p>\n</blockquote>",
+        "id": 631419230,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1791917491
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> rvolosatovs created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14633#discussion_r4262476797\">PR review comment</a>:</p>\n<blockquote>\n<p>This does not work for proxy components where the guest forwards the response body to the host unchanged. In that case the body must outlive the store.<br>\nAFAIK being able to efficiently hand over an HTTP body to the host is a desirable feature.</p>\n</blockquote>",
+        "id": 631419231,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1791917491
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> rvolosatovs created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14633#discussion_r4262511317\">PR review comment</a>:</p>\n<blockquote>\n<p><div class=\"codehilite\" data-code-language=\"suggestion\"><pre><span></span><code>            // will all hold references to an abort handle on the task\n</code></pre></div><br>\n</p>\n</blockquote>",
+        "id": 631419232,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1791917492
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> rvolosatovs created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14633#discussion_r4262513151\">PR review comment</a>:</p>\n<blockquote>\n<p><div class=\"codehilite\" data-code-language=\"suggestion\"><pre><span></span><code>            // not retain ownership of the task, so they cannot keep it alive\n</code></pre></div><br>\n</p>\n</blockquote>",
+        "id": 631419234,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1791917492
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> rvolosatovs created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14633#discussion_r4262570283\">PR review comment</a>:</p>\n<blockquote>\n<p>In case where the host constructs the request and this task is aborted by the timeout, this line is never reached and the receiver gets DROPPED_FUTURE_ERROR, is that intended?</p>\n</blockquote>",
+        "id": 631419235,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1791917492
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> rvolosatovs created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14633#discussion_r4262672557\">PR review comment</a>:</p>\n<blockquote>\n<p>nit; are these renames required to make this work? if not, could we avoid them to make the diff simpler to review?</p>\n</blockquote>",
+        "id": 631419236,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1791917492
+    },
+    {
+        "content": "<p>adamrk <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14633#issuecomment-6194949428\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14633\">PR #14633</a>:</p>\n<blockquote>\n<p>Closing in favor of <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14743\">https://github.com/bytecodealliance/wasmtime/pull/14743</a></p>\n</blockquote>",
+        "id": 631982029,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792075787
+    },
+    {
+        "content": "<p><span aria-label=\"cross mark\" class=\"emoji emoji-274c\" role=\"img\" title=\"cross mark\">:cross_mark:</span> adamrk closed without merge <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14633\">PR #14633</a>.</p>",
+        "id": 631982030,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792075787
+    }
+]

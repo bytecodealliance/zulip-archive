@@ -1,0 +1,392 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14671 `VMContext` layout misaligns `fun... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314671.20.60VMContext.60.20layout.20misaligns.20.60fun.2E.2E.2E.html">wasmtime / issue #14671 `VMContext` layout misaligns `fun...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="631064143"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314671%20%60VMContext%60%20layout%20misaligns%20%60fun.../near/631064143" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314671.20.60VMContext.60.20layout.20misaligns.20.60fun.2E.2E.2E.html#631064143">(Oct 12 2026 at 17:16)</a>:</h4>
+<p>elliekorn opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14671">issue #14671</a>:</p>
+<blockquote>
+<h3>Test Case</h3>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="err">tag</span> <span class="nv">$e</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span><span class="p">))</span>
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"identity"</span><span class="p">)</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="p">(</span><span class="nb">local.get</span> <span class="mi">0</span><span class="p">))</span>
+<span class="p">)</span>
+</code></pre></div>
+<p>Nothing throws and no exception opcode is executed - merely <em>defining</em> a tag is<br>
+enough.</p>
+<h3>Steps to Reproduce</h3>
+<ul>
+<li>
+<p>Create a binary crate depending on <code>wasmtime</code> (path or git dependency at the<br>
+  commit below) with the <code>gc</code> and <code>gc-drc</code> features:<br>
+<code>toml
+  [dependencies]
+  wasmtime = { path = "../wasmtime/crates/wasmtime", features = ["gc", "gc-drc"] }
+  </code></p>
+</li>
+<li>
+<p><code>src/main.rs</code>:<br>
+<code>rust
+  use wasmtime::*;
+  const WAT: &amp;str = r#"
+  (module
+    (tag $e (param i32))
+    (func (export "identity") (param i32) (result i32)
+      (local.get 0))
+  )
+  "#;
+  fn main() -&gt; Result&lt;()&gt; {
+      let mut config = Config::new();
+      config.wasm_exceptions(true);
+      let engine = Engine::new(&amp;config)?;
+      let module = Module::new(&amp;engine, WAT)?;
+      let mut store: Store&lt;()&gt; = Store::new(&amp;engine, ());
+      let instance = Linker::&lt;()&gt;::new(&amp;engine).instantiate(&amp;mut store, &amp;module)?;
+      let f = instance.get_typed_func::&lt;i32, i32&gt;(&amp;mut store, "identity")?;
+      assert_eq!(f.call(&amp;mut store, 7)?, 7);
+      Ok(())
+  }
+  </code></p>
+</li>
+<li>
+<p>Build and run with a debug-assertions <code>std</code>. The <code>ptr::write</code> alignment check<br>
+  sits behind <code>#[cfg(debug_assertions)]</code> inside <code>core</code>, so a plain <code>cargo run</code><br>
+  against the prebuilt release <code>std</code> does <strong>not</strong> catch this; <code>std</code> has to be<br>
+  rebuilt:<br>
+<code>sh
+  cargo +nightly run -Zbuild-std=std,panic_abort --target x86_64-unknown-linux-gnu
+  </code><br>
+  (Reproduced here with stable 1.98.1 and <code>RUSTC_BOOTSTRAP=1</code>, which is<br>
+  equivalent for this purpose.)</p>
+</li>
+<li>
+<p>For comparison, remove the <code>(tag …)</code> line, or add a second tag; both pass:<br>
+| Module | Debug-assertions <code>std</code> |<br>
+|---|---|<br>
+| no tags | ok |<br>
+| <strong>1 tag</strong> | <strong>abort</strong> |<br>
+| 2 tags | ok |</p>
+</li>
+</ul>
+<h3>Expected Results</h3>
+<p>The module instantiates and <code>identity</code> returns 7. Every <code>VMFuncRef</code> in the<br>
+<code>VMContext</code> is pointer-aligned regardless of how many tags the module defines.</p>
+<h3>Actual Results</h3>
+<p>The process aborts during instantiation:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">thread</span><span class="w"> </span><span class="o">'</span><span class="na">main</span><span class="o">'</span><span class="w"> </span><span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">library</span><span class="o">/</span><span class="n">core</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">ptr</span><span class="o">/</span><span class="n">non_null</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">1078</span><span class="p">:</span><span class="mi">18</span><span class="p">:</span>
+<span class="nc">unsafe</span><span class="w"> </span><span class="n">precondition</span><span class="p">(</span><span class="n">s</span><span class="p">)</span><span class="w"> </span><span class="n">violated</span><span class="p">:</span><span class="w"> </span><span class="nc">ptr</span><span class="p">::</span><span class="n">write</span><span class="w"> </span><span class="n">requires</span><span class="w"> </span><span class="n">that</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">pointer</span><span class="w"> </span><span class="n">argument</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="n">aligned</span><span class="w"> </span><span class="n">and</span><span class="w"> </span><span class="n">non</span><span class="o">-</span><span class="n">null</span>
+<span class="n">This</span><span class="w"> </span><span class="n">indicates</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="n">bug</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">program</span><span class="p">.</span><span class="w"> </span><span class="n">This</span><span class="w"> </span><span class="n">Undefined</span><span class="w"> </span><span class="n">Behavior</span><span class="w"> </span><span class="n">check</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="n">optional</span><span class="p">,</span><span class="w"> </span><span class="n">and</span><span class="w"> </span><span class="n">cannot</span><span class="w"> </span><span class="n">be</span><span class="w"> </span><span class="n">relied</span><span class="w"> </span><span class="n">on</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">safety</span><span class="p">.</span>
+<span class="n">thread</span><span class="w"> </span><span class="n">caused</span><span class="w"> </span><span class="n">non</span><span class="o">-</span><span class="n">unwinding</span><span class="w"> </span><span class="n">panic</span><span class="p">.</span><span class="w"> </span><span class="n">aborting</span><span class="p">.</span>
+</code></pre></div>
+<p>The misalignment itself does not depend on the build mode. With the prebuilt<br>
+release <code>std</code> the module appears to work, but the exported function's<br>
+<code>VMFuncRef</code> (from <code>Func::to_raw</code>) sits at a misaligned address:<br>
+| Module | <code>VMFuncRef</code> address |<br>
+|---|---|<br>
+| no tags | <code>0x…300</code> (0 mod 8) |<br>
+| <strong>1 tag</strong> | <strong><code>0x…304</code> (4 mod 8)</strong> |<br>
+| 2 tags | <code>0x…308</code> (0 mod 8) |<br>
+and <code>VMOffsets</code> for one defined tag, one escaped function, a start function and<br>
+one runtime data segment places <code>func_refs</code> at 52, <code>startup_func_ref</code> at 84 and<br>
+<code>runtime_data_bases</code> at 116 — all 4 mod 8 (48 / 80 / 112 with no tags).</p>
+<h3>Versions and Environment</h3>
+<p>Wasmtime version or commit: <code>a473f42e459680d55ade5873e5ac95ac0f81966c</code><br>
+(51.0.0-dev)<br>
+Operating system: Linux<br>
+Architecture: x86_64</p>
+<h3>Extra Info</h3>
+<p><strong>Root cause.</strong> <code>VMTagDefinition</code> (in <code>for_each_vm_type!</code>,<br>
+<code>crates/environ/src/vmtypes.rs</code>) is a plain <code>#[repr(C)]</code> struct with a single<br>
+<code>VMSharedTypeIndex</code> field, so it is 4 bytes with 4-byte alignment.<br>
+The <code>VMContext</code> layout's <code>dynamic</code> section (in <code>for_each_vmctx_type!</code>,<br>
+<code>crates/environ/src/vmctxtypes.rs</code>) places <code>tags</code> directly before <code>func_refs</code>:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">align</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="mi">16</span><span class="w"> </span><span class="p">}</span>
+<span class="n">array</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="cp">#[aggregate]</span>
+<span class="w">    </span><span class="n">globals</span><span class="p">[</span><span class="n">num_defined_globals</span><span class="p">;</span><span class="w"> </span><span class="n">DefinedGlobalIndex</span><span class="p">]:</span><span class="w"> </span><span class="nc">VMGlobalDefinition</span>
+<span class="p">}</span>
+<span class="n">array</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="cp">#[aggregate]</span>
+<span class="w">    </span><span class="n">tags</span><span class="p">[</span><span class="n">num_defined_tags</span><span class="p">;</span><span class="w"> </span><span class="n">DefinedTagIndex</span><span class="p">]:</span><span class="w"> </span><span class="nc">VMTagDefinition</span>
+<span class="p">}</span>
+<span class="n">array</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="cp">#[aggregate]</span>
+<span class="w">    </span><span class="n">func_refs</span><span class="p">[</span><span class="n">num_escaped_funcs</span><span class="p">;</span><span class="w"> </span><span class="n">FuncRefIndex</span><span class="p">]:</span><span class="w"> </span><span class="nc">VMFuncRef</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The layout grammar never derives padding from a field's type - alignment is<br>
+always an explicit <code>align { ... }</code> entry - and there is none between <code>tags</code> and<br>
+<code>func_refs</code>. With <code>globals</code> starting 16-aligned at 16 bytes per element,<br>
+<code>func_refs</code> begins at <code>16·k + 4·num_defined_tags</code>, which is 4 mod 8 for an odd<br>
+tag count on 64-bit targets. Every later entry is a multiple of 8 bytes, so<br>
+<code>startup_func_ref</code> and <code>runtime_data_bases</code> are misaligned too<br>
+(<code>runtime_data_lengths</code>, being <code>u32</code>, is unaffected). 32-bit targets are<br>
+unaffected. <code>VMComponentContext</code>'s layout, by contrast, has an <code>align { ptr }</code><br>
+before <code>trampoline_func_refs</code>.<br>
+<code>Instance::initialize_and_return_funcref</code> writes the <code>VMFuncRef</code> with<br>
+<code>NonNull::write</code> at <code>vmctx + func_refs().at(index)</code>; the index is valid and in<br>
+range, only the address is misaligned.<br>
+<strong>Why CI doesn't catch it.</strong> The <code>ptr::write</code> precondition is only compiled in<br>
+when <code>core</code> itself is built with debug assertions, which the prebuilt <code>std</code><br>
+shipped by rustup is not. Ordinary <code>cargo test</code> therefore never runs it. The<br>
+existing <code>check_vmtag_begins_aligned</code> test uses an empty module and only checks<br>
+where <code>tags</code> begins.<br>
+<strong>Impact.</strong> On x86-64 and AArch64 the misaligned plain loads and stores are<br>
+tolerated by hardware, so release builds behave correctly; the practical effect<br>
+is aborts in debug-<code>std</code> builds, plus Rust-level UB. Every C++ guest compiled<br>
+with native Wasm exception handling declares exactly one tag<br>
+(<code>__cpp_exception</code>), so such guests always land on the odd case.<br>
+<strong>Suggested fix.</strong> One alignment entry in <code>for_each_vmctx_type!</code>:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">array</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="cp">#[aggregate]</span>
+<span class="w">    </span><span class="n">tags</span><span class="p">[</span><span class="n">num_defined_tags</span><span class="p">;</span><span class="w"> </span><span class="n">DefinedTagIndex</span><span class="p">]:</span><span class="w"> </span><span class="nc">VMTagDefinition</span>
+<span class="p">}</span>
+<span class="n">align</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">ptr</span><span class="w"> </span><span class="p">}</span>
+<span class="n">array</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="cp">#[aggregate]</span>
+<span class="w">    </span><span class="n">func_refs</span><span class="p">[</span><span class="n">num_escaped_funcs</span><span class="p">;</span><span class="w"> </span><span class="n">FuncRefIndex</span><span class="p">]:</span><span class="w"> </span><span class="nc">VMFuncRef</span>
+<span class="p">}</span>
+</code></pre></div>
+<p><code>align { ptr }</code> rather than <code>align { 8 }</code> so 32-bit targets get no unneeded<br>
+padding. The runtime and Cranelift both take their offsets from this one layout,<br>
+so the single entry fixes both and also re-aligns <code>startup_func_ref</code> and<br>
+<code>runtime_data_bases</code>.<br>
+<strong>Suggested regression test</strong>, built from <code>VMOffsetsFields</code> so it covers both<br>
+pointer widths regardless of host or build mode:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#[test]</span>
+<span class="k">fn</span><span class="w"> </span><span class="nf">func_refs_aligned_after_odd_tag_count</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="n">ptr</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="p">[</span><span class="mi">4</span><span class="k">u8</span><span class="p">,</span><span class="w"> </span><span class="mi">8</span><span class="k">u8</span><span class="p">]</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">offsets</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">VMOffsets</span><span class="p">::</span><span class="n">from</span><span class="p">(</span><span class="n">VMOffsetsFields</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">ptr</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_imported_functions</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_imported_tables</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_imported_memories</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_imported_globals</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_imported_tags</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_defined_tables</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_defined_memories</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_owned_memories</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_defined_globals</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_defined_tags</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_escaped_funcs</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_runtime_data</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">            </span><span class="n">has_startup_func</span><span class="p">:</span><span class="w"> </span><span class="nc">true</span><span class="p">,</span>
+<span class="w">        </span><span class="p">});</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kt">u32</span><span class="p">::</span><span class="n">from</span><span class="p">(</span><span class="n">ptr</span><span class="p">);</span>
+<span class="w">        </span><span class="fm">assert_eq!</span><span class="p">(</span><span class="n">offsets</span><span class="p">.</span><span class="n">func_refs</span><span class="p">().</span><span class="n">begin</span><span class="p">()</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">p</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">        </span><span class="fm">assert_eq!</span><span class="p">(</span><span class="n">offsets</span><span class="p">.</span><span class="n">startup_func_ref</span><span class="p">()</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">p</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">        </span><span class="fm">assert_eq!</span><span class="p">(</span><span class="n">offsets</span><span class="p">.</span><span class="n">runtime_data_bases</span><span class="p">().</span><span class="n">begin</span><span class="p">()</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">p</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+</blockquote>
+
+
+
+<a name="631064145"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314671%20%60VMContext%60%20layout%20misaligns%20%60fun.../near/631064145" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314671.20.60VMContext.60.20layout.20misaligns.20.60fun.2E.2E.2E.html#631064145">(Oct 12 2026 at 17:16)</a>:</h4>
+<p><a href="https://github.com/elliekorn">elliekorn</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14671">Issue #14671</a>.</p>
+
+
+
+<a name="631673370"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314671%20%60VMContext%60%20layout%20misaligns%20%60fun.../near/631673370" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314671.20.60VMContext.60.20layout.20misaligns.20.60fun.2E.2E.2E.html#631673370">(Oct 14 2026 at 14:41)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/14671#issuecomment-6170983400">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14671">issue #14671</a>:</p>
+<blockquote>
+<p>Thanks for the issue here, but this is a source of UB and thus a security issue for Wasmtime. We'll be publishing an advisory later today at <a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-p79w-pv2r-29qp">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-p79w-pv2r-29qp</a></p>
+</blockquote>
+
+
+
+<a name="631673373"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314671%20%60VMContext%60%20layout%20misaligns%20%60fun.../near/631673373" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314671.20.60VMContext.60.20layout.20misaligns.20.60fun.2E.2E.2E.html#631673373">(Oct 14 2026 at 14:41)</a>:</h4>
+<p>alexcrichton closed <a href="https://github.com/bytecodealliance/wasmtime/issues/14671">issue #14671</a>:</p>
+<blockquote>
+<h3>Test Case</h3>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="err">tag</span> <span class="nv">$e</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span><span class="p">))</span>
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">"identity"</span><span class="p">)</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="p">(</span><span class="nb">local.get</span> <span class="mi">0</span><span class="p">))</span>
+<span class="p">)</span>
+</code></pre></div>
+<p>Nothing throws and no exception opcode is executed - merely <em>defining</em> a tag is<br>
+enough.</p>
+<h3>Steps to Reproduce</h3>
+<ul>
+<li>
+<p>Create a binary crate depending on <code>wasmtime</code> (path or git dependency at the<br>
+  commit below) with the <code>gc</code> and <code>gc-drc</code> features:<br>
+<code>toml
+  [dependencies]
+  wasmtime = { path = "../wasmtime/crates/wasmtime", features = ["gc", "gc-drc"] }
+  </code></p>
+</li>
+<li>
+<p><code>src/main.rs</code>:<br>
+<code>rust
+  use wasmtime::*;
+  const WAT: &amp;str = r#"
+  (module
+    (tag $e (param i32))
+    (func (export "identity") (param i32) (result i32)
+      (local.get 0))
+  )
+  "#;
+  fn main() -&gt; Result&lt;()&gt; {
+      let mut config = Config::new();
+      config.wasm_exceptions(true);
+      let engine = Engine::new(&amp;config)?;
+      let module = Module::new(&amp;engine, WAT)?;
+      let mut store: Store&lt;()&gt; = Store::new(&amp;engine, ());
+      let instance = Linker::&lt;()&gt;::new(&amp;engine).instantiate(&amp;mut store, &amp;module)?;
+      let f = instance.get_typed_func::&lt;i32, i32&gt;(&amp;mut store, "identity")?;
+      assert_eq!(f.call(&amp;mut store, 7)?, 7);
+      Ok(())
+  }
+  </code></p>
+</li>
+<li>
+<p>Build and run with a debug-assertions <code>std</code>. The <code>ptr::write</code> alignment check<br>
+  sits behind <code>#[cfg(debug_assertions)]</code> inside <code>core</code>, so a plain <code>cargo run</code><br>
+  against the prebuilt release <code>std</code> does <strong>not</strong> catch this; <code>std</code> has to be<br>
+  rebuilt:<br>
+<code>sh
+  cargo +nightly run -Zbuild-std=std,panic_abort --target x86_64-unknown-linux-gnu
+  </code><br>
+  (Reproduced here with stable 1.98.1 and <code>RUSTC_BOOTSTRAP=1</code>, which is<br>
+  equivalent for this purpose.)</p>
+</li>
+<li>
+<p>For comparison, remove the <code>(tag …)</code> line, or add a second tag; both pass:<br>
+| Module | Debug-assertions <code>std</code> |<br>
+|---|---|<br>
+| no tags | ok |<br>
+| <strong>1 tag</strong> | <strong>abort</strong> |<br>
+| 2 tags | ok |</p>
+</li>
+</ul>
+<h3>Expected Results</h3>
+<p>The module instantiates and <code>identity</code> returns 7. Every <code>VMFuncRef</code> in the<br>
+<code>VMContext</code> is pointer-aligned regardless of how many tags the module defines.</p>
+<h3>Actual Results</h3>
+<p>The process aborts during instantiation:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">thread</span><span class="w"> </span><span class="o">'</span><span class="na">main</span><span class="o">'</span><span class="w"> </span><span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">library</span><span class="o">/</span><span class="n">core</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">ptr</span><span class="o">/</span><span class="n">non_null</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">1078</span><span class="p">:</span><span class="mi">18</span><span class="p">:</span>
+<span class="nc">unsafe</span><span class="w"> </span><span class="n">precondition</span><span class="p">(</span><span class="n">s</span><span class="p">)</span><span class="w"> </span><span class="n">violated</span><span class="p">:</span><span class="w"> </span><span class="nc">ptr</span><span class="p">::</span><span class="n">write</span><span class="w"> </span><span class="n">requires</span><span class="w"> </span><span class="n">that</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">pointer</span><span class="w"> </span><span class="n">argument</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="n">aligned</span><span class="w"> </span><span class="n">and</span><span class="w"> </span><span class="n">non</span><span class="o">-</span><span class="n">null</span>
+<span class="n">This</span><span class="w"> </span><span class="n">indicates</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="n">bug</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">program</span><span class="p">.</span><span class="w"> </span><span class="n">This</span><span class="w"> </span><span class="n">Undefined</span><span class="w"> </span><span class="n">Behavior</span><span class="w"> </span><span class="n">check</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="n">optional</span><span class="p">,</span><span class="w"> </span><span class="n">and</span><span class="w"> </span><span class="n">cannot</span><span class="w"> </span><span class="n">be</span><span class="w"> </span><span class="n">relied</span><span class="w"> </span><span class="n">on</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">safety</span><span class="p">.</span>
+<span class="n">thread</span><span class="w"> </span><span class="n">caused</span><span class="w"> </span><span class="n">non</span><span class="o">-</span><span class="n">unwinding</span><span class="w"> </span><span class="n">panic</span><span class="p">.</span><span class="w"> </span><span class="n">aborting</span><span class="p">.</span>
+</code></pre></div>
+<p>The misalignment itself does not depend on the build mode. With the prebuilt<br>
+release <code>std</code> the module appears to work, but the exported function's<br>
+<code>VMFuncRef</code> (from <code>Func::to_raw</code>) sits at a misaligned address:<br>
+| Module | <code>VMFuncRef</code> address |<br>
+|---|---|<br>
+| no tags | <code>0x…300</code> (0 mod 8) |<br>
+| <strong>1 tag</strong> | <strong><code>0x…304</code> (4 mod 8)</strong> |<br>
+| 2 tags | <code>0x…308</code> (0 mod 8) |<br>
+and <code>VMOffsets</code> for one defined tag, one escaped function, a start function and<br>
+one runtime data segment places <code>func_refs</code> at 52, <code>startup_func_ref</code> at 84 and<br>
+<code>runtime_data_bases</code> at 116 — all 4 mod 8 (48 / 80 / 112 with no tags).</p>
+<h3>Versions and Environment</h3>
+<p>Wasmtime version or commit: <code>a473f42e459680d55ade5873e5ac95ac0f81966c</code><br>
+(51.0.0-dev)<br>
+Operating system: Linux<br>
+Architecture: x86_64</p>
+<h3>Extra Info</h3>
+<p><strong>Root cause.</strong> <code>VMTagDefinition</code> (in <code>for_each_vm_type!</code>,<br>
+<code>crates/environ/src/vmtypes.rs</code>) is a plain <code>#[repr(C)]</code> struct with a single<br>
+<code>VMSharedTypeIndex</code> field, so it is 4 bytes with 4-byte alignment.<br>
+The <code>VMContext</code> layout's <code>dynamic</code> section (in <code>for_each_vmctx_type!</code>,<br>
+<code>crates/environ/src/vmctxtypes.rs</code>) places <code>tags</code> directly before <code>func_refs</code>:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">align</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="mi">16</span><span class="w"> </span><span class="p">}</span>
+<span class="n">array</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="cp">#[aggregate]</span>
+<span class="w">    </span><span class="n">globals</span><span class="p">[</span><span class="n">num_defined_globals</span><span class="p">;</span><span class="w"> </span><span class="n">DefinedGlobalIndex</span><span class="p">]:</span><span class="w"> </span><span class="nc">VMGlobalDefinition</span>
+<span class="p">}</span>
+<span class="n">array</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="cp">#[aggregate]</span>
+<span class="w">    </span><span class="n">tags</span><span class="p">[</span><span class="n">num_defined_tags</span><span class="p">;</span><span class="w"> </span><span class="n">DefinedTagIndex</span><span class="p">]:</span><span class="w"> </span><span class="nc">VMTagDefinition</span>
+<span class="p">}</span>
+<span class="n">array</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="cp">#[aggregate]</span>
+<span class="w">    </span><span class="n">func_refs</span><span class="p">[</span><span class="n">num_escaped_funcs</span><span class="p">;</span><span class="w"> </span><span class="n">FuncRefIndex</span><span class="p">]:</span><span class="w"> </span><span class="nc">VMFuncRef</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The layout grammar never derives padding from a field's type - alignment is<br>
+always an explicit <code>align { ... }</code> entry - and there is none between <code>tags</code> and<br>
+<code>func_refs</code>. With <code>globals</code> starting 16-aligned at 16 bytes per element,<br>
+<code>func_refs</code> begins at <code>16·k + 4·num_defined_tags</code>, which is 4 mod 8 for an odd<br>
+tag count on 64-bit targets. Every later entry is a multiple of 8 bytes, so<br>
+<code>startup_func_ref</code> and <code>runtime_data_bases</code> are misaligned too<br>
+(<code>runtime_data_lengths</code>, being <code>u32</code>, is unaffected). 32-bit targets are<br>
+unaffected. <code>VMComponentContext</code>'s layout, by contrast, has an <code>align { ptr }</code><br>
+before <code>trampoline_func_refs</code>.<br>
+<code>Instance::initialize_and_return_funcref</code> writes the <code>VMFuncRef</code> with<br>
+<code>NonNull::write</code> at <code>vmctx + func_refs().at(index)</code>; the index is valid and in<br>
+range, only the address is misaligned.<br>
+<strong>Why CI doesn't catch it.</strong> The <code>ptr::write</code> precondition is only compiled in<br>
+when <code>core</code> itself is built with debug assertions, which the prebuilt <code>std</code><br>
+shipped by rustup is not. Ordinary <code>cargo test</code> therefore never runs it. The<br>
+existing <code>check_vmtag_begins_aligned</code> test uses an empty module and only checks<br>
+where <code>tags</code> begins.<br>
+<strong>Impact.</strong> On x86-64 and AArch64 the misaligned plain loads and stores are<br>
+tolerated by hardware, so release builds behave correctly; the practical effect<br>
+is aborts in debug-<code>std</code> builds, plus Rust-level UB. Every C++ guest compiled<br>
+with native Wasm exception handling declares exactly one tag<br>
+(<code>__cpp_exception</code>), so such guests always land on the odd case.<br>
+<strong>Suggested fix.</strong> One alignment entry in <code>for_each_vmctx_type!</code>:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">array</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="cp">#[aggregate]</span>
+<span class="w">    </span><span class="n">tags</span><span class="p">[</span><span class="n">num_defined_tags</span><span class="p">;</span><span class="w"> </span><span class="n">DefinedTagIndex</span><span class="p">]:</span><span class="w"> </span><span class="nc">VMTagDefinition</span>
+<span class="p">}</span>
+<span class="n">align</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">ptr</span><span class="w"> </span><span class="p">}</span>
+<span class="n">array</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="cp">#[aggregate]</span>
+<span class="w">    </span><span class="n">func_refs</span><span class="p">[</span><span class="n">num_escaped_funcs</span><span class="p">;</span><span class="w"> </span><span class="n">FuncRefIndex</span><span class="p">]:</span><span class="w"> </span><span class="nc">VMFuncRef</span>
+<span class="p">}</span>
+</code></pre></div>
+<p><code>align { ptr }</code> rather than <code>align { 8 }</code> so 32-bit targets get no unneeded<br>
+padding. The runtime and Cranelift both take their offsets from this one layout,<br>
+so the single entry fixes both and also re-aligns <code>startup_func_ref</code> and<br>
+<code>runtime_data_bases</code>.<br>
+<strong>Suggested regression test</strong>, built from <code>VMOffsetsFields</code> so it covers both<br>
+pointer widths regardless of host or build mode:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#[test]</span>
+<span class="k">fn</span><span class="w"> </span><span class="nf">func_refs_aligned_after_odd_tag_count</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="n">ptr</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="p">[</span><span class="mi">4</span><span class="k">u8</span><span class="p">,</span><span class="w"> </span><span class="mi">8</span><span class="k">u8</span><span class="p">]</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">offsets</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">VMOffsets</span><span class="p">::</span><span class="n">from</span><span class="p">(</span><span class="n">VMOffsetsFields</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">ptr</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_imported_functions</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_imported_tables</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_imported_memories</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_imported_globals</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_imported_tags</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_defined_tables</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_defined_memories</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_owned_memories</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_defined_globals</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_defined_tags</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_escaped_funcs</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">            </span><span class="n">num_runtime_data</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">            </span><span class="n">has_startup_func</span><span class="p">:</span><span class="w"> </span><span class="nc">true</span><span class="p">,</span>
+<span class="w">        </span><span class="p">});</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kt">u32</span><span class="p">::</span><span class="n">from</span><span class="p">(</span><span class="n">ptr</span><span class="p">);</span>
+<span class="w">        </span><span class="fm">assert_eq!</span><span class="p">(</span><span class="n">offsets</span><span class="p">.</span><span class="n">func_refs</span><span class="p">().</span><span class="n">begin</span><span class="p">()</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">p</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">        </span><span class="fm">assert_eq!</span><span class="p">(</span><span class="n">offsets</span><span class="p">.</span><span class="n">startup_func_ref</span><span class="p">()</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">p</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">        </span><span class="fm">assert_eq!</span><span class="p">(</span><span class="n">offsets</span><span class="p">.</span><span class="n">runtime_data_bases</span><span class="p">().</span><span class="n">begin</span><span class="p">()</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">p</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+</blockquote>
+
+
+
+<hr><p>Last updated: Oct 17 2026 at 17:06 UTC</p>
+</html>
