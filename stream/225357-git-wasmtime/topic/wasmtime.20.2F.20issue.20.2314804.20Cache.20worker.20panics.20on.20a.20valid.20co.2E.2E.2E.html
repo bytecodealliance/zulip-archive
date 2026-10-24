@@ -1,0 +1,147 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14804 Cache worker panics on a valid co... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314804.20Cache.20worker.20panics.20on.20a.20valid.20co.2E.2E.2E.html">wasmtime / issue #14804 Cache worker panics on a valid co...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="632969244"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314804%20Cache%20worker%20panics%20on%20a%20valid%20co.../near/632969244" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314804.20Cache.20worker.20panics.20on.20a.20valid.20co.2E.2E.2E.html#632969244">(Oct 19 2026 at 11:01)</a>:</h4>
+<p>clippytool opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14804">issue #14804</a>:</p>
+<blockquote>
+<h3>Test Case</h3>
+<p>No Wasm module is needed: the panic depends only on the cache configuration.</p>
+<h3>Steps to Reproduce</h3>
+<ol>
+<li>
+<p>Create a config file (<code>wasmtime config new</code> prints the default path) containing:</p>
+<p><code>toml
+ [cache]
+ file-count-soft-limit = "18446744073709551615"
+ files-total-size-soft-limit = "18446744073709551615"
+ file-count-limit-percent-if-deleting = "70%"
+ files-total-size-limit-percent-if-deleting = "70%"
+ </code></p>
+</li>
+<li>
+<p>Run any module that gets cached, e.g. <code>wasmtime hello.wasm</code>.</p>
+</li>
+<li>
+<p>The first cache update triggers the cleanup task, which panics.</p>
+</li>
+</ol>
+<h3>Expected Results</h3>
+<p>The configuration is accepted (it is), and the cleanup task computes its<br>
+deletion thresholds and runs normally.</p>
+<h3>Actual Results</h3>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">thread</span><span class="w"> </span><span class="o">'&lt;</span><span class="n">unnamed</span><span class="o">&gt;'</span><span class="w"> </span><span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">crates</span><span class="o">/</span><span class="n">cache</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">worker</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">484</span><span class="p">:</span><span class="mi">14</span><span class="p">:</span>
+<span class="nc">called</span><span class="w"> </span><span class="err">`</span><span class="nb">Option</span><span class="p">::</span><span class="n">unwrap</span><span class="p">()</span><span class="err">`</span><span class="w"> </span><span class="n">on</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="err">`</span><span class="nb">None</span><span class="err">`</span><span class="w"> </span><span class="n">value</span>
+</code></pre></div>
+<p>(<code>:488</code> is the same expression for the file count.) The panic happens on the<br>
+cache worker thread, so the CLI itself keeps running, but the worker is gone for<br>
+the rest of the process: stats are no longer updated, recompression and cleanup<br>
+never run again, and every subsequent event logs "Failed to send asynchronously<br>
+message to worker thread". Builds using <code>panic = "abort"</code> abort the process.</p>
+<h3>Versions and Environment</h3>
+<p>Wasmtime 51.0.0-dev, commit a33c18ed39. macOS aarch64 (architecture-independent).</p>
+<h3>Extra Info</h3>
+<p><code>CacheConfig::validate</code> bounds <code>file-count-limit-percent-if-deleting</code> and<br>
+<code>files-total-size-limit-percent-if-deleting</code> to 0-100, but nothing bounds<br>
+<code>file-count-soft-limit</code> / <code>files-total-size-soft-limit</code>, which are plain <code>u64</code><br>
+values. The cleanup task then computes</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="n">tsl_if_deleting</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">total_size_limit</span>
+<span class="w">    </span><span class="p">.</span><span class="n">checked_mul</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">cache_config</span><span class="p">.</span><span class="n">files_total_size_limit_percent_if_deleting</span><span class="p">()</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">u64</span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="n">unwrap</span><span class="p">()</span>
+<span class="w">    </span><span class="o">/</span><span class="w"> </span><span class="mi">100</span><span class="p">;</span>
+</code></pre></div>
+<p>so any soft limit above <code>u64::MAX / 70</code> (~2.6e17) with <code>70%</code> panics instead of<br>
+producing a threshold. <code>u64::MAX</code> is a legitimate "effectively unlimited"<br>
+setting, so I don't think the fix should reject large values in validation;<br>
+computing the percentage without overflowing is enough, e.g.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">fn</span><span class="w"> </span><span class="nf">percent_of</span><span class="p">(</span><span class="n">value</span><span class="p">:</span><span class="w"> </span><span class="kt">u64</span><span class="p">,</span><span class="w"> </span><span class="n">percent</span><span class="p">:</span><span class="w"> </span><span class="kt">u8</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">u64</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">percent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kt">u64</span><span class="p">::</span><span class="n">from</span><span class="p">(</span><span class="n">percent</span><span class="p">);</span>
+<span class="w">    </span><span class="n">value</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">100</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">percent</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="p">(</span><span class="n">value</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="mi">100</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">percent</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">100</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>which equals <code>floor(value * percent / 100)</code> and cannot overflow for <code>percent &lt;= 100</code>.</p>
+<p>I reproduced this in a unit test that calls the cleanup task directly with the<br>
+configuration above (it panics at the line quoted); I did not run the CLI binary<br>
+end-to-end. Happy to send a PR with the fix and the regression test.<br>
+</p>
+</blockquote>
+
+
+
+<a name="633150086"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314804%20Cache%20worker%20panics%20on%20a%20valid%20co.../near/633150086" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314804.20Cache.20worker.20panics.20on.20a.20valid.20co.2E.2E.2E.html#633150086">(Oct 19 2026 at 22:38)</a>:</h4>
+<p>dicej closed <a href="https://github.com/bytecodealliance/wasmtime/issues/14804">issue #14804</a>:</p>
+<blockquote>
+<h3>Test Case</h3>
+<p>No Wasm module is needed: the panic depends only on the cache configuration.</p>
+<h3>Steps to Reproduce</h3>
+<ol>
+<li>
+<p>Create a config file (<code>wasmtime config new</code> prints the default path) containing:</p>
+<p><code>toml
+ [cache]
+ file-count-soft-limit = "18446744073709551615"
+ files-total-size-soft-limit = "18446744073709551615"
+ file-count-limit-percent-if-deleting = "70%"
+ files-total-size-limit-percent-if-deleting = "70%"
+ </code></p>
+</li>
+<li>
+<p>Run any module that gets cached, e.g. <code>wasmtime hello.wasm</code>.</p>
+</li>
+<li>
+<p>The first cache update triggers the cleanup task, which panics.</p>
+</li>
+</ol>
+<h3>Expected Results</h3>
+<p>The configuration is accepted (it is), and the cleanup task computes its<br>
+deletion thresholds and runs normally.</p>
+<h3>Actual Results</h3>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">thread</span><span class="w"> </span><span class="o">'&lt;</span><span class="n">unnamed</span><span class="o">&gt;'</span><span class="w"> </span><span class="n">panicked</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">crates</span><span class="o">/</span><span class="n">cache</span><span class="o">/</span><span class="n">src</span><span class="o">/</span><span class="n">worker</span><span class="p">.</span><span class="n">rs</span><span class="p">:</span><span class="mi">484</span><span class="p">:</span><span class="mi">14</span><span class="p">:</span>
+<span class="nc">called</span><span class="w"> </span><span class="err">`</span><span class="nb">Option</span><span class="p">::</span><span class="n">unwrap</span><span class="p">()</span><span class="err">`</span><span class="w"> </span><span class="n">on</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="err">`</span><span class="nb">None</span><span class="err">`</span><span class="w"> </span><span class="n">value</span>
+</code></pre></div>
+<p>(<code>:488</code> is the same expression for the file count.) The panic happens on the<br>
+cache worker thread, so the CLI itself keeps running, but the worker is gone for<br>
+the rest of the process: stats are no longer updated, recompression and cleanup<br>
+never run again, and every subsequent event logs "Failed to send asynchronously<br>
+message to worker thread". Builds using <code>panic = "abort"</code> abort the process.</p>
+<h3>Versions and Environment</h3>
+<p>Wasmtime 51.0.0-dev, commit a33c18ed39. macOS aarch64 (architecture-independent).</p>
+<h3>Extra Info</h3>
+<p><code>CacheConfig::validate</code> bounds <code>file-count-limit-percent-if-deleting</code> and<br>
+<code>files-total-size-limit-percent-if-deleting</code> to 0-100, but nothing bounds<br>
+<code>file-count-soft-limit</code> / <code>files-total-size-soft-limit</code>, which are plain <code>u64</code><br>
+values. The cleanup task then computes</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="n">tsl_if_deleting</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">total_size_limit</span>
+<span class="w">    </span><span class="p">.</span><span class="n">checked_mul</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">cache_config</span><span class="p">.</span><span class="n">files_total_size_limit_percent_if_deleting</span><span class="p">()</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">u64</span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="n">unwrap</span><span class="p">()</span>
+<span class="w">    </span><span class="o">/</span><span class="w"> </span><span class="mi">100</span><span class="p">;</span>
+</code></pre></div>
+<p>so any soft limit above <code>u64::MAX / 70</code> (~2.6e17) with <code>70%</code> panics instead of<br>
+producing a threshold. <code>u64::MAX</code> is a legitimate "effectively unlimited"<br>
+setting, so I don't think the fix should reject large values in validation;<br>
+computing the percentage without overflowing is enough, e.g.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">fn</span><span class="w"> </span><span class="nf">percent_of</span><span class="p">(</span><span class="n">value</span><span class="p">:</span><span class="w"> </span><span class="kt">u64</span><span class="p">,</span><span class="w"> </span><span class="n">percent</span><span class="p">:</span><span class="w"> </span><span class="kt">u8</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">u64</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">percent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kt">u64</span><span class="p">::</span><span class="n">from</span><span class="p">(</span><span class="n">percent</span><span class="p">);</span>
+<span class="w">    </span><span class="n">value</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">100</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">percent</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="p">(</span><span class="n">value</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="mi">100</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">percent</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">100</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>which equals <code>floor(value * percent / 100)</code> and cannot overflow for <code>percent &lt;= 100</code>.</p>
+<p>I reproduced this in a unit test that calls the cleanup task directly with the<br>
+configuration above (it panics at the line quoted); I did not run the CLI binary<br>
+end-to-end. Happy to send a PR with the fix and the regression test.<br>
+</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Oct 24 2026 at 15:06 UTC</p>
+</html>

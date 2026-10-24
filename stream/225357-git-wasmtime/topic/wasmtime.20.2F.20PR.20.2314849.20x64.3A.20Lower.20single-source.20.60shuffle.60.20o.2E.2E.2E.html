@@ -1,0 +1,298 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #14849 x64: Lower single-source `shuffle` o... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314849.20x64.3A.20Lower.20single-source.20.60shuffle.60.20o.2E.2E.2E.html">wasmtime / PR #14849 x64: Lower single-source `shuffle` o...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="633124533"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314849%20x64%3A%20Lower%20single-source%20%60shuffle%60%20o.../near/633124533" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314849.20x64.3A.20Lower.20single-source.20.60shuffle.60.20o.2E.2E.2E.html#633124533">(Oct 19 2026 at 20:27)</a>:</h4>
+<p>EvanCarroll opened <a href="https://github.com/bytecodealliance/wasmtime/pull/14849">PR #14849</a> from <code>EvanCarroll:x64-single-source-shuffle</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<h1>x64: Lower single-source <code>shuffle</code> of distinct operands to one <code>pshufb</code></h1>
+<p>Fixes #14848 </p>
+<p>A <code>shuffle</code> whose mask only selects lanes from one operand got a single <code>pshufb</code><br>
+only when both operands were the same value. With distinct operands it fell<br>
+through to <code>vpermi2b</code> or to <code>pshufb</code> + <code>pshufb</code> + <code>por</code>, both of which read the<br>
+operand the mask never selects. This adds two rules, ahead of the <code>vpermi2b</code><br>
+rules, that shuffle only the selected operand when every lane comes from one side.</p>
+<h2>Changes</h2>
+<ul>
+<li>
+<p><code>lower.isle</code>: two rules guarded on SSSE3, like the existing <code>shuffle _ a a</code><br>
+  rule:</p>
+<ul>
+<li><code>shuffle _ a _</code> with an lhs-only mask becomes <code>pshufb a</code>;</li>
+<li><code>shuffle _ _ b</code> with an rhs-only mask becomes <code>pshufb b</code>.</li>
+</ul>
+<p>ISLE can't prove the new extractors disjoint from the <code>a a</code> rule, so they get<br>
+their own priorities (2 and 1), and the three rules below shift down to 0, -1<br>
+and -2. The twelve rules above are unchanged.</p>
+</li>
+<li>
+<p><code>lower/isle.rs</code>: <code>shuffle_lhs_only</code> / <code>shuffle_rhs_only</code> extractors. The masks<br>
+  reuse <code>shuffle_0_15_mask</code> / <code>shuffle_16_31_mask</code>, which already produce exactly<br>
+  the right constant when a mask reads only one side.</p>
+</li>
+<li>
+<p>The SSSE3 guard keeps a target with AVX512VBMI but no SSSE3 on <code>vpermi2b</code><br>
+  instead of a <code>pshufb</code> libcall. No real CPU has that combination, but the<br>
+  existing <code>shuffle-avx512.clif</code> target does, so the new VBMI tests are in their<br>
+  own file with a realistic target.</p>
+</li>
+</ul>
+<h2>Tests</h2>
+<ul>
+<li>
+<p><code>isa/x64/shuffle.clif</code> (SSE4.1) and new <code>isa/x64/shuffle-avx512-single-source.clif</code><br>
+  (SSSE3 + VBMI): lhs-only and rhs-only masks over distinct operands. Against<br>
+  the old lowering they fail with <code>pshufb</code>/<code>pshufb</code>/<code>por</code> and <code>vpermi2b</code><br>
+  respectively.</p>
+</li>
+<li>
+<p><code>runtests/simd-shuffle.clif</code>: the same two masks, on every target in the file,<br>
+  including baseline x86_64 without SSSE3.</p>
+</li>
+<li>
+<p>All 1378 filetests and the 158 SIMD spec tests (<code>cargo test --test wast -- simd</code>)<br>
+  pass. No existing filetest output changes.</p>
+</li>
+</ul>
+<h2>Results</h2>
+<p>i7-1165G7 (AVX512VBMI), single-thread:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>wasmtime 49.0.3</th>
+<th>this PR</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>shuffle-false-dep.wat</code> from the issue</td>
+<td>3.37 s (3.4 ns/iteration)</td>
+<td>0.85 s (0.85 ns/iteration), 4.0× faster</td>
+</tr>
+<tr>
+<td>tract <code>wasm_i32_4x1</code>, 512×512 int8 GEMV, vs scalar <code>generic_i32_4x1</code> in the same build</td>
+<td>0.70–0.79×</td>
+<td>1.48×</td>
+</tr>
+</tbody>
+</table>
+<p>The second row compares the kernel against a scalar kernel in the same run,<br>
+which cancels out machine load. The two builds also have different bases (49.0.3<br>
+against <code>main</code> plus this PR). In absolute terms, on a single 49.0.3 binary,<br>
+changing only that shuffle operand in the module takes the kernel from 56.7 µs<br>
+to 27.2 µs.<br>
+</p>
+</blockquote>
+
+
+
+<a name="633124538"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314849%20x64%3A%20Lower%20single-source%20%60shuffle%60%20o.../near/633124538" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314849.20x64.3A.20Lower.20single-source.20.60shuffle.60.20o.2E.2E.2E.html#633124538">(Oct 19 2026 at 20:27)</a>:</h4>
+<p>EvanCarroll requested <a href="https://github.com/cfallin">cfallin</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14849">PR #14849</a>.</p>
+
+
+
+<a name="633124539"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314849%20x64%3A%20Lower%20single-source%20%60shuffle%60%20o.../near/633124539" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314849.20x64.3A.20Lower.20single-source.20.60shuffle.60.20o.2E.2E.2E.html#633124539">(Oct 19 2026 at 20:27)</a>:</h4>
+<p>EvanCarroll removed the review request for <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> from <a href="https://github.com/bytecodealliance/wasmtime/pull/14849">PR #14849</a>.</p>
+
+
+
+<a name="633124544"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314849%20x64%3A%20Lower%20single-source%20%60shuffle%60%20o.../near/633124544" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314849.20x64.3A.20Lower.20single-source.20.60shuffle.60.20o.2E.2E.2E.html#633124544">(Oct 19 2026 at 20:27)</a>:</h4>
+<p>EvanCarroll requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14849">PR #14849</a>.</p>
+
+
+
+<a name="633151010"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314849%20x64%3A%20Lower%20single-source%20%60shuffle%60%20o.../near/633151010" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314849.20x64.3A.20Lower.20single-source.20.60shuffle.60.20o.2E.2E.2E.html#633151010">(Oct 19 2026 at 22:44)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift:area:x64</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14849">PR #14849</a>.</p>
+
+
+
+<a name="633151013"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314849%20x64%3A%20Lower%20single-source%20%60shuffle%60%20o.../near/633151013" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314849.20x64.3A.20Lower.20single-source.20.60shuffle.60.20o.2E.2E.2E.html#633151013">(Oct 19 2026 at 22:44)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14849">PR #14849</a>.</p>
+
+
+
+<a name="633151014"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314849%20x64%3A%20Lower%20single-source%20%60shuffle%60%20o.../near/633151014" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314849.20x64.3A.20Lower.20single-source.20.60shuffle.60.20o.2E.2E.2E.html#633151014">(Oct 19 2026 at 22:44)</a>:</h4>
+<p>github-actions[bot] added the label <code>isle</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14849">PR #14849</a>.</p>
+
+
+
+<a name="633151106"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314849%20x64%3A%20Lower%20single-source%20%60shuffle%60%20o.../near/633151106" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314849.20x64.3A.20Lower.20single-source.20.60shuffle.60.20o.2E.2E.2E.html#633151106">(Oct 19 2026 at 22:45)</a>:</h4>
+<p>github-actions[bot] <a href="https://github.com/bytecodealliance/wasmtime/pull/14849#issuecomment-6279009503">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14849">PR #14849</a>:</p>
+<blockquote>
+<h4>Subscribe to Label Action</h4>
+<p>cc @avanhatt, @cfallin, @fitzgen, @mmcloughlin</p>
+<p>&lt;details&gt;<br>
+This issue or pull request has been labeled: "cranelift", "cranelift:area:x64", "isle"</p>
+<p>Thus the following users have been cc'd because of the following labels:</p>
+<ul>
+<li>avanhatt: isle</li>
+<li>cfallin: isle</li>
+<li>fitzgen: isle</li>
+<li>mmcloughlin: isle</li>
+</ul>
+<p>To subscribe or unsubscribe from this label, edit the &lt;code&gt;.github/subscribe-to-label.json&lt;/code&gt; configuration file.</p>
+<p><a href="https://github.com/bytecodealliance/subscribe-to-label-action">Learn more.</a><br>
+&lt;/details&gt;</p>
+</blockquote>
+
+
+
+<a name="633216387"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314849%20x64%3A%20Lower%20single-source%20%60shuffle%60%20o.../near/633216387" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314849.20x64.3A.20Lower.20single-source.20.60shuffle.60.20o.2E.2E.2E.html#633216387">(Oct 20 2026 at 06:15)</a>:</h4>
+<p>EvanCarroll <a href="https://github.com/bytecodealliance/wasmtime/pull/14849#issuecomment-6284701194">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14849">PR #14849</a>:</p>
+<blockquote>
+<p>Some background on how this turned up, plus a clean before/after measurement of the code that found it.</p>
+<p><strong>How it was found.</strong> I'm porting a translation model (opus-mt, run with <a href="https://github.com/sonos/tract">tract</a>) to WebAssembly, and wrote an int8 matrix-vector kernel for it: <a href="https://github.com/EvanCarroll/tract/blob/7d43f384b8e56a3ab587b0d3f952d514b7b80635/linalg/src/wasm/mmm_i32.rs#L357"><code>wasm_i32_4x1</code></a>. Its inner loop runs one <code>i8x16.shuffle</code> per 16 bytes (from <code>i8x16_shuffle::&lt;0, 4, 1, 5, …&gt;(a16, a16)</code>, <a href="https://github.com/EvanCarroll/tract/blob/7d43f384b8e56a3ab587b0d3f952d514b7b80635/linalg/src/wasm/mmm_i32.rs#L386">L386</a>), then <code>i32x4.dot_i16x8_s</code>. Under V8 the kernel is 2.8–4.3× faster than tract's scalar <code>generic_i32_4x1</code>. Under Wasmtime, with the same <code>.wasm</code> and the same <a href="https://github.com/EvanCarroll/tract/blob/7d43f384b8e56a3ab587b0d3f952d514b7b80635/linalg/benches/wasm.rs#L881-L953">microbenchmark</a>, it was 15–25% <em>slower</em> than the scalar kernel.</p>
+<p>The cause was the shuffle. LLVM emits it with the loop accumulator as the unused second operand, and on this machine (AVX512VBMI) Cranelift lowers it to <code>vpermi2b</code>, which reads that operand, so each iteration's shuffle waits on the previous iteration's add. Changing only that operand in the module, so that the existing <code>shuffle a a</code> rule matches, halved the kernel's time on 49.0.3. This PR does that in the lowering instead.</p>
+<p><strong>Before/after on the microbenchmark.</strong> The same module throughout (built from the commit linked above, sha256 <code>9b381e03…f9d504</code>), on three Wasmtime builds:</p>
+<ul>
+<li><code>stock</code>: release 49.0.3</li>
+<li><code>base</code>: this PR's base, dcfbea188d</li>
+<li><code>pr</code>: this PR, e08d044365</li>
+</ul>
+<p>Both source builds use <a href="http://crates.io">crates.io</a> regalloc2 0.15.2, with no patches. Each configuration ran 5 rounds, interleaved, rotating the order, pinned to one core, on an i7-1165G7 (load average 1.2–3.1). Medians in ns per call (min–max):</p>
+<table>
+<thead>
+<tr>
+<th>m × k</th>
+<th><code>wasm_i32_4x1</code> stock</th>
+<th><code>wasm_i32_4x1</code> base</th>
+<th><code>wasm_i32_4x1</code> PR</th>
+<th>PR vs base</th>
+<th>scalar <code>generic_i32_4x1</code> stock / base / PR</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>16 × 96</td>
+<td>579 (569–598)</td>
+<td>582 (565–663)</td>
+<td>440 (428–510)</td>
+<td>1.32×</td>
+<td>569 / 570 / 567</td>
+</tr>
+<tr>
+<td>64 × 64</td>
+<td>1,429 (1,415–1,493)</td>
+<td>1,387 (1,345–1,663)</td>
+<td>1,096 (1,073–1,099)</td>
+<td>1.27×</td>
+<td>1,451 / 1,424 / 1,440</td>
+</tr>
+<tr>
+<td>64 × 256</td>
+<td>3,923 (3,896–4,105)</td>
+<td>3,928 (3,805–4,833)</td>
+<td>2,444 (2,334–2,767)</td>
+<td>1.61×</td>
+<td>3,427 / 3,365 / 3,333</td>
+</tr>
+<tr>
+<td>256 × 256</td>
+<td>15,721 (15,448–19,084)</td>
+<td>15,603 (14,968–17,794)</td>
+<td>9,040 (8,738–9,804)</td>
+<td>1.73×</td>
+<td>13,210 / 13,131 / 12,886</td>
+</tr>
+<tr>
+<td>1024 × 256</td>
+<td>62,802 (61,056–92,200)</td>
+<td>61,934 (59,275–71,235)</td>
+<td>34,943 (34,425–35,780)</td>
+<td>1.77×</td>
+<td>52,461 / 51,984 / 50,680</td>
+</tr>
+<tr>
+<td>512 × 512</td>
+<td>58,862 (57,348–78,755)</td>
+<td>58,183 (56,735–67,651)</td>
+<td>30,944 (30,343–31,330)</td>
+<td>1.88×</td>
+<td>46,365 / 46,778 / 45,628</td>
+</tr>
+<tr>
+<td>256 × 1536</td>
+<td>83,715 (83,046–117,030)</td>
+<td>83,151 (82,114–98,475)</td>
+<td>41,609 (41,402–42,580)</td>
+<td>2.00×</td>
+<td>63,399 / 63,894 / 63,202</td>
+</tr>
+<tr>
+<td>2048 × 512</td>
+<td>232,149 (231,300–310,398)</td>
+<td>234,916 (227,389–265,062)</td>
+<td>123,569 (123,441–124,753)</td>
+<td>1.90×</td>
+<td>184,763 / 184,725 / 182,738</td>
+</tr>
+<tr>
+<td>512 × 2048</td>
+<td>222,993 (221,020–311,282)</td>
+<td>223,783 (217,946–290,383)</td>
+<td>110,397 (107,887–111,378)</td>
+<td>2.03×</td>
+<td>167,067 / 167,148 / 166,449</td>
+</tr>
+</tbody>
+</table>
+<p>The scalar kernel runs in the same process and contains no shuffle, so it works as a control: it is the same on all three builds. Stock and base also match each other, so the difference comes from this PR alone. The kernel goes from about 0.75× the scalar kernel's speed to about 1.5×. The 512 × 512, 2048 × 512 and 512 × 2048 rows are the shapes of a transformer decoder's weight matmuls.</p>
+<p>The kernel doesn't quite reach the hand-patched module's 27.2 µs at 512 × 512. That remaining gap is a separate register-allocation spill in the same loop, which I'm reporting to regalloc2 on its own.</p>
+<p>To reproduce:</p>
+<p><div class="codehilite" data-code-language="Bash"><pre><span></span><code>git<span class="w"> </span>clone<span class="w"> </span>-b<span class="w"> </span>opus-mt-wasm-parity<span class="w"> </span>https://github.com/EvanCarroll/tract<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">cd</span><span class="w"> </span>tract
+git<span class="w"> </span>checkout<span class="w"> </span>7d43f384b8e56a3ab587b0d3f952d514b7b80635
+<span class="nv">RUSTFLAGS</span><span class="o">=</span><span class="s1">'-C target-feature=+simd128'</span><span class="w"> </span>cargo<span class="w"> </span>bench<span class="w"> </span>--no-run<span class="w"> </span>--target<span class="w"> </span>wasm32-wasip1<span class="w"> </span>-p<span class="w"> </span>tract-linalg<span class="w"> </span>--bench<span class="w"> </span>wasm
+taskset<span class="w"> </span>-c<span class="w"> </span><span class="m">7</span><span class="w"> </span>wasmtime<span class="w"> </span>--env<span class="w"> </span><span class="nv">RUST_TEST_NOCAPTURE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>--<span class="w"> </span>target/wasm32-wasip1/release/deps/wasm-*.wasm<span class="w"> </span>--bench
+<span class="c1"># the "int8 matvec (n=1)" section</span>
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="633375201"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314849%20x64%3A%20Lower%20single-source%20%60shuffle%60%20o.../near/633375201" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314849.20x64.3A.20Lower.20single-source.20.60shuffle.60.20o.2E.2E.2E.html#633375201">(Oct 20 2026 at 16:22)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14849#pullrequestreview-5588150986">PR review</a>:</p>
+<blockquote>
+<p>Thanks!</p>
+</blockquote>
+
+
+
+<a name="633375252"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314849%20x64%3A%20Lower%20single-source%20%60shuffle%60%20o.../near/633375252" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314849.20x64.3A.20Lower.20single-source.20.60shuffle.60.20o.2E.2E.2E.html#633375252">(Oct 20 2026 at 16:22)</a>:</h4>
+<p>alexcrichton added <a href="https://github.com/bytecodealliance/wasmtime/pull/14849">PR #14849 x64: Lower single-source <code>shuffle</code> of distinct operands to one <code>pshufb</code></a> to the merge queue</p>
+
+
+
+<a name="633385858"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314849%20x64%3A%20Lower%20single-source%20%60shuffle%60%20o.../near/633385858" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314849.20x64.3A.20Lower.20single-source.20.60shuffle.60.20o.2E.2E.2E.html#633385858">(Oct 20 2026 at 17:01)</a>:</h4>
+<p>alexcrichton removed <a href="https://github.com/bytecodealliance/wasmtime/pull/14849">PR #14849 x64: Lower single-source <code>shuffle</code> of distinct operands to one <code>pshufb</code></a> from the merge queue</p>
+
+
+
+<a name="633385860"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314849%20x64%3A%20Lower%20single-source%20%60shuffle%60%20o.../near/633385860" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314849.20x64.3A.20Lower.20single-source.20.60shuffle.60.20o.2E.2E.2E.html#633385860">(Oct 20 2026 at 17:01)</a>:</h4>
+<p><span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span> alexcrichton merged <a href="https://github.com/bytecodealliance/wasmtime/pull/14849">PR #14849</a>.</p>
+
+
+
+<hr><p>Last updated: Oct 24 2026 at 15:06 UTC</p>
+</html>

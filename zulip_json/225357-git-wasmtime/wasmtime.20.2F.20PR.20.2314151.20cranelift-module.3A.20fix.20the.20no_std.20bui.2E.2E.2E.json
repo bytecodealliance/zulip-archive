@@ -1,0 +1,98 @@
+[
+    {
+        "content": "<p>Lstarsky0 requested <a href=\"https://github.com/fitzgen\">fitzgen</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151\">PR #14151</a>.</p>",
+        "id": 617171693,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787052917
+    },
+    {
+        "content": "<p>Lstarsky0 opened <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151\">PR #14151</a> from <code>Lstarsky0:fix/cranelift-module-no-std</code> to <code>bytecodealliance:main</code>:</p>\n<blockquote>\n<p><code>cargo check -p cranelift-module --no-default-features</code> fails on main with 11 errors, and <code>--no-default-features --features core</code> fails with 6. Both have been broken since #5173 (2022-11-03).</p>\n<h2>What is broken</h2>\n<p><code>cranelift/module/src/lib.rs</code> is <code>#![no_std]</code> and aliases <code>alloc</code> as <code>std</code> when the <code>std</code> feature is off:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"cp\">#[cfg(not(feature = </span><span class=\"s\">\"std\"</span><span class=\"cp\">))]</span>\n<span class=\"k\">extern</span><span class=\"w\"> </span><span class=\"k\">crate</span><span class=\"w\"> </span><span class=\"n\">alloc</span><span class=\"w\"> </span><span class=\"k\">as</span><span class=\"w\"> </span><span class=\"n\">std</span><span class=\"p\">;</span>\n</code></pre></div>\n<p><code>module.rs</code> then uses three paths that only exist in real <code>std</code>:</p>\n<table>\n<thead>\n<tr>\n<th>site</th>\n<th>path</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td><code>ModuleError::Allocation</code> payload</td>\n<td><code>std::io::Error</code></td>\n</tr>\n<tr>\n<td>the <code>Error</code> impl and its <code>source()</code></td>\n<td><code>std::error::Error</code></td>\n</tr>\n<tr>\n<td>two <code>From</code> impls</td>\n<td><code>std::convert::From</code></td>\n</tr>\n</tbody>\n</table>\n<p><code>--features core</code> does not help — it only pulls in <code>hashbrown</code>, so the same three paths still fail. Bare <code>--no-default-features</code> fails on those plus <code>hashbrown</code> itself, which the manifest only supplies through <code>core</code>.</p>\n<h2>Why it went unnoticed</h2>\n<p><code>cranelift-module</code> appears in no file under <code>.github/</code>, so no job builds it in any non-default configuration.</p>\n<p>The one configuration that forwards to it cannot catch it either. <code>cranelift</code>'s <code>core</code> feature lists <code>cranelift-module?/core</code>, but the umbrella declares</p>\n<div class=\"codehilite\" data-code-language=\"TOML\"><pre><span></span><code><span class=\"n\">cranelift-module</span><span class=\"w\"> </span><span class=\"o\">=</span><span class=\"w\"> </span><span class=\"p\">{</span><span class=\"w\"> </span><span class=\"n\">workspace</span><span class=\"w\"> </span><span class=\"p\">=</span><span class=\"w\"> </span><span class=\"kc\">true</span><span class=\"p\">,</span><span class=\"w\"> </span><span class=\"n\">optional</span><span class=\"w\"> </span><span class=\"p\">=</span><span class=\"w\"> </span><span class=\"kc\">true</span><span class=\"w\"> </span><span class=\"p\">}</span>\n</code></pre></div>\n<p>without <code>default-features = false</code>, and the workspace entry does not set it either, so <code>cranelift-module/std</code> is on whenever the dep is. <code>cargo tree -e features -p cranelift --no-default-features --features core,module</code> shows <code>core</code> and <code>std</code> both active. <code>cranelift-codegen</code> is declared with <code>default-features = false</code> at the workspace level; <code>cranelift-frontend</code> and <code>cranelift-module</code> are not.</p>\n<p>I have left that alone — whether <code>cranelift</code>'s <code>core</code> should actually mean core is a separate call, and it would need this fix first anyway.</p>\n<h2>The change</h2>\n<ul>\n<li><code>Allocation</code> is gated on <code>std</code>. The payload is a <code>std::io::Error</code> and the only producer is <code>cranelift-jit</code> (<code>compiled_blob.rs</code>), which needs <code>std</code> regardless.</li>\n<li><code>core::error::Error</code> instead of <code>std::error::Error</code> — stable since 1.81, MSRV here is 1.95. Plain <code>From</code> instead of <code>std::convert::From</code>.</li>\n<li><code>hashbrown</code> becomes non-optional, matching <code>cranelift-frontend</code>, which has the identical <code>#[cfg(not(feature = \"std\"))] use hashbrown::...</code> and a non-optional <code>hashbrown</code>. The <code>hashbrown</code> feature is dropped from <code>core</code> as a result.</li>\n</ul>\n<p>That last one removes the <code>cranelift-module/hashbrown</code> feature. Nothing in the workspace names it; the umbrella only forwards <code>?/std</code> and <code>?/core</code>.</p>\n<h2>Testing</h2>\n<p>Three checks added to the <code>micro_checks</code> matrix. On unpatched main they fail:</p>\n<table>\n<thead>\n<tr>\n<th>check</th>\n<th>main</th>\n<th>with this PR</th>\n</tr>\n</thead>\n<tbody>\n<tr>\n<td><code>-p cranelift-module --no-default-features</code></td>\n<td>11 errors</td>\n<td>ok</td>\n</tr>\n<tr>\n<td><code>-p cranelift-module --no-default-features --features core</code></td>\n<td>6 errors</td>\n<td>ok</td>\n</tr>\n<tr>\n<td><code>-p cranelift-module --no-default-features --features core,enable-serde</code></td>\n<td>6 errors</td>\n<td>ok</td>\n</tr>\n</tbody>\n</table>\n<p>Also run locally, all clean: <code>-p cranelift-module --all-features</code>, <code>cargo test -p cranelift-module</code>, <code>cargo clippy -p cranelift-module --all-targets</code> and the same with <code>--no-default-features</code>, <code>cargo fmt --all -- --check</code>, and <code>cargo check</code> for <code>cranelift-jit</code>, <code>cranelift-object</code>, <code>cranelift</code>, <code>cranelift-filetests</code> and <code>cranelift-tools</code>. <code>Cargo.lock</code> is unchanged.</p>\n<p>This does not make the crate buildable for a bare-metal target on its own — <code>anyhow</code> is a hard dependency carrying <code>features = ['std']</code>. It makes the configurations the crate already advertises compile again.<br>\n</p>\n</blockquote>",
+        "id": 617171694,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787052917
+    },
+    {
+        "content": "<p>Lstarsky0 requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers\">wasmtime-compiler-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151\">PR #14151</a>.</p>",
+        "id": 617171695,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787052917
+    },
+    {
+        "content": "<p>Lstarsky0 requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-default-reviewers\">wasmtime-default-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151\">PR #14151</a>.</p>",
+        "id": 617171696,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787052918
+    },
+    {
+        "content": "<p>bjorn3 <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151#issuecomment-5327880680\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151\">PR #14151</a>:</p>\n<blockquote>\n<p><code>std::error::Error</code> is just a re-export of <code>core::error::Error</code>.</p>\n</blockquote>",
+        "id": 617187452,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787054550
+    },
+    {
+        "content": "<p>bjorn3 deleted a <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151#issuecomment-5327880680\">comment</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151\">PR #14151</a>:</p>\n<blockquote>\n<p><code>std::error::Error</code> is just a re-export of <code>core::error::Error</code>.</p>\n</blockquote>",
+        "id": 617187623,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787054598
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>cranelift</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151\">PR #14151</a>.</p>",
+        "id": 617227521,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787064854
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>cranelift:module</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151\">PR #14151</a>.</p>",
+        "id": 617227522,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787064854
+    },
+    {
+        "content": "<p><span aria-label=\"repeat\" class=\"emoji emoji-1f501\" role=\"img\" title=\"repeat\">:repeat:</span> pchickey submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151#pullrequestreview-4963488371\">PR review</a>:</p>\n<blockquote>\n<p>First, please review the AI tool policy <a href=\"https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md\">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>\n<p>Second, cranelift-codegen's Cargo.toml describes that the <code>core</code> feature is no longer used, remaining in name only for compatibility purposes. So, cranelift-module's use of that feature also no longer needs to exist, and does not need to consume CI resources with test coverage.</p>\n</blockquote>",
+        "id": 617252220,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787071125
+    },
+    {
+        "content": "<p>Lstarsky0 updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151\">PR #14151</a>.</p>",
+        "id": 617401458,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787132040
+    },
+    {
+        "content": "<p>Lstarsky0 <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151#issuecomment-5340365058\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151\">PR #14151</a>:</p>\n<blockquote>\n<p>Read the policy. you are right about core, codegen has it as core = [], name only now. Dropped the forward and the two --features core CI lines with it. I left it as core = [] rather than deleting outright, since umbrella forwards cranelift-module?/core and the crate is published. Happy to delete both if you'd rather. frontend and native carry the same dead forward; left those alone.<br>\nThe build fix underneath is a separate thing from core though. cargo check -p cranelift-module --no-default-features is 8 errors on main right now — hashbrown is imported unconditionally but was only pulled in by core, and a few impls reach for std::. That's what the one remaining CI line covers.</p>\n</blockquote>",
+        "id": 617403628,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787132701
+    },
+    {
+        "content": "<p><span aria-label=\"thumbs up\" class=\"emoji emoji-1f44d\" role=\"img\" title=\"thumbs up\">:thumbs_up:</span> pchickey submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151#pullrequestreview-4995944738\">PR review</a>.</p>",
+        "id": 617985834,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787334401
+    },
+    {
+        "content": "<p>pchickey added <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151\">PR #14151 cranelift-module: fix the no_std build and cover it in CI</a> to the merge queue.</p>",
+        "id": 617985847,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787334406
+    },
+    {
+        "content": "<p>pchickey <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151#issuecomment-5373310292\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151\">PR #14151</a>:</p>\n<blockquote>\n<p>Thank you</p>\n</blockquote>",
+        "id": 617985864,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787334412
+    },
+    {
+        "content": "<p><span aria-label=\"check\" class=\"emoji emoji-2705\" role=\"img\" title=\"check\">:check:</span> pchickey merged <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151\">PR #14151</a>.</p>",
+        "id": 617991129,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787335939
+    },
+    {
+        "content": "<p>pchickey removed <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14151\">PR #14151 cranelift-module: fix the no_std build and cover it in CI</a> from the merge queue.</p>",
+        "id": 617991138,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787335940
+    }
+]

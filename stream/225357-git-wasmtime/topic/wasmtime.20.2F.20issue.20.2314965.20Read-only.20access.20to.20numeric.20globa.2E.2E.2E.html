@@ -1,0 +1,52 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14965 Read-only access to numeric globa... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314965.20Read-only.20access.20to.20numeric.20globa.2E.2E.2E.html">wasmtime / issue #14965 Read-only access to numeric globa...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="634448668"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314965%20Read-only%20access%20to%20numeric%20globa.../near/634448668" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314965.20Read-only.20access.20to.20numeric.20globa.2E.2E.2E.html#634448668">(Oct 23 2026 at 16:35)</a>:</h4>
+<p>smarcd opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14965">issue #14965</a>:</p>
+<blockquote>
+<p>#14386 narrowed epoch-deadline and call-hook callbacks to <code>StoreHookState</code>, which implements <code>AsContext</code> and gives <code>&amp;mut T</code>. We agree with the rationale: mutating wasm-visible state between instructions is wrong.</p>
+<p>That change leaves one read-only use case with no API: reading the current value of a mutable <em>numeric</em> global from inside the callback.</p>
+<p><code>Global::get</code> takes <code>impl AsContextMut</code>. As far as I can tell that is because the <code>Ref</code> arms clone GC refs (<code>clone_gc_ref</code>, <code>ExternRef::from_cloned_gc_ref</code>) and need <code>AutoAssertNoGc</code>. For <code>i32</code>/<code>i64</code>/<code>f32</code>/<code>f64</code> (and <code>v128</code>) it is a plain load from the <code>VMGlobalDefinition</code> and mutates nothing. So there is no way to read a numeric global with only an <code>AsContext</code>.</p>
+<p>Our use case: an embedder that snapshots a suspended guest thread reads the guest's mutable globals (such as the shadow stack pointer) at the moment an epoch tick parks the thread, while the wasm frames are still live on the stack. The thread is paused at a safe point; nothing is mutated, and we do not call back into wasm.</p>
+<p>Proposal: a getter that takes <code>impl AsContext</code> and returns <code>Option&lt;Val&gt;</code>/<code>Result&lt;Val&gt;</code> for non-reference global types (returning <code>None</code>/<code>Err</code> for <code>Ref</code> types), e.g. <code>Global::get_numeric</code>. It would be safe to expose from <code>StoreHookState</code> for the same reason <code>Memory::data(&amp;store)</code> already is.</p>
+<p>If you would rather not add API surface, is there an intended way for an embedder to observe global values from an epoch callback now? The <code>DebugHandler</code> route (<code>DebugEvent::EpochYield</code>) seems to require <code>guest_debug</code> and async, which is heavier than we want for this.</p>
+<p>Happy to send a PR if this direction is acceptable.</p>
+</blockquote>
+
+
+
+<a name="634506700"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314965%20Read-only%20access%20to%20numeric%20globa.../near/634506700" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314965.20Read-only.20access.20to.20numeric.20globa.2E.2E.2E.html#634506700">(Oct 23 2026 at 20:23)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/14965#issuecomment-6373988262">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14965">issue #14965</a>:</p>
+<blockquote>
+<p>Thanks for the report! This was a known possible downside of #14386 and there's no current replacement for the functionality.</p>
+<p>One of the downsides of an accessor like this is that it's so specialized to just numeric globals and doesn't handle the GC proposal of wasm. Originally <code>Global::get</code> used to take <code>AsContext</code> but with GC that's where it changed to <code>AsContextMut</code> because rooting/frobbing needs to happen in that situation. I realize though that's exactly the intention here, but the second downside is that this is duplicating API/implementation surface area for this.</p>
+<p>That being said I don't really see a way around this, and I think it's a reasonable ask to be able to read globals with just <code>AsContext</code>. We'll eventually need to extend that to tables too most likely, but that can probably wait until it's needed.</p>
+<p>Bikeshedding-wise I don't have any great idea other than <code>get_numeric</code>, so that seems reasonable to me. If you'd like to send a PR we can review.</p>
+</blockquote>
+
+
+
+<a name="634506713"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314965%20Read-only%20access%20to%20numeric%20globa.../near/634506713" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314965.20Read-only.20access.20to.20numeric.20globa.2E.2E.2E.html#634506713">(Oct 23 2026 at 20:23)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the enhancement label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14965">Issue #14965</a>.</p>
+
+
+
+<a name="634506717"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314965%20Read-only%20access%20to%20numeric%20globa.../near/634506717" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314965.20Read-only.20access.20to.20numeric.20globa.2E.2E.2E.html#634506717">(Oct 23 2026 at 20:23)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasmtime:api label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14965">Issue #14965</a>.</p>
+
+
+
+<hr><p>Last updated: Oct 24 2026 at 15:06 UTC</p>
+</html>

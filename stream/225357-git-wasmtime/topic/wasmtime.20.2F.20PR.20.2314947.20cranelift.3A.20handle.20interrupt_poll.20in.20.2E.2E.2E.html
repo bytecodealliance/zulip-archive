@@ -1,0 +1,162 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #14947 cranelift: handle interrupt_poll in ... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314947.20cranelift.3A.20handle.20interrupt_poll.20in.20.2E.2E.2E.html">wasmtime / PR #14947 cranelift: handle interrupt_poll in ...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="634055623"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314947%20cranelift%3A%20handle%20interrupt_poll%20in%20.../near/634055623" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314947.20cranelift.3A.20handle.20interrupt_poll.20in.20.2E.2E.2E.html#634055623">(Oct 22 2026 at 18:09)</a>:</h4>
+<p>Shoryamishra61 opened <a href="https://github.com/bytecodealliance/wasmtime/pull/14947">PR #14947</a> from <code>Shoryamishra61:fix/interrupt-poll-14926</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>Fixes #14926</p>
+<h3>Why this change is needed</h3>
+<p>When inlining functions that contain <code>interrupt_poll</code> or compiling functions where an <code>interrupt_poll</code> possesses user stack maps, Cranelift encountered several issues:</p>
+<ol>
+<li><strong>Inliner Crash / Unknown Call Opcode:</strong> <code>interrupt_poll</code> has <code>Opcode::is_call() == true</code> because it transfers control to the runtime interpreter, but it lacks a <code>FuncRef</code> / external callee body. The inliner previously hit the unhandled call assertion.</li>
+<li><strong>Calling Convention Invariant:</strong> The IR verifier mandates that <code>interrupt_poll</code> only appears in functions with the <code>tail</code> calling convention. Inlining a <code>tail</code> callee containing an <code>interrupt_poll</code> into a caller with a different convention (e.g. <code>system_v</code>) resulted in invalid CLIF.</li>
+<li><strong>Exception Table Fixups:</strong> When inlining into a <code>try_call</code> site, exception table fixups attempted to inspect <code>interrupt_poll</code> as a callable target.</li>
+<li><strong>Backend Safepoints &amp; Stack Map PC:</strong> Neither the x64 nor AArch64 backends classified <code>InterruptPoll</code> as a safepoint (<code>is_safepoint()</code>), and stack maps were not attached to the faulting load instruction PC where runtime signal handlers inspect frame state.</li>
+<li><strong>Consecutive Stack Map PC Collision:</strong> In rare cases where a <code>preserve_all</code> call immediately precedes an <code>interrupt_poll</code> and both have stack maps, the call return PC and the faulting load PC coincide, violating exact-PC stack map uniqueness.</li>
+</ol>
+<h3>Implementation Highlights</h3>
+<ul>
+<li><strong>Inliner (<code>cranelift/codegen/src/inline.rs</code>):</strong><ul>
+<li>Allowed <code>interrupt_poll</code> to pass through the instruction-copying loop without tripping the unhandled call assertion.</li>
+<li>Added <code>can_inline</code> check requiring callers to have <code>CallConv::Tail</code> if the callee contains <code>interrupt_poll</code>; non-tail callers preserve the out-of-line call.</li>
+<li>Restricted exception table fixup candidates to <code>Call</code>, <code>CallIndirect</code>, <code>TryCall</code>, and <code>TryCallIndirect</code>.</li>
+</ul>
+</li>
+<li><strong>ISA Backends (<code>cranelift/codegen/src/isa/{x64, aarch64}/inst/</code>):</strong><ul>
+<li>Updated <code>is_safepoint()</code> to return <code>true</code> for <code>Inst::InterruptPoll</code>.</li>
+<li>Emitted user stack maps at the address of the faulting load (<code>sink.cur_offset()</code>).</li>
+<li>Emitted an architecture-specific NOP (x64: <code>0x90</code>, AArch64: <code>0xd503201f</code>) when a preceding call stack map shares the same PC with the poll's stack map.</li>
+</ul>
+</li>
+<li><strong>MachBuffer &amp; Disassembly (<code>buffer.rs</code>, <code>write.rs</code>):</strong><ul>
+<li>Added <code>MachBuffer::last_user_stack_map_pc()</code> to detect PC collisions.</li>
+<li>Generalized <code>write.rs</code> to print user stack maps for any safepoint instruction in textual CLIF output.</li>
+</ul>
+</li>
+<li><strong>Regression Tests (<code>cranelift/filetests/</code>):</strong><ul>
+<li>Added 5 new CLIF fixtures covering inliner behavior, x64/AArch64 stack map emission, and consecutive call/poll PC collision handling.</li>
+</ul>
+</li>
+</ul>
+<h3>Verification Done</h3>
+<p>The following test suites were executed locally against current upstream <code>main</code> (<code>257ecb40e665</code>):</p>
+<ul>
+<li><code>issue_repro_1.clif</code> and <code>issue_repro_2.clif</code> from #14926 (PASSED)</li>
+<li><code>cargo run -p cranelift-tools -- test cranelift/filetests/filetests</code> (1,387 tests PASSED)</li>
+<li><code>cargo test -p cranelift-codegen -j 1</code> (204 unit tests, 22 doctests PASSED)</li>
+<li><code>cargo test -p cranelift-filetests -j 1</code> (3 unit tests, 1 doctest PASSED)</li>
+<li><code>cargo fmt -p cranelift-codegen -- --check</code> &amp; <code>cargo clippy -p cranelift-codegen --all-targets -- -D warnings</code> (PASSED, 0 warnings)</li>
+<li><code>cargo run --release -p cranelift-tools -j 1 -- test &lt;5 fixtures&gt;</code> (release build compiled and 5 regression tests PASSED)</li>
+</ul>
+<h3>AI Tool Usage Disclosure</h3>
+<p>In compliance with the <a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">Bytecode Alliance AI Tool Use Policy</a>: An AI assistant (Antigravity) was used locally to assist with forward-porting the patch to current upstream <code>main</code>, running test harness commands, resolving trailing whitespace on test fixtures, and formatting this submission text. All code logic, test results, and diffs were inspected and reviewed.<br>
+</p>
+</blockquote>
+
+
+
+<a name="634055625"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314947%20cranelift%3A%20handle%20interrupt_poll%20in%20.../near/634055625" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314947.20cranelift.3A.20handle.20interrupt_poll.20in.20.2E.2E.2E.html#634055625">(Oct 22 2026 at 18:09)</a>:</h4>
+<p>Shoryamishra61 removed the review request for <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> from <a href="https://github.com/bytecodealliance/wasmtime/pull/14947">PR #14947</a>.</p>
+
+
+
+<a name="634055629"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314947%20cranelift%3A%20handle%20interrupt_poll%20in%20.../near/634055629" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314947.20cranelift.3A.20handle.20interrupt_poll.20in.20.2E.2E.2E.html#634055629">(Oct 22 2026 at 18:09)</a>:</h4>
+<p>Shoryamishra61 requested <a href="https://github.com/alexcrichton">alexcrichton</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14947">PR #14947</a>.</p>
+
+
+
+<a name="634055632"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314947%20cranelift%3A%20handle%20interrupt_poll%20in%20.../near/634055632" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314947.20cranelift.3A.20handle.20interrupt_poll.20in.20.2E.2E.2E.html#634055632">(Oct 22 2026 at 18:10)</a>:</h4>
+<p>Shoryamishra61 requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers">wasmtime-compiler-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14947">PR #14947</a>.</p>
+
+
+
+<a name="634099934"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314947%20cranelift%3A%20handle%20interrupt_poll%20in%20.../near/634099934" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314947.20cranelift.3A.20handle.20interrupt_poll.20in.20.2E.2E.2E.html#634099934">(Oct 22 2026 at 20:47)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14947">PR #14947</a>.</p>
+
+
+
+<a name="634099936"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314947%20cranelift%3A%20handle%20interrupt_poll%20in%20.../near/634099936" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314947.20cranelift.3A.20handle.20interrupt_poll.20in.20.2E.2E.2E.html#634099936">(Oct 22 2026 at 20:47)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift:area:machinst</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14947">PR #14947</a>.</p>
+
+
+
+<a name="634099939"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314947%20cranelift%3A%20handle%20interrupt_poll%20in%20.../near/634099939" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314947.20cranelift.3A.20handle.20interrupt_poll.20in.20.2E.2E.2E.html#634099939">(Oct 22 2026 at 20:47)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift:area:x64</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14947">PR #14947</a>.</p>
+
+
+
+<a name="634099947"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314947%20cranelift%3A%20handle%20interrupt_poll%20in%20.../near/634099947" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314947.20cranelift.3A.20handle.20interrupt_poll.20in.20.2E.2E.2E.html#634099947">(Oct 22 2026 at 20:47)</a>:</h4>
+<p>github-actions[bot] added the label <code>cranelift:area:aarch64</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14947">PR #14947</a>.</p>
+
+
+
+<a name="634103672"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314947%20cranelift%3A%20handle%20interrupt_poll%20in%20.../near/634103672" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314947.20cranelift.3A.20handle.20interrupt_poll.20in.20.2E.2E.2E.html#634103672">(Oct 22 2026 at 20:58)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14947#pullrequestreview-5620728855">PR review</a>.</p>
+
+
+
+<a name="634103677"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314947%20cranelift%3A%20handle%20interrupt_poll%20in%20.../near/634103677" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314947.20cranelift.3A.20handle.20interrupt_poll.20in.20.2E.2E.2E.html#634103677">(Oct 22 2026 at 20:58)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14947#discussion_r4353433061">PR review comment</a>:</p>
+<blockquote>
+<p>It's ok to trim down verbose LLM comments like this. Basically this just needs to convey "<code>InterruptPoll</code> returns <code>is_call()</code>, but it doesn't participate in inlining"</p>
+</blockquote>
+
+
+
+<a name="634103679"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314947%20cranelift%3A%20handle%20interrupt_poll%20in%20.../near/634103679" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314947.20cranelift.3A.20handle.20interrupt_poll.20in.20.2E.2E.2E.html#634103679">(Oct 22 2026 at 20:58)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14947#discussion_r4353425962">PR review comment</a>:</p>
+<blockquote>
+<p>IIRC we've already got inlining heuristics elsewhere in Wasmtime which would cover things like this. Subjectively I'd say it's ok to drop this and leave this up to callers, and if the heuristics from Wasmtime are ever extracted we could perhaps consolidate with this.</p>
+</blockquote>
+
+
+
+<a name="634103680"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314947%20cranelift%3A%20handle%20interrupt_poll%20in%20.../near/634103680" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314947.20cranelift.3A.20handle.20interrupt_poll.20in.20.2E.2E.2E.html#634103680">(Oct 22 2026 at 20:58)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14947#discussion_r4353462505">PR review comment</a>:</p>
+<blockquote>
+<p>IIRC we've already got infrastructure in other places for whether or not metadata applies to after an instruction or that instruction itself (or something like that). For example I think <code>MachDebugTagPos</code> serves that purpose. Personally I think it would be better to improve stack map lookup to handle that as opposed to injecting otherwise-not-useful <code>nop</code>s.</p>
+</blockquote>
+
+
+
+<a name="634122845"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314947%20cranelift%3A%20handle%20interrupt_poll%20in%20.../near/634122845" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314947.20cranelift.3A.20handle.20interrupt_poll.20in.20.2E.2E.2E.html#634122845">(Oct 22 2026 at 22:05)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/14947#issuecomment-6352328741">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14947">PR #14947</a>:</p>
+<blockquote>
+<blockquote>
+<p><code>interrupt_poll</code> has <code>Opcode::is_call() == true</code></p>
+</blockquote>
+<p>My intuition here is that this is probably the wrong decision, in hindsight: yes it can "do a call" in a sense, if a signal handler runs, but that's completely transparent. The "can call" opcode characteristic is really more relevant for things like inlining, as we see here, and in most ways the opcode is <em>not</em> a call (with args, with a callee, etc). So we should probably flip the condition here and then work through the implications, IMHO.</p>
+<p>(I will take a more detailed look next week when I am fully back at the keyboard; I just wanted to leave this thought now as the discussion is open)</p>
+</blockquote>
+
+
+
+<a name="634428162"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314947%20cranelift%3A%20handle%20interrupt_poll%20in%20.../near/634428162" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314947.20cranelift.3A.20handle.20interrupt_poll.20in.20.2E.2E.2E.html#634428162">(Oct 23 2026 at 15:38)</a>:</h4>
+<p>alexcrichton requested <a href="https://github.com/cfallin">cfallin</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14947">PR #14947</a>.</p>
+
+
+
+<hr><p>Last updated: Oct 24 2026 at 15:06 UTC</p>
+</html>

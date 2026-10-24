@@ -1,0 +1,215 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14769 wasi-http p3: reused instance lea... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314769.20wasi-http.20p3.3A.20reused.20instance.20lea.2E.2E.2E.html">wasmtime / issue #14769 wasi-http p3: reused instance lea...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="631838507"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314769%20wasi-http%20p3%3A%20reused%20instance%20lea.../near/631838507" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314769.20wasi-http.20p3.3A.20reused.20instance.20lea.2E.2E.2E.html#631838507">(Oct 15 2026 at 04:30)</a>:</h4>
+<p>avkonst opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14769">issue #14769</a>:</p>
+<blockquote>
+<p>A <code>wasi:http/handler@0.3</code> instance that is reused for many requests leaks handles until it traps, if all three of these are true:</p>
+<ol>
+<li>the guest's response sets <code>content-length</code>;</li>
+<li>the host reads exactly <code>content-length</code> bytes of the response body and then drops the body without polling it to the end. hyper does this when it serves a response with <code>content-length</code>, so <code>wasmtime serve</code>-style embeddings will hit it;</li>
+<li>at least 2 requests are in flight on the instance at once.</li>
+</ol>
+<p>If any one of these is false, 300,000 requests run fine on one instance.</p>
+<p>The trap is raised while the guest creates the <em>next</em> response, so it looks like resources from earlier responses are never released:</p>
+<table>
+<thead>
+<tr>
+<th>wasmtime</th>
+<th style="text-align: right;">Fails after</th>
+<th>Error</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>50.0.0-rc.1</td>
+<td style="text-align: right;">~100,000 requests</td>
+<td><code>resource table has no free keys</code>, in the guest's <code>Response::new</code></td>
+</tr>
+<tr>
+<td>49.0.3</td>
+<td style="text-align: right;">~25,400 requests</td>
+<td><code>cannot allocate another handle: store handle limit exceeded</code>, in the guest's <code>BodyWriter::new</code></td>
+</tr>
+</tbody>
+</table>
+<h3>Test Case</h3>
+<p>Repro: <a href="https://github.com/avkonst/wasi-repro">https://github.com/avkonst/wasi-repro</a> (<code>./run.sh</code> runs the failing case and the three passing ones). In summary:</p>
+<ul>
+<li><strong>guest</strong>: a <code>wasip3::http_compat</code> component with two routes that differ only in whether the response sets <code>content-length</code>.</li>
+<li><strong>host</strong>: one instance in one <code>Store</code>, with up to N calls in flight, each started with <code>handler::Prepared</code> inside <code>Store::run_concurrent</code>. Each response body is either read to the end (<code>full</code>) or read until <code>content-length</code> bytes have arrived and then dropped (<code>until-length</code>, like hyper).</li>
+</ul>
+<h3>Steps to Reproduce</h3>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/avkonst/wasi-repro<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">cd</span><span class="w"> </span>wasi-repro
+./run.sh<span class="w">   </span><span class="c1"># rust-toolchain.toml pins rustc 1.99.0 + wasm32-wasip2</span>
+
+<span class="c1"># or by hand:</span>
+<span class="nv">W</span><span class="o">=</span>guest/target/wasm32-wasip2/release/guest.wasm
+<span class="nv">H</span><span class="o">=</span>host/target/release/host
+
+<span class="c1"># fails</span>
+<span class="nv">$H</span><span class="w"> </span><span class="nv">$W</span><span class="w"> </span>/with-content-length<span class="w">    </span><span class="m">300000</span><span class="w"> </span>until-length<span class="w"> </span><span class="m">2</span><span class="w"> </span>direct
+<span class="c1"># pass</span>
+<span class="nv">$H</span><span class="w"> </span><span class="nv">$W</span><span class="w"> </span>/with-content-length<span class="w">    </span><span class="m">300000</span><span class="w"> </span>until-length<span class="w"> </span><span class="m">1</span><span class="w"> </span>direct
+<span class="nv">$H</span><span class="w"> </span><span class="nv">$W</span><span class="w"> </span>/with-content-length<span class="w">    </span><span class="m">300000</span><span class="w"> </span>full<span class="w">         </span><span class="m">2</span><span class="w"> </span>direct
+<span class="nv">$H</span><span class="w"> </span><span class="nv">$W</span><span class="w"> </span>/without-content-length<span class="w"> </span><span class="m">300000</span><span class="w"> </span>until-length<span class="w"> </span><span class="m">2</span><span class="w"> </span>direct
+</code></pre></div>
+<h3>Expected Results</h3>
+<p>All 300,000 requests succeed on one instance, as they do when any one of the three conditions is removed.</p>
+<h3>Actual Results</h3>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>instance failed after 99998 requests: error while executing at wasm backtrace:
+    0:  0x3ee1d - &lt;unknown&gt;!&lt;wasm function 9&gt;
+    1:   0x8ead - guest.wasm!wasip3::service::wasi::http::types::Response::new
+    2:   0x53db - guest.wasm!wasip3::http_compat::conversions::http_into_wasi_response
+    3:   0x5924 - guest.wasm!wasip3::service::exports::wasi::http::handler::_export_handle_cabi::{{closure}}
+    4:  0x112ca - guest.wasm!&lt;futures_util::stream::futures_unordered::FuturesUnordered&lt;Fut&gt; as futures_core::stream::Stream&gt;::poll_next
+    5:  0x14a0c - guest.wasm!wit_bindgen::rt::async_support::spawn::Tasks::poll_next
+    6:  0x11876 - guest.wasm!wit_bindgen::rt::async_support::TaskState::callback
+    7:  0x116a2 - guest.wasm!wit_bindgen::rt::async_support::callback
+    8:   0x55bf - guest.wasm!wit_bindgen::rt::async_support::start_task
+    9:   0x7e65 - guest.wasm![async-lift]wasi:http/handler@0.3.0#handle
+
+Caused by:
+    resource table has no free keys
+</code></pre></div>
+<p>&lt;details&gt;&lt;summary&gt;On 49.0.3&lt;/summary&gt;</p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>instance failed after 25394 requests: error while executing at wasm backtrace:
+    0:  0x10262 - guest.wasm!wasip3::http_compat::body_writer::BodyWriter::new
+    1:   0x538a - guest.wasm!wasip3::http_compat::conversions::http_into_wasi_response
+    ...
+Caused by:
+    cannot allocate another handle: store handle limit exceeded
+</code></pre></div>
+<p>To build the host against 49.0.3, change <code>=50.0.0-rc.1</code> to <code>=49.0.3</code> in <code>host/Cargo.toml</code>, and <code>TaskGroupId</code> to <code>GuestTaskId</code> in <code>host/src/main.rs</code>.<br>
+&lt;/details&gt;</p>
+<p>Results (<code>/with-content-length</code> unless noted):</p>
+<table>
+<thead>
+<tr>
+<th>Driver</th>
+<th>Body</th>
+<th style="text-align: right;">In flight</th>
+<th>50.0.0-rc.1</th>
+<th>49.0.3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>direct</td>
+<td>until-length</td>
+<td style="text-align: right;">1</td>
+<td>300,000 ok</td>
+<td>300,000 ok</td>
+</tr>
+<tr>
+<td>direct</td>
+<td>until-length</td>
+<td style="text-align: right;">2</td>
+<td><strong>traps after 99,998</strong></td>
+<td><strong>traps after 25,394</strong></td>
+</tr>
+<tr>
+<td>direct</td>
+<td>until-length</td>
+<td style="text-align: right;">64</td>
+<td><strong>traps after 99,968</strong></td>
+<td><strong>traps after 25,344</strong></td>
+</tr>
+<tr>
+<td>direct</td>
+<td>full</td>
+<td style="text-align: right;">64</td>
+<td>300,000 ok</td>
+<td>300,000 ok</td>
+</tr>
+<tr>
+<td>direct, <code>/without-content-length</code></td>
+<td>until-length</td>
+<td style="text-align: right;">64</td>
+<td>300,000 ok</td>
+<td>300,000 ok</td>
+</tr>
+<tr>
+<td><code>ProxyHandler</code> (reuse, never expire)</td>
+<td>until-length</td>
+<td style="text-align: right;">64</td>
+<td>6,000,000 ok over 25 instances</td>
+<td><strong><code>worker trapped or panicked</code> after 2,263,112</strong> over 27 instances</td>
+</tr>
+<tr>
+<td><code>ProxyHandler</code> (reuse, never expire)</td>
+<td>full</td>
+<td style="text-align: right;">64</td>
+<td>3,000,000 ok over 27 instances</td>
+<td>3,000,000 ok over 26 instances</td>
+</tr>
+</tbody>
+</table>
+<p>The <code>ProxyHandler</code> only starts a concurrent request on an instance whose tasks are blocked on I/O, so each instance sees less overlap. On 49.0.3 that only delays the failure.</p>
+<h3>Versions and Environment</h3>
+<ul>
+<li>Wasmtime version or commit: <code>wasmtime</code>, <code>wasmtime-wasi</code>, <code>wasmtime-wasi-http</code> 50.0.0-rc.1 (<code>component-model-async</code>); also 49.0.3</li>
+<li>Guest: <code>wasip3</code> 0.9.0+wasi-0.3.0 (<code>http-compat</code>), wit-bindgen 0.62.0</li>
+<li>rustc 1.99.0, target <code>wasm32-wasip2</code></li>
+<li>Operating system: Linux</li>
+<li>Architecture: x86_64</li>
+</ul>
+<h3>Extra Info</h3>
+<ul>
+<li>With <code>content-length</code>, wasmtime-wasi-http consumes the guest body with <code>LimitedGuestBodyConsumer</code> (<code>src/p3/body.rs</code>), not <code>UnlimitedGuestBodyConsumer</code>. <code>GuestBody::size_hint</code> is then exact, which is what lets hyper stop after the declared length and drop the body.</li>
+<li>The guest writes the body and then the trailers from a task that <code>http_into_wasi_response</code> spawns (<code>spawn_local</code>, then <code>BodyWriter::send_http_body</code>). That task, or the stream and future ends it holds, may be what never completes once the host drops the body. If so, it may be partly or wholly a <code>wasip3</code>/wit-bindgen issue and not only a host-side one.</li>
+<li>Workaround attempt on 49.0.3: polling the dropped body to the end on a spawned host task made the trap less frequent but did not stop it.</li>
+</ul>
+<h3>Guest</h3>
+<p>The whole guest, for reference (the host is in the repo):</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="sd">//! A `wasi:http/handler@0.3` component with two routes that differ only in</span>
+<span class="sd">//! whether the response carries a `content-length` header:</span>
+<span class="sd">//!</span>
+<span class="sd">//! - `GET /with-content-length`</span>
+<span class="sd">//! - `GET /without-content-length`</span>
+
+<span class="k">use</span><span class="w"> </span><span class="n">bytes</span><span class="p">::</span><span class="n">Bytes</span><span class="p">;</span>
+<span class="k">use</span><span class="w"> </span><span class="n">http</span><span class="p">::</span><span class="n">header</span><span class="p">;</span>
+<span class="k">use</span><span class="w"> </span><span class="n">http_body_util</span><span class="p">::</span><span class="n">Full</span><span class="p">;</span>
+<span class="k">use</span><span class="w"> </span><span class="n">wasip3</span><span class="p">::</span><span class="n">http</span><span class="p">::</span><span class="n">types</span><span class="p">::{</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">ErrorCode</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">wasip3</span><span class="p">::</span><span class="n">http_compat</span><span class="p">::{</span><span class="n">http_from_wasi_request</span><span class="p">,</span><span class="w"> </span><span class="n">http_into_wasi_response</span><span class="p">};</span>
+
+<span class="n">wasip3</span><span class="p">::</span><span class="n">http</span><span class="p">::</span><span class="n">service</span><span class="p">::</span><span class="n">export</span><span class="o">!</span><span class="p">(</span><span class="n">Guest</span><span class="p">);</span>
+
+<span class="k">struct</span><span class="w"> </span><span class="nc">Guest</span><span class="p">;</span>
+
+<span class="k">impl</span><span class="w"> </span><span class="n">wasip3</span><span class="p">::</span><span class="n">exports</span><span class="p">::</span><span class="n">http</span><span class="p">::</span><span class="n">handler</span><span class="p">::</span><span class="n">Guest</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">Guest</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">handle</span><span class="p">(</span><span class="n">request</span><span class="p">:</span><span class="w"> </span><span class="nc">types</span><span class="p">::</span><span class="n">Request</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="n">types</span><span class="p">::</span><span class="n">Response</span><span class="p">,</span><span class="w"> </span><span class="n">ErrorCode</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">request</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">http_from_wasi_request</span><span class="p">(</span><span class="n">request</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">body</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">"hello</span><span class="se">\n</span><span class="s">"</span><span class="p">;</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">response</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">http</span><span class="p">::</span><span class="n">Response</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">Full</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">Bytes</span><span class="p">::</span><span class="n">from_static</span><span class="p">(</span><span class="n">body</span><span class="p">.</span><span class="n">as_bytes</span><span class="p">())));</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="n">request</span><span class="p">.</span><span class="n">uri</span><span class="p">().</span><span class="n">path</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s">"/with-content-length"</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">response</span>
+<span class="w">                </span><span class="p">.</span><span class="n">headers_mut</span><span class="p">()</span>
+<span class="w">                </span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="n">header</span><span class="p">::</span><span class="n">CONTENT_LENGTH</span><span class="p">,</span><span class="w"> </span><span class="n">body</span><span class="p">.</span><span class="n">len</span><span class="p">().</span><span class="n">into</span><span class="p">());</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="n">http_into_wasi_response</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+</blockquote>
+
+
+
+<a name="631838508"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314769%20wasi-http%20p3%3A%20reused%20instance%20lea.../near/631838508" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314769.20wasi-http.20p3.3A.20reused.20instance.20lea.2E.2E.2E.html#631838508">(Oct 15 2026 at 04:30)</a>:</h4>
+<p><a href="https://github.com/avkonst">avkonst</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14769">Issue #14769</a>.</p>
+
+
+
+<hr><p>Last updated: Oct 24 2026 at 15:06 UTC</p>
+</html>
