@@ -1,0 +1,212 @@
+[
+    {
+        "content": "<p>I'm working on a suite of components that virtualize WASI interfaces (wrapping each interface to trace calls, apply access controls, etc.). I've hit a limitation in the 0.3 async model that I don't think wrappers can work around.</p>\n<p>The concrete case is <code>wasi:http/types</code> <code>request.new</code>, a sync function that accepts <code>trailers: future&lt;result&lt;option&lt;trailers&gt;, error-code&gt;&gt;</code>. The virtualizer's exported <code>trailers</code> is a distinct resource type from the imported one, so that future can't be forwarded to the upstream <code>request.new</code>. Something has to await it, unwrap the resource, and write a new future. But a sync-lifted export has no task that outlives the call. Once it returns, the component can't run until it's called again. Blocking inside <code>new</code> would deadlock, because the caller only writes trailers after <code>new</code> returns.</p>\n<p>wit-bindgen 0.62 papered over this: <code>spawn_local</code> from a sync export queued the work, and it ran during whatever async export came next. 0.63 now reasonably asserts there's an active task, which surfaced the problem: <a href=\"https://github.com/bytecodealliance/wit-bindgen/issues/1754\">https://github.com/bytecodealliance/wit-bindgen/issues/1754</a>. Even before that, my approach was inherently fragile.</p>\n<p>The pattern isn't specific to http. Any sync function that takes or returns a <code>future</code>/<code>stream</code> whose payload contains a resource has this problem (<code>request/response.new</code>, <code>consume-body</code>, and I believe <code>wasi:sockets</code> <code>tcp-socket.listen</code>). Streams of plain data can be passed through, but can't be observed without a task either (e.g. <code>wasi:cli</code> <code>write-via-stream</code>).</p>\n<p>Colorless composition was an early goal that has narrowed. It leaves sync functions with no way to start work that continues after they return. Some directions I can see, none of which I'm confident in:</p>\n<ol>\n<li>\n<p>Allow sync-typed functions to be lifted with the async ABI, keep running after <code>task.return</code>, and trap only if they block before returning.</p>\n</li>\n<li>\n<p>Let cooperative threads outlive the sync task that created them.</p>\n</li>\n<li>\n<p>Require any WIT function that takes or returns a future/stream to be <code>async</code>. This works, but it pushes the cost onto every caller.</p>\n</li>\n</ol>\n<p>Is there an intended pattern for this, or is the ability to virtualize any interface not a goal the current design can guarantee? I know just enough here to be dangerous, and deeply appreciate the effort put into the design to date.</p>",
+        "id": 633406161,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1792519836
+    },
+    {
+        "content": "<p>I believe a variation of this question came up in a different thread; I'll see if I can find it.</p>\n<p>Meanwhile, have you considered spawning a thread to read from or write to a future or stream?  (EDIT: yes, I see you did; sorry for skimming too fast the first time!)  At the moment, that requires some obscure incantations for most guest toolchains, but it's technically possible now for C/C++, Rust, and Python now and will \"just work\" as support is stabilized over the next month or two.  If the guest language is JS, I'm not sure what the options are or will be aside from composing with a language that supports multithreading.</p>",
+        "id": 633417867,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1792522639
+    },
+    {
+        "content": "<p>BTW, I believe that lifting sync-typed functions with the async ABI is currently prohibited by the Component Model.</p>",
+        "id": 633418492,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1792522778
+    },
+    {
+        "content": "<p>Here's the thread (no pun intended) I was thinking of: <a href=\"#narrow/channel/219900-wasi/topic/Creating.20a.20.60stream.60.20in.20a.20sync.20context\">#wasi &gt; Creating a &#96;stream&#96; in a sync context</a></p>",
+        "id": 633419643,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1792523011
+    },
+    {
+        "content": "<p>My current hacky support for calling async components from a sync context. It doesn’t work for the http <a href=\"http://request.new\">request.new</a> case. <a href=\"https://github.com/componentized/filesystem/blob/main/crates/componentized-rt/src/lib.rs\">https://github.com/componentized/filesystem/blob/main/crates/componentized-rt/src/lib.rs</a></p>",
+        "id": 633421552,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1792523501
+    },
+    {
+        "content": "<p>Once Rust 1.100 ships in a few weeks, you'll be able to use <code>std::thread::spawn</code> (and it should work on nightly now).</p>",
+        "id": 633429330,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1792525425
+    },
+    {
+        "content": "<p>This does sound like a poster-child style use case for threads if that can work, and there's no restriction that threads must live within the context of their task -- I think it'd work for this use case. As a caveat though <code>std::thread::spawn</code> won't work in Rust 1.100 out-the-box, you'll need the <a href=\"https://doc.rust-lang.org/nightly/rustc/platform-support/wasm32-wasip3.html#testing-cooperative-multithreading\">mysterious incantations</a></p>",
+        "id": 633435194,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1792526759
+    },
+    {
+        "content": "<p>Is wasm32-wasip3 required? I really want to avoid the import barf that entails.</p>",
+        "id": 633439466,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1792527864
+    },
+    {
+        "content": "<p><code>std::thread::spawn</code> will only be supported on wasip3 yeah, no other target will support threading in rust</p>",
+        "id": 633439752,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1792527918
+    },
+    {
+        "content": "<p>an aside: I find it odd that a platform with a zero capability by default model would default to enabling every capability on the host for the premier build target.</p>",
+        "id": 633442229,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1792528545
+    },
+    {
+        "content": "<p>All my components are currently built with <code>wasm32-unknown-unknown</code> and <code>wasm-tools component new</code> in order to get only the imports the component actually needs.</p>\n<p>I saw <code>wasm32-none-component</code> landed yesterday in tier 3, but that's a bit bare bones.</p>",
+        "id": 633442742,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1792528677
+    },
+    {
+        "content": "<p>I tried <code>wasm32-wasip3</code> with rust 1.100 (beta), wasi-sdk 34 and wasmtime main@28e3807. The wasi:http <a href=\"http://request.new\">request.new</a> is able to spawn a new thread and returns, however, the next call into the component triggers a memory fault:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"n\">Error</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">error</span><span class=\"w\"> </span><span class=\"k\">while</span><span class=\"w\"> </span><span class=\"n\">executing</span><span class=\"w\"> </span><span class=\"n\">at</span><span class=\"w\"> </span><span class=\"n\">wasm</span><span class=\"w\"> </span><span class=\"n\">backtrace</span><span class=\"p\">:</span>\n<span class=\"w\">    </span><span class=\"mi\">0</span><span class=\"p\">:</span><span class=\"w\">  </span><span class=\"mh\">0x27a9f</span><span class=\"w\"> </span><span class=\"o\">-</span><span class=\"w\"> </span><span class=\"n\">trace</span><span class=\"p\">.</span><span class=\"n\">wasm</span><span class=\"o\">!</span><span class=\"n\">dlfree</span>\n<span class=\"w\">    </span><span class=\"mi\">1</span><span class=\"p\">:</span><span class=\"w\">  </span><span class=\"mh\">0x27795</span><span class=\"w\"> </span><span class=\"o\">-</span><span class=\"w\"> </span><span class=\"n\">trace</span><span class=\"p\">.</span><span class=\"n\">wasm</span><span class=\"o\">!</span><span class=\"n\">free</span>\n<span class=\"w\">    </span><span class=\"mi\">2</span><span class=\"p\">:</span><span class=\"w\">   </span><span class=\"mh\">0x6c19</span><span class=\"w\"> </span><span class=\"o\">-</span><span class=\"w\"> </span><span class=\"n\">trace</span><span class=\"p\">.</span><span class=\"n\">wasm</span><span class=\"o\">!&lt;</span><span class=\"n\">wit_bindgen</span><span class=\"p\">[</span><span class=\"mi\">1</span><span class=\"n\">dc4b884a9bc26</span><span class=\"p\">]::</span><span class=\"n\">rt</span><span class=\"p\">::</span><span class=\"n\">Cleanup</span><span class=\"w\"> </span><span class=\"k\">as</span><span class=\"w\"> </span><span class=\"n\">core</span><span class=\"p\">[</span><span class=\"mi\">8</span><span class=\"n\">a7f440ef15db33b</span><span class=\"p\">]::</span><span class=\"n\">ops</span><span class=\"p\">::</span><span class=\"nb\">drop</span><span class=\"p\">::</span><span class=\"nb\">Drop</span><span class=\"o\">&gt;</span><span class=\"p\">::</span><span class=\"nb\">drop</span>\n<span class=\"w\">    </span><span class=\"mi\">3</span><span class=\"p\">:</span><span class=\"w\">   </span><span class=\"mh\">0x6bf5</span><span class=\"w\"> </span><span class=\"o\">-</span><span class=\"w\"> </span><span class=\"n\">trace</span><span class=\"p\">.</span><span class=\"n\">wasm</span><span class=\"o\">!</span><span class=\"n\">core</span><span class=\"p\">[</span><span class=\"mi\">8</span><span class=\"n\">a7f440ef15db33b</span><span class=\"p\">]::</span><span class=\"n\">ptr</span><span class=\"p\">::</span><span class=\"n\">drop_glue</span><span class=\"p\">::</span><span class=\"o\">&lt;</span><span class=\"n\">wit_bindgen</span><span class=\"p\">[</span><span class=\"mi\">1</span><span class=\"n\">dc4b884a9bc26</span><span class=\"p\">]::</span><span class=\"n\">rt</span><span class=\"p\">::</span><span class=\"n\">async_support</span><span class=\"p\">::</span><span class=\"n\">subtask</span><span class=\"p\">::</span><span class=\"n\">InProgress</span><span class=\"o\">&lt;</span><span class=\"n\">trace</span><span class=\"p\">[</span><span class=\"mi\">537</span><span class=\"n\">ff8db433888f6</span><span class=\"p\">]::</span><span class=\"n\">wasi</span><span class=\"p\">::</span><span class=\"n\">http</span><span class=\"p\">::</span><span class=\"n\">client</span><span class=\"p\">::</span><span class=\"n\">send</span><span class=\"p\">::{</span><span class=\"n\">closure</span><span class=\"p\">#</span><span class=\"mi\">0</span><span class=\"p\">}::</span><span class=\"n\">_MySubtask</span><span class=\"o\">&gt;&gt;</span>\n<span class=\"w\">    </span><span class=\"mi\">4</span><span class=\"p\">:</span><span class=\"w\">   </span><span class=\"mh\">0x7706</span><span class=\"w\"> </span><span class=\"o\">-</span><span class=\"w\"> </span><span class=\"n\">trace</span><span class=\"p\">.</span><span class=\"n\">wasm</span><span class=\"o\">!&lt;</span><span class=\"n\">wit_bindgen</span><span class=\"p\">[</span><span class=\"mi\">1</span><span class=\"n\">dc4b884a9bc26</span><span class=\"p\">]::</span><span class=\"n\">rt</span><span class=\"p\">::</span><span class=\"n\">async_support</span><span class=\"p\">::</span><span class=\"n\">waitable</span><span class=\"p\">::</span><span class=\"n\">WaitableOperation</span><span class=\"o\">&lt;</span><span class=\"n\">wit_bindgen</span><span class=\"p\">[</span><span class=\"mi\">1</span><span class=\"n\">dc4b884a9bc26</span><span class=\"p\">]::</span><span class=\"n\">rt</span><span class=\"p\">::</span><span class=\"n\">async_support</span><span class=\"p\">::</span><span class=\"n\">subtask</span><span class=\"p\">::</span><span class=\"n\">SubtaskOps</span><span class=\"o\">&lt;</span><span class=\"n\">trace</span><span class=\"p\">[</span><span class=\"mi\">537</span><span class=\"n\">ff8db433888f6</span><span class=\"p\">]::</span><span class=\"n\">wasi</span><span class=\"p\">::</span><span class=\"n\">http</span><span class=\"p\">::</span><span class=\"n\">client</span><span class=\"p\">::</span><span class=\"n\">send</span><span class=\"p\">::{</span><span class=\"n\">closure</span><span class=\"p\">#</span><span class=\"mi\">0</span><span class=\"p\">}::</span><span class=\"n\">_MySubtask</span><span class=\"o\">&gt;&gt;&gt;</span><span class=\"p\">::</span><span class=\"n\">poll_complete_with_code</span>\n<span class=\"w\">    </span><span class=\"mi\">5</span><span class=\"p\">:</span><span class=\"w\">   </span><span class=\"mh\">0xa8d6</span><span class=\"w\"> </span><span class=\"o\">-</span><span class=\"w\"> </span><span class=\"n\">trace</span><span class=\"p\">.</span><span class=\"n\">wasm</span><span class=\"o\">!</span><span class=\"n\">trace</span><span class=\"p\">[</span><span class=\"mi\">537</span><span class=\"n\">ff8db433888f6</span><span class=\"p\">]::</span><span class=\"n\">exports</span><span class=\"p\">::</span><span class=\"n\">wasi</span><span class=\"p\">::</span><span class=\"n\">http</span><span class=\"p\">::</span><span class=\"n\">client</span><span class=\"p\">::</span><span class=\"n\">_export_send_cabi</span><span class=\"p\">::</span><span class=\"o\">&lt;</span><span class=\"n\">trace</span><span class=\"p\">[</span><span class=\"mi\">537</span><span class=\"n\">ff8db433888f6</span><span class=\"p\">]::</span><span class=\"n\">Trace</span><span class=\"o\">&gt;</span><span class=\"p\">::{</span><span class=\"n\">closure</span><span class=\"p\">#</span><span class=\"mi\">0</span><span class=\"p\">}</span>\n<span class=\"w\">    </span><span class=\"mi\">6</span><span class=\"p\">:</span><span class=\"w\">   </span><span class=\"mh\">0x8493</span><span class=\"w\"> </span><span class=\"o\">-</span><span class=\"w\"> </span><span class=\"n\">trace</span><span class=\"p\">.</span><span class=\"n\">wasm</span><span class=\"o\">!&lt;</span><span class=\"n\">wit_bindgen</span><span class=\"p\">[</span><span class=\"mi\">1</span><span class=\"n\">dc4b884a9bc26</span><span class=\"p\">]::</span><span class=\"n\">rt</span><span class=\"p\">::</span><span class=\"n\">async_support</span><span class=\"p\">::</span><span class=\"n\">TaskState</span><span class=\"o\">&gt;</span><span class=\"p\">::</span><span class=\"n\">callback</span>\n<span class=\"w\">    </span><span class=\"mi\">7</span><span class=\"p\">:</span><span class=\"w\">   </span><span class=\"mh\">0x419a</span><span class=\"w\"> </span><span class=\"o\">-</span><span class=\"w\"> </span><span class=\"n\">trace</span><span class=\"p\">.</span><span class=\"n\">wasm</span><span class=\"o\">!</span><span class=\"n\">wit_bindgen</span><span class=\"p\">[</span><span class=\"mi\">1</span><span class=\"n\">dc4b884a9bc26</span><span class=\"p\">]::</span><span class=\"n\">rt</span><span class=\"p\">::</span><span class=\"n\">async_support</span><span class=\"p\">::</span><span class=\"n\">callback</span>\n<span class=\"w\">    </span><span class=\"mi\">8</span><span class=\"p\">:</span><span class=\"w\">   </span><span class=\"mh\">0x4429</span><span class=\"w\"> </span><span class=\"o\">-</span><span class=\"w\"> </span><span class=\"n\">trace</span><span class=\"p\">.</span><span class=\"n\">wasm</span><span class=\"o\">!</span><span class=\"p\">[</span><span class=\"n\">callback</span><span class=\"p\">][</span><span class=\"k\">async</span><span class=\"o\">-</span><span class=\"n\">lift</span><span class=\"p\">]</span><span class=\"n\">wasi</span><span class=\"p\">:</span><span class=\"nc\">http</span><span class=\"o\">/</span><span class=\"n\">client</span><span class=\"o\">@</span><span class=\"mf\">0.3.0</span><span class=\"p\">#</span><span class=\"n\">send</span>\n<span class=\"w\">    </span><span class=\"mi\">9</span><span class=\"p\">:</span><span class=\"w\">  </span><span class=\"mh\">0x3ee8a</span><span class=\"w\"> </span><span class=\"o\">-</span><span class=\"w\"> </span><span class=\"o\">&lt;</span><span class=\"n\">unknown</span><span class=\"o\">&gt;!&lt;</span><span class=\"n\">wasm</span><span class=\"w\"> </span><span class=\"n\">function</span><span class=\"w\"> </span><span class=\"mi\">112</span><span class=\"o\">&gt;</span>\n\n<span class=\"n\">Caused</span><span class=\"w\"> </span><span class=\"n\">by</span><span class=\"p\">:</span>\n<span class=\"w\">    </span><span class=\"mi\">0</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">memory</span><span class=\"w\"> </span><span class=\"n\">fault</span><span class=\"w\"> </span><span class=\"n\">at</span><span class=\"w\"> </span><span class=\"n\">wasm</span><span class=\"w\"> </span><span class=\"n\">address</span><span class=\"w\"> </span><span class=\"mh\">0x80105ca8</span><span class=\"w\"> </span><span class=\"k\">in</span><span class=\"w\"> </span><span class=\"n\">linear</span><span class=\"w\"> </span><span class=\"n\">memory</span><span class=\"w\"> </span><span class=\"n\">of</span><span class=\"w\"> </span><span class=\"n\">size</span><span class=\"w\"> </span><span class=\"mh\">0x410000</span>\n<span class=\"w\">    </span><span class=\"mi\">1</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">wasm</span><span class=\"w\"> </span><span class=\"n\">trap</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">out</span><span class=\"w\"> </span><span class=\"n\">of</span><span class=\"w\"> </span><span class=\"n\">bounds</span><span class=\"w\"> </span><span class=\"n\">memory</span><span class=\"w\"> </span><span class=\"n\">access</span>\n</code></pre></div>\n<p>full backtrace at <a href=\"https://pastebin.com/vqbi2tw5\">https://pastebin.com/vqbi2tw5</a></p>",
+        "id": 633470821,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1792537572
+    },
+    {
+        "content": "<p>That looks like memory corruption in the module itself, and for debugging that I'd recommend using the <code>dlmalloc</code> crate with the <code>debug</code> feature turne on. That may help narrow it down to the point of corruption. One common cause with threads is stack overflow in the case that there's a big stack buffer or perhaps the stack is just too small</p>",
+        "id": 633674516,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1792594463
+    },
+    {
+        "content": "<p>It looks like the root cause of the memory corruption was resolved by <a href=\"https://github.com/WebAssembly/wasi-libc/pull/884\">https://github.com/WebAssembly/wasi-libc/pull/884</a>. With that fix applied to wasi-sdk and wasm32-wasip3 std:<span aria-label=\"thread\" class=\"emoji emoji-1f9f5\" role=\"img\" title=\"thread\">:thread:</span>:spawn seems to work.</p>",
+        "id": 633756202,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1792610474
+    },
+    {
+        "content": "<p>Was also able to hack around the additional wasi imports brought in by wasm32-wasip3 through a combination of dead code pruning and a no-op stub component. It's unfortunate that it's necessary to add bloat to a component to remove capabilities that aren't needed or desired.</p>",
+        "id": 633758121,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1792610925
+    },
+    {
+        "content": "<blockquote>\n<p>an aside: I find it odd that a platform with a zero capability by default model would default to enabling every capability on the host for the premier build target.</p>\n</blockquote>\n<p>You're not wrong that it'd be a lot nicer conceptually if we could avoid this. The reality is, though, that we need to meet developers where they are for any of this to be useful. And developers exist in established ecosystems, backed by language standard libraries and package repositories that fundamentally expect these interfaces to exist.</p>\n<p>(An aside to my answer to your aside: making interfaces available isn't the same as making capabilities available. E.g., <code>wasi:filesystem</code> being available doesn't mean you have access to any particular file handle, or the ability to gain that access. The actual capabilities system isn't ideal, but also far stronger than \"default[ing] to enabling every capability on the host\".)</p>",
+        "id": 634311900,
+        "sender_full_name": "Till Schneidereit",
+        "timestamp": 1792751070
+    },
+    {
+        "content": "<p>My concern is less that their is a way to turn these imports on, and more that their isn’t an obvious way to turn the off.  I agree that existing language ecosystems expect these capabilities, because that’s how it’s always been. Components disrupt that status quo.</p>\n<p>Of course the host, or another component can limit the capabilities. I’m working on exactly that.  It’s a powerful ability with components that two different branches of a composition can have different degrees of access to a capability like wasi:sockets. </p>\n<p>That doesn’t preclude my stance that a component which doesn’t need the network, should never have access to the network. Latent capabilities that aren’t used today, have a history of becoming tomorrow’s security vulnerabilities.</p>",
+        "id": 634333108,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1792754835
+    },
+    {
+        "content": "<blockquote>\n<p>a component which doesn’t need the network, should never have access to the network.</p>\n</blockquote>\n<p>Strongly agreed! The particular embedding of Wasmtime I work on (Spin) does exactly that, with deny-all defaults for both fs and network (via both sockets and http). But again, that's not the same as not providing the APIs. We tried that, hard, and found that it just doesn't work in the real world.</p>\n<p>As for the obvious way to turn off these capabilities: targeting <code>wasm32-unknown-unknown</code> with your own set of imports using <code>wit-bindgen</code> is the best we can do. I'm also unsure about what else we <em>could</em> do, as long as language standard libraries are relatively monolithic—even lean ones like Rust's.</p>",
+        "id": 634386373,
+        "sender_full_name": "Till Schneidereit",
+        "timestamp": 1792763466
+    },
+    {
+        "content": "<p>You’re hitting on the crux of this thread. wasm32-unknown-unknown is my current, and preferred, target. The problem is that the cooperative threading support is gated behind wasm32-wasip3, which brings the additional imports.  I need the threading support in order to handle translating a resource wrapped in a future in a sync method.</p>",
+        "id": 634392168,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1792764326
+    },
+    {
+        "content": "<p>It’s possible to obscure these imports, but it requires extra build hoops and makes the component even larger.</p>",
+        "id": 634392938,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1792764441
+    },
+    {
+        "content": "<p>A phrase I heard recently and like is “absent by default”. It’s stronger than “deny by default” as the capability doesn’t exist, so there no way to bypass the deny policy.</p>",
+        "id": 634393992,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1792764586
+    },
+    {
+        "content": "<p>Seems like <code>#![no_std]</code> is a better fit for \"absent by default\" than <code>wasm32-unknown-unknown</code>.  The former will give you a compile error if you try to use e.g. <code>std::fs::File::open</code>, whereas the latter will happily let that compile and then fail at runtime.</p>",
+        "id": 634442788,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1792772291
+    },
+    {
+        "content": "<p>I think the upcoming \"optional imports\" feature will be the sweet spot for this kind of thing and make <code>wasm32-unknown-unknown</code> obsolete.  That will allow the <code>wasm32-wasi*</code> targets to use e.g. <code>wasi:filesystem</code> if it's present and otherwise gracefully return an error to the caller.</p>",
+        "id": 634445307,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1792772720
+    },
+    {
+        "content": "<p>I don’t think you can use std:<span aria-label=\"thread\" class=\"emoji emoji-1f9f5\" role=\"img\" title=\"thread\">:thread:</span>:spawn with #![no_std].</p>",
+        "id": 634448854,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1792773353
+    },
+    {
+        "content": "<p>Right, but you can't do it with <code>wasm32-unknown-unknown</code>, either.  You <em>can</em> use the component model intrinsics for spawning threads with <code>#![no_std]</code> and <code>--target=wasm32-wasip3</code>, unlike with <code>wasm32-unknown-unknown</code>.  For ideal ergonomics, we'll need to wait for optional imports.</p>",
+        "id": 634454697,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1792774429
+    },
+    {
+        "content": "<p>Do you have an example or doc for how to do this?  I’m traveling right now and won’t be able to try it until mid next week.</p>",
+        "id": 634455541,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1792774586
+    },
+    {
+        "content": "<p>No, sorry; just thought I'd chime in with what I know about the relevant current and future options.</p>",
+        "id": 634456096,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1792774696
+    },
+    {
+        "content": "<p>I imagine using <code>#![no_std]</code> and <code>libc::pthread_create</code> and friends would also work for <code>wasm32-wasip3</code>, although I haven't tried that myself.</p>\n<p>Another approach would be to <em>not</em> use <code>#![no_std]</code> but override the default panic handler like <a href=\"https://github.com/bytecodealliance/wasm-tools/blob/891e113cc2dc16b7041daa47c630600852fade25/crates/wit-component/dl/src/lib.rs#L160-L164\">here</a>, which should help avoid pulling in stdio-related stuff and allow it to be dead-code-eliminated.  Again, I haven't tried that myself, but seems promising.</p>",
+        "id": 634458555,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1792775154
+    },
+    {
+        "content": "<p>I’ll give those a try next week, thanks</p>",
+        "id": 634525085,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1792794360
+    },
+    {
+        "content": "<p><code>no_std</code> was able to reduce the imports down to only <code>wasi:clocks/types</code> (for duration) and <code>wasi:cli/exit</code> (used by __wasi_coop_thread_start).</p>",
+        "id": 635444233,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1793117806
+    },
+    {
+        "content": "<p>defining a custom exit func removes that import.</p>",
+        "id": 635447730,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1793118579
+    },
+    {
+        "content": "<p>wasi:clocks is a dependency of http, which my commonest needs. The version bumped which made me think it was a new dep. With no_std and overriding the exit method I'm back down to the same imports/exports as wasm32-unknown-unknown. The downside is that I can no longer use the parts of std that would never have triggered an import.</p>",
+        "id": 635455475,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1793120131
+    },
+    {
+        "content": "<p>Are the parts of <code>std</code> that you need available in <code>alloc</code> (e.g. <code>Vec</code>, etc.)?</p>",
+        "id": 635456770,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1793120386
+    },
+    {
+        "content": "<p>yea, everything I need is available in <code>alloc</code> or <code>core</code></p>",
+        "id": 635459896,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1793121046
+    },
+    {
+        "content": "<p>Also found that system-clock and monotonic-clock are pulled in by the threads support via <code>__tl_lock</code> and <code>__tl_unlock</code>, even with <code>no_std</code>. <code>wasm-opt</code> was removing the imports before I noticed.</p>",
+        "id": 635481751,
+        "sender_full_name": "Scott Andrews",
+        "timestamp": 1793126396
+    }
+]

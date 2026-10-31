@@ -1,0 +1,325 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14752 GuestProfiler::new rebuilds the m... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314752.20GuestProfiler.3A.3Anew.20rebuilds.20the.20m.2E.2E.2E.html">wasmtime / issue #14752 GuestProfiler::new rebuilds the m...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="631758632"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314752%20GuestProfiler%3A%3Anew%20rebuilds%20the%20m.../near/631758632" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314752.20GuestProfiler.3A.3Anew.20rebuilds.20the.20m.2E.2E.2E.html#631758632">(Oct 14 2026 at 19:59)</a>:</h4>
+<p>andrewl6097 opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14752">issue #14752</a>:</p>
+<blockquote>
+<h4>Feature</h4>
+<p><code>GuestProfiler::new</code> demangles every defined function's name and builds a fresh<br>
+symbol table for each module it is given, every time it is called. The table<br>
+depends only on the module, so it could be built once per <code>Module</code> and shared by<br>
+every later profiler.</p>
+<h4>Benefit</h4>
+<p><code>GuestProfiler</code> is documented as suitable for profiling individual guests in a<br>
+multi-tenant embedder, which suggests one profiler per request. Today each of<br>
+those profilers pays a setup cost that grows with the size of the module, and<br>
+for large Rust modules it becomes a large share of the request:</p>
+<ul>
+<li>
+<p>On a 1.7 MB Rust module with about 1,500 defined functions, <code>new()</code> takes about<br>
+  2.4 ms (measured on wasmtime 43). Demangling the names takes about 2.1 ms of that, and everything in<br>
+<code>new()</code> that does not depend on the module takes under 1 µs. The guest<br>
+  invocation we were profiling ran for about 44 ms, so setup cost more than<br>
+  sampling every millisecond for the whole invocation (about 0.2 ms).  And this was a pathological case; many of our guests run for far shorter time periods so this overhead would be even more painful.</p>
+</li>
+<li>
+<p>The program below generates modules with N Rust-mangled function names and<br>
+  times <code>new()</code>. On wasmtime 49.0.3, x86_64 Linux, release build:</p>
+<table>
+<thead>
+<tr>
+<th>Functions</th>
+<th><code>GuestProfiler::new</code>, median of 1000</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1,500</td>
+<td>681 µs</td>
+</tr>
+<tr>
+<td>10,000</td>
+<td>4.64 ms</td>
+</tr>
+</tbody>
+</table>
+<p>(The generated names are shorter than real rustc output, which is why the<br>
+1,500-function case is cheaper here than in the real module above.)</p>
+</li>
+</ul>
+<p>&lt;details&gt;&lt;summary&gt;Reproduction&lt;/summary&gt;</p>
+<div class="codehilite" data-code-language="TOML"><pre><span></span><code><span class="c1"># Cargo.toml</span>
+<span class="k">[package]</span>
+<span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"guest-profiler-new-cost"</span>
+<span class="n">version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"0.0.0"</span>
+<span class="n">edition</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"2024"</span>
+<span class="n">publish</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
+
+<span class="k">[dependencies]</span>
+<span class="n">wasmtime</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"49"</span>
+</code></pre></div>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="c1">// src/main.rs</span>
+<span class="sd">//! Times `GuestProfiler::new` on a module with many Rust-mangled function names.</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">fmt</span><span class="p">::</span><span class="n">Write</span><span class="p">;</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">time</span><span class="p">::{</span><span class="n">Duration</span><span class="p">,</span><span class="w"> </span><span class="n">Instant</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">wasmtime</span><span class="p">::{</span><span class="n">Engine</span><span class="p">,</span><span class="w"> </span><span class="n">GuestProfiler</span><span class="p">,</span><span class="w"> </span><span class="n">Module</span><span class="p">};</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">wasmtime</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">funcs</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">env</span><span class="p">::</span><span class="n">args</span><span class="p">().</span><span class="n">nth</span><span class="p">(</span><span class="mi">1</span><span class="p">).</span><span class="n">map_or</span><span class="p">(</span><span class="mi">1500</span><span class="p">,</span><span class="w"> </span><span class="o">|</span><span class="n">s</span><span class="o">|</span><span class="w"> </span><span class="n">s</span><span class="p">.</span><span class="n">parse</span><span class="p">().</span><span class="n">unwrap</span><span class="p">());</span>
+<span class="w">    </span><span class="c1">// Legacy-mangled names shaped like rustc output: crate::module_N::function_N::{hash}.</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">wat</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">String</span><span class="p">::</span><span class="n">from</span><span class="p">(</span><span class="s">"(module</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="mi">0</span><span class="o">..</span><span class="n">funcs</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="n">m</span><span class="p">,</span><span class="w"> </span><span class="n">f</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="fm">format!</span><span class="p">(</span><span class="s">"module_{i}"</span><span class="p">),</span><span class="w"> </span><span class="fm">format!</span><span class="p">(</span><span class="s">"function_{i}"</span><span class="p">));</span>
+<span class="w">        </span><span class="fm">writeln!</span><span class="p">(</span>
+<span class="w">            </span><span class="n">wat</span><span class="p">,</span>
+<span class="w">            </span><span class="s">"  (func $_ZN10some_crate{}{}{}{}17h{:016x}E)"</span><span class="p">,</span>
+<span class="w">            </span><span class="n">m</span><span class="p">.</span><span class="n">len</span><span class="p">(),</span><span class="w"> </span><span class="n">m</span><span class="p">,</span><span class="w"> </span><span class="n">f</span><span class="p">.</span><span class="n">len</span><span class="p">(),</span><span class="w"> </span><span class="n">f</span><span class="p">,</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">u64</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mh">0x9e37_79b9_7f4a_7c15</span>
+<span class="w">        </span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">wat</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="sc">')'</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">engine</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Engine</span><span class="p">::</span><span class="n">default</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">module</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Module</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">wat</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">new</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">GuestProfiler</span><span class="p">::</span><span class="n">new</span><span class="p">(</span>
+<span class="w">            </span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span>
+<span class="w">            </span><span class="s">"bench"</span><span class="p">,</span>
+<span class="w">            </span><span class="n">Duration</span><span class="p">::</span><span class="n">from_millis</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span>
+<span class="w">            </span><span class="p">[(</span><span class="s">"bench.wasm"</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span><span class="w"> </span><span class="n">module</span><span class="p">.</span><span class="n">clone</span><span class="p">())],</span>
+<span class="w">        </span><span class="p">)</span>
+<span class="w">        </span><span class="p">.</span><span class="n">unwrap</span><span class="p">()</span>
+<span class="w">    </span><span class="p">};</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">t</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Instant</span><span class="p">::</span><span class="n">now</span><span class="p">();</span>
+<span class="w">    </span><span class="nb">drop</span><span class="p">(</span><span class="n">new</span><span class="p">());</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">first</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">t</span><span class="p">.</span><span class="n">elapsed</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">times</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="n">Duration</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="mi">0</span><span class="o">..</span><span class="mi">1000</span><span class="p">)</span>
+<span class="w">        </span><span class="p">.</span><span class="n">map</span><span class="p">(</span><span class="o">|</span><span class="n">_</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="kd">let</span><span class="w"> </span><span class="n">t</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Instant</span><span class="p">::</span><span class="n">now</span><span class="p">();</span>
+<span class="w">            </span><span class="nb">drop</span><span class="p">(</span><span class="n">new</span><span class="p">());</span>
+<span class="w">            </span><span class="n">t</span><span class="p">.</span><span class="n">elapsed</span><span class="p">()</span>
+<span class="w">        </span><span class="p">})</span>
+<span class="w">        </span><span class="p">.</span><span class="n">collect</span><span class="p">();</span>
+<span class="w">    </span><span class="n">times</span><span class="p">.</span><span class="n">sort</span><span class="p">();</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span>
+<span class="w">        </span><span class="s">"{funcs} functions: first new() {first:?}, later new() median {:?}, p99 {:?}"</span><span class="p">,</span>
+<span class="w">        </span><span class="n">times</span><span class="p">[</span><span class="mi">500</span><span class="p">],</span><span class="w"> </span><span class="n">times</span><span class="p">[</span><span class="mi">990</span><span class="p">]</span>
+<span class="w">    </span><span class="p">);</span>
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Run with <code>cargo run --release -- 1500</code> and <code>cargo run --release -- 10000</code>.</p>
+<p>&lt;/details&gt;</p>
+<h4>Implementation</h4>
+<p>Cache the table on the module: a <code>OnceLock&lt;Option&lt;Arc&lt;SymbolTable&gt;&gt;&gt;</code> on<br>
+<code>ModuleInner</code>, behind the <code>profiling</code> feature, filled by <code>module_symbols</code> the<br>
+first time a profiler includes the module. <code>fxprof_processed_profile</code> already<br>
+holds a library's symbol table as an <code>Arc&lt;SymbolTable&gt;</code>, so sharing it needs no<br>
+copy.</p>
+<p>One detail: <code>Profile::add_lib</code> keys libraries by value, so a <code>LibraryInfo</code><br>
+carrying the table hashes every symbol name on each call. Adding the library<br>
+without a table and then attaching the shared table with<br>
+<code>Profile::set_lib_symbol_table</code> avoids that. In my measurements, passing the<br>
+table inside <code>LibraryInfo</code> made each cached <code>new()</code> on the 1,500-function<br>
+module take 31.7 µs, against 16.3 µs with <code>set_lib_symbol_table</code>.</p>
+<p>I have a patch for this and can open a PR.</p>
+<h4>Alternatives</h4>
+<ul>
+<li>
+<p><strong>Hold the table in a separate, reusable profiler object.</strong> This is close to<br>
+  the "standalone profiler struct where you acquire thread-specific profilers"<br>
+  idea from the review of #6282. It would mean new public API, while caching on<br>
+<code>Module</code> changes none.</p>
+</li>
+<li>
+<p><strong>Pass a prebuilt symbol table into <code>GuestProfiler::new</code>.</strong> This also needs<br>
+  new public API, and the embedder would have to keep the table alongside each<br>
+  module.</p>
+</li>
+<li>
+<p><strong>Have the embedder demangle names at build time.</strong> Rewriting the name<br>
+  section with already-demangled names cuts our 2.4 ms to about 0.65 ms,<br>
+  because both demanglers then fail fast. It needs a build step in every guest<br>
+  toolchain and still costs time on every profile.</p>
+</li>
+</ul>
+<p>Memory cost: the cache keeps one symbol table alive per profiled <code>Module</code> for<br>
+the module's lifetime. That is roughly the size of the demangled names, about<br>
+240 KB of strings for the 1,500-function module. Modules that are never<br>
+profiled pay nothing beyond an empty <code>OnceLock</code>.<br>
+</p>
+</blockquote>
+
+
+
+<a name="631759444"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314752%20GuestProfiler%3A%3Anew%20rebuilds%20the%20m.../near/631759444" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314752.20GuestProfiler.3A.3Anew.20rebuilds.20the.20m.2E.2E.2E.html#631759444">(Oct 14 2026 at 20:02)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the performance label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14752">Issue #14752</a>.</p>
+
+
+
+<a name="631759446"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314752%20GuestProfiler%3A%3Anew%20rebuilds%20the%20m.../near/631759446" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314752.20GuestProfiler.3A.3Anew.20rebuilds.20the.20m.2E.2E.2E.html#631759446">(Oct 14 2026 at 20:02)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the guest-profiler label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14752">Issue #14752</a>.</p>
+
+
+
+<a name="632091890"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314752%20GuestProfiler%3A%3Anew%20rebuilds%20the%20m.../near/632091890" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314752.20GuestProfiler.3A.3Anew.20rebuilds.20the.20m.2E.2E.2E.html#632091890">(Oct 15 2026 at 21:31)</a>:</h4>
+<p>alexcrichton closed <a href="https://github.com/bytecodealliance/wasmtime/issues/14752">issue #14752</a>:</p>
+<blockquote>
+<h4>Feature</h4>
+<p><code>GuestProfiler::new</code> demangles every defined function's name and builds a fresh<br>
+symbol table for each module it is given, every time it is called. The table<br>
+depends only on the module, so it could be built once per <code>Module</code> and shared by<br>
+every later profiler.</p>
+<h4>Benefit</h4>
+<p><code>GuestProfiler</code> is documented as suitable for profiling individual guests in a<br>
+multi-tenant embedder, which suggests one profiler per request. Today each of<br>
+those profilers pays a setup cost that grows with the size of the module, and<br>
+for large Rust modules it becomes a large share of the request:</p>
+<ul>
+<li>
+<p>On a 1.7 MB Rust module with about 1,500 defined functions, <code>new()</code> takes about<br>
+  2.4 ms (measured on wasmtime 43). Demangling the names takes about 2.1 ms of that, and everything in<br>
+<code>new()</code> that does not depend on the module takes under 1 µs. The guest<br>
+  invocation we were profiling ran for about 44 ms, so setup cost more than<br>
+  sampling every millisecond for the whole invocation (about 0.2 ms).  And this was a pathological case; many of our guests run for far shorter time periods so this overhead would be even more painful.</p>
+</li>
+<li>
+<p>The program below generates modules with N Rust-mangled function names and<br>
+  times <code>new()</code>. On wasmtime 49.0.3, x86_64 Linux, release build:</p>
+<table>
+<thead>
+<tr>
+<th>Functions</th>
+<th><code>GuestProfiler::new</code>, median of 1000</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1,500</td>
+<td>681 µs</td>
+</tr>
+<tr>
+<td>10,000</td>
+<td>4.64 ms</td>
+</tr>
+</tbody>
+</table>
+<p>(The generated names are shorter than real rustc output, which is why the<br>
+1,500-function case is cheaper here than in the real module above.)</p>
+</li>
+</ul>
+<p>&lt;details&gt;&lt;summary&gt;Reproduction&lt;/summary&gt;</p>
+<div class="codehilite" data-code-language="TOML"><pre><span></span><code><span class="c1"># Cargo.toml</span>
+<span class="k">[package]</span>
+<span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"guest-profiler-new-cost"</span>
+<span class="n">version</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"0.0.0"</span>
+<span class="n">edition</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"2024"</span>
+<span class="n">publish</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
+
+<span class="k">[dependencies]</span>
+<span class="n">wasmtime</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"49"</span>
+</code></pre></div>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="c1">// src/main.rs</span>
+<span class="sd">//! Times `GuestProfiler::new` on a module with many Rust-mangled function names.</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">fmt</span><span class="p">::</span><span class="n">Write</span><span class="p">;</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">time</span><span class="p">::{</span><span class="n">Duration</span><span class="p">,</span><span class="w"> </span><span class="n">Instant</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">wasmtime</span><span class="p">::{</span><span class="n">Engine</span><span class="p">,</span><span class="w"> </span><span class="n">GuestProfiler</span><span class="p">,</span><span class="w"> </span><span class="n">Module</span><span class="p">};</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">wasmtime</span><span class="p">::</span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">funcs</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">env</span><span class="p">::</span><span class="n">args</span><span class="p">().</span><span class="n">nth</span><span class="p">(</span><span class="mi">1</span><span class="p">).</span><span class="n">map_or</span><span class="p">(</span><span class="mi">1500</span><span class="p">,</span><span class="w"> </span><span class="o">|</span><span class="n">s</span><span class="o">|</span><span class="w"> </span><span class="n">s</span><span class="p">.</span><span class="n">parse</span><span class="p">().</span><span class="n">unwrap</span><span class="p">());</span>
+<span class="w">    </span><span class="c1">// Legacy-mangled names shaped like rustc output: crate::module_N::function_N::{hash}.</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">wat</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">String</span><span class="p">::</span><span class="n">from</span><span class="p">(</span><span class="s">"(module</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="mi">0</span><span class="o">..</span><span class="n">funcs</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="p">(</span><span class="n">m</span><span class="p">,</span><span class="w"> </span><span class="n">f</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="fm">format!</span><span class="p">(</span><span class="s">"module_{i}"</span><span class="p">),</span><span class="w"> </span><span class="fm">format!</span><span class="p">(</span><span class="s">"function_{i}"</span><span class="p">));</span>
+<span class="w">        </span><span class="fm">writeln!</span><span class="p">(</span>
+<span class="w">            </span><span class="n">wat</span><span class="p">,</span>
+<span class="w">            </span><span class="s">"  (func $_ZN10some_crate{}{}{}{}17h{:016x}E)"</span><span class="p">,</span>
+<span class="w">            </span><span class="n">m</span><span class="p">.</span><span class="n">len</span><span class="p">(),</span><span class="w"> </span><span class="n">m</span><span class="p">,</span><span class="w"> </span><span class="n">f</span><span class="p">.</span><span class="n">len</span><span class="p">(),</span><span class="w"> </span><span class="n">f</span><span class="p">,</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">u64</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mh">0x9e37_79b9_7f4a_7c15</span>
+<span class="w">        </span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">wat</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="sc">')'</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">engine</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Engine</span><span class="p">::</span><span class="n">default</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">module</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Module</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">wat</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">new</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">GuestProfiler</span><span class="p">::</span><span class="n">new</span><span class="p">(</span>
+<span class="w">            </span><span class="o">&amp;</span><span class="n">engine</span><span class="p">,</span>
+<span class="w">            </span><span class="s">"bench"</span><span class="p">,</span>
+<span class="w">            </span><span class="n">Duration</span><span class="p">::</span><span class="n">from_millis</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span>
+<span class="w">            </span><span class="p">[(</span><span class="s">"bench.wasm"</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span><span class="w"> </span><span class="n">module</span><span class="p">.</span><span class="n">clone</span><span class="p">())],</span>
+<span class="w">        </span><span class="p">)</span>
+<span class="w">        </span><span class="p">.</span><span class="n">unwrap</span><span class="p">()</span>
+<span class="w">    </span><span class="p">};</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">t</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Instant</span><span class="p">::</span><span class="n">now</span><span class="p">();</span>
+<span class="w">    </span><span class="nb">drop</span><span class="p">(</span><span class="n">new</span><span class="p">());</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">first</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">t</span><span class="p">.</span><span class="n">elapsed</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">times</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="n">Duration</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="mi">0</span><span class="o">..</span><span class="mi">1000</span><span class="p">)</span>
+<span class="w">        </span><span class="p">.</span><span class="n">map</span><span class="p">(</span><span class="o">|</span><span class="n">_</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="kd">let</span><span class="w"> </span><span class="n">t</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Instant</span><span class="p">::</span><span class="n">now</span><span class="p">();</span>
+<span class="w">            </span><span class="nb">drop</span><span class="p">(</span><span class="n">new</span><span class="p">());</span>
+<span class="w">            </span><span class="n">t</span><span class="p">.</span><span class="n">elapsed</span><span class="p">()</span>
+<span class="w">        </span><span class="p">})</span>
+<span class="w">        </span><span class="p">.</span><span class="n">collect</span><span class="p">();</span>
+<span class="w">    </span><span class="n">times</span><span class="p">.</span><span class="n">sort</span><span class="p">();</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span>
+<span class="w">        </span><span class="s">"{funcs} functions: first new() {first:?}, later new() median {:?}, p99 {:?}"</span><span class="p">,</span>
+<span class="w">        </span><span class="n">times</span><span class="p">[</span><span class="mi">500</span><span class="p">],</span><span class="w"> </span><span class="n">times</span><span class="p">[</span><span class="mi">990</span><span class="p">]</span>
+<span class="w">    </span><span class="p">);</span>
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Run with <code>cargo run --release -- 1500</code> and <code>cargo run --release -- 10000</code>.</p>
+<p>&lt;/details&gt;</p>
+<h4>Implementation</h4>
+<p>Cache the table on the module: a <code>OnceLock&lt;Option&lt;Arc&lt;SymbolTable&gt;&gt;&gt;</code> on<br>
+<code>ModuleInner</code>, behind the <code>profiling</code> feature, filled by <code>module_symbols</code> the<br>
+first time a profiler includes the module. <code>fxprof_processed_profile</code> already<br>
+holds a library's symbol table as an <code>Arc&lt;SymbolTable&gt;</code>, so sharing it needs no<br>
+copy.</p>
+<p>One detail: <code>Profile::add_lib</code> keys libraries by value, so a <code>LibraryInfo</code><br>
+carrying the table hashes every symbol name on each call. Adding the library<br>
+without a table and then attaching the shared table with<br>
+<code>Profile::set_lib_symbol_table</code> avoids that. In my measurements, passing the<br>
+table inside <code>LibraryInfo</code> made each cached <code>new()</code> on the 1,500-function<br>
+module take 31.7 µs, against 16.3 µs with <code>set_lib_symbol_table</code>.</p>
+<p>I have a patch for this and can open a PR.</p>
+<h4>Alternatives</h4>
+<ul>
+<li>
+<p><strong>Hold the table in a separate, reusable profiler object.</strong> This is close to<br>
+  the "standalone profiler struct where you acquire thread-specific profilers"<br>
+  idea from the review of #6282. It would mean new public API, while caching on<br>
+<code>Module</code> changes none.</p>
+</li>
+<li>
+<p><strong>Pass a prebuilt symbol table into <code>GuestProfiler::new</code>.</strong> This also needs<br>
+  new public API, and the embedder would have to keep the table alongside each<br>
+  module.</p>
+</li>
+<li>
+<p><strong>Have the embedder demangle names at build time.</strong> Rewriting the name<br>
+  section with already-demangled names cuts our 2.4 ms to about 0.65 ms,<br>
+  because both demanglers then fail fast. It needs a build step in every guest<br>
+  toolchain and still costs time on every profile.</p>
+</li>
+</ul>
+<p>Memory cost: the cache keeps one symbol table alive per profiled <code>Module</code> for<br>
+the module's lifetime. That is roughly the size of the demangled names, about<br>
+240 KB of strings for the 1,500-function module. Modules that are never<br>
+profiled pay nothing beyond an empty <code>OnceLock</code>.<br>
+</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Oct 31 2026 at 21:03 UTC</p>
+</html>

@@ -1,0 +1,269 @@
+<html>
+<head><meta charset="utf-8"><title>Trouble virtualizing wasi interfaces · wasi · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/index.html">wasi</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html">Trouble virtualizing wasi interfaces</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="633406161"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/633406161" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#633406161">(Oct 20 2026 at 18:10)</a>:</h4>
+<p>I'm working on a suite of components that virtualize WASI interfaces (wrapping each interface to trace calls, apply access controls, etc.). I've hit a limitation in the 0.3 async model that I don't think wrappers can work around.</p>
+<p>The concrete case is <code>wasi:http/types</code> <code>request.new</code>, a sync function that accepts <code>trailers: future&lt;result&lt;option&lt;trailers&gt;, error-code&gt;&gt;</code>. The virtualizer's exported <code>trailers</code> is a distinct resource type from the imported one, so that future can't be forwarded to the upstream <code>request.new</code>. Something has to await it, unwrap the resource, and write a new future. But a sync-lifted export has no task that outlives the call. Once it returns, the component can't run until it's called again. Blocking inside <code>new</code> would deadlock, because the caller only writes trailers after <code>new</code> returns.</p>
+<p>wit-bindgen 0.62 papered over this: <code>spawn_local</code> from a sync export queued the work, and it ran during whatever async export came next. 0.63 now reasonably asserts there's an active task, which surfaced the problem: <a href="https://github.com/bytecodealliance/wit-bindgen/issues/1754">https://github.com/bytecodealliance/wit-bindgen/issues/1754</a>. Even before that, my approach was inherently fragile.</p>
+<p>The pattern isn't specific to http. Any sync function that takes or returns a <code>future</code>/<code>stream</code> whose payload contains a resource has this problem (<code>request/response.new</code>, <code>consume-body</code>, and I believe <code>wasi:sockets</code> <code>tcp-socket.listen</code>). Streams of plain data can be passed through, but can't be observed without a task either (e.g. <code>wasi:cli</code> <code>write-via-stream</code>).</p>
+<p>Colorless composition was an early goal that has narrowed. It leaves sync functions with no way to start work that continues after they return. Some directions I can see, none of which I'm confident in:</p>
+<ol>
+<li>
+<p>Allow sync-typed functions to be lifted with the async ABI, keep running after <code>task.return</code>, and trap only if they block before returning.</p>
+</li>
+<li>
+<p>Let cooperative threads outlive the sync task that created them.</p>
+</li>
+<li>
+<p>Require any WIT function that takes or returns a future/stream to be <code>async</code>. This works, but it pushes the cost onto every caller.</p>
+</li>
+</ol>
+<p>Is there an intended pattern for this, or is the ability to virtualize any interface not a goal the current design can guarantee? I know just enough here to be dangerous, and deeply appreciate the effort put into the design to date.</p>
+
+
+
+<a name="633417867"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/633417867" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#633417867">(Oct 20 2026 at 18:57)</a>:</h4>
+<p>I believe a variation of this question came up in a different thread; I'll see if I can find it.</p>
+<p>Meanwhile, have you considered spawning a thread to read from or write to a future or stream?  (EDIT: yes, I see you did; sorry for skimming too fast the first time!)  At the moment, that requires some obscure incantations for most guest toolchains, but it's technically possible now for C/C++, Rust, and Python now and will "just work" as support is stabilized over the next month or two.  If the guest language is JS, I'm not sure what the options are or will be aside from composing with a language that supports multithreading.</p>
+
+
+
+<a name="633418492"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/633418492" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#633418492">(Oct 20 2026 at 18:59)</a>:</h4>
+<p>BTW, I believe that lifting sync-typed functions with the async ABI is currently prohibited by the Component Model.</p>
+
+
+
+<a name="633419643"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/633419643" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#633419643">(Oct 20 2026 at 19:03)</a>:</h4>
+<p>Here's the thread (no pun intended) I was thinking of: <a href="#narrow/channel/219900-wasi/topic/Creating.20a.20.60stream.60.20in.20a.20sync.20context">#wasi &gt; Creating a &#96;stream&#96; in a sync context</a></p>
+
+
+
+<a name="633421552"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/633421552" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#633421552">(Oct 20 2026 at 19:11)</a>:</h4>
+<p>My current hacky support for calling async components from a sync context. It doesn’t work for the http <a href="http://request.new">request.new</a> case. <a href="https://github.com/componentized/filesystem/blob/main/crates/componentized-rt/src/lib.rs">https://github.com/componentized/filesystem/blob/main/crates/componentized-rt/src/lib.rs</a></p>
+
+
+
+<a name="633429330"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/633429330" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#633429330">(Oct 20 2026 at 19:43)</a>:</h4>
+<p>Once Rust 1.100 ships in a few weeks, you'll be able to use <code>std::thread::spawn</code> (and it should work on nightly now).</p>
+
+
+
+<a name="633435194"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/633435194" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#633435194">(Oct 20 2026 at 20:05)</a>:</h4>
+<p>This does sound like a poster-child style use case for threads if that can work, and there's no restriction that threads must live within the context of their task -- I think it'd work for this use case. As a caveat though <code>std::thread::spawn</code> won't work in Rust 1.100 out-the-box, you'll need the <a href="https://doc.rust-lang.org/nightly/rustc/platform-support/wasm32-wasip3.html#testing-cooperative-multithreading">mysterious incantations</a></p>
+
+
+
+<a name="633439466"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/633439466" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#633439466">(Oct 20 2026 at 20:24)</a>:</h4>
+<p>Is wasm32-wasip3 required? I really want to avoid the import barf that entails.</p>
+
+
+
+<a name="633439752"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/633439752" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#633439752">(Oct 20 2026 at 20:25)</a>:</h4>
+<p><code>std::thread::spawn</code> will only be supported on wasip3 yeah, no other target will support threading in rust</p>
+
+
+
+<a name="633442229"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/633442229" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#633442229">(Oct 20 2026 at 20:35)</a>:</h4>
+<p>an aside: I find it odd that a platform with a zero capability by default model would default to enabling every capability on the host for the premier build target.</p>
+
+
+
+<a name="633442742"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/633442742" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#633442742">(Oct 20 2026 at 20:37)</a>:</h4>
+<p>All my components are currently built with <code>wasm32-unknown-unknown</code> and <code>wasm-tools component new</code> in order to get only the imports the component actually needs.</p>
+<p>I saw <code>wasm32-none-component</code> landed yesterday in tier 3, but that's a bit bare bones.</p>
+
+
+
+<a name="633470821"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/633470821" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#633470821">(Oct 20 2026 at 23:06)</a>:</h4>
+<p>I tried <code>wasm32-wasip3</code> with rust 1.100 (beta), wasi-sdk 34 and wasmtime main@28e3807. The wasi:http <a href="http://request.new">request.new</a> is able to spawn a new thread and returns, however, the next call into the component triggers a memory fault:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">Error</span><span class="p">:</span><span class="w"> </span><span class="nc">error</span><span class="w"> </span><span class="k">while</span><span class="w"> </span><span class="n">executing</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">wasm</span><span class="w"> </span><span class="n">backtrace</span><span class="p">:</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">:</span><span class="w">  </span><span class="mh">0x27a9f</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">trace</span><span class="p">.</span><span class="n">wasm</span><span class="o">!</span><span class="n">dlfree</span>
+<span class="w">    </span><span class="mi">1</span><span class="p">:</span><span class="w">  </span><span class="mh">0x27795</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">trace</span><span class="p">.</span><span class="n">wasm</span><span class="o">!</span><span class="n">free</span>
+<span class="w">    </span><span class="mi">2</span><span class="p">:</span><span class="w">   </span><span class="mh">0x6c19</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">trace</span><span class="p">.</span><span class="n">wasm</span><span class="o">!&lt;</span><span class="n">wit_bindgen</span><span class="p">[</span><span class="mi">1</span><span class="n">dc4b884a9bc26</span><span class="p">]::</span><span class="n">rt</span><span class="p">::</span><span class="n">Cleanup</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">core</span><span class="p">[</span><span class="mi">8</span><span class="n">a7f440ef15db33b</span><span class="p">]::</span><span class="n">ops</span><span class="p">::</span><span class="nb">drop</span><span class="p">::</span><span class="nb">Drop</span><span class="o">&gt;</span><span class="p">::</span><span class="nb">drop</span>
+<span class="w">    </span><span class="mi">3</span><span class="p">:</span><span class="w">   </span><span class="mh">0x6bf5</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">trace</span><span class="p">.</span><span class="n">wasm</span><span class="o">!</span><span class="n">core</span><span class="p">[</span><span class="mi">8</span><span class="n">a7f440ef15db33b</span><span class="p">]::</span><span class="n">ptr</span><span class="p">::</span><span class="n">drop_glue</span><span class="p">::</span><span class="o">&lt;</span><span class="n">wit_bindgen</span><span class="p">[</span><span class="mi">1</span><span class="n">dc4b884a9bc26</span><span class="p">]::</span><span class="n">rt</span><span class="p">::</span><span class="n">async_support</span><span class="p">::</span><span class="n">subtask</span><span class="p">::</span><span class="n">InProgress</span><span class="o">&lt;</span><span class="n">trace</span><span class="p">[</span><span class="mi">537</span><span class="n">ff8db433888f6</span><span class="p">]::</span><span class="n">wasi</span><span class="p">::</span><span class="n">http</span><span class="p">::</span><span class="n">client</span><span class="p">::</span><span class="n">send</span><span class="p">::{</span><span class="n">closure</span><span class="p">#</span><span class="mi">0</span><span class="p">}::</span><span class="n">_MySubtask</span><span class="o">&gt;&gt;</span>
+<span class="w">    </span><span class="mi">4</span><span class="p">:</span><span class="w">   </span><span class="mh">0x7706</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">trace</span><span class="p">.</span><span class="n">wasm</span><span class="o">!&lt;</span><span class="n">wit_bindgen</span><span class="p">[</span><span class="mi">1</span><span class="n">dc4b884a9bc26</span><span class="p">]::</span><span class="n">rt</span><span class="p">::</span><span class="n">async_support</span><span class="p">::</span><span class="n">waitable</span><span class="p">::</span><span class="n">WaitableOperation</span><span class="o">&lt;</span><span class="n">wit_bindgen</span><span class="p">[</span><span class="mi">1</span><span class="n">dc4b884a9bc26</span><span class="p">]::</span><span class="n">rt</span><span class="p">::</span><span class="n">async_support</span><span class="p">::</span><span class="n">subtask</span><span class="p">::</span><span class="n">SubtaskOps</span><span class="o">&lt;</span><span class="n">trace</span><span class="p">[</span><span class="mi">537</span><span class="n">ff8db433888f6</span><span class="p">]::</span><span class="n">wasi</span><span class="p">::</span><span class="n">http</span><span class="p">::</span><span class="n">client</span><span class="p">::</span><span class="n">send</span><span class="p">::{</span><span class="n">closure</span><span class="p">#</span><span class="mi">0</span><span class="p">}::</span><span class="n">_MySubtask</span><span class="o">&gt;&gt;&gt;</span><span class="p">::</span><span class="n">poll_complete_with_code</span>
+<span class="w">    </span><span class="mi">5</span><span class="p">:</span><span class="w">   </span><span class="mh">0xa8d6</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">trace</span><span class="p">.</span><span class="n">wasm</span><span class="o">!</span><span class="n">trace</span><span class="p">[</span><span class="mi">537</span><span class="n">ff8db433888f6</span><span class="p">]::</span><span class="n">exports</span><span class="p">::</span><span class="n">wasi</span><span class="p">::</span><span class="n">http</span><span class="p">::</span><span class="n">client</span><span class="p">::</span><span class="n">_export_send_cabi</span><span class="p">::</span><span class="o">&lt;</span><span class="n">trace</span><span class="p">[</span><span class="mi">537</span><span class="n">ff8db433888f6</span><span class="p">]::</span><span class="n">Trace</span><span class="o">&gt;</span><span class="p">::{</span><span class="n">closure</span><span class="p">#</span><span class="mi">0</span><span class="p">}</span>
+<span class="w">    </span><span class="mi">6</span><span class="p">:</span><span class="w">   </span><span class="mh">0x8493</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">trace</span><span class="p">.</span><span class="n">wasm</span><span class="o">!&lt;</span><span class="n">wit_bindgen</span><span class="p">[</span><span class="mi">1</span><span class="n">dc4b884a9bc26</span><span class="p">]::</span><span class="n">rt</span><span class="p">::</span><span class="n">async_support</span><span class="p">::</span><span class="n">TaskState</span><span class="o">&gt;</span><span class="p">::</span><span class="n">callback</span>
+<span class="w">    </span><span class="mi">7</span><span class="p">:</span><span class="w">   </span><span class="mh">0x419a</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">trace</span><span class="p">.</span><span class="n">wasm</span><span class="o">!</span><span class="n">wit_bindgen</span><span class="p">[</span><span class="mi">1</span><span class="n">dc4b884a9bc26</span><span class="p">]::</span><span class="n">rt</span><span class="p">::</span><span class="n">async_support</span><span class="p">::</span><span class="n">callback</span>
+<span class="w">    </span><span class="mi">8</span><span class="p">:</span><span class="w">   </span><span class="mh">0x4429</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">trace</span><span class="p">.</span><span class="n">wasm</span><span class="o">!</span><span class="p">[</span><span class="n">callback</span><span class="p">][</span><span class="k">async</span><span class="o">-</span><span class="n">lift</span><span class="p">]</span><span class="n">wasi</span><span class="p">:</span><span class="nc">http</span><span class="o">/</span><span class="n">client</span><span class="o">@</span><span class="mf">0.3.0</span><span class="p">#</span><span class="n">send</span>
+<span class="w">    </span><span class="mi">9</span><span class="p">:</span><span class="w">  </span><span class="mh">0x3ee8a</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="o">&lt;</span><span class="n">unknown</span><span class="o">&gt;!&lt;</span><span class="n">wasm</span><span class="w"> </span><span class="n">function</span><span class="w"> </span><span class="mi">112</span><span class="o">&gt;</span>
+
+<span class="n">Caused</span><span class="w"> </span><span class="n">by</span><span class="p">:</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">:</span><span class="w"> </span><span class="nc">memory</span><span class="w"> </span><span class="n">fault</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="n">wasm</span><span class="w"> </span><span class="n">address</span><span class="w"> </span><span class="mh">0x80105ca8</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">linear</span><span class="w"> </span><span class="n">memory</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">size</span><span class="w"> </span><span class="mh">0x410000</span>
+<span class="w">    </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="nc">wasm</span><span class="w"> </span><span class="n">trap</span><span class="p">:</span><span class="w"> </span><span class="nc">out</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">bounds</span><span class="w"> </span><span class="n">memory</span><span class="w"> </span><span class="n">access</span>
+</code></pre></div>
+<p>full backtrace at <a href="https://pastebin.com/vqbi2tw5">https://pastebin.com/vqbi2tw5</a></p>
+
+
+
+<a name="633674516"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/633674516" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Alex Crichton <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#633674516">(Oct 21 2026 at 14:54)</a>:</h4>
+<p>That looks like memory corruption in the module itself, and for debugging that I'd recommend using the <code>dlmalloc</code> crate with the <code>debug</code> feature turne on. That may help narrow it down to the point of corruption. One common cause with threads is stack overflow in the case that there's a big stack buffer or perhaps the stack is just too small</p>
+
+
+
+<a name="633756202"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/633756202" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#633756202">(Oct 21 2026 at 19:21)</a>:</h4>
+<p>It looks like the root cause of the memory corruption was resolved by <a href="https://github.com/WebAssembly/wasi-libc/pull/884">https://github.com/WebAssembly/wasi-libc/pull/884</a>. With that fix applied to wasi-sdk and wasm32-wasip3 std:<span aria-label="thread" class="emoji emoji-1f9f5" role="img" title="thread">:thread:</span>:spawn seems to work.</p>
+
+
+
+<a name="633758121"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/633758121" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#633758121">(Oct 21 2026 at 19:28)</a>:</h4>
+<p>Was also able to hack around the additional wasi imports brought in by wasm32-wasip3 through a combination of dead code pruning and a no-op stub component. It's unfortunate that it's necessary to add bloat to a component to remove capabilities that aren't needed or desired.</p>
+
+
+
+<a name="634311900"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/634311900" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Till Schneidereit <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#634311900">(Oct 23 2026 at 10:24)</a>:</h4>
+<blockquote>
+<p>an aside: I find it odd that a platform with a zero capability by default model would default to enabling every capability on the host for the premier build target.</p>
+</blockquote>
+<p>You're not wrong that it'd be a lot nicer conceptually if we could avoid this. The reality is, though, that we need to meet developers where they are for any of this to be useful. And developers exist in established ecosystems, backed by language standard libraries and package repositories that fundamentally expect these interfaces to exist.</p>
+<p>(An aside to my answer to your aside: making interfaces available isn't the same as making capabilities available. E.g., <code>wasi:filesystem</code> being available doesn't mean you have access to any particular file handle, or the ability to gain that access. The actual capabilities system isn't ideal, but also far stronger than "default[ing] to enabling every capability on the host".)</p>
+
+
+
+<a name="634333108"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/634333108" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#634333108">(Oct 23 2026 at 11:27)</a>:</h4>
+<p>My concern is less that their is a way to turn these imports on, and more that their isn’t an obvious way to turn the off.  I agree that existing language ecosystems expect these capabilities, because that’s how it’s always been. Components disrupt that status quo.</p>
+<p>Of course the host, or another component can limit the capabilities. I’m working on exactly that.  It’s a powerful ability with components that two different branches of a composition can have different degrees of access to a capability like wasi:sockets. </p>
+<p>That doesn’t preclude my stance that a component which doesn’t need the network, should never have access to the network. Latent capabilities that aren’t used today, have a history of becoming tomorrow’s security vulnerabilities.</p>
+
+
+
+<a name="634386373"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/634386373" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Till Schneidereit <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#634386373">(Oct 23 2026 at 13:51)</a>:</h4>
+<blockquote>
+<p>a component which doesn’t need the network, should never have access to the network.</p>
+</blockquote>
+<p>Strongly agreed! The particular embedding of Wasmtime I work on (Spin) does exactly that, with deny-all defaults for both fs and network (via both sockets and http). But again, that's not the same as not providing the APIs. We tried that, hard, and found that it just doesn't work in the real world.</p>
+<p>As for the obvious way to turn off these capabilities: targeting <code>wasm32-unknown-unknown</code> with your own set of imports using <code>wit-bindgen</code> is the best we can do. I'm also unsure about what else we <em>could</em> do, as long as language standard libraries are relatively monolithic—even lean ones like Rust's.</p>
+
+
+
+<a name="634392168"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/634392168" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#634392168">(Oct 23 2026 at 14:05)</a>:</h4>
+<p>You’re hitting on the crux of this thread. wasm32-unknown-unknown is my current, and preferred, target. The problem is that the cooperative threading support is gated behind wasm32-wasip3, which brings the additional imports.  I need the threading support in order to handle translating a resource wrapped in a future in a sync method.</p>
+
+
+
+<a name="634392938"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/634392938" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#634392938">(Oct 23 2026 at 14:07)</a>:</h4>
+<p>It’s possible to obscure these imports, but it requires extra build hoops and makes the component even larger.</p>
+
+
+
+<a name="634393992"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/634393992" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#634393992">(Oct 23 2026 at 14:09)</a>:</h4>
+<p>A phrase I heard recently and like is “absent by default”. It’s stronger than “deny by default” as the capability doesn’t exist, so there no way to bypass the deny policy.</p>
+
+
+
+<a name="634442788"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/634442788" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#634442788">(Oct 23 2026 at 16:18)</a>:</h4>
+<p>Seems like <code>#![no_std]</code> is a better fit for "absent by default" than <code>wasm32-unknown-unknown</code>.  The former will give you a compile error if you try to use e.g. <code>std::fs::File::open</code>, whereas the latter will happily let that compile and then fail at runtime.</p>
+
+
+
+<a name="634445307"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/634445307" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#634445307">(Oct 23 2026 at 16:25)</a>:</h4>
+<p>I think the upcoming "optional imports" feature will be the sweet spot for this kind of thing and make <code>wasm32-unknown-unknown</code> obsolete.  That will allow the <code>wasm32-wasi*</code> targets to use e.g. <code>wasi:filesystem</code> if it's present and otherwise gracefully return an error to the caller.</p>
+
+
+
+<a name="634448854"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/634448854" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#634448854">(Oct 23 2026 at 16:35)</a>:</h4>
+<p>I don’t think you can use std:<span aria-label="thread" class="emoji emoji-1f9f5" role="img" title="thread">:thread:</span>:spawn with #![no_std].</p>
+
+
+
+<a name="634454697"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/634454697" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#634454697">(Oct 23 2026 at 16:53)</a>:</h4>
+<p>Right, but you can't do it with <code>wasm32-unknown-unknown</code>, either.  You <em>can</em> use the component model intrinsics for spawning threads with <code>#![no_std]</code> and <code>--target=wasm32-wasip3</code>, unlike with <code>wasm32-unknown-unknown</code>.  For ideal ergonomics, we'll need to wait for optional imports.</p>
+
+
+
+<a name="634455541"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/634455541" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#634455541">(Oct 23 2026 at 16:56)</a>:</h4>
+<p>Do you have an example or doc for how to do this?  I’m traveling right now and won’t be able to try it until mid next week.</p>
+
+
+
+<a name="634456096"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/634456096" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#634456096">(Oct 23 2026 at 16:58)</a>:</h4>
+<p>No, sorry; just thought I'd chime in with what I know about the relevant current and future options.</p>
+
+
+
+<a name="634458555"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/634458555" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#634458555">(Oct 23 2026 at 17:05)</a>:</h4>
+<p>I imagine using <code>#![no_std]</code> and <code>libc::pthread_create</code> and friends would also work for <code>wasm32-wasip3</code>, although I haven't tried that myself.</p>
+<p>Another approach would be to <em>not</em> use <code>#![no_std]</code> but override the default panic handler like <a href="https://github.com/bytecodealliance/wasm-tools/blob/891e113cc2dc16b7041daa47c630600852fade25/crates/wit-component/dl/src/lib.rs#L160-L164">here</a>, which should help avoid pulling in stdio-related stuff and allow it to be dead-code-eliminated.  Again, I haven't tried that myself, but seems promising.</p>
+
+
+
+<a name="634525085"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/634525085" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#634525085">(Oct 23 2026 at 22:26)</a>:</h4>
+<p>I’ll give those a try next week, thanks</p>
+
+
+
+<a name="635444233"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/635444233" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#635444233">(Oct 27 2026 at 16:16)</a>:</h4>
+<p><code>no_std</code> was able to reduce the imports down to only <code>wasi:clocks/types</code> (for duration) and <code>wasi:cli/exit</code> (used by __wasi_coop_thread_start).</p>
+
+
+
+<a name="635447730"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/635447730" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#635447730">(Oct 27 2026 at 16:29)</a>:</h4>
+<p>defining a custom exit func removes that import.</p>
+
+
+
+<a name="635455475"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/635455475" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#635455475">(Oct 27 2026 at 16:55)</a>:</h4>
+<p>wasi:clocks is a dependency of http, which my commonest needs. The version bumped which made me think it was a new dep. With no_std and overriding the exit method I'm back down to the same imports/exports as wasm32-unknown-unknown. The downside is that I can no longer use the parts of std that would never have triggered an import.</p>
+
+
+
+<a name="635456770"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/635456770" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Joel Dice <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#635456770">(Oct 27 2026 at 16:59)</a>:</h4>
+<p>Are the parts of <code>std</code> that you need available in <code>alloc</code> (e.g. <code>Vec</code>, etc.)?</p>
+
+
+
+<a name="635459896"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/635459896" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#635459896">(Oct 27 2026 at 17:10)</a>:</h4>
+<p>yea, everything I need is available in <code>alloc</code> or <code>core</code></p>
+
+
+
+<a name="635481751"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/219900-wasi/topic/Trouble%20virtualizing%20wasi%20interfaces/near/635481751" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Scott Andrews <a href="https://bytecodealliance.github.io/zulip-archive/stream/219900-wasi/topic/Trouble.20virtualizing.20wasi.20interfaces.html#635481751">(Oct 27 2026 at 18:39)</a>:</h4>
+<p>Also found that system-clock and monotonic-clock are pulled in by the threads support via <code>__tl_lock</code> and <code>__tl_unlock</code>, even with <code>no_std</code>. <code>wasm-opt</code> was removing the imports before I noticed.</p>
+
+
+
+<hr><p>Last updated: Oct 31 2026 at 21:03 UTC</p>
+</html>

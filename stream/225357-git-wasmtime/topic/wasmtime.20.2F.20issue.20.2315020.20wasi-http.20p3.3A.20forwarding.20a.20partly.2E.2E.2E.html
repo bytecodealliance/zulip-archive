@@ -1,0 +1,455 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #15020 wasi-http p3: forwarding a partly... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315020.20wasi-http.20p3.3A.20forwarding.20a.20partly.2E.2E.2E.html">wasmtime / issue #15020 wasi-http p3: forwarding a partly...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="635213212"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2315020%20wasi-http%20p3%3A%20forwarding%20a%20partly.../near/635213212" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315020.20wasi-http.20p3.3A.20forwarding.20a.20partly.2E.2E.2E.html#635213212">(Oct 27 2026 at 00:17)</a>:</h4>
+<p>pchickey opened <a href="https://github.com/bytecodealliance/wasmtime/issues/15020">issue #15020</a>:</p>
+<blockquote>
+<p>wasmtime-wasi-http p3 can silently drop the buffered portion of the body if it reads part of the body as a stream, then forwards the body.</p>
+<p>&lt;details&gt;<br>
+&lt;summary&gt;AI Report&lt;/summary&gt;</p>
+<h1>p3: forwarding a partly read host body silently drops buffered bytes</h1>
+<ul>
+<li>System: Linux 6.8.0-137-generic x86_64 (Ubuntu)</li>
+<li>Wasmtime commit: b229cb936b35039bda5a04c9eb8e65d337dfade7</li>
+<li>Date: 2026-10-12</li>
+<li>Model: Claude Opus 5.5</li>
+<li>Lane: C (p3 streams). The coordinator re-ran the reproducer and wrote this<br>
+  report.</li>
+</ul>
+<h2>Summary</h2>
+<p>A WASIp3 guest gets a body stream backed by the host<br>
+(<code>HostBodyStreamProducer</code>) from <code>request.consume-body</code> or<br>
+<code>response.consume-body</code>. If it reads part of the stream (or does a<br>
+zero-length read, the documented readiness probe) and then passes the same<br>
+stream to <code>response.new</code> or <code>request.new</code>, the host converts the stream<br>
+back into the underlying host body with <code>StreamReader::try_into</code><br>
+(<code>p3/body.rs:72-91</code>, <code>p3/response.rs:441-460</code>). The <code>try_into</code> closure in<br>
+<code>crates/wasmtime/src/runtime/component/concurrent/futures_and_streams.rs:
+2790-2799</code> takes <code>(producer, buffer)</code> and <strong>drops <code>buffer</code></strong>. The<br>
+<code>HostBodyStreamProducer</code> keeps leftover frame data in that buffer after a<br>
+short read (<code>dst.set_buffer(...)</code>, <code>p3/body.rs:534-545</code>), and a whole frame<br>
+after a zero-length read (<code>:567-580</code>). Those bytes disappear. The response<br>
+is sent with the remaining bytes, a self-consistent framing, status 200, and<br>
+the guest's transmit future resolves <code>Ok(())</code>.</p>
+<p>In the same short-cut, the guest's own <code>trailers</code> future is closed unread<br>
+(<code>trailers.close(...)</code>, <code>response.rs:445</code>). A guest that forwards a body but<br>
+reports an error through its trailers future (which per WIT must abort the<br>
+response) instead produces a clean, complete 200.</p>
+<h2>Affected surfaces</h2>
+<p>p3 (<code>response.new</code> via <code>wasmtime serve</code>, and <code>request.new</code> with<br>
+<code>client.send</code>, which has the same root cause by reading but wasn't run). p2<br>
+doesn't have the short-cut.</p>
+<h2>Attacker and embedding</h2>
+<p>No attacker is needed for the data loss. Any p3 proxy-style guest that<br>
+peeks at a body before forwarding it corrupts the data. An adversarial guest<br>
+can use the trailers path to hide errors. Default <code>wasmtime serve</code>.</p>
+<h2>Root cause</h2>
+<ul>
+<li>
+<p><code>crates/wasmtime/src/runtime/component/concurrent/futures_and_streams.rs:
+  2790-2799</code>: <code>try_into</code> discards the producer's pending buffer.</p>
+</li>
+<li>
+<p><code>crates/wasi-http/src/p3/body.rs:534-545, :567-580</code>: the producer<br>
+  legitimately leaves data in that buffer.</p>
+</li>
+<li>
+<p><code>crates/wasi-http/src/p3/response.rs:441-460</code> (and <code>body.rs:72-91</code>): the<br>
+  short-cut is used whenever <code>try_into</code> succeeds, and it also discards the<br>
+  guest's trailers future.</p>
+</li>
+</ul>
+<h2>Reproduction</h2>
+<blockquote>
+<p><strong>Running the reproducer.</strong> Pass a <code>wasmtime</code> CLI built from the commit<br>
+under test (found on b229cb936b) as the script asks (<code>WASMTIME</code>, or an<br>
+argument). Set <code>CARGO_TARGET_DIR</code> to share builds. Guests need stable<br>
+<code>wasm32-wasip2</code> and/or nightly <code>wasm32-wasip3</code>.<br>
+This finding's guests use the exact WIT of the Wasmtime under test: also<br>
+set <code>WASMTIME_SRC</code> to that Wasmtime checkout (<code>link-wit.sh</code> links it in).</p>
+</blockquote>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code><span class="nb">cd</span><span class="w"> </span>untriaged/0146-wasi-http-p3-forwarded-body-drops-buffered-bytes
+<span class="nv">WASMTIME</span><span class="o">=</span>&lt;wasmtime&gt;<span class="w"> </span>bash<span class="w"> </span>run.sh
+</code></pre></div>
+<p>It POSTs 200,000 bytes to a guest that echoes the request body as its<br>
+response body, with one of four modes: forward untouched, read 1 byte first<br>
+(and write it out separately), do a zero-length read first, or forward with a<br>
+trailers future that resolves to an error.</p>
+<h2>Observed output</h2>
+<p>Coordinator re-run on 2026-10-12, debug CLI. The lane observed the same on a<br>
+release CLI.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">mode</span><span class="o">=</span><span class="n">none</span><span class="w">  </span><span class="n">expected</span><span class="o">=</span><span class="mi">200000</span><span class="w"> </span><span class="n">got</span><span class="o">=</span><span class="mi">200000</span><span class="w"> </span><span class="n">lost</span><span class="o">=</span><span class="mi">0</span><span class="w"> </span><span class="n">OK</span>
+<span class="n">mode</span><span class="o">=</span><span class="n">peek1</span><span class="w"> </span><span class="n">expected</span><span class="o">=</span><span class="mi">199999</span><span class="w"> </span><span class="n">got</span><span class="o">=</span><span class="mi">191975</span><span class="w"> </span><span class="n">lost</span><span class="o">=</span><span class="mi">8024</span><span class="w"> </span><span class="n">BUG</span><span class="p">:</span><span class="w"> </span><span class="nc">bytes</span><span class="w"> </span><span class="n">silently</span><span class="w"> </span><span class="n">dropped</span>
+<span class="n">mode</span><span class="o">=</span><span class="n">zero</span><span class="w">  </span><span class="n">expected</span><span class="o">=</span><span class="mi">200000</span><span class="w"> </span><span class="n">got</span><span class="o">=</span><span class="mi">191974</span><span class="w"> </span><span class="n">lost</span><span class="o">=</span><span class="mi">8026</span><span class="w"> </span><span class="n">BUG</span><span class="p">:</span><span class="w"> </span><span class="nc">bytes</span><span class="w"> </span><span class="n">silently</span><span class="w"> </span><span class="n">dropped</span>
+<span class="n">mode</span><span class="o">=</span><span class="n">trailers</span><span class="o">-</span><span class="n">err</span><span class="w"> </span><span class="n">status</span><span class="o">=</span><span class="mi">200</span><span class="w"> </span><span class="n">got</span><span class="o">=</span><span class="mi">200000</span><span class="w"> </span><span class="n">curl_exit</span><span class="o">=</span><span class="mi">0</span>
+<span class="n">guest</span><span class="p">:</span><span class="w"> </span><span class="nc">trailers</span><span class="w"> </span><span class="n">error</span><span class="w"> </span><span class="n">delivered</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">host</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
+<span class="n">guest</span><span class="p">:</span><span class="w"> </span><span class="nc">transmit</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(())</span>
+</code></pre></div>
+<h2>Impact</h2>
+<p>Silent corruption of proxied HTTP bodies (truncation in the middle, with<br>
+consistent framing, so neither side notices), and the error-signalling<br>
+contract of the trailers future is bypassed. This is an integrity bug in<br>
+default, Tier 1 p3 wasi-http. No memory-safety impact. Severity: medium.</p>
+<h2>Suggested fix</h2>
+<p>In the <code>try_into</code> closure, only convert when the buffer is empty; otherwise<br>
+put <code>(mine, buffer)</code> back and return <code>None</code> so the generic path is used.<br>
+Or pass the buffer along so the host body can be prefixed with it. In the<br>
+wasi-http short-cut, don't drop the guest's trailers future: if the guest<br>
+supplied one, fall back to the generic path, or chain it after the host<br>
+body's trailers.</p>
+<p>Request direction: confirmed by lane C2 (see 0154, "Other<br>
+results"). After a 1-byte peek the upstream got 191984 of 199999 bytes,<br>
+and the guest's trailers future is ignored there too.</p>
+<h2>Duplicate check</h2>
+<p>Not in the triage repository. The CM-async audit's notes examined<br>
+<code>StreamReader::try_into</code> only for lock contention and <code>unwrap</code> (round 3 and<br>
+round 4 <code>host-api.md</code>, <code>streams-futures.md</code>), not for the dropped buffer.<br>
+0002 involves the same splice path, but it's a resource leak. No upstream<br>
+fix.</p>
+<h2>Triage</h2>
+<p><strong>Result: normal-bug.</strong> When a WASIp3 guest forwards a host body stream it<br>
+has partly read (or probed with a zero-length read), the host silently drops<br>
+the bytes buffered in the stream's producer, about 8 KiB, and ignores the<br>
+guest's trailers future. The result is corrupted proxied traffic with<br>
+consistent framing and an <code>Ok</code> result. That's an integrity bug for the<br>
+guest's own traffic, not a host-safety issue.</p>
+<ul>
+<li>Triaged by Pat Hickey (agent-assisted, Claude Opus 5.5), 2026-10-13.</li>
+<li><strong>Decision:</strong> normal-bug. This was the reviewer's call: Pat Hickey chose<br>
+  the outcome, matching the pre-triage assessment's recommendation<br>
+  (<code>background/wasi-http-audit/assessment-2026-10-13.md</code>, Till<br>
+  Schneidereit: "normal-bug (medium functional) ... Silent corruption of<br>
+  proxied bodies. The victim is the guest's own traffic"). Pat Hickey gave<br>
+  no further reasons in this session. The reasoning below is the<br>
+  assessment's and this triage's.</li>
+</ul>
+<h3>Reasoning</h3>
+<ul>
+<li>
+<p><strong>Who can trigger it:</strong> the guest, by its own actions: peek-then-forward,<br>
+  or forwarding with a trailers future that reports an error. No attacker<br>
+  is needed for the data loss, and a benign proxy guest hits it. A client<br>
+  only supplies the body.</p>
+</li>
+<li>
+<p><strong>Release-build behaviour:</strong> release and debug alike (the lane observed a<br>
+  release CLI, the coordinator a debug CLI). Bytes are lost with no error,<br>
+  and there's no panic, no memory-safety impact, and no effect on other<br>
+  guests or the host.</p>
+</li>
+<li>
+<p><strong>Why not a vulnerability:</strong> the guest loses its own data, or chooses to<br>
+  hide its own error. It gains no capability or resource it didn't have,<br>
+  and nothing crosses a sandbox boundary. The trailers-error bypass lets a<br>
+  guest send a "clean" response it could have sent anyway by not reporting<br>
+  the error.</p>
+</li>
+<li>
+<p><strong>Feature tiers:</strong> <code>wasi-http</code> (Tier 1) with WASIp3<br>
+  (<code>component-model-async</code>/p3, on by default in the 48, 49 and 50 CLIs;<br>
+  the p3 module docs still say "experimental"). Part of the root cause is<br>
+  in core <code>wasmtime</code>'s component-model-async streams.</p>
+</li>
+<li>
+<p><strong>Affected releases:</strong> 48.x, 49.x, 50.0.0-rc.1 and <code>main</code> (code<br>
+  reading). 36.x has no p3.</p>
+</li>
+</ul>
+<h3>Evidence</h3>
+<p>Wasmtime checkout <code>~/src/wasmtime</code>, <code>git fetch origin</code> on 2026-10-13,<br>
+<code>origin/main</code> = <code>a59a82daf2e389e04badf436fc30d928b60241a4</code>.</p>
+<ol>
+<li>
+<p>The core <code>try_into</code> closure still drops <code>buffer</code> on success, and is<br>
+   unchanged since the audit:</p>
+<p><code>
+ $ git show "a59a82daf2:crates/wasmtime/src/runtime/component/concurrent/futures_and_streams.rs" | grep -n -A9 'let try_into = Box::new'
+ 2796:        let try_into = Box::new(move |ty| {
+ 2797:            let (mine, buffer) = producer.try_lock().ok()?.take()?;
+ 2798:            match P::try_into(mine, ty) {
+ 2799:                Ok(value) =&gt; Some(value),
+ 2800:                Err(mine) =&gt; {
+ 2801:                    *producer.try_lock().ok()? = Some((mine, buffer));
+ 2802:                    None
+ $ diff &lt;(b229cb936b's closure) &lt;(a59a82daf2's closure)
+ (no differences) -&gt; "try_into closure identical b229cb936b vs main"
+ </code></p>
+</li>
+<li>
+<p>The producer still leaves data in that buffer, and the short-cut still<br>
+   closes the guest's trailers future unread. On <code>main</code> the short-cut is in<br>
+<code>Body::new_guest</code> (<code>p3/body.rs</code>), which <code>response.new</code> and <code>request.new</code><br>
+   both use:</p>
+<p><code>
+ $ git show "a59a82daf2:crates/wasi-http/src/p3/body.rs" | grep -n 'set_buffer'
+ 569:                                        dst.set_buffer(frame.split_off(cap));
+ 580:                                    dst.set_buffer(frame);
+ $ git show "a59a82daf2:crates/wasi-http/src/p3/body.rs" | sed -n 72,80p
+         let contents = match contents
+             .map(|rx| rx.try_into::&lt;HostBodyStreamProducer&gt;(store.as_context_mut()))
+         {
+             Some(Ok(mut producer)) =&gt; {
+                 trailers.close(store.as_context_mut())?;
+                 ...
+                 let body = Body::Host { body: mem::take(&amp;mut producer.body), result_tx };
+ </code></p>
+</li>
+<li>
+<p>Release branches have the same code:</p>
+<p><code>
+ $ for b in release-48.0.0 release-49.0.0 release-50.0.0; do git show origin/$b:.../futures_and_streams.rs | grep -n 'let (mine, buffer) = producer.try_lock().ok()?.take()?;'; git show origin/$b:crates/wasi-http/src/p3/body.rs | grep -n 'try_into::&lt;HostBodyStreamProducer'; done
+ release-48.0.0: 2767 (closure)   63 (.map(|rx| rx.try_into::&lt;HostBodyStreamProducer&lt;T&gt;&gt;(&amp;mut *store)))
+ release-49.0.0: 2767             63 (same)
+ release-50.0.0: 2767             67 (.map(|rx| rx.try_into::&lt;HostBodyStreamProducer&gt;(store.as_context_mut())))
+ </code></p>
+</li>
+<li>
+<p>Upstream commits since the audit touch the concurrent runtime, but none<br>
+   changes this closure (point 1) or the short-cut:</p>
+<p>```<br>
+ $ git log --oneline b229cb936b..a59a82daf2 -- crates/wasmtime/src/runtime/component/concurr<br>
+[message truncated]</p>
+</li>
+</ol>
+</blockquote>
+
+
+
+<a name="635213213"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2315020%20wasi-http%20p3%3A%20forwarding%20a%20partly.../near/635213213" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315020.20wasi-http.20p3.3A.20forwarding.20a.20partly.2E.2E.2E.html#635213213">(Oct 27 2026 at 00:17)</a>:</h4>
+<p><a href="https://github.com/pchickey">pchickey</a> added the bug label to <a href="https://github.com/bytecodealliance/wasmtime/issues/15020">Issue #15020</a>.</p>
+
+
+
+<a name="635217567"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2315020%20wasi-http%20p3%3A%20forwarding%20a%20partly.../near/635217567" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315020.20wasi-http.20p3.3A.20forwarding.20a.20partly.2E.2E.2E.html#635217567">(Oct 27 2026 at 00:34)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasi-http label to <a href="https://github.com/bytecodealliance/wasmtime/issues/15020">Issue #15020</a>.</p>
+
+
+
+<a name="635755026"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2315020%20wasi-http%20p3%3A%20forwarding%20a%20partly.../near/635755026" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315020.20wasi-http.20p3.3A.20forwarding.20a.20partly.2E.2E.2E.html#635755026">(Oct 28 2026 at 16:36)</a>:</h4>
+<p>rvolosatovs closed <a href="https://github.com/bytecodealliance/wasmtime/issues/15020">issue #15020</a>:</p>
+<blockquote>
+<p>wasmtime-wasi-http p3 can silently drop the buffered portion of the body if it reads part of the body as a stream, then forwards the body.</p>
+<p>&lt;details&gt;<br>
+&lt;summary&gt;AI Report&lt;/summary&gt;</p>
+<h1>p3: forwarding a partly read host body silently drops buffered bytes</h1>
+<ul>
+<li>System: Linux 6.8.0-137-generic x86_64 (Ubuntu)</li>
+<li>Wasmtime commit: b229cb936b35039bda5a04c9eb8e65d337dfade7</li>
+<li>Date: 2026-10-12</li>
+<li>Model: Claude Opus 5.5</li>
+<li>Lane: C (p3 streams). The coordinator re-ran the reproducer and wrote this<br>
+  report.</li>
+</ul>
+<h2>Summary</h2>
+<p>A WASIp3 guest gets a body stream backed by the host<br>
+(<code>HostBodyStreamProducer</code>) from <code>request.consume-body</code> or<br>
+<code>response.consume-body</code>. If it reads part of the stream (or does a<br>
+zero-length read, the documented readiness probe) and then passes the same<br>
+stream to <code>response.new</code> or <code>request.new</code>, the host converts the stream<br>
+back into the underlying host body with <code>StreamReader::try_into</code><br>
+(<code>p3/body.rs:72-91</code>, <code>p3/response.rs:441-460</code>). The <code>try_into</code> closure in<br>
+<code>crates/wasmtime/src/runtime/component/concurrent/futures_and_streams.rs:
+2790-2799</code> takes <code>(producer, buffer)</code> and <strong>drops <code>buffer</code></strong>. The<br>
+<code>HostBodyStreamProducer</code> keeps leftover frame data in that buffer after a<br>
+short read (<code>dst.set_buffer(...)</code>, <code>p3/body.rs:534-545</code>), and a whole frame<br>
+after a zero-length read (<code>:567-580</code>). Those bytes disappear. The response<br>
+is sent with the remaining bytes, a self-consistent framing, status 200, and<br>
+the guest's transmit future resolves <code>Ok(())</code>.</p>
+<p>In the same short-cut, the guest's own <code>trailers</code> future is closed unread<br>
+(<code>trailers.close(...)</code>, <code>response.rs:445</code>). A guest that forwards a body but<br>
+reports an error through its trailers future (which per WIT must abort the<br>
+response) instead produces a clean, complete 200.</p>
+<h2>Affected surfaces</h2>
+<p>p3 (<code>response.new</code> via <code>wasmtime serve</code>, and <code>request.new</code> with<br>
+<code>client.send</code>, which has the same root cause by reading but wasn't run). p2<br>
+doesn't have the short-cut.</p>
+<h2>Attacker and embedding</h2>
+<p>No attacker is needed for the data loss. Any p3 proxy-style guest that<br>
+peeks at a body before forwarding it corrupts the data. An adversarial guest<br>
+can use the trailers path to hide errors. Default <code>wasmtime serve</code>.</p>
+<h2>Root cause</h2>
+<ul>
+<li>
+<p><code>crates/wasmtime/src/runtime/component/concurrent/futures_and_streams.rs:
+  2790-2799</code>: <code>try_into</code> discards the producer's pending buffer.</p>
+</li>
+<li>
+<p><code>crates/wasi-http/src/p3/body.rs:534-545, :567-580</code>: the producer<br>
+  legitimately leaves data in that buffer.</p>
+</li>
+<li>
+<p><code>crates/wasi-http/src/p3/response.rs:441-460</code> (and <code>body.rs:72-91</code>): the<br>
+  short-cut is used whenever <code>try_into</code> succeeds, and it also discards the<br>
+  guest's trailers future.</p>
+</li>
+</ul>
+<h2>Reproduction</h2>
+<blockquote>
+<p><strong>Running the reproducer.</strong> Pass a <code>wasmtime</code> CLI built from the commit<br>
+under test (found on b229cb936b) as the script asks (<code>WASMTIME</code>, or an<br>
+argument). Set <code>CARGO_TARGET_DIR</code> to share builds. Guests need stable<br>
+<code>wasm32-wasip2</code> and/or nightly <code>wasm32-wasip3</code>.<br>
+This finding's guests use the exact WIT of the Wasmtime under test: also<br>
+set <code>WASMTIME_SRC</code> to that Wasmtime checkout (<code>link-wit.sh</code> links it in).</p>
+</blockquote>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code><span class="nb">cd</span><span class="w"> </span>untriaged/0146-wasi-http-p3-forwarded-body-drops-buffered-bytes
+<span class="nv">WASMTIME</span><span class="o">=</span>&lt;wasmtime&gt;<span class="w"> </span>bash<span class="w"> </span>run.sh
+</code></pre></div>
+<p>It POSTs 200,000 bytes to a guest that echoes the request body as its<br>
+response body, with one of four modes: forward untouched, read 1 byte first<br>
+(and write it out separately), do a zero-length read first, or forward with a<br>
+trailers future that resolves to an error.</p>
+<h2>Observed output</h2>
+<p>Coordinator re-run on 2026-10-12, debug CLI. The lane observed the same on a<br>
+release CLI.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">mode</span><span class="o">=</span><span class="n">none</span><span class="w">  </span><span class="n">expected</span><span class="o">=</span><span class="mi">200000</span><span class="w"> </span><span class="n">got</span><span class="o">=</span><span class="mi">200000</span><span class="w"> </span><span class="n">lost</span><span class="o">=</span><span class="mi">0</span><span class="w"> </span><span class="n">OK</span>
+<span class="n">mode</span><span class="o">=</span><span class="n">peek1</span><span class="w"> </span><span class="n">expected</span><span class="o">=</span><span class="mi">199999</span><span class="w"> </span><span class="n">got</span><span class="o">=</span><span class="mi">191975</span><span class="w"> </span><span class="n">lost</span><span class="o">=</span><span class="mi">8024</span><span class="w"> </span><span class="n">BUG</span><span class="p">:</span><span class="w"> </span><span class="nc">bytes</span><span class="w"> </span><span class="n">silently</span><span class="w"> </span><span class="n">dropped</span>
+<span class="n">mode</span><span class="o">=</span><span class="n">zero</span><span class="w">  </span><span class="n">expected</span><span class="o">=</span><span class="mi">200000</span><span class="w"> </span><span class="n">got</span><span class="o">=</span><span class="mi">191974</span><span class="w"> </span><span class="n">lost</span><span class="o">=</span><span class="mi">8026</span><span class="w"> </span><span class="n">BUG</span><span class="p">:</span><span class="w"> </span><span class="nc">bytes</span><span class="w"> </span><span class="n">silently</span><span class="w"> </span><span class="n">dropped</span>
+<span class="n">mode</span><span class="o">=</span><span class="n">trailers</span><span class="o">-</span><span class="n">err</span><span class="w"> </span><span class="n">status</span><span class="o">=</span><span class="mi">200</span><span class="w"> </span><span class="n">got</span><span class="o">=</span><span class="mi">200000</span><span class="w"> </span><span class="n">curl_exit</span><span class="o">=</span><span class="mi">0</span>
+<span class="n">guest</span><span class="p">:</span><span class="w"> </span><span class="nc">trailers</span><span class="w"> </span><span class="n">error</span><span class="w"> </span><span class="n">delivered</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">host</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
+<span class="n">guest</span><span class="p">:</span><span class="w"> </span><span class="nc">transmit</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(())</span>
+</code></pre></div>
+<h2>Impact</h2>
+<p>Silent corruption of proxied HTTP bodies (truncation in the middle, with<br>
+consistent framing, so neither side notices), and the error-signalling<br>
+contract of the trailers future is bypassed. This is an integrity bug in<br>
+default, Tier 1 p3 wasi-http. No memory-safety impact. Severity: medium.</p>
+<h2>Suggested fix</h2>
+<p>In the <code>try_into</code> closure, only convert when the buffer is empty; otherwise<br>
+put <code>(mine, buffer)</code> back and return <code>None</code> so the generic path is used.<br>
+Or pass the buffer along so the host body can be prefixed with it. In the<br>
+wasi-http short-cut, don't drop the guest's trailers future: if the guest<br>
+supplied one, fall back to the generic path, or chain it after the host<br>
+body's trailers.</p>
+<p>Request direction: confirmed by lane C2 (see 0154, "Other<br>
+results"). After a 1-byte peek the upstream got 191984 of 199999 bytes,<br>
+and the guest's trailers future is ignored there too.</p>
+<h2>Duplicate check</h2>
+<p>Not in the triage repository. The CM-async audit's notes examined<br>
+<code>StreamReader::try_into</code> only for lock contention and <code>unwrap</code> (round 3 and<br>
+round 4 <code>host-api.md</code>, <code>streams-futures.md</code>), not for the dropped buffer.<br>
+0002 involves the same splice path, but it's a resource leak. No upstream<br>
+fix.</p>
+<h2>Triage</h2>
+<p><strong>Result: normal-bug.</strong> When a WASIp3 guest forwards a host body stream it<br>
+has partly read (or probed with a zero-length read), the host silently drops<br>
+the bytes buffered in the stream's producer, about 8 KiB, and ignores the<br>
+guest's trailers future. The result is corrupted proxied traffic with<br>
+consistent framing and an <code>Ok</code> result. That's an integrity bug for the<br>
+guest's own traffic, not a host-safety issue.</p>
+<ul>
+<li>Triaged by Pat Hickey (agent-assisted, Claude Opus 5.5), 2026-10-13.</li>
+<li><strong>Decision:</strong> normal-bug. This was the reviewer's call: Pat Hickey chose<br>
+  the outcome, matching the pre-triage assessment's recommendation<br>
+  (<code>background/wasi-http-audit/assessment-2026-10-13.md</code>, Till<br>
+  Schneidereit: "normal-bug (medium functional) ... Silent corruption of<br>
+  proxied bodies. The victim is the guest's own traffic"). Pat Hickey gave<br>
+  no further reasons in this session. The reasoning below is the<br>
+  assessment's and this triage's.</li>
+</ul>
+<h3>Reasoning</h3>
+<ul>
+<li>
+<p><strong>Who can trigger it:</strong> the guest, by its own actions: peek-then-forward,<br>
+  or forwarding with a trailers future that reports an error. No attacker<br>
+  is needed for the data loss, and a benign proxy guest hits it. A client<br>
+  only supplies the body.</p>
+</li>
+<li>
+<p><strong>Release-build behaviour:</strong> release and debug alike (the lane observed a<br>
+  release CLI, the coordinator a debug CLI). Bytes are lost with no error,<br>
+  and there's no panic, no memory-safety impact, and no effect on other<br>
+  guests or the host.</p>
+</li>
+<li>
+<p><strong>Why not a vulnerability:</strong> the guest loses its own data, or chooses to<br>
+  hide its own error. It gains no capability or resource it didn't have,<br>
+  and nothing crosses a sandbox boundary. The trailers-error bypass lets a<br>
+  guest send a "clean" response it could have sent anyway by not reporting<br>
+  the error.</p>
+</li>
+<li>
+<p><strong>Feature tiers:</strong> <code>wasi-http</code> (Tier 1) with WASIp3<br>
+  (<code>component-model-async</code>/p3, on by default in the 48, 49 and 50 CLIs;<br>
+  the p3 module docs still say "experimental"). Part of the root cause is<br>
+  in core <code>wasmtime</code>'s component-model-async streams.</p>
+</li>
+<li>
+<p><strong>Affected releases:</strong> 48.x, 49.x, 50.0.0-rc.1 and <code>main</code> (code<br>
+  reading). 36.x has no p3.</p>
+</li>
+</ul>
+<h3>Evidence</h3>
+<p>Wasmtime checkout <code>~/src/wasmtime</code>, <code>git fetch origin</code> on 2026-10-13,<br>
+<code>origin/main</code> = <code>a59a82daf2e389e04badf436fc30d928b60241a4</code>.</p>
+<ol>
+<li>
+<p>The core <code>try_into</code> closure still drops <code>buffer</code> on success, and is<br>
+   unchanged since the audit:</p>
+<p><code>
+ $ git show "a59a82daf2:crates/wasmtime/src/runtime/component/concurrent/futures_and_streams.rs" | grep -n -A9 'let try_into = Box::new'
+ 2796:        let try_into = Box::new(move |ty| {
+ 2797:            let (mine, buffer) = producer.try_lock().ok()?.take()?;
+ 2798:            match P::try_into(mine, ty) {
+ 2799:                Ok(value) =&gt; Some(value),
+ 2800:                Err(mine) =&gt; {
+ 2801:                    *producer.try_lock().ok()? = Some((mine, buffer));
+ 2802:                    None
+ $ diff &lt;(b229cb936b's closure) &lt;(a59a82daf2's closure)
+ (no differences) -&gt; "try_into closure identical b229cb936b vs main"
+ </code></p>
+</li>
+<li>
+<p>The producer still leaves data in that buffer, and the short-cut still<br>
+   closes the guest's trailers future unread. On <code>main</code> the short-cut is in<br>
+<code>Body::new_guest</code> (<code>p3/body.rs</code>), which <code>response.new</code> and <code>request.new</code><br>
+   both use:</p>
+<p><code>
+ $ git show "a59a82daf2:crates/wasi-http/src/p3/body.rs" | grep -n 'set_buffer'
+ 569:                                        dst.set_buffer(frame.split_off(cap));
+ 580:                                    dst.set_buffer(frame);
+ $ git show "a59a82daf2:crates/wasi-http/src/p3/body.rs" | sed -n 72,80p
+         let contents = match contents
+             .map(|rx| rx.try_into::&lt;HostBodyStreamProducer&gt;(store.as_context_mut()))
+         {
+             Some(Ok(mut producer)) =&gt; {
+                 trailers.close(store.as_context_mut())?;
+                 ...
+                 let body = Body::Host { body: mem::take(&amp;mut producer.body), result_tx };
+ </code></p>
+</li>
+<li>
+<p>Release branches have the same code:</p>
+<p><code>
+ $ for b in release-48.0.0 release-49.0.0 release-50.0.0; do git show origin/$b:.../futures_and_streams.rs | grep -n 'let (mine, buffer) = producer.try_lock().ok()?.take()?;'; git show origin/$b:crates/wasi-http/src/p3/body.rs | grep -n 'try_into::&lt;HostBodyStreamProducer'; done
+ release-48.0.0: 2767 (closure)   63 (.map(|rx| rx.try_into::&lt;HostBodyStreamProducer&lt;T&gt;&gt;(&amp;mut *store)))
+ release-49.0.0: 2767             63 (same)
+ release-50.0.0: 2767             67 (.map(|rx| rx.try_into::&lt;HostBodyStreamProducer&gt;(store.as_context_mut())))
+ </code></p>
+</li>
+<li>
+<p>Upstream commits since the audit touch the concurrent runtime, but none<br>
+   changes this closure (point 1) or the short-cut:</p>
+<p>```<br>
+ $ git log --oneline b229cb936b..a59a82daf2 -- crates/wasmtime/src/runtime/component/conc<br>
+[message truncated]</p>
+</li>
+</ol>
+</blockquote>
+
+
+
+<hr><p>Last updated: Oct 31 2026 at 21:03 UTC</p>
+</html>

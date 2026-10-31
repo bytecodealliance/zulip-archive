@@ -1,0 +1,95 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14989 Proposal to rework `MemoryCreator... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314989.20Proposal.20to.20rework.20.60MemoryCreator.2E.2E.2E.html">wasmtime / issue #14989 Proposal to rework `MemoryCreator...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="634775818"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314989%20Proposal%20to%20rework%20%60MemoryCreator.../near/634775818" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314989.20Proposal.20to.20rework.20.60MemoryCreator.2E.2E.2E.html#634775818">(Oct 25 2026 at 17:22)</a>:</h4>
+<p>V0ldek opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14989">issue #14989</a>:</p>
+<blockquote>
+<p>Building on #14885, I'd like to tackle the other half of the linear memory traits. This is already a FIXME in the memory code:</p>
+<p><a href="https://github.com/bytecodealliance/wasmtime/blob/ffff2e2db24a291f02429f123aba1631fa8eea67/crates/wasmtime/src/runtime/vm/memory.rs#L73-L74">https://github.com/bytecodealliance/wasmtime/blob/ffff2e2db24a291f02429f123aba1631fa8eea67/crates/wasmtime/src/runtime/vm/memory.rs#L73-L74</a></p>
+<p>Since it involves a breaking public API change I thought I'd first go through an issue before I go into slashing the codebase.</p>
+<h4>Feature</h4>
+<p>The change would remove <code>RuntimeMemoryCreator</code> and <code>MemoryCreatorProxy</code>. The <code>DefaultMemoryCreator</code> struct would be implemented wholly in terms of the public <code>MemoryCreator</code> trait.</p>
+<p>This requires a breaking change to the <code>MemoryCreator</code>. First, the <code>DefaultMemoryCreator</code> receives <code>reservation_for_growth</code>, which is currently not present on the public trait's <code>new_memory</code>. Second, more minor, the current trait requires to return a <code>Result&lt;_, String&gt;</code> instead of the standard wasmtime error type, so fidelity would be lost as the <code>DefaultMemoryCreator</code> would convert all strongly-typed errors to string.</p>
+<h4>Benefit</h4>
+<p>Simplifies the code base, fixes an outstanding FIXME, avoids running into issues similar to #10740 because of a mismatch of how the user can implement the memory backend from the outside and internal-only shortcuts.</p>
+<h4>Implementation</h4>
+<p>My proposal would be to change the public API so that <code>new_memory</code> task a single parameter, <code>MemoryRequest</code>. That way things can be added as functions on the type without breaking current implementations. Public accessors on the request would return all things the creator needs to serve the request:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">impl</span><span class="o">&lt;'</span><span class="na">a</span><span class="o">&gt;</span><span class="w"> </span><span class="n">MemoryRequest</span><span class="o">&lt;'</span><span class="na">a</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">ty</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">MemoryType</span><span class="p">;</span>
+<span class="w">  </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">minimum</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">usize</span><span class="p">;</span>
+<span class="w">  </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">maximum</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="kt">usize</span><span class="o">&gt;</span><span class="p">;</span>
+<span class="w">  </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">reserved_size_in_bytes</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="kt">usize</span><span class="o">&gt;</span><span class="p">;</span>
+<span class="w">  </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">guard_size_in_bytes</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">usize</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The return type turns into the standard wasmtime Error. This is not really an issue, a user of <code>wasmtime</code> already has to cope with the wasmtime Error anywhere, I don't think there's any advantage to allowing <code>Result&lt;_, String&gt;</code> as it currently is.</p>
+<p>Internally, <code>RuntimeMemoryCreator</code> is gone, as is <code>MemoryCreatorProxy</code>. <code>Config</code> holds an <code>Arc&lt;dyn MemoryCreator&gt;</code> instead. The implementation that creates memory in <code>vm::Memory</code> will construct a <code>MemoryRequest</code> and route it to the creator.</p>
+<p>Not all things are exposed publicly, I don't necessarily want to increase the public API surface here. The <code>DefaultMemoryCreator</code> needs <code>MemoryTunables</code> for some of the config as well as <code>ty: &amp;wasmtime_environ::Memory</code>. These are not public types, so I'd keep them on <code>MemoryRequest</code> exposed as <code>pub(crate)</code>, but not to the outside.</p>
+<h4>Alternatives</h4>
+<p>There's a few things one could consider changing:</p>
+<ol>
+<li>The documentation now doesn't mention that, but the custom creator is also used for GC heaps. An implementation might want to serve these differently, because their purpose and access patterns are different, but currently there's no way to distinguish that from the public parameters. A simple <code>pub fn kind(&amp;self)</code> returning a non-exhausting <code>MemoryKind</code> enum with <code>LinearMemory</code> and <code>GcHeap</code> fixes this.</li>
+<li>The other parameters are passed via tunables and not exposed. For example, <code>MmapMemory</code> uses <code>reservation_for_growth</code> and <code>guard_before_linear_memory</code>, plus <code>signals_based_traps</code> and <code>memory_init_cow</code> to decide whether to use Mmap or Malloc-backed memory.</li>
+</ol>
+<p>I also have one open question: <code>reserved_size_in_bytes</code> is an <code>Option&lt;usize&gt;</code>, but the engine always passes <code>Some</code>, with <code>Some(0)</code> meaning "no reservation". Is there any reason for this? What would be the semantic difference between <code>Some(0)</code> and <code>None</code>? Can we just make it a <code>usize</code>?<br>
+</p>
+</blockquote>
+
+
+
+<a name="635043822"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314989%20Proposal%20to%20rework%20%60MemoryCreator.../near/635043822" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314989.20Proposal.20to.20rework.20.60MemoryCreator.2E.2E.2E.html#635043822">(Oct 26 2026 at 15:16)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasmtime:api label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14989">Issue #14989</a>.</p>
+
+
+
+<a name="635044723"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314989%20Proposal%20to%20rework%20%60MemoryCreator.../near/635044723" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314989.20Proposal.20to.20rework.20.60MemoryCreator.2E.2E.2E.html#635044723">(Oct 26 2026 at 15:18)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/14989#issuecomment-6419712709">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14989">issue #14989</a>:</p>
+<blockquote>
+<p>This all sounds reasonable to me, thanks for working on this!</p>
+<p>For <code>MemoryRequest&lt;'a&gt;</code> one downside of that approach is the loss of compiler warnings if you forget to take into account some parameter/field. Not a deal-breaker per-se and it's nice to not break the API when new functionality is added, but in this situation I think it's probably more important to expose all the parameters since if we add one we probably do want to break all downstream consumers as they'll need to update to account for it.</p>
+<p>For<code> reserved_size_in_bytes</code> that might just be a historical artifact being <code>Option</code>-vs-not, and if it's always <code>Some</code> feel free to unwrap it.</p>
+</blockquote>
+
+
+
+<a name="635428057"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314989%20Proposal%20to%20rework%20%60MemoryCreator.../near/635428057" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314989.20Proposal.20to.20rework.20.60MemoryCreator.2E.2E.2E.html#635428057">(Oct 27 2026 at 15:24)</a>:</h4>
+<p>V0ldek <a href="https://github.com/bytecodealliance/wasmtime/issues/14989#issuecomment-6446008362">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14989">issue #14989</a>:</p>
+<blockquote>
+<p>The problem with passing arguments directly is that then we cannot hide internal parameters. The alternative would be to expose <code>MemoryTunables</code> and <code>wasmtime_environ::Memory</code> as parameters of the <code>new_memory</code> function, but neither of those types are part of the public API of <code>wasmtime</code> currently.</p>
+</blockquote>
+
+
+
+<a name="635428697"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314989%20Proposal%20to%20rework%20%60MemoryCreator.../near/635428697" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314989.20Proposal.20to.20rework.20.60MemoryCreator.2E.2E.2E.html#635428697">(Oct 27 2026 at 15:26)</a>:</h4>
+<p>V0ldek edited a <a href="https://github.com/bytecodealliance/wasmtime/issues/14989#issuecomment-6446008362">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14989">issue #14989</a>:</p>
+<blockquote>
+<p>The problem with passing arguments directly is that then we cannot hide internal parameters. The alternative would be to expose <code>MemoryTunables</code> and <code>wasmtime_environ::Memory</code> as parameters of the <code>new_memory</code> function, but neither of those types are part of the public API of <code>wasmtime</code> currently.</p>
+<p>I guess the question here is whether we want to keep hiding things, or do we want full parity (i.e. an outside user could build exactly the <code>wasmtime::DefaultMemoryCreator</code>). We could expose just the parameters that are actively used (<code>reservation_for_growth</code>, <code>guard_before_linear_memory</code>, <code>signals_based_traps</code>, <code>memory_init_cow</code>).</p>
+</blockquote>
+
+
+
+<a name="635549302"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314989%20Proposal%20to%20rework%20%60MemoryCreator.../near/635549302" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314989.20Proposal.20to.20rework.20.60MemoryCreator.2E.2E.2E.html#635549302">(Oct 28 2026 at 00:50)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/14989#issuecomment-6457666433">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/14989">issue #14989</a>:</p>
+<blockquote>
+<p>Ah sorry I missed that part of the OP here, and good point! In tha tcase seems reasonable to me to have a <code>MemoryRequest&lt;'_&gt;</code> and we can tweak the documentation over time of what's required vs what isn't</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Oct 31 2026 at 21:03 UTC</p>
+</html>

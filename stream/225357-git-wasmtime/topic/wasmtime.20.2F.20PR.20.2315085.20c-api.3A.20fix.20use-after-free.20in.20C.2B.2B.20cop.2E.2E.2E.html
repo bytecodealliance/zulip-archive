@@ -1,0 +1,86 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #15085 c-api: fix use-after-free in C++ cop... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315085.20c-api.3A.20fix.20use-after-free.20in.20C.2B.2B.20cop.2E.2E.2E.html">wasmtime / PR #15085 c-api: fix use-after-free in C++ cop...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="636204245"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315085%20c-api%3A%20fix%20use-after-free%20in%20C%2B%2B%20cop.../near/636204245" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315085.20c-api.3A.20fix.20use-after-free.20in.20C.2B.2B.20cop.2E.2E.2E.html#636204245">(Oct 30 2026 at 06:36)</a>:</h4>
+<p>netliomax25-code opened <a href="https://github.com/bytecodealliance/wasmtime/pull/15085">PR #15085</a> from <code>netliomax25-code:c-api-cpp-self-assignment</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>Several copy assignment operators in the C++ headers release the current value before cloning from <code>other</code>, so when <code>other</code> is <code>*this</code> the clone reads the value that was just freed. Self-assignment usually arrives through an alias or a generic algorithm (for example <code>std::fill</code> over a range that contains the fill value). For component values the same thing happens when <code>other</code> is owned by the destination, which is a natural way to unwrap nested values:</p>
+<div class="codehilite" data-code-language="C++"><pre><span></span><code><span class="n">Val</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">WitOption</span><span class="p">(</span><span class="n">Val</span><span class="o">::</span><span class="n">string</span><span class="p">(</span><span class="s">"..."</span><span class="p">));</span>
+<span class="n">v</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">*</span><span class="n">v</span><span class="p">.</span><span class="n">get_option</span><span class="p">().</span><span class="n">value</span><span class="p">();</span><span class="w"> </span><span class="c1">// clones from the freed option payload</span>
+</code></pre></div>
+<p>The affected operators are <code>VAL_REPR</code> (component <code>Val</code>, <code>List</code>, <code>Record</code>, <code>Tuple</code>, <code>Variant</code>, <code>WitOption</code>, <code>WitResult</code>, <code>Flag</code>, <code>Flags</code>, <code>Map</code>), <code>WASMTIME_REF_WRAPPER</code> (<code>EqRef</code>, <code>StructRef</code>, <code>ArrayRef</code>), core <code>Val</code>, <code>HeapType</code>, <code>RefType</code>, <code>StorageType</code>, <code>FieldType</code>, <code>ValType</code>, component <code>ValType</code> and <code>ComponentItem</code>. I checked each one with a small program that self-assigns a value, linked against a C API built with <code>-Zsanitizer=address</code>. All of them report heap-use-after-free except <code>List</code> and <code>Record</code>, where self-assignment silently leaves an empty value. For <code>ExternRef</code> and a core <code>Val</code> holding an externref, the assignment drops the last strong reference to the root's liveness flag and then clones it back from the raw pointer, so the flag is later freed while the store still holds a <code>Weak</code> to it and <code>Store::gc</code> reads freed memory.</p>
+<p>Each operator now clones <code>other</code> before releasing the old value. Most of them copy-construct and then move-assign, since their move assignment already releases the old value. <code>VAL_REPR</code> snapshots the raw value instead, because constructor overload resolution there has to consider <code>WitOption(std::optional&lt;Val&gt;)</code> while <code>Val</code> is still incomplete. <code>ValType</code> clones into a local first, since its move assignment doesn't release the previous <code>wasmtime_ty</code> (that looks like a separate leak, which I left alone here).</p>
+<p>I added a <code>component.assign_from_self_or_child</code> test to <code>crates/c-api/tests/component/values.cc</code>. Without the fix it fails (the list comes back with size 0, then reading the freed option payload trips an assertion). With the fix the C API ctest suite passes (181 tests, Debug, <code>-DBUILD_SHARED_LIBS=ON -DBUILD_TESTS=ON</code>, macOS aarch64), the gtest binary also passes when built with <code>-fsanitize=address</code>, and clang-format 22 is clean. Since the C++ API is tier 2 and the trigger is in embedder code, I don't think this falls under the security process, so I'm sending it as a regular PR.<br>
+</p>
+</blockquote>
+
+
+
+<a name="636204254"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315085%20c-api%3A%20fix%20use-after-free%20in%20C%2B%2B%20cop.../near/636204254" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315085.20c-api.3A.20fix.20use-after-free.20in.20C.2B.2B.20cop.2E.2E.2E.html#636204254">(Oct 30 2026 at 06:36)</a>:</h4>
+<p>netliomax25-code removed the review request for <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> from <a href="https://github.com/bytecodealliance/wasmtime/pull/15085">PR #15085</a>.</p>
+
+
+
+<a name="636204255"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315085%20c-api%3A%20fix%20use-after-free%20in%20C%2B%2B%20cop.../near/636204255" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315085.20c-api.3A.20fix.20use-after-free.20in.20C.2B.2B.20cop.2E.2E.2E.html#636204255">(Oct 30 2026 at 06:36)</a>:</h4>
+<p>netliomax25-code requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/15085">PR #15085</a>.</p>
+
+
+
+<a name="636204257"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315085%20c-api%3A%20fix%20use-after-free%20in%20C%2B%2B%20cop.../near/636204257" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315085.20c-api.3A.20fix.20use-after-free.20in.20C.2B.2B.20cop.2E.2E.2E.html#636204257">(Oct 30 2026 at 06:36)</a>:</h4>
+<p>netliomax25-code requested <a href="https://github.com/dicej">dicej</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/15085">PR #15085</a>.</p>
+
+
+
+<a name="636226999"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315085%20c-api%3A%20fix%20use-after-free%20in%20C%2B%2B%20cop.../near/636226999" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315085.20c-api.3A.20fix.20use-after-free.20in.20C.2B.2B.20cop.2E.2E.2E.html#636226999">(Oct 30 2026 at 08:44)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:c-api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15085">PR #15085</a>.</p>
+
+
+
+<a name="636316928"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315085%20c-api%3A%20fix%20use-after-free%20in%20C%2B%2B%20cop.../near/636316928" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315085.20c-api.3A.20fix.20use-after-free.20in.20C.2B.2B.20cop.2E.2E.2E.html#636316928">(Oct 30 2026 at 14:36)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15085#pullrequestreview-5713845377">PR review</a>.</p>
+
+
+
+<a name="636317003"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315085%20c-api%3A%20fix%20use-after-free%20in%20C%2B%2B%20cop.../near/636317003" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315085.20c-api.3A.20fix.20use-after-free.20in.20C.2B.2B.20cop.2E.2E.2E.html#636317003">(Oct 30 2026 at 14:36)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/15085#issuecomment-6525360772">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15085">PR #15085</a>:</p>
+<blockquote>
+<p>TIL a new feature of C++...</p>
+</blockquote>
+
+
+
+<a name="636317024"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315085%20c-api%3A%20fix%20use-after-free%20in%20C%2B%2B%20cop.../near/636317024" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315085.20c-api.3A.20fix.20use-after-free.20in.20C.2B.2B.20cop.2E.2E.2E.html#636317024">(Oct 30 2026 at 14:36)</a>:</h4>
+<p>alexcrichton added <a href="https://github.com/bytecodealliance/wasmtime/pull/15085">PR #15085 c-api: fix use-after-free in C++ copy assignment operators</a> to the merge queue.</p>
+
+
+
+<a name="636325271"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315085%20c-api%3A%20fix%20use-after-free%20in%20C%2B%2B%20cop.../near/636325271" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315085.20c-api.3A.20fix.20use-after-free.20in.20C.2B.2B.20cop.2E.2E.2E.html#636325271">(Oct 30 2026 at 15:00)</a>:</h4>
+<p><span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span> alexcrichton merged <a href="https://github.com/bytecodealliance/wasmtime/pull/15085">PR #15085</a>.</p>
+
+
+
+<a name="636325273"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315085%20c-api%3A%20fix%20use-after-free%20in%20C%2B%2B%20cop.../near/636325273" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315085.20c-api.3A.20fix.20use-after-free.20in.20C.2B.2B.20cop.2E.2E.2E.html#636325273">(Oct 30 2026 at 15:00)</a>:</h4>
+<p>alexcrichton removed <a href="https://github.com/bytecodealliance/wasmtime/pull/15085">PR #15085 c-api: fix use-after-free in C++ copy assignment operators</a> from the merge queue.</p>
+
+
+
+<hr><p>Last updated: Oct 31 2026 at 21:03 UTC</p>
+</html>

@@ -1,0 +1,510 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #14885 Moving to `LinearMemory` trait and f... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html">wasmtime / PR #14885 Moving to `LinearMemory` trait and f...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="633303447"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633303447" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633303447">(Oct 20 2026 at 12:39)</a>:</h4>
+<p>V0ldek opened <a href="https://github.com/bytecodealliance/wasmtime/pull/14885">PR #14885</a> from <code>V0ldek:v0ldek/custom-linear-memories</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please review the Bytecode Alliance's AI tool usage policy at<br>
+<a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+<p>Following up on the discussion on #10740 I propose a rework of the memory API that centralizes the requirements for linear memory implementation in the public <code>LinearMemory</code> trait.</p>
+<p>The core challenge is resolving the issue from #10740 -- custom memories did not work with the CoW mechanism. This is because the code mounting memory images was hardwired to the internal mmap implementation. The idea is to move the responsibility for supporting CoW into the <code>LinearMemory</code> implementation with the new function <code>init_from_image</code>. It receives an opaque public <code>MemoryImage</code> that informs the implementor where it needs to be mounted (offset and length). The predicted path is that a memory that supports mapping the image over it (backed by mmap) calls the <code>map_at</code> callback and acknowledges that the pages required for the image have been remapped (returns <code>true</code>). If this is not supported, the implementation (default) returns <code>false</code> and wasmtime abandons CoW mapping in favour of a full copy of the data pages. The <code>MemoryImage</code> struct also exposes the underlying bytes of the memory and equality semantics, so custom implementors can, in theory, implement their own lazy copying or their own pooling.</p>
+<p>The second change is that <code>LocalMemory</code> was holding an <code>Option&lt;MemoryImageSlot&gt;</code> to support the <code>StaticMemory</code> and pooling allocators. It also manually called the <code>set_heap_limit</code> on the slot during grow. I did two things: </p>
+<ol>
+<li>The  <code>MemoryImageSlot</code> is now owned by the <code>StaticMemory</code> and <code>LocalMemory</code> only records if the memory needs to be initialized from an image (for the purposes of <code>needs_init()</code> required by instantiation code). This makes it so that <code>LocalMemory</code> depends only on the <code>LinearMemory</code> implementation and needs no knowledge of the pooling allocator machinery. </li>
+<li><code>LinearMemory</code> now has the <code>Any</code> supertrait. This is a) required so that the pooling allocator can get the inner <code>Box&lt;dyn LinearMemory&gt;</code> from <code>LocalMemory</code> and unwrap it to what it knows to be <code>StaticMemory</code> and recover the <code>MemoryImageSlot</code>, b) useful in the potential future where we add the ability to retrieve the memory impl from an instance, as a custom memory could be downcast from <code>Box&lt;dyn LinearMemory&gt;</code>.</li>
+</ol>
+<p>== Overview of code changes</p>
+<p>Public API changes:</p>
+<ul>
+<li><code>LinearMemory</code> gets <code>init_from_image</code></li>
+<li><code>MemoryImage</code> (arg to the above) is public</li>
+</ul>
+<p>These are non-breaking: existing LinearMemories will not support CoW, but instead of crashing they'll just force wasmtime to copy.</p>
+<p>Removed:</p>
+<ul>
+<li>the internal <code>RuntimeLinearMemory</code> trait</li>
+<li>the <code>LinearMemoryProxy</code> that wrapped a <code>Box&lt;dyn LinearMemory&gt;</code> and provided the <code>RuntimeLinearMemory</code> impl</li>
+</ul>
+<p>This functionality is now centralized in the <code>LinearMemory</code> trait.</p>
+<p>The <code>MmapMemory</code> was refactored to accommodate the changes, it relied on <code>RuntimeLinearMemory</code>. Now it uses the standardised path through <code>init_from_image</code> to map a CoW image, although with a hatch through an internal <code>MemoryImage::vm()</code> to keep all of the mmap code as it was with the nice static Mmap types that were already there. Technically one could get rid of the <code>vm()</code> function, but changing all the mmap code felt like more hassle than it's worth.</p>
+<p><code>MemoryImageSlot</code> is now only used by the pooling code. In fact, its definition could be gated behind <code>#[cfg(feature = 'pooling-allocator')]', but that would trigger a whole cascade of cfgs because a lot of </code>use` statements become dead code with the feature disabled and trigger warnings. I wasn't sure if we want those cfgs splattered everywhere, but I can introduce them if we do (judgement call for the code owners).</p>
+<p>I fixed what I think was a bug (see Zulip discussion <a href="#narrow/channel/217126-wasmtime/topic/Custom.20memory.20creators.20for.20host.20memories/near/633018919">#wasmtime &gt; Custom memory creators for host memories @ 💬</a>) in <code>create_memory</code> where custom memory creators were bypassed and the default creator was always used. This mean <code>Memory::new</code> always created a default memory and not a custom one. I added a regression test for that.</p>
+<p>The new functionality is tested in <code>tests/all/memory_creator.rs</code> with focus on CoW behaviour for custom memories. The new public <code>MemoryImage</code> is thoroughly tested in unit tests in <code>runtime/memory.rs</code>. I also added a few tests I felt were missing: <code>MmapOffset</code> (to make sure the bounds checks are correct, since they must be for unsafe code to be sound) and a few tests for <code>LocalMemory</code> growth.</p>
+<p>I also tried to make the <code>LinearMemory</code> safety documentation more useful for implementors. Organised the requirements into bullets so that an implementor can reason about their safety contract and "tick-off" the requirements.</p>
+</blockquote>
+
+
+
+<a name="633303452"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633303452" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633303452">(Oct 20 2026 at 12:39)</a>:</h4>
+<p>V0ldek removed the review request for <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> from <a href="https://github.com/bytecodealliance/wasmtime/pull/14885">PR #14885</a>.</p>
+
+
+
+<a name="633303454"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633303454" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633303454">(Oct 20 2026 at 12:39)</a>:</h4>
+<p>V0ldek requested <a href="https://github.com/dicej">dicej</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14885">PR #14885</a>.</p>
+
+
+
+<a name="633303456"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633303456" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633303456">(Oct 20 2026 at 12:39)</a>:</h4>
+<p>V0ldek requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14885">PR #14885</a>.</p>
+
+
+
+<a name="633304476"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633304476" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633304476">(Oct 20 2026 at 12:43)</a>:</h4>
+<p>V0ldek edited <a href="https://github.com/bytecodealliance/wasmtime/pull/14885">PR #14885</a>:</p>
+<blockquote>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please review the Bytecode Alliance's AI tool usage policy at<br>
+<a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+<p>Following up on the discussion on #10740 I propose a rework of the memory API that centralizes the requirements for linear memory implementation in the public <code>LinearMemory</code> trait.</p>
+<p>The core challenge is resolving the issue from #10740 -- custom memories did not work with the CoW mechanism. This is because the code mounting memory images was hardwired to the internal mmap implementation. The idea is to move the responsibility for supporting CoW into the <code>LinearMemory</code> implementation with the new function <code>init_from_image</code>. It receives an opaque public <code>MemoryImage</code> that informs the implementor where it needs to be mounted (offset and length). The predicted path is that a memory that supports mapping the image over it (backed by mmap) calls the <code>map_at</code> callback and acknowledges that the pages required for the image have been remapped (returns <code>true</code>). If this is not supported, the implementation (default) returns <code>false</code> and wasmtime abandons CoW mapping in favour of a full copy of the data pages. The <code>MemoryImage</code> struct also exposes the underlying bytes of the memory and equality semantics, so custom implementors can, in theory, implement their own lazy copying or their own pooling.</p>
+<p>The second change is that <code>LocalMemory</code> was holding an <code>Option&lt;MemoryImageSlot&gt;</code> to support the <code>StaticMemory</code> and pooling allocators. It also manually called the <code>set_heap_limit</code> on the slot during grow. I did two things: </p>
+<ol>
+<li>The  <code>MemoryImageSlot</code> is now owned by the <code>StaticMemory</code> and <code>LocalMemory</code> only records if the memory needs to be initialized from an image (for the purposes of <code>needs_init()</code> required by instantiation code). This makes it so that <code>LocalMemory</code> depends only on the <code>LinearMemory</code> implementation and needs no knowledge of the pooling allocator machinery. </li>
+<li><code>LinearMemory</code> now has the <code>Any</code> supertrait. This is a) required so that the pooling allocator can get the inner <code>Box&lt;dyn LinearMemory&gt;</code> from <code>LocalMemory</code> and unwrap it to what it knows to be <code>StaticMemory</code> and recover the <code>MemoryImageSlot</code>, b) useful in the potential future where we add the ability to retrieve the memory impl from an instance, as a custom memory could be downcast from <code>Box&lt;dyn LinearMemory&gt;</code>.</li>
+</ol>
+<h2>Overview of code changes</h2>
+<p>Public API changes:</p>
+<ul>
+<li><code>LinearMemory</code> gets <code>init_from_image</code></li>
+<li><code>MemoryImage</code> (arg to the above) is public</li>
+</ul>
+<p>These are non-breaking: existing LinearMemories will not support CoW, but instead of crashing they'll just force wasmtime to copy.</p>
+<p>Removed:</p>
+<ul>
+<li>the internal <code>RuntimeLinearMemory</code> trait</li>
+<li>the <code>LinearMemoryProxy</code> that wrapped a <code>Box&lt;dyn LinearMemory&gt;</code> and provided the <code>RuntimeLinearMemory</code> impl</li>
+</ul>
+<p>This functionality is now centralized in the <code>LinearMemory</code> trait.</p>
+<p>The <code>MmapMemory</code> was refactored to accommodate the changes, it relied on <code>RuntimeLinearMemory</code>. Now it uses the standardised path through <code>init_from_image</code> to map a CoW image, although with a hatch through an internal <code>MemoryImage::vm()</code> to keep all of the mmap code as it was with the nice static Mmap types that were already there. Technically one could get rid of the <code>vm()</code> function, but changing all the mmap code felt like more hassle than it's worth.</p>
+<p><code>MemoryImageSlot</code> is now only used by the pooling code. In fact, its definition could be gated behind <code>#[cfg(feature = 'pooling-allocator')]', but that would trigger a whole cascade of cfgs because a lot of </code>use` statements become dead code with the feature disabled and trigger warnings. I wasn't sure if we want those cfgs splattered everywhere, but I can introduce them if we do (judgement call for the code owners).</p>
+<p>I fixed what I think was a bug (see Zulip discussion <a href="#narrow/channel/217126-wasmtime/topic/Custom.20memory.20creators.20for.20host.20memories/near/633018919">#wasmtime &gt; Custom memory creators for host memories @ 💬</a>) in <code>create_memory</code> where custom memory creators were bypassed and the default creator was always used. This mean <code>Memory::new</code> always created a default memory and not a custom one. I added a regression test for that.</p>
+<p>The new functionality is tested in <code>tests/all/memory_creator.rs</code> with focus on CoW behaviour for custom memories. The new public <code>MemoryImage</code> is thoroughly tested in unit tests in <code>runtime/memory.rs</code>. I also added a few tests I felt were missing: <code>MmapOffset</code> (to make sure the bounds checks are correct, since they must be for unsafe code to be sound) and a few tests for <code>LocalMemory</code> growth.</p>
+<p>I also tried to make the <code>LinearMemory</code> safety documentation more useful for implementors. Organised the requirements into bullets so that an implementor can reason about their safety contract and "tick-off" the requirements.</p>
+</blockquote>
+
+
+
+<a name="633304621"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633304621" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633304621">(Oct 20 2026 at 12:43)</a>:</h4>
+<p>V0ldek edited <a href="https://github.com/bytecodealliance/wasmtime/pull/14885">PR #14885</a>:</p>
+<blockquote>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please review the Bytecode Alliance's AI tool usage policy at<br>
+<a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+<p>Following up on the discussion on #10740 I propose a rework of the memory API that centralizes the requirements for linear memory implementation in the public <code>LinearMemory</code> trait.</p>
+<p>The core challenge is resolving the issue from #10740 -- custom memories did not work with the CoW mechanism. This is because the code mounting memory images was hardwired to the internal mmap implementation. The idea is to move the responsibility for supporting CoW into the <code>LinearMemory</code> implementation with the new function <code>init_from_image</code>. It receives an opaque public <code>MemoryImage</code> that informs the implementor where it needs to be mounted (offset and length). The predicted path is that a memory that supports mapping the image over it (backed by mmap) calls the <code>map_at</code> callback and acknowledges that the pages required for the image have been remapped (returns <code>true</code>). If this is not supported, the implementation (default) returns <code>false</code> and wasmtime abandons CoW mapping in favour of a full copy of the data pages. The <code>MemoryImage</code> struct also exposes the underlying bytes of the memory and equality semantics, so custom implementors can, in theory, implement their own lazy copying or their own pooling.</p>
+<p>The second change is that <code>LocalMemory</code> was holding an <code>Option&lt;MemoryImageSlot&gt;</code> to support the <code>StaticMemory</code> and pooling allocators. It also manually called the <code>set_heap_limit</code> on the slot during grow. I did two things: </p>
+<ol>
+<li>The  <code>MemoryImageSlot</code> is now owned by the <code>StaticMemory</code> and <code>LocalMemory</code> only records if the memory needs to be initialized from an image (for the purposes of <code>needs_init()</code> required by instantiation code). This makes it so that <code>LocalMemory</code> depends only on the <code>LinearMemory</code> implementation and needs no knowledge of the pooling allocator machinery. </li>
+<li><code>LinearMemory</code> now has the <code>Any</code> supertrait. This is a) required so that the pooling allocator can get the inner <code>Box&lt;dyn LinearMemory&gt;</code> from <code>LocalMemory</code> and unwrap it to what it knows to be <code>StaticMemory</code> and recover the <code>MemoryImageSlot</code>, b) useful in the potential future where we add the ability to retrieve the memory impl from an instance, as a custom memory could be downcast from <code>Box&lt;dyn LinearMemory&gt;</code>.</li>
+</ol>
+<h2>Overview of code changes</h2>
+<p>Public API changes:</p>
+<ul>
+<li><code>LinearMemory</code> gets <code>init_from_image</code></li>
+<li><code>MemoryImage</code> (arg to the above) is public</li>
+</ul>
+<p>These are non-breaking: existing LinearMemories will not support CoW, but instead of crashing they'll just force wasmtime to copy via the default impl of <code>init_from_image</code>.</p>
+<p>Removed:</p>
+<ul>
+<li>the internal <code>RuntimeLinearMemory</code> trait</li>
+<li>the <code>LinearMemoryProxy</code> that wrapped a <code>Box&lt;dyn LinearMemory&gt;</code> and provided the <code>RuntimeLinearMemory</code> impl</li>
+</ul>
+<p>This functionality is now centralized in the <code>LinearMemory</code> trait.</p>
+<p>The <code>MmapMemory</code> was refactored to accommodate the changes, it relied on <code>RuntimeLinearMemory</code>. Now it uses the standardised path through <code>init_from_image</code> to map a CoW image, although with a hatch through an internal <code>MemoryImage::vm()</code> to keep all of the mmap code as it was with the nice static Mmap types that were already there. Technically one could get rid of the <code>vm()</code> function, but changing all the mmap code felt like more hassle than it's worth.</p>
+<p><code>MemoryImageSlot</code> is now only used by the pooling code. In fact, its definition could be gated behind <code>#[cfg(feature = 'pooling-allocator')]', but that would trigger a whole cascade of cfgs because a lot of </code>use` statements become dead code with the feature disabled and trigger warnings. I wasn't sure if we want those cfgs splattered everywhere, but I can introduce them if we do (judgement call for the code owners).</p>
+<p>I fixed what I think was a bug (see Zulip discussion <a href="#narrow/channel/217126-wasmtime/topic/Custom.20memory.20creators.20for.20host.20memories/near/633018919">#wasmtime &gt; Custom memory creators for host memories @ 💬</a>) in <code>create_memory</code> where custom memory creators were bypassed and the default creator was always used. This mean <code>Memory::new</code> always created a default memory and not a custom one. I added a regression test for that.</p>
+<p>The new functionality is tested in <code>tests/all/memory_creator.rs</code> with focus on CoW behaviour for custom memories. The new public <code>MemoryImage</code> is thoroughly tested in unit tests in <code>runtime/memory.rs</code>. I also added a few tests I felt were missing: <code>MmapOffset</code> (to make sure the bounds checks are correct, since they must be for unsafe code to be sound) and a few tests for <code>LocalMemory</code> growth.</p>
+<p>I also tried to make the <code>LinearMemory</code> safety documentation more useful for implementors. Organised the requirements into bullets so that an implementor can reason about their safety contract and "tick-off" the requirements.</p>
+</blockquote>
+
+
+
+<a name="633304727"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633304727" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633304727">(Oct 20 2026 at 12:44)</a>:</h4>
+<p>V0ldek edited <a href="https://github.com/bytecodealliance/wasmtime/pull/14885">PR #14885</a>:</p>
+<blockquote>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please review the Bytecode Alliance's AI tool usage policy at<br>
+<a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+<p>Following up on the discussion on #10740 I propose a rework of the memory API that centralizes the requirements for linear memory implementation in the public <code>LinearMemory</code> trait.</p>
+<p>The core challenge is resolving the issue from #10740 -- custom memories did not work with the CoW mechanism. This is because the code mounting memory images was hardwired to the internal mmap implementation. The idea is to move the responsibility for supporting CoW into the <code>LinearMemory</code> implementation with the new function <code>init_from_image</code>. It receives an opaque public <code>MemoryImage</code> that informs the implementor where it needs to be mounted (offset and length). The predicted path is that a memory that supports mapping the image over it (backed by mmap) calls the <code>map_at</code> callback and acknowledges that the pages required for the image have been remapped (returns <code>true</code>). If this is not supported, the implementation (default) returns <code>false</code> and wasmtime abandons CoW mapping in favour of a full copy of the data pages. The <code>MemoryImage</code> struct also exposes the underlying bytes of the memory and equality semantics, so custom implementors can, in theory, implement their own lazy copying or their own pooling.</p>
+<p>The second change is that <code>LocalMemory</code> was holding an <code>Option&lt;MemoryImageSlot&gt;</code> to support the <code>StaticMemory</code> and pooling allocators. It also manually called the <code>set_heap_limit</code> on the slot during grow. I did two things: </p>
+<ol>
+<li>The  <code>MemoryImageSlot</code> is now owned by the <code>StaticMemory</code> and <code>LocalMemory</code> only records if the memory needs to be initialized from an image (for the purposes of <code>needs_init()</code> required by instantiation code). This makes it so that <code>LocalMemory</code> depends only on the <code>LinearMemory</code> implementation and needs no knowledge of the pooling allocator machinery. </li>
+<li><code>LinearMemory</code> now has the <code>Any</code> supertrait. This is a) required so that the pooling allocator can get the inner <code>Box&lt;dyn LinearMemory&gt;</code> from <code>LocalMemory</code> and unwrap it to what it knows to be <code>StaticMemory</code> and recover the <code>MemoryImageSlot</code>, b) useful in the potential future where we add the ability to retrieve the memory impl from an instance, as a custom memory could be downcast from <code>Box&lt;dyn LinearMemory&gt;</code>.</li>
+</ol>
+<h2>Overview of code changes</h2>
+<p>Public API changes:</p>
+<ul>
+<li><code>LinearMemory</code> gets <code>init_from_image</code></li>
+<li><code>MemoryImage</code> (arg to the above) is public</li>
+</ul>
+<p>These are non-breaking: existing LinearMemories will not support CoW, but instead of crashing they'll just force wasmtime to copy via the default impl of <code>init_from_image</code>.</p>
+<p>Removed:</p>
+<ul>
+<li>the internal <code>RuntimeLinearMemory</code> trait</li>
+<li>the <code>LinearMemoryProxy</code> that wrapped a <code>Box&lt;dyn LinearMemory&gt;</code> and provided the <code>RuntimeLinearMemory</code> impl</li>
+</ul>
+<p>This functionality is now centralized in the <code>LinearMemory</code> trait.</p>
+<p>The <code>MmapMemory</code> was refactored to accommodate the changes, it relied on <code>RuntimeLinearMemory</code>. Now it uses the standardised path through <code>init_from_image</code> to map a CoW image, although with a hatch through an internal <code>MemoryImage::vm()</code> to keep all of the mmap code as it was with the nice static Mmap types that were already there. Technically one could get rid of the <code>vm()</code> function, but changing all the mmap code felt like more hassle than it's worth.</p>
+<p><code>MemoryImageSlot</code> is now only used by the pooling code. In fact, its definition could be gated behind <code>#[cfg(feature = 'pooling-allocator')]</code>, but that would trigger a whole cascade of cfgs because a lot of <code>use</code> statements become dead code with the feature disabled and trigger warnings. I wasn't sure if we want those cfgs splattered everywhere, but I can introduce them if we do (judgement call for the code owners).</p>
+<p>I fixed what I think was a bug (see Zulip discussion <a href="#narrow/channel/217126-wasmtime/topic/Custom.20memory.20creators.20for.20host.20memories/near/633018919">#wasmtime &gt; Custom memory creators for host memories @ 💬</a>) in <code>create_memory</code> where custom memory creators were bypassed and the default creator was always used. This mean <code>Memory::new</code> always created a default memory and not a custom one. I added a regression test for that.</p>
+<p>The new functionality is tested in <code>tests/all/memory_creator.rs</code> with focus on CoW behaviour for custom memories. The new public <code>MemoryImage</code> is thoroughly tested in unit tests in <code>runtime/memory.rs</code>. I also added a few tests I felt were missing: <code>MmapOffset</code> (to make sure the bounds checks are correct, since they must be for unsafe code to be sound) and a few tests for <code>LocalMemory</code> growth.</p>
+<p>I also tried to make the <code>LinearMemory</code> safety documentation more useful for implementors. Organised the requirements into bullets so that an implementor can reason about their safety contract and "tick-off" the requirements.</p>
+</blockquote>
+
+
+
+<a name="633344852"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633344852" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633344852">(Oct 20 2026 at 14:49)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14885">PR #14885</a>.</p>
+
+
+
+<a name="633344854"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633344854" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633344854">(Oct 20 2026 at 14:49)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:ref-types</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14885">PR #14885</a>.</p>
+
+
+
+<a name="633364449"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633364449" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633364449">(Oct 20 2026 at 15:48)</a>:</h4>
+<p>github-actions[bot] <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#issuecomment-6294962847">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/14885">PR #14885</a>:</p>
+<blockquote>
+<h4>Subscribe to Label Action</h4>
+<p>cc @fitzgen</p>
+<p>&lt;details&gt;<br>
+This issue or pull request has been labeled: "wasmtime:api", "wasmtime:ref-types"</p>
+<p>Thus the following users have been cc'd because of the following labels:</p>
+<ul>
+<li>fitzgen: wasmtime:ref-types</li>
+</ul>
+<p>To subscribe or unsubscribe from this label, edit the &lt;code&gt;.github/subscribe-to-label.json&lt;/code&gt; configuration file.</p>
+<p><a href="https://github.com/bytecodealliance/subscribe-to-label-action">Learn more.</a><br>
+&lt;/details&gt;</p>
+</blockquote>
+
+
+
+<a name="633420338"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633420338" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633420338">(Oct 20 2026 at 19:06)</a>:</h4>
+<p>alexcrichton removed the review request for <a href="https://github.com/dicej">dicej</a> from <a href="https://github.com/bytecodealliance/wasmtime/pull/14885">PR #14885</a>.</p>
+
+
+
+<a name="633420339"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633420339" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633420339">(Oct 20 2026 at 19:06)</a>:</h4>
+<p>alexcrichton requested <a href="https://github.com/alexcrichton">alexcrichton</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/14885">PR #14885</a>.</p>
+
+
+
+<a name="633447829"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633447829" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633447829">(Oct 20 2026 at 21:00)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#pullrequestreview-5591482901">PR review</a>:</p>
+<blockquote>
+<p>Thank you so much for this! Overall this looks like great work to me. I've left some minor comments about tests/docs/organization, but nothing major. Happy to merge with them addressed and/or as-is if you feel things should stay</p>
+</blockquote>
+
+
+
+<a name="633447831"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633447831" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633447831">(Oct 20 2026 at 21:00)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4330170900">PR review comment</a>:</p>
+<blockquote>
+<p>Are the new tests here testing much beyond what's already testable form the public API? We try to prefer <code>tests/all/*.rs</code> where possible since that's a more stable surface to test against. If these have specific coverage of internals though it's fine to keep, but wanted to ask. (on review to me these look pretty similar to what's already tested elsewhere)</p>
+</blockquote>
+
+
+
+<a name="633447832"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633447832" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633447832">(Oct 20 2026 at 21:00)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4330228838">PR review comment</a>:</p>
+<blockquote>
+<p>One thing I'd recommend adding to this is a clause saying that this documentation strives to be thorough but is not guaranteed to be exhaustive. Basically if we forgot something here that's a bug, not a CVE</p>
+</blockquote>
+
+
+
+<a name="633447833"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633447833" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633447833">(Oct 20 2026 at 21:00)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4330098427">PR review comment</a>:</p>
+<blockquote>
+<p>I think it's reasonable to keep this (as opposed to making it truly conditional and cascading everything) -- but could the <code>allow</code> change to <code>expect</code>?</p>
+</blockquote>
+
+
+
+<a name="633447834"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633447834" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633447834">(Oct 20 2026 at 21:00)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4330197192">PR review comment</a>:</p>
+<blockquote>
+<p>In my experience <code>should_panic</code> tests are pretty finnicky and also typically indicative of something that should be transmitted through a <code>Result</code>. Perhaps the <code>map_image_at</code> API could return a result instead of panicking on these conditions? Makes it easier to test and additionally lessens the severity of accidentally tripping over the assertions later (e.g. a panic is a CVE, but a spurious error not so)</p>
+</blockquote>
+
+
+
+<a name="633447840"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633447840" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633447840">(Oct 20 2026 at 21:00)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4330218233">PR review comment</a>:</p>
+<blockquote>
+<p>I think with simd bits we actually require 16-byte alignment.</p>
+</blockquote>
+
+
+
+<a name="633580262"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633580262" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633580262">(Oct 21 2026 at 09:36)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> V0ldek submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#pullrequestreview-5597721731">PR review</a>.</p>
+
+
+
+<a name="633580264"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633580264" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633580264">(Oct 21 2026 at 09:36)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> V0ldek created <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4335239818">PR review comment</a>:</p>
+<blockquote>
+<p>I'm relatively sure SIMD doesn't need it, <code>v128.load</code> is valid regardless of alignment, but 16-byte aligned would potentially be faster (avoiding cache-line splits).</p>
+<p>In any case, we can always require more than needed from the implementations "just in case", the internal ones align to 16 already. </p>
+</blockquote>
+
+
+
+<a name="633597351"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633597351" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633597351">(Oct 21 2026 at 10:43)</a>:</h4>
+<p>V0ldek updated <a href="https://github.com/bytecodealliance/wasmtime/pull/14885">PR #14885</a>.</p>
+
+
+
+<a name="633597687"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633597687" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633597687">(Oct 21 2026 at 10:44)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> V0ldek submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#pullrequestreview-5598484620">PR review</a>.</p>
+
+
+
+<a name="633597689"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633597689" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633597689">(Oct 21 2026 at 10:44)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> V0ldek created <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4335849142">PR review comment</a>:</p>
+<blockquote>
+<p>I added the following "disclaimer":</p>
+<p><div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="sd">/// Note that while we strive to be thorough in this documentation, we do not guarantee that the</span>
+<span class="sd">/// following points are exhaustive.</span>
+<span class="sd">/// When using a custom memory backend in a security-sensitive context auditing just the external</span>
+<span class="sd">/// implementation of this trait is not sufficient.</span>
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="633597810"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633597810" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633597810">(Oct 21 2026 at 10:44)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> V0ldek submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#pullrequestreview-5598490836">PR review</a>.</p>
+
+
+
+<a name="633597813"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633597813" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633597813">(Oct 21 2026 at 10:44)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> V0ldek created <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4335853878">PR review comment</a>:</p>
+<blockquote>
+<p>Changed <code>MmapOffset::map_image_at</code> to return an error instead of panicking, tests adjusted.</p>
+</blockquote>
+
+
+
+<a name="633598064"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633598064" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633598064">(Oct 21 2026 at 10:45)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> V0ldek submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#pullrequestreview-5598498504">PR review</a>.</p>
+
+
+
+<a name="633598066"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633598066" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633598066">(Oct 21 2026 at 10:45)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> V0ldek created <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4335860252">PR review comment</a>:</p>
+<blockquote>
+<p>Hey, that's a neat feature I didn't know of! While at it, I adjusted a bunch of similar <code>allow</code> statements in the same file to be <code>expect</code> when pooling allocator is disabled.</p>
+</blockquote>
+
+
+
+<a name="633598242"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633598242" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633598242">(Oct 21 2026 at 10:46)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> V0ldek submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#pullrequestreview-5598504403">PR review</a>.</p>
+
+
+
+<a name="633598243"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633598243" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633598243">(Oct 21 2026 at 10:46)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> V0ldek created <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4335865203">PR review comment</a>:</p>
+<blockquote>
+<p>No, these are specifically tests of the public API. I'll move them to the integration tests and double-check if I'm not duplicating work.</p>
+</blockquote>
+
+
+
+<a name="633600590"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633600590" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633600590">(Oct 21 2026 at 10:55)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> V0ldek edited <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4335239818">PR review comment</a>.</p>
+
+
+
+<a name="633670768"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633670768" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633670768">(Oct 21 2026 at 14:44)</a>:</h4>
+<p>V0ldek updated <a href="https://github.com/bytecodealliance/wasmtime/pull/14885">PR #14885</a>.</p>
+
+
+
+<a name="633672699"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633672699" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633672699">(Oct 21 2026 at 14:49)</a>:</h4>
+<p>V0ldek updated <a href="https://github.com/bytecodealliance/wasmtime/pull/14885">PR #14885</a>.</p>
+
+
+
+<a name="633674380"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633674380" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633674380">(Oct 21 2026 at 14:54)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> V0ldek submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#pullrequestreview-5601512909">PR review</a>.</p>
+
+
+
+<a name="633674445"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633674445" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633674445">(Oct 21 2026 at 14:54)</a>:</h4>
+<p>V0ldek updated <a href="https://github.com/bytecodealliance/wasmtime/pull/14885">PR #14885</a>.</p>
+
+
+
+<a name="633674539"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633674539" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633674539">(Oct 21 2026 at 14:54)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> V0ldek created <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4338214985">PR review comment</a>:</p>
+<blockquote>
+<p>I moved the tests to tests/all/memory_creator.rs and then essentially rewrote that test module:</p>
+<ul>
+<li>It now runs most tests on both unix and windows, except for CoW images that require memfd</li>
+<li>Removed the old simple tests and covered the MemoryCreator and LinearMemory public API expectations in new tests.</li>
+</ul>
+<p>One of them uses an <code>expect_panic</code> which you said you dislike, but I think it's justified there. It's a cheap defense-in-depth effort by the engine to prevent wrong implementations from doing something stupid. I don't think it's reasonable to Err out of there, because when <code>memory.grow</code> fails the user might attempt to still use the memory for something, but in this case critical invariants were violated so the correct decision is to explode. I also changed it to have an actual panic message.</p>
+</blockquote>
+
+
+
+<a name="633679073"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633679073" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633679073">(Oct 21 2026 at 15:07)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#pullrequestreview-5601713868">PR review</a>.</p>
+
+
+
+<a name="633680590"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633680590" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633680590">(Oct 21 2026 at 15:11)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4338370958">PR review comment</a>:</p>
+<blockquote>
+<p>Oh right good point I was misremembering -- it's atomics that require alignment not simd. In any case I think documenting 16 for now is reasonable, thanks!</p>
+</blockquote>
+
+
+
+<a name="633684643"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633684643" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633684643">(Oct 21 2026 at 15:24)</a>:</h4>
+<p><span aria-label="thumbs up" class="emoji emoji-1f44d" role="img" title="thumbs up">:thumbs_up:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/14885#pullrequestreview-5601912555">PR review</a>:</p>
+<blockquote>
+<p>Thanks again!</p>
+</blockquote>
+
+
+
+<a name="633688051"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633688051" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633688051">(Oct 21 2026 at 15:35)</a>:</h4>
+<p>alexcrichton added <a href="https://github.com/bytecodealliance/wasmtime/pull/14885">PR #14885 Moving to <code>LinearMemory</code> trait and fixing custom memories</a> to the merge queue.</p>
+
+
+
+<a name="633693077"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633693077" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633693077">(Oct 21 2026 at 15:52)</a>:</h4>
+<p><span aria-label="check" class="emoji emoji-2705" role="img" title="check">:check:</span> alexcrichton merged <a href="https://github.com/bytecodealliance/wasmtime/pull/14885">PR #14885</a>.</p>
+
+
+
+<a name="633694606"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2314885%20Moving%20to%20%60LinearMemory%60%20trait%20and%20f.../near/633694606" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2314885.20Moving.20to.20.60LinearMemory.60.20trait.20and.20f.2E.2E.2E.html#633694606">(Oct 21 2026 at 15:57)</a>:</h4>
+<p>alexcrichton removed <a href="https://github.com/bytecodealliance/wasmtime/pull/14885">PR #14885 Moving to <code>LinearMemory</code> trait and fixing custom memories</a> from the merge queue.</p>
+
+
+
+<hr><p>Last updated: Oct 31 2026 at 21:03 UTC</p>
+</html>

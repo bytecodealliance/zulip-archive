@@ -1,0 +1,265 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #14848 Cranelift x64: a `shuffle` whose ... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314848.20Cranelift.20x64.3A.20a.20.60shuffle.60.20whose.20.2E.2E.2E.html">wasmtime / issue #14848 Cranelift x64: a `shuffle` whose ...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="633123573"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314848%20Cranelift%20x64%3A%20a%20%60shuffle%60%20whose%20.../near/633123573" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314848.20Cranelift.20x64.3A.20a.20.60shuffle.60.20whose.20.2E.2E.2E.html#633123573">(Oct 19 2026 at 20:23)</a>:</h4>
+<p>EvanCarroll opened <a href="https://github.com/bytecodealliance/wasmtime/issues/14848">issue #14848</a>:</p>
+<blockquote>
+<h1>Cranelift x64: a <code>shuffle</code> whose mask reads one operand still depends on the other</h1>
+<h2>Summary</h2>
+<p>On x64, a <code>shuffle</code> gets a single <code>pshufb</code> only when both operands are the same<br>
+value (<code>shuffle a a</code>). If the operands differ but the mask only selects lanes from<br>
+one of them (every index &lt; 16, or every index &gt;= 16), lowering falls through to:</p>
+<ul>
+<li><code>vpermi2b mask, a, b</code> when AVX512VL + AVX512VBMI are available, or</li>
+<li><code>pshufb a</code> + <code>pshufb b</code> (zeroing mask) + <code>por</code> otherwise.</li>
+</ul>
+<p>Both read the operand the mask never selects. That costs instructions, and it<br>
+also adds a false data dependency on that operand.</p>
+<p>Wasm producers emit this pattern. In <code>core::arch::wasm32::i8x16_shuffle::&lt;0, 4, 1,
+5, …&gt;(x, x)</code>, LLVM marks the second operand undefined, and the wasm backend fills<br>
+it with whatever local is handy. In the case below that local is the loop's<br>
+accumulator, so the shuffle waits on the previous iteration's add and the loop<br>
+runs serially. V8 lowers the same module to a single <code>pshufb</code>.</p>
+<h2>Reproducer</h2>
+<p>CLIF (<code>test compile precise-output</code>, <code>target x86_64 ssse3 has_avx512vl has_avx512vbmi</code>):</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">function</span><span class="w"> </span><span class="o">%</span><span class="n">shuffle_lhs_only</span><span class="p">(</span><span class="n">i8x16</span><span class="p">,</span><span class="w"> </span><span class="n">i8x16</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">i8x16</span><span class="w"> </span><span class="p">{</span>
+<span class="n">block0</span><span class="p">(</span><span class="n">v0</span><span class="p">:</span><span class="w"> </span><span class="nc">i8x16</span><span class="p">,</span><span class="w"> </span><span class="n">v1</span><span class="p">:</span><span class="w"> </span><span class="nc">i8x16</span><span class="p">):</span>
+<span class="w">    </span><span class="nc">v2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">shuffle</span><span class="w"> </span><span class="n">v0</span><span class="p">,</span><span class="w"> </span><span class="n">v1</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="mi">0</span><span class="w"> </span><span class="mi">4</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="mi">5</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="mi">6</span><span class="w"> </span><span class="mi">3</span><span class="w"> </span><span class="mi">7</span><span class="w"> </span><span class="mi">8</span><span class="w"> </span><span class="mi">12</span><span class="w"> </span><span class="mi">9</span><span class="w"> </span><span class="mi">13</span><span class="w"> </span><span class="mi">10</span><span class="w"> </span><span class="mi">14</span><span class="w"> </span><span class="mi">11</span><span class="w"> </span><span class="mi">15</span><span class="p">]</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">v2</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Observed (<code>main</code> at dcfbea188d):</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="w">  </span><span class="n">movdqa</span><span class="w"> </span><span class="o">%</span><span class="n">xmm0</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm5</span>
+<span class="w">  </span><span class="n">movdqu</span><span class="w"> </span><span class="p">(</span><span class="o">%</span><span class="n">rip</span><span class="p">),</span><span class="w"> </span><span class="o">%</span><span class="n">xmm0</span>
+<span class="w">  </span><span class="n">movdqa</span><span class="w"> </span><span class="o">%</span><span class="n">xmm5</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm6</span>
+<span class="w">  </span><span class="n">vpermi2b</span><span class="w"> </span><span class="o">%</span><span class="n">xmm1</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm6</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm0</span>
+</code></pre></div>
+<p>With <code>target x86_64 sse41</code> it is two <code>pshufb</code>s and a <code>por</code>. Expected in both<br>
+cases: <code>pshufb (%rip), %xmm0</code>. The mirror case, every index &gt;= 16, behaves the<br>
+same way with <code>v1</code> and <code>v0</code> swapped.</p>
+<p>Wasm loop showing the false dependency (<code>shuffle-false-dep.wat</code>, attached):</p>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">loop</span> <span class="nv">$l</span>
+  <span class="p">(</span><span class="nb">local.set</span> <span class="nv">$v</span>
+    <span class="p">(</span><span class="err">i</span><span class="mf">8x16</span><span class="err">.shuffle</span> <span class="mf">0 4</span> <span class="mf">1 5</span> <span class="mf">2 6</span> <span class="mf">3 7</span> <span class="mf">8 12</span> <span class="mf">9 13</span> <span class="mi">10</span> <span class="mi">14</span> <span class="mi">11</span> <span class="mi">15</span>
+      <span class="p">(</span><span class="err">v</span><span class="mf">128</span><span class="err">.load</span> <span class="err">…</span><span class="p">)</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$acc</span><span class="p">)))</span>          <span class="c1">;; $acc is never selected</span>
+  <span class="p">(</span><span class="nb">local.set</span> <span class="nv">$acc</span> <span class="p">(</span><span class="kt">i32</span><span class="err">x</span><span class="mi">4</span><span class="err">.add</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$acc</span><span class="p">)</span> <span class="p">(</span><span class="kt">i32</span><span class="err">x</span><span class="mi">4</span><span class="err">.dot_i</span><span class="mi">16</span><span class="err">x</span><span class="mi">8</span><span class="err">_s</span> <span class="err">…</span><span class="p">)))</span>
+  <span class="p">(</span><span class="nb">br_if</span> <span class="nv">$l</span> <span class="err">…</span><span class="p">))</span>
+</code></pre></div>
+<h2>Impact</h2>
+<p><code>shuffle-false-dep.wat</code>, i7-1165G7 (has AVX512VBMI):</p>
+<table>
+<thead>
+<tr>
+<th>wasmtime</th>
+<th>time</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>49.0.3</td>
+<td>3.37 s (3.4 ns/iteration)</td>
+</tr>
+<tr>
+<td>with a single-operand lowering</td>
+<td>0.85 s (0.85 ns/iteration), 4.0× faster</td>
+</tr>
+</tbody>
+</table>
+<p><code>n = 1_000_000_000</code>, <code>wasmtime run --invoke run shuffle-false-dep.wat 1000000000</code>,<br>
+pinned to one core; two runs each agree to the hundredth of a second. The loop<br>
+on 49.0.3:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">vmovdqu</span><span class="w"> </span><span class="p">(</span><span class="o">%</span><span class="n">rax</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">rcx</span><span class="p">),</span><span class="w"> </span><span class="o">%</span><span class="n">xmm1</span>
+<span class="n">subl</span><span class="w">    </span><span class="cp">$</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">edx</span>
+<span class="n">vmovdqu</span><span class="w"> </span><span class="mh">0x38</span><span class="p">(</span><span class="o">%</span><span class="n">rip</span><span class="p">),</span><span class="w"> </span><span class="o">%</span><span class="n">xmm2</span>
+<span class="n">vpermi2b</span><span class="w"> </span><span class="o">%</span><span class="n">xmm0</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm1</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm2</span><span class="w">      </span><span class="p">;</span><span class="w"> </span><span class="o">%</span><span class="n">xmm0</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="cp">$acc</span><span class="p">,</span><span class="w"> </span><span class="n">never</span><span class="w"> </span><span class="n">selected</span>
+<span class="n">vpmovsxbw</span><span class="w"> </span><span class="o">%</span><span class="n">xmm2</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm1</span>
+<span class="n">vpalignr</span><span class="w"> </span><span class="cp">$</span><span class="mi">8</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm2</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm2</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm2</span>
+<span class="n">vpmovsxbw</span><span class="w"> </span><span class="o">%</span><span class="n">xmm2</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm2</span>
+<span class="n">vpmaddwd</span><span class="w"> </span><span class="o">%</span><span class="n">xmm2</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm1</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm1</span>
+<span class="n">vpaddd</span><span class="w">  </span><span class="o">%</span><span class="n">xmm1</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm0</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm0</span><span class="w">       </span><span class="p">;</span><span class="w"> </span><span class="cp">$acc</span>
+</code></pre></div>
+<p>With <code>vpshufb 0x27(%rip), %xmm1, %xmm2</code> in place of the <code>vmovdqu 0x38(%rip)</code> /<br>
+<code>vpermi2b</code> pair, the shuffle no longer waits on the previous iteration's <code>vpaddd</code>.</p>
+<p>In a real int8 matrix-vector kernel (tract's <code>wasm_i32_4x1</code>, the inner loop of a<br>
+transformer decoder's weight matmuls), patching only this operand in the module<br>
+(passing the loaded vector twice, so that <code>shuffle a a</code> matches) takes a<br>
+512×512 call from 56.7 µs to 27.2 µs on wasmtime 49.0.3: 2.1×, level with V8<br>
+(26 µs).</p>
+<h2>Where it comes from</h2>
+<p><code>cranelift/codegen/src/isa/x64/lower.isle</code>, <code>shuffle</code> rules: rule 3 is<br>
+<code>(shuffle _ a a …)</code>. Rules 2 and 1 (<code>vpermi2b</code>) and the <code>por</code> fallback take<br>
+<code>(shuffle _ a b …)</code> with no check on which operands the mask reads. Several<br>
+special cases already match "lhs only" or "rhs only" masks (<code>pshufd_lhs_imm</code> /<br>
+<code>pshufd_rhs_imm</code>, <code>pshuflw_*</code>, <code>pshufhw_*</code>), but no general byte shuffle does.<br>
+Neither the mid-end nor the wasm translator canonicalizes <code>shuffle a b</code> to<br>
+<code>shuffle a a</code>.</p>
+<h2>Related</h2>
+<ul>
+<li>
+<p>#2531: shuffle optimizations needed. Closed once the common patterns got<br>
+  single-instruction lowerings; single-operand masks with distinct operands were<br>
+  not among them.</p>
+</li>
+<li>
+<p>#2930: added the <code>vpermi2b</code> lowering for shuffles of two different registers.<br>
+  It is the rule that now also catches these single-operand masks.</p>
+</li>
+<li>
+<p>#4772: port of the x64 shuffle lowering to ISLE (the rules above).</p>
+</li>
+<li>
+<p>#5930, #5999: more <code>shuffle</code> specializations (<code>pshufd</code>/<code>pshuf{l,h}w</code> lhs/rhs,<br>
+<code>palignr</code>); they show the lhs/rhs-only pattern this needs.</p>
+</li>
+<li>
+<p>#6606: non-SSSE3 <code>pshufb</code> lowering (the <code>X86Pshufb</code> libcall).<br>
+</p>
+</li>
+</ul>
+</blockquote>
+
+
+
+<a name="633124108"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314848%20Cranelift%20x64%3A%20a%20%60shuffle%60%20whose%20.../near/633124108" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314848.20Cranelift.20x64.3A.20a.20.60shuffle.60.20whose.20.2E.2E.2E.html#633124108">(Oct 19 2026 at 20:25)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the cranelift<span aria-label="goal" class="emoji emoji-1f945" role="img" title="goal">:goal:</span>optimize-speed label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14848">Issue #14848</a>.</p>
+
+
+
+<a name="633124109"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314848%20Cranelift%20x64%3A%20a%20%60shuffle%60%20whose%20.../near/633124109" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314848.20Cranelift.20x64.3A.20a.20.60shuffle.60.20whose.20.2E.2E.2E.html#633124109">(Oct 19 2026 at 20:25)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the cranelift:area:x64 label to <a href="https://github.com/bytecodealliance/wasmtime/issues/14848">Issue #14848</a>.</p>
+
+
+
+<a name="633385867"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2314848%20Cranelift%20x64%3A%20a%20%60shuffle%60%20whose%20.../near/633385867" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2314848.20Cranelift.20x64.3A.20a.20.60shuffle.60.20whose.20.2E.2E.2E.html#633385867">(Oct 20 2026 at 17:01)</a>:</h4>
+<p>alexcrichton closed <a href="https://github.com/bytecodealliance/wasmtime/issues/14848">issue #14848</a>:</p>
+<blockquote>
+<h1>Cranelift x64: a <code>shuffle</code> whose mask reads one operand still depends on the other</h1>
+<h2>Summary</h2>
+<p>On x64, a <code>shuffle</code> gets a single <code>pshufb</code> only when both operands are the same<br>
+value (<code>shuffle a a</code>). If the operands differ but the mask only selects lanes from<br>
+one of them (every index &lt; 16, or every index &gt;= 16), lowering falls through to:</p>
+<ul>
+<li><code>vpermi2b mask, a, b</code> when AVX512VL + AVX512VBMI are available, or</li>
+<li><code>pshufb a</code> + <code>pshufb b</code> (zeroing mask) + <code>por</code> otherwise.</li>
+</ul>
+<p>Both read the operand the mask never selects. That costs instructions, and it<br>
+also adds a false data dependency on that operand.</p>
+<p>Wasm producers emit this pattern. In <code>core::arch::wasm32::i8x16_shuffle::&lt;0, 4, 1,
+5, …&gt;(x, x)</code>, LLVM marks the second operand undefined, and the wasm backend fills<br>
+it with whatever local is handy. In the case below that local is the loop's<br>
+accumulator, so the shuffle waits on the previous iteration's add and the loop<br>
+runs serially. V8 lowers the same module to a single <code>pshufb</code>.</p>
+<h2>Reproducer</h2>
+<p>CLIF (<code>test compile precise-output</code>, <code>target x86_64 ssse3 has_avx512vl has_avx512vbmi</code>):</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">function</span><span class="w"> </span><span class="o">%</span><span class="n">shuffle_lhs_only</span><span class="p">(</span><span class="n">i8x16</span><span class="p">,</span><span class="w"> </span><span class="n">i8x16</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">i8x16</span><span class="w"> </span><span class="p">{</span>
+<span class="n">block0</span><span class="p">(</span><span class="n">v0</span><span class="p">:</span><span class="w"> </span><span class="nc">i8x16</span><span class="p">,</span><span class="w"> </span><span class="n">v1</span><span class="p">:</span><span class="w"> </span><span class="nc">i8x16</span><span class="p">):</span>
+<span class="w">    </span><span class="nc">v2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">shuffle</span><span class="w"> </span><span class="n">v0</span><span class="p">,</span><span class="w"> </span><span class="n">v1</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="mi">0</span><span class="w"> </span><span class="mi">4</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="mi">5</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="mi">6</span><span class="w"> </span><span class="mi">3</span><span class="w"> </span><span class="mi">7</span><span class="w"> </span><span class="mi">8</span><span class="w"> </span><span class="mi">12</span><span class="w"> </span><span class="mi">9</span><span class="w"> </span><span class="mi">13</span><span class="w"> </span><span class="mi">10</span><span class="w"> </span><span class="mi">14</span><span class="w"> </span><span class="mi">11</span><span class="w"> </span><span class="mi">15</span><span class="p">]</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">v2</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Observed (<code>main</code> at dcfbea188d):</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="w">  </span><span class="n">movdqa</span><span class="w"> </span><span class="o">%</span><span class="n">xmm0</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm5</span>
+<span class="w">  </span><span class="n">movdqu</span><span class="w"> </span><span class="p">(</span><span class="o">%</span><span class="n">rip</span><span class="p">),</span><span class="w"> </span><span class="o">%</span><span class="n">xmm0</span>
+<span class="w">  </span><span class="n">movdqa</span><span class="w"> </span><span class="o">%</span><span class="n">xmm5</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm6</span>
+<span class="w">  </span><span class="n">vpermi2b</span><span class="w"> </span><span class="o">%</span><span class="n">xmm1</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm6</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm0</span>
+</code></pre></div>
+<p>With <code>target x86_64 sse41</code> it is two <code>pshufb</code>s and a <code>por</code>. Expected in both<br>
+cases: <code>pshufb (%rip), %xmm0</code>. The mirror case, every index &gt;= 16, behaves the<br>
+same way with <code>v1</code> and <code>v0</code> swapped.</p>
+<p>Wasm loop showing the false dependency (<code>shuffle-false-dep.wat</code>, attached):</p>
+<div class="codehilite" data-code-language="WebAssembly"><pre><span></span><code><span class="p">(</span><span class="k">loop</span> <span class="nv">$l</span>
+  <span class="p">(</span><span class="nb">local.set</span> <span class="nv">$v</span>
+    <span class="p">(</span><span class="err">i</span><span class="mf">8x16</span><span class="err">.shuffle</span> <span class="mf">0 4</span> <span class="mf">1 5</span> <span class="mf">2 6</span> <span class="mf">3 7</span> <span class="mf">8 12</span> <span class="mf">9 13</span> <span class="mi">10</span> <span class="mi">14</span> <span class="mi">11</span> <span class="mi">15</span>
+      <span class="p">(</span><span class="err">v</span><span class="mf">128</span><span class="err">.load</span> <span class="err">…</span><span class="p">)</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$acc</span><span class="p">)))</span>          <span class="c1">;; $acc is never selected</span>
+  <span class="p">(</span><span class="nb">local.set</span> <span class="nv">$acc</span> <span class="p">(</span><span class="kt">i32</span><span class="err">x</span><span class="mi">4</span><span class="err">.add</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$acc</span><span class="p">)</span> <span class="p">(</span><span class="kt">i32</span><span class="err">x</span><span class="mi">4</span><span class="err">.dot_i</span><span class="mi">16</span><span class="err">x</span><span class="mi">8</span><span class="err">_s</span> <span class="err">…</span><span class="p">)))</span>
+  <span class="p">(</span><span class="nb">br_if</span> <span class="nv">$l</span> <span class="err">…</span><span class="p">))</span>
+</code></pre></div>
+<h2>Impact</h2>
+<p><code>shuffle-false-dep.wat</code>, i7-1165G7 (has AVX512VBMI):</p>
+<table>
+<thead>
+<tr>
+<th>wasmtime</th>
+<th>time</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>49.0.3</td>
+<td>3.37 s (3.4 ns/iteration)</td>
+</tr>
+<tr>
+<td>with a single-operand lowering</td>
+<td>0.85 s (0.85 ns/iteration), 4.0× faster</td>
+</tr>
+</tbody>
+</table>
+<p><code>n = 1_000_000_000</code>, <code>wasmtime run --invoke run shuffle-false-dep.wat 1000000000</code>,<br>
+pinned to one core; two runs each agree to the hundredth of a second. The loop<br>
+on 49.0.3:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">vmovdqu</span><span class="w"> </span><span class="p">(</span><span class="o">%</span><span class="n">rax</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">rcx</span><span class="p">),</span><span class="w"> </span><span class="o">%</span><span class="n">xmm1</span>
+<span class="n">subl</span><span class="w">    </span><span class="cp">$</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">edx</span>
+<span class="n">vmovdqu</span><span class="w"> </span><span class="mh">0x38</span><span class="p">(</span><span class="o">%</span><span class="n">rip</span><span class="p">),</span><span class="w"> </span><span class="o">%</span><span class="n">xmm2</span>
+<span class="n">vpermi2b</span><span class="w"> </span><span class="o">%</span><span class="n">xmm0</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm1</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm2</span><span class="w">      </span><span class="p">;</span><span class="w"> </span><span class="o">%</span><span class="n">xmm0</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="cp">$acc</span><span class="p">,</span><span class="w"> </span><span class="n">never</span><span class="w"> </span><span class="n">selected</span>
+<span class="n">vpmovsxbw</span><span class="w"> </span><span class="o">%</span><span class="n">xmm2</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm1</span>
+<span class="n">vpalignr</span><span class="w"> </span><span class="cp">$</span><span class="mi">8</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm2</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm2</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm2</span>
+<span class="n">vpmovsxbw</span><span class="w"> </span><span class="o">%</span><span class="n">xmm2</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm2</span>
+<span class="n">vpmaddwd</span><span class="w"> </span><span class="o">%</span><span class="n">xmm2</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm1</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm1</span>
+<span class="n">vpaddd</span><span class="w">  </span><span class="o">%</span><span class="n">xmm1</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm0</span><span class="p">,</span><span class="w"> </span><span class="o">%</span><span class="n">xmm0</span><span class="w">       </span><span class="p">;</span><span class="w"> </span><span class="cp">$acc</span>
+</code></pre></div>
+<p>With <code>vpshufb 0x27(%rip), %xmm1, %xmm2</code> in place of the <code>vmovdqu 0x38(%rip)</code> /<br>
+<code>vpermi2b</code> pair, the shuffle no longer waits on the previous iteration's <code>vpaddd</code>.</p>
+<p>In a real int8 matrix-vector kernel (tract's <code>wasm_i32_4x1</code>, the inner loop of a<br>
+transformer decoder's weight matmuls), patching only this operand in the module<br>
+(passing the loaded vector twice, so that <code>shuffle a a</code> matches) takes a<br>
+512×512 call from 56.7 µs to 27.2 µs on wasmtime 49.0.3: 2.1×, level with V8<br>
+(26 µs).</p>
+<h2>Where it comes from</h2>
+<p><code>cranelift/codegen/src/isa/x64/lower.isle</code>, <code>shuffle</code> rules: rule 3 is<br>
+<code>(shuffle _ a a …)</code>. Rules 2 and 1 (<code>vpermi2b</code>) and the <code>por</code> fallback take<br>
+<code>(shuffle _ a b …)</code> with no check on which operands the mask reads. Several<br>
+special cases already match "lhs only" or "rhs only" masks (<code>pshufd_lhs_imm</code> /<br>
+<code>pshufd_rhs_imm</code>, <code>pshuflw_*</code>, <code>pshufhw_*</code>), but no general byte shuffle does.<br>
+Neither the mid-end nor the wasm translator canonicalizes <code>shuffle a b</code> to<br>
+<code>shuffle a a</code>.</p>
+<h2>Related</h2>
+<ul>
+<li>
+<p>#2531: shuffle optimizations needed. Closed once the common patterns got<br>
+  single-instruction lowerings; single-operand masks with distinct operands were<br>
+  not among them.</p>
+</li>
+<li>
+<p>#2930: added the <code>vpermi2b</code> lowering for shuffles of two different registers.<br>
+  It is the rule that now also catches these single-operand masks.</p>
+</li>
+<li>
+<p>#4772: port of the x64 shuffle lowering to ISLE (the rules above).</p>
+</li>
+<li>
+<p>#5930, #5999: more <code>shuffle</code> specializations (<code>pshufd</code>/<code>pshuf{l,h}w</code> lhs/rhs,<br>
+<code>palignr</code>); they show the lhs/rhs-only pattern this needs.</p>
+</li>
+<li>
+<p>#6606: non-SSSE3 <code>pshufb</code> lowering (the <code>X86Pshufb</code> libcall).<br>
+</p>
+</li>
+</ul>
+</blockquote>
+
+
+
+<hr><p>Last updated: Oct 31 2026 at 21:03 UTC</p>
+</html>

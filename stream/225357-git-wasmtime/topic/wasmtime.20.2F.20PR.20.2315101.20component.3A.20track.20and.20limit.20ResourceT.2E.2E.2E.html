@@ -1,0 +1,94 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #15101 component: track and limit ResourceT... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html">wasmtime / PR #15101 component: track and limit ResourceT...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="636427167"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636427167" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636427167">(Oct 30 2026 at 22:19)</a>:</h4>
+<p>posborne opened <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a> from <code>posborne:resource-table-host-heap-limiter</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<h3>Motivation</h3>
+<p>Embedders currently lack an aggregate host-side memory boundary for component model resources in <code>ResourceTable</code>. While #12652 added mitigations around handle counts and hostcall fuel, cumulative host heap allocations owned by resources in <code>ResourceTable</code> were previously untracked by any umbrella mechanism.</p>
+<p>Over the past several releases, Wasmtime has had to address a recurring class of guest-driven host memory exhaustion advisories with mitigations including [GHSA-852m-cvvp-9p4w] and [GHSA-243v-98vx-264h] (#12652), [GHSA-c9gc-w9vx-w86p], [GHSA-gqmc-89g8-p25r], and [GHSA-6fr9-xmw9-5352]. While per-resource and per-call limits help, they do not bound the aggregate host heap memory accumulated across entries in a <code>ResourceTable</code>.</p>
+<h3>Solution</h3>
+<p>This PR adds host heap usage accounting and optional per-table byte limits to <code>wasmtime::component::ResourceTable</code>. This provides a level of umbrella coverage to protect against host paths that may not have protections currently and to provide a higher level limit that is easier to reason about for embedders.</p>
+<p>The way that this is achieved involves the introduction of a <code>HostHeapUsage</code> trait which is required for all resources. This is accompanied by a <code>FixedHostHeapUsage</code> trait as a marker for types which do not contain children with heap storage not accounted for in their own size directly. Methods on the table that push, delete or mutate (update) resources use the traits to account for the heap usage changes associated with the operation. If a limit is set and an operation causes the heap usage to grow beyond the set limit, the operations return an error which will typically result in a guest-side trap.</p>
+<p>These new requirements necessitate updates across the wasmtime tree and will be a breaking change for embedders that are pushing their own resources into <code>ResourceTable</code>s.</p>
+<h3>Design Decisions</h3>
+<p>The code here has gone through a few iterations and updates based on discussion in #12984. What is present here tries to incorporate that feedback and is closer to some of the implementation from servo/firefox/stylo <code>MallocSizeOf</code> trait.</p>
+<p>In instrumenting the code to implement the traits, I decided that to ease the burden on embedders and to provide some additional static guarantees, it would be beneficial to introduce proc-macros in order to aid in deriving the traits on compatible structs and enums.</p>
+<p>For mutation I went with a closure-based <code>update</code> rather than a guard, because the limit check has to be fallible and a guard could only account in <code>Drop</code>. This makes former get_mut call sites a bit noisier. Since update can only measure after the mutation runs, growth past the limit is reported rather than prevented, and the mutation isn't rolled back because the error is expected to trap. The overshoot is roughly limited to what a single host call can allocate.</p>
+<p>Across the code in tree (mostly wasi p2/p3), I tried to provide pragmatic implementations of the trait where reasonable and erred on the side of overcounting bytes in most cases. There are some reference counted cases which are not tracked with complete accuracy but, even in those cases, abuse should be challenging as the fixed size of the resource will be counted even if the amortized cost of the shared data is left unaccounted.</p>
+<h3>Future Work</h3>
+<p>The changes here are sprawling, so I wanted to avoid increasing the scope beyond what was required for purpose and reasonable ergonomics (adding derive). Potential future work that I opted to not try to incorporate here include:</p>
+<ul>
+<li>Allow for the limit to be set at a higher level outside of individual tables, probably on the <code>ResourceLimiter</code>.</li>
+<li>Hooks to intervene when limits are exceeded or at watermarks prior to the limit.</li>
+<li>Fast path or conditional compilation to opt out of tracking; even if no limit is set the accounting is done and count is available.</li>
+</ul>
+<p>Closes #12984</p>
+<p>[GHSA-852m-cvvp-9p4w]: <a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-852m-cvvp-9p4w">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-852m-cvvp-9p4w</a><br>
+[GHSA-243v-98vx-264h]: <a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-243v-98vx-264h">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-243v-98vx-264h</a><br>
+[GHSA-c9gc-w9vx-w86p]: <a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-c9gc-w9vx-w86p">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-c9gc-w9vx-w86p</a><br>
+[GHSA-gqmc-89g8-p25r]: <a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-gqmc-89g8-p25r">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-gqmc-89g8-p25r</a><br>
+[GHSA-6fr9-xmw9-5352]: <a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-6fr9-xmw9-5352">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-6fr9-xmw9-5352</a></p>
+</blockquote>
+
+
+
+<a name="636427176"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636427176" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636427176">(Oct 30 2026 at 22:19)</a>:</h4>
+<p>posborne removed the review request for <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-wasi-reviewers">wasmtime-wasi-reviewers</a> from <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a>.</p>
+
+
+
+<a name="636427177"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636427177" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636427177">(Oct 30 2026 at 22:19)</a>:</h4>
+<p>posborne requested <a href="https://github.com/rvolosatovs">rvolosatovs</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a>.</p>
+
+
+
+<a name="636427179"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636427179" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636427179">(Oct 30 2026 at 22:19)</a>:</h4>
+<p>posborne requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-wasi-reviewers">wasmtime-wasi-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a>.</p>
+
+
+
+<a name="636427188"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636427188" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636427188">(Oct 30 2026 at 22:19)</a>:</h4>
+<p>posborne removed the review request for <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> from <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a>.</p>
+
+
+
+<a name="636427191"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636427191" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636427191">(Oct 30 2026 at 22:19)</a>:</h4>
+<p>posborne requested <a href="https://github.com/alexcrichton">alexcrichton</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a>.</p>
+
+
+
+<a name="636427193"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636427193" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636427193">(Oct 30 2026 at 22:19)</a>:</h4>
+<p>posborne requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a>.</p>
+
+
+
+<a name="636439392"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636439392" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636439392">(Oct 30 2026 at 23:44)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasi</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a>.</p>
+
+
+
+<a name="636439395"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636439395" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636439395">(Oct 30 2026 at 23:44)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:c-api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a>.</p>
+
+
+
+<hr><p>Last updated: Oct 31 2026 at 21:03 UTC</p>
+</html>
