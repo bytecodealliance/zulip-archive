@@ -1,0 +1,248 @@
+[
+    {
+        "content": "<p>V0ldek opened <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885\">PR #14885</a> from <code>V0ldek:v0ldek/custom-linear-memories</code> to <code>bytecodealliance:main</code>:</p>\n<blockquote>\n<p>&lt;!--<br>\nPlease make sure you include the following information:</p>\n<ul>\n<li>\n<p>If this work has been discussed elsewhere, please include a link to that<br>\n  conversation. If it was discussed in an issue, just mention \"issue #...\".</p>\n</li>\n<li>\n<p>Explain why this change is needed. If the details are in an issue already,<br>\n  this can be brief.</p>\n</li>\n</ul>\n<p>Our development process is documented in the Wasmtime book:<br>\n<a href=\"https://docs.wasmtime.dev/contributing-development-process.html\">https://docs.wasmtime.dev/contributing-development-process.html</a></p>\n<p>Please review the Bytecode Alliance's AI tool usage policy at<br>\n<a href=\"https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md\">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>\n<p>Please ensure all communication follows the code of conduct:<br>\n<a href=\"https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md\">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>\n--&gt;</p>\n<p>Following up on the discussion on #10740 I propose a rework of the memory API that centralizes the requirements for linear memory implementation in the public <code>LinearMemory</code> trait.</p>\n<p>The core challenge is resolving the issue from #10740 -- custom memories did not work with the CoW mechanism. This is because the code mounting memory images was hardwired to the internal mmap implementation. The idea is to move the responsibility for supporting CoW into the <code>LinearMemory</code> implementation with the new function <code>init_from_image</code>. It receives an opaque public <code>MemoryImage</code> that informs the implementor where it needs to be mounted (offset and length). The predicted path is that a memory that supports mapping the image over it (backed by mmap) calls the <code>map_at</code> callback and acknowledges that the pages required for the image have been remapped (returns <code>true</code>). If this is not supported, the implementation (default) returns <code>false</code> and wasmtime abandons CoW mapping in favour of a full copy of the data pages. The <code>MemoryImage</code> struct also exposes the underlying bytes of the memory and equality semantics, so custom implementors can, in theory, implement their own lazy copying or their own pooling.</p>\n<p>The second change is that <code>LocalMemory</code> was holding an <code>Option&lt;MemoryImageSlot&gt;</code> to support the <code>StaticMemory</code> and pooling allocators. It also manually called the <code>set_heap_limit</code> on the slot during grow. I did two things: </p>\n<ol>\n<li>The  <code>MemoryImageSlot</code> is now owned by the <code>StaticMemory</code> and <code>LocalMemory</code> only records if the memory needs to be initialized from an image (for the purposes of <code>needs_init()</code> required by instantiation code). This makes it so that <code>LocalMemory</code> depends only on the <code>LinearMemory</code> implementation and needs no knowledge of the pooling allocator machinery. </li>\n<li><code>LinearMemory</code> now has the <code>Any</code> supertrait. This is a) required so that the pooling allocator can get the inner <code>Box&lt;dyn LinearMemory&gt;</code> from <code>LocalMemory</code> and unwrap it to what it knows to be <code>StaticMemory</code> and recover the <code>MemoryImageSlot</code>, b) useful in the potential future where we add the ability to retrieve the memory impl from an instance, as a custom memory could be downcast from <code>Box&lt;dyn LinearMemory&gt;</code>.</li>\n</ol>\n<p>== Overview of code changes</p>\n<p>Public API changes:</p>\n<ul>\n<li><code>LinearMemory</code> gets <code>init_from_image</code></li>\n<li><code>MemoryImage</code> (arg to the above) is public</li>\n</ul>\n<p>These are non-breaking: existing LinearMemories will not support CoW, but instead of crashing they'll just force wasmtime to copy.</p>\n<p>Removed:</p>\n<ul>\n<li>the internal <code>RuntimeLinearMemory</code> trait</li>\n<li>the <code>LinearMemoryProxy</code> that wrapped a <code>Box&lt;dyn LinearMemory&gt;</code> and provided the <code>RuntimeLinearMemory</code> impl</li>\n</ul>\n<p>This functionality is now centralized in the <code>LinearMemory</code> trait.</p>\n<p>The <code>MmapMemory</code> was refactored to accommodate the changes, it relied on <code>RuntimeLinearMemory</code>. Now it uses the standardised path through <code>init_from_image</code> to map a CoW image, although with a hatch through an internal <code>MemoryImage::vm()</code> to keep all of the mmap code as it was with the nice static Mmap types that were already there. Technically one could get rid of the <code>vm()</code> function, but changing all the mmap code felt like more hassle than it's worth.</p>\n<p><code>MemoryImageSlot</code> is now only used by the pooling code. In fact, its definition could be gated behind <code>#[cfg(feature = 'pooling-allocator')]', but that would trigger a whole cascade of cfgs because a lot of </code>use` statements become dead code with the feature disabled and trigger warnings. I wasn't sure if we want those cfgs splattered everywhere, but I can introduce them if we do (judgement call for the code owners).</p>\n<p>I fixed what I think was a bug (see Zulip discussion <a href=\"#narrow/channel/217126-wasmtime/topic/Custom.20memory.20creators.20for.20host.20memories/near/633018919\">#wasmtime &gt; Custom memory creators for host memories @ 💬</a>) in <code>create_memory</code> where custom memory creators were bypassed and the default creator was always used. This mean <code>Memory::new</code> always created a default memory and not a custom one. I added a regression test for that.</p>\n<p>The new functionality is tested in <code>tests/all/memory_creator.rs</code> with focus on CoW behaviour for custom memories. The new public <code>MemoryImage</code> is thoroughly tested in unit tests in <code>runtime/memory.rs</code>. I also added a few tests I felt were missing: <code>MmapOffset</code> (to make sure the bounds checks are correct, since they must be for unsafe code to be sound) and a few tests for <code>LocalMemory</code> growth.</p>\n<p>I also tried to make the <code>LinearMemory</code> safety documentation more useful for implementors. Organised the requirements into bullets so that an implementor can reason about their safety contract and \"tick-off\" the requirements.</p>\n</blockquote>",
+        "id": 633303447,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792499994
+    },
+    {
+        "content": "<p>V0ldek removed the review request for <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers\">wasmtime-core-reviewers</a> from <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885\">PR #14885</a>.</p>",
+        "id": 633303452,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792499994
+    },
+    {
+        "content": "<p>V0ldek requested <a href=\"https://github.com/dicej\">dicej</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885\">PR #14885</a>.</p>",
+        "id": 633303454,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792499994
+    },
+    {
+        "content": "<p>V0ldek requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers\">wasmtime-core-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885\">PR #14885</a>.</p>",
+        "id": 633303456,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792499994
+    },
+    {
+        "content": "<p>V0ldek edited <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885\">PR #14885</a>:</p>\n<blockquote>\n<p>&lt;!--<br>\nPlease make sure you include the following information:</p>\n<ul>\n<li>\n<p>If this work has been discussed elsewhere, please include a link to that<br>\n  conversation. If it was discussed in an issue, just mention \"issue #...\".</p>\n</li>\n<li>\n<p>Explain why this change is needed. If the details are in an issue already,<br>\n  this can be brief.</p>\n</li>\n</ul>\n<p>Our development process is documented in the Wasmtime book:<br>\n<a href=\"https://docs.wasmtime.dev/contributing-development-process.html\">https://docs.wasmtime.dev/contributing-development-process.html</a></p>\n<p>Please review the Bytecode Alliance's AI tool usage policy at<br>\n<a href=\"https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md\">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>\n<p>Please ensure all communication follows the code of conduct:<br>\n<a href=\"https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md\">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>\n--&gt;</p>\n<p>Following up on the discussion on #10740 I propose a rework of the memory API that centralizes the requirements for linear memory implementation in the public <code>LinearMemory</code> trait.</p>\n<p>The core challenge is resolving the issue from #10740 -- custom memories did not work with the CoW mechanism. This is because the code mounting memory images was hardwired to the internal mmap implementation. The idea is to move the responsibility for supporting CoW into the <code>LinearMemory</code> implementation with the new function <code>init_from_image</code>. It receives an opaque public <code>MemoryImage</code> that informs the implementor where it needs to be mounted (offset and length). The predicted path is that a memory that supports mapping the image over it (backed by mmap) calls the <code>map_at</code> callback and acknowledges that the pages required for the image have been remapped (returns <code>true</code>). If this is not supported, the implementation (default) returns <code>false</code> and wasmtime abandons CoW mapping in favour of a full copy of the data pages. The <code>MemoryImage</code> struct also exposes the underlying bytes of the memory and equality semantics, so custom implementors can, in theory, implement their own lazy copying or their own pooling.</p>\n<p>The second change is that <code>LocalMemory</code> was holding an <code>Option&lt;MemoryImageSlot&gt;</code> to support the <code>StaticMemory</code> and pooling allocators. It also manually called the <code>set_heap_limit</code> on the slot during grow. I did two things: </p>\n<ol>\n<li>The  <code>MemoryImageSlot</code> is now owned by the <code>StaticMemory</code> and <code>LocalMemory</code> only records if the memory needs to be initialized from an image (for the purposes of <code>needs_init()</code> required by instantiation code). This makes it so that <code>LocalMemory</code> depends only on the <code>LinearMemory</code> implementation and needs no knowledge of the pooling allocator machinery. </li>\n<li><code>LinearMemory</code> now has the <code>Any</code> supertrait. This is a) required so that the pooling allocator can get the inner <code>Box&lt;dyn LinearMemory&gt;</code> from <code>LocalMemory</code> and unwrap it to what it knows to be <code>StaticMemory</code> and recover the <code>MemoryImageSlot</code>, b) useful in the potential future where we add the ability to retrieve the memory impl from an instance, as a custom memory could be downcast from <code>Box&lt;dyn LinearMemory&gt;</code>.</li>\n</ol>\n<h2>Overview of code changes</h2>\n<p>Public API changes:</p>\n<ul>\n<li><code>LinearMemory</code> gets <code>init_from_image</code></li>\n<li><code>MemoryImage</code> (arg to the above) is public</li>\n</ul>\n<p>These are non-breaking: existing LinearMemories will not support CoW, but instead of crashing they'll just force wasmtime to copy.</p>\n<p>Removed:</p>\n<ul>\n<li>the internal <code>RuntimeLinearMemory</code> trait</li>\n<li>the <code>LinearMemoryProxy</code> that wrapped a <code>Box&lt;dyn LinearMemory&gt;</code> and provided the <code>RuntimeLinearMemory</code> impl</li>\n</ul>\n<p>This functionality is now centralized in the <code>LinearMemory</code> trait.</p>\n<p>The <code>MmapMemory</code> was refactored to accommodate the changes, it relied on <code>RuntimeLinearMemory</code>. Now it uses the standardised path through <code>init_from_image</code> to map a CoW image, although with a hatch through an internal <code>MemoryImage::vm()</code> to keep all of the mmap code as it was with the nice static Mmap types that were already there. Technically one could get rid of the <code>vm()</code> function, but changing all the mmap code felt like more hassle than it's worth.</p>\n<p><code>MemoryImageSlot</code> is now only used by the pooling code. In fact, its definition could be gated behind <code>#[cfg(feature = 'pooling-allocator')]', but that would trigger a whole cascade of cfgs because a lot of </code>use` statements become dead code with the feature disabled and trigger warnings. I wasn't sure if we want those cfgs splattered everywhere, but I can introduce them if we do (judgement call for the code owners).</p>\n<p>I fixed what I think was a bug (see Zulip discussion <a href=\"#narrow/channel/217126-wasmtime/topic/Custom.20memory.20creators.20for.20host.20memories/near/633018919\">#wasmtime &gt; Custom memory creators for host memories @ 💬</a>) in <code>create_memory</code> where custom memory creators were bypassed and the default creator was always used. This mean <code>Memory::new</code> always created a default memory and not a custom one. I added a regression test for that.</p>\n<p>The new functionality is tested in <code>tests/all/memory_creator.rs</code> with focus on CoW behaviour for custom memories. The new public <code>MemoryImage</code> is thoroughly tested in unit tests in <code>runtime/memory.rs</code>. I also added a few tests I felt were missing: <code>MmapOffset</code> (to make sure the bounds checks are correct, since they must be for unsafe code to be sound) and a few tests for <code>LocalMemory</code> growth.</p>\n<p>I also tried to make the <code>LinearMemory</code> safety documentation more useful for implementors. Organised the requirements into bullets so that an implementor can reason about their safety contract and \"tick-off\" the requirements.</p>\n</blockquote>",
+        "id": 633304476,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792500201
+    },
+    {
+        "content": "<p>V0ldek edited <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885\">PR #14885</a>:</p>\n<blockquote>\n<p>&lt;!--<br>\nPlease make sure you include the following information:</p>\n<ul>\n<li>\n<p>If this work has been discussed elsewhere, please include a link to that<br>\n  conversation. If it was discussed in an issue, just mention \"issue #...\".</p>\n</li>\n<li>\n<p>Explain why this change is needed. If the details are in an issue already,<br>\n  this can be brief.</p>\n</li>\n</ul>\n<p>Our development process is documented in the Wasmtime book:<br>\n<a href=\"https://docs.wasmtime.dev/contributing-development-process.html\">https://docs.wasmtime.dev/contributing-development-process.html</a></p>\n<p>Please review the Bytecode Alliance's AI tool usage policy at<br>\n<a href=\"https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md\">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>\n<p>Please ensure all communication follows the code of conduct:<br>\n<a href=\"https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md\">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>\n--&gt;</p>\n<p>Following up on the discussion on #10740 I propose a rework of the memory API that centralizes the requirements for linear memory implementation in the public <code>LinearMemory</code> trait.</p>\n<p>The core challenge is resolving the issue from #10740 -- custom memories did not work with the CoW mechanism. This is because the code mounting memory images was hardwired to the internal mmap implementation. The idea is to move the responsibility for supporting CoW into the <code>LinearMemory</code> implementation with the new function <code>init_from_image</code>. It receives an opaque public <code>MemoryImage</code> that informs the implementor where it needs to be mounted (offset and length). The predicted path is that a memory that supports mapping the image over it (backed by mmap) calls the <code>map_at</code> callback and acknowledges that the pages required for the image have been remapped (returns <code>true</code>). If this is not supported, the implementation (default) returns <code>false</code> and wasmtime abandons CoW mapping in favour of a full copy of the data pages. The <code>MemoryImage</code> struct also exposes the underlying bytes of the memory and equality semantics, so custom implementors can, in theory, implement their own lazy copying or their own pooling.</p>\n<p>The second change is that <code>LocalMemory</code> was holding an <code>Option&lt;MemoryImageSlot&gt;</code> to support the <code>StaticMemory</code> and pooling allocators. It also manually called the <code>set_heap_limit</code> on the slot during grow. I did two things: </p>\n<ol>\n<li>The  <code>MemoryImageSlot</code> is now owned by the <code>StaticMemory</code> and <code>LocalMemory</code> only records if the memory needs to be initialized from an image (for the purposes of <code>needs_init()</code> required by instantiation code). This makes it so that <code>LocalMemory</code> depends only on the <code>LinearMemory</code> implementation and needs no knowledge of the pooling allocator machinery. </li>\n<li><code>LinearMemory</code> now has the <code>Any</code> supertrait. This is a) required so that the pooling allocator can get the inner <code>Box&lt;dyn LinearMemory&gt;</code> from <code>LocalMemory</code> and unwrap it to what it knows to be <code>StaticMemory</code> and recover the <code>MemoryImageSlot</code>, b) useful in the potential future where we add the ability to retrieve the memory impl from an instance, as a custom memory could be downcast from <code>Box&lt;dyn LinearMemory&gt;</code>.</li>\n</ol>\n<h2>Overview of code changes</h2>\n<p>Public API changes:</p>\n<ul>\n<li><code>LinearMemory</code> gets <code>init_from_image</code></li>\n<li><code>MemoryImage</code> (arg to the above) is public</li>\n</ul>\n<p>These are non-breaking: existing LinearMemories will not support CoW, but instead of crashing they'll just force wasmtime to copy via the default impl of <code>init_from_image</code>.</p>\n<p>Removed:</p>\n<ul>\n<li>the internal <code>RuntimeLinearMemory</code> trait</li>\n<li>the <code>LinearMemoryProxy</code> that wrapped a <code>Box&lt;dyn LinearMemory&gt;</code> and provided the <code>RuntimeLinearMemory</code> impl</li>\n</ul>\n<p>This functionality is now centralized in the <code>LinearMemory</code> trait.</p>\n<p>The <code>MmapMemory</code> was refactored to accommodate the changes, it relied on <code>RuntimeLinearMemory</code>. Now it uses the standardised path through <code>init_from_image</code> to map a CoW image, although with a hatch through an internal <code>MemoryImage::vm()</code> to keep all of the mmap code as it was with the nice static Mmap types that were already there. Technically one could get rid of the <code>vm()</code> function, but changing all the mmap code felt like more hassle than it's worth.</p>\n<p><code>MemoryImageSlot</code> is now only used by the pooling code. In fact, its definition could be gated behind <code>#[cfg(feature = 'pooling-allocator')]', but that would trigger a whole cascade of cfgs because a lot of </code>use` statements become dead code with the feature disabled and trigger warnings. I wasn't sure if we want those cfgs splattered everywhere, but I can introduce them if we do (judgement call for the code owners).</p>\n<p>I fixed what I think was a bug (see Zulip discussion <a href=\"#narrow/channel/217126-wasmtime/topic/Custom.20memory.20creators.20for.20host.20memories/near/633018919\">#wasmtime &gt; Custom memory creators for host memories @ 💬</a>) in <code>create_memory</code> where custom memory creators were bypassed and the default creator was always used. This mean <code>Memory::new</code> always created a default memory and not a custom one. I added a regression test for that.</p>\n<p>The new functionality is tested in <code>tests/all/memory_creator.rs</code> with focus on CoW behaviour for custom memories. The new public <code>MemoryImage</code> is thoroughly tested in unit tests in <code>runtime/memory.rs</code>. I also added a few tests I felt were missing: <code>MmapOffset</code> (to make sure the bounds checks are correct, since they must be for unsafe code to be sound) and a few tests for <code>LocalMemory</code> growth.</p>\n<p>I also tried to make the <code>LinearMemory</code> safety documentation more useful for implementors. Organised the requirements into bullets so that an implementor can reason about their safety contract and \"tick-off\" the requirements.</p>\n</blockquote>",
+        "id": 633304621,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792500228
+    },
+    {
+        "content": "<p>V0ldek edited <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885\">PR #14885</a>:</p>\n<blockquote>\n<p>&lt;!--<br>\nPlease make sure you include the following information:</p>\n<ul>\n<li>\n<p>If this work has been discussed elsewhere, please include a link to that<br>\n  conversation. If it was discussed in an issue, just mention \"issue #...\".</p>\n</li>\n<li>\n<p>Explain why this change is needed. If the details are in an issue already,<br>\n  this can be brief.</p>\n</li>\n</ul>\n<p>Our development process is documented in the Wasmtime book:<br>\n<a href=\"https://docs.wasmtime.dev/contributing-development-process.html\">https://docs.wasmtime.dev/contributing-development-process.html</a></p>\n<p>Please review the Bytecode Alliance's AI tool usage policy at<br>\n<a href=\"https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md\">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>\n<p>Please ensure all communication follows the code of conduct:<br>\n<a href=\"https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md\">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>\n--&gt;</p>\n<p>Following up on the discussion on #10740 I propose a rework of the memory API that centralizes the requirements for linear memory implementation in the public <code>LinearMemory</code> trait.</p>\n<p>The core challenge is resolving the issue from #10740 -- custom memories did not work with the CoW mechanism. This is because the code mounting memory images was hardwired to the internal mmap implementation. The idea is to move the responsibility for supporting CoW into the <code>LinearMemory</code> implementation with the new function <code>init_from_image</code>. It receives an opaque public <code>MemoryImage</code> that informs the implementor where it needs to be mounted (offset and length). The predicted path is that a memory that supports mapping the image over it (backed by mmap) calls the <code>map_at</code> callback and acknowledges that the pages required for the image have been remapped (returns <code>true</code>). If this is not supported, the implementation (default) returns <code>false</code> and wasmtime abandons CoW mapping in favour of a full copy of the data pages. The <code>MemoryImage</code> struct also exposes the underlying bytes of the memory and equality semantics, so custom implementors can, in theory, implement their own lazy copying or their own pooling.</p>\n<p>The second change is that <code>LocalMemory</code> was holding an <code>Option&lt;MemoryImageSlot&gt;</code> to support the <code>StaticMemory</code> and pooling allocators. It also manually called the <code>set_heap_limit</code> on the slot during grow. I did two things: </p>\n<ol>\n<li>The  <code>MemoryImageSlot</code> is now owned by the <code>StaticMemory</code> and <code>LocalMemory</code> only records if the memory needs to be initialized from an image (for the purposes of <code>needs_init()</code> required by instantiation code). This makes it so that <code>LocalMemory</code> depends only on the <code>LinearMemory</code> implementation and needs no knowledge of the pooling allocator machinery. </li>\n<li><code>LinearMemory</code> now has the <code>Any</code> supertrait. This is a) required so that the pooling allocator can get the inner <code>Box&lt;dyn LinearMemory&gt;</code> from <code>LocalMemory</code> and unwrap it to what it knows to be <code>StaticMemory</code> and recover the <code>MemoryImageSlot</code>, b) useful in the potential future where we add the ability to retrieve the memory impl from an instance, as a custom memory could be downcast from <code>Box&lt;dyn LinearMemory&gt;</code>.</li>\n</ol>\n<h2>Overview of code changes</h2>\n<p>Public API changes:</p>\n<ul>\n<li><code>LinearMemory</code> gets <code>init_from_image</code></li>\n<li><code>MemoryImage</code> (arg to the above) is public</li>\n</ul>\n<p>These are non-breaking: existing LinearMemories will not support CoW, but instead of crashing they'll just force wasmtime to copy via the default impl of <code>init_from_image</code>.</p>\n<p>Removed:</p>\n<ul>\n<li>the internal <code>RuntimeLinearMemory</code> trait</li>\n<li>the <code>LinearMemoryProxy</code> that wrapped a <code>Box&lt;dyn LinearMemory&gt;</code> and provided the <code>RuntimeLinearMemory</code> impl</li>\n</ul>\n<p>This functionality is now centralized in the <code>LinearMemory</code> trait.</p>\n<p>The <code>MmapMemory</code> was refactored to accommodate the changes, it relied on <code>RuntimeLinearMemory</code>. Now it uses the standardised path through <code>init_from_image</code> to map a CoW image, although with a hatch through an internal <code>MemoryImage::vm()</code> to keep all of the mmap code as it was with the nice static Mmap types that were already there. Technically one could get rid of the <code>vm()</code> function, but changing all the mmap code felt like more hassle than it's worth.</p>\n<p><code>MemoryImageSlot</code> is now only used by the pooling code. In fact, its definition could be gated behind <code>#[cfg(feature = 'pooling-allocator')]</code>, but that would trigger a whole cascade of cfgs because a lot of <code>use</code> statements become dead code with the feature disabled and trigger warnings. I wasn't sure if we want those cfgs splattered everywhere, but I can introduce them if we do (judgement call for the code owners).</p>\n<p>I fixed what I think was a bug (see Zulip discussion <a href=\"#narrow/channel/217126-wasmtime/topic/Custom.20memory.20creators.20for.20host.20memories/near/633018919\">#wasmtime &gt; Custom memory creators for host memories @ 💬</a>) in <code>create_memory</code> where custom memory creators were bypassed and the default creator was always used. This mean <code>Memory::new</code> always created a default memory and not a custom one. I added a regression test for that.</p>\n<p>The new functionality is tested in <code>tests/all/memory_creator.rs</code> with focus on CoW behaviour for custom memories. The new public <code>MemoryImage</code> is thoroughly tested in unit tests in <code>runtime/memory.rs</code>. I also added a few tests I felt were missing: <code>MmapOffset</code> (to make sure the bounds checks are correct, since they must be for unsafe code to be sound) and a few tests for <code>LocalMemory</code> growth.</p>\n<p>I also tried to make the <code>LinearMemory</code> safety documentation more useful for implementors. Organised the requirements into bullets so that an implementor can reason about their safety contract and \"tick-off\" the requirements.</p>\n</blockquote>",
+        "id": 633304727,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792500247
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885\">PR #14885</a>.</p>",
+        "id": 633344852,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792507791
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>wasmtime:ref-types</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885\">PR #14885</a>.</p>",
+        "id": 633344854,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792507791
+    },
+    {
+        "content": "<p>github-actions[bot] <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#issuecomment-6294962847\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885\">PR #14885</a>:</p>\n<blockquote>\n<h4>Subscribe to Label Action</h4>\n<p>cc @fitzgen</p>\n<p>&lt;details&gt;<br>\nThis issue or pull request has been labeled: \"wasmtime:api\", \"wasmtime:ref-types\"</p>\n<p>Thus the following users have been cc'd because of the following labels:</p>\n<ul>\n<li>fitzgen: wasmtime:ref-types</li>\n</ul>\n<p>To subscribe or unsubscribe from this label, edit the &lt;code&gt;.github/subscribe-to-label.json&lt;/code&gt; configuration file.</p>\n<p><a href=\"https://github.com/bytecodealliance/subscribe-to-label-action\">Learn more.</a><br>\n&lt;/details&gt;</p>\n</blockquote>",
+        "id": 633364449,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792511305
+    },
+    {
+        "content": "<p>alexcrichton removed the review request for <a href=\"https://github.com/dicej\">dicej</a> from <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885\">PR #14885</a>.</p>",
+        "id": 633420338,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792523181
+    },
+    {
+        "content": "<p>alexcrichton requested <a href=\"https://github.com/alexcrichton\">alexcrichton</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885\">PR #14885</a>.</p>",
+        "id": 633420339,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792523181
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> alexcrichton submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#pullrequestreview-5591482901\">PR review</a>:</p>\n<blockquote>\n<p>Thank you so much for this! Overall this looks like great work to me. I've left some minor comments about tests/docs/organization, but nothing major. Happy to merge with them addressed and/or as-is if you feel things should stay</p>\n</blockquote>",
+        "id": 633447829,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792530008
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> alexcrichton created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4330170900\">PR review comment</a>:</p>\n<blockquote>\n<p>Are the new tests here testing much beyond what's already testable form the public API? We try to prefer <code>tests/all/*.rs</code> where possible since that's a more stable surface to test against. If these have specific coverage of internals though it's fine to keep, but wanted to ask. (on review to me these look pretty similar to what's already tested elsewhere)</p>\n</blockquote>",
+        "id": 633447831,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792530008
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> alexcrichton created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4330228838\">PR review comment</a>:</p>\n<blockquote>\n<p>One thing I'd recommend adding to this is a clause saying that this documentation strives to be thorough but is not guaranteed to be exhaustive. Basically if we forgot something here that's a bug, not a CVE</p>\n</blockquote>",
+        "id": 633447832,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792530008
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> alexcrichton created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4330098427\">PR review comment</a>:</p>\n<blockquote>\n<p>I think it's reasonable to keep this (as opposed to making it truly conditional and cascading everything) -- but could the <code>allow</code> change to <code>expect</code>?</p>\n</blockquote>",
+        "id": 633447833,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792530008
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> alexcrichton created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4330197192\">PR review comment</a>:</p>\n<blockquote>\n<p>In my experience <code>should_panic</code> tests are pretty finnicky and also typically indicative of something that should be transmitted through a <code>Result</code>. Perhaps the <code>map_image_at</code> API could return a result instead of panicking on these conditions? Makes it easier to test and additionally lessens the severity of accidentally tripping over the assertions later (e.g. a panic is a CVE, but a spurious error not so)</p>\n</blockquote>",
+        "id": 633447834,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792530008
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> alexcrichton created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4330218233\">PR review comment</a>:</p>\n<blockquote>\n<p>I think with simd bits we actually require 16-byte alignment.</p>\n</blockquote>",
+        "id": 633447840,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792530009
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> V0ldek submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#pullrequestreview-5597721731\">PR review</a>.</p>",
+        "id": 633580262,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792575369
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> V0ldek created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4335239818\">PR review comment</a>:</p>\n<blockquote>\n<p>I'm relatively sure SIMD doesn't need it, <code>v128.load</code> is valid regardless of alignment, but 16-byte aligned would potentially be faster (avoiding cache-line splits).</p>\n<p>In any case, we can always require more than needed from the implementations \"just in case\", the internal ones align to 16 already. </p>\n</blockquote>",
+        "id": 633580264,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792575369
+    },
+    {
+        "content": "<p>V0ldek updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885\">PR #14885</a>.</p>",
+        "id": 633597351,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792579409
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> V0ldek submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#pullrequestreview-5598484620\">PR review</a>.</p>",
+        "id": 633597687,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792579463
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> V0ldek created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4335849142\">PR review comment</a>:</p>\n<blockquote>\n<p>I added the following \"disclaimer\":</p>\n<p><div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"sd\">/// Note that while we strive to be thorough in this documentation, we do not guarantee that the</span>\n<span class=\"sd\">/// following points are exhaustive.</span>\n<span class=\"sd\">/// When using a custom memory backend in a security-sensitive context auditing just the external</span>\n<span class=\"sd\">/// implementation of this trait is not sufficient.</span>\n</code></pre></div><br>\n</p>\n</blockquote>",
+        "id": 633597689,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792579464
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> V0ldek submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#pullrequestreview-5598490836\">PR review</a>.</p>",
+        "id": 633597810,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792579495
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> V0ldek created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4335853878\">PR review comment</a>:</p>\n<blockquote>\n<p>Changed <code>MmapOffset::map_image_at</code> to return an error instead of panicking, tests adjusted.</p>\n</blockquote>",
+        "id": 633597813,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792579496
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> V0ldek submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#pullrequestreview-5598498504\">PR review</a>.</p>",
+        "id": 633598064,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792579537
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> V0ldek created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4335860252\">PR review comment</a>:</p>\n<blockquote>\n<p>Hey, that's a neat feature I didn't know of! While at it, I adjusted a bunch of similar <code>allow</code> statements in the same file to be <code>expect</code> when pooling allocator is disabled.</p>\n</blockquote>",
+        "id": 633598066,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792579538
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> V0ldek submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#pullrequestreview-5598504403\">PR review</a>.</p>",
+        "id": 633598242,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792579573
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> V0ldek created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4335865203\">PR review comment</a>:</p>\n<blockquote>\n<p>No, these are specifically tests of the public API. I'll move them to the integration tests and double-check if I'm not duplicating work.</p>\n</blockquote>",
+        "id": 633598243,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792579574
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> V0ldek edited <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4335239818\">PR review comment</a>.</p>",
+        "id": 633600590,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792580151
+    },
+    {
+        "content": "<p>V0ldek updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885\">PR #14885</a>.</p>",
+        "id": 633670768,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792593840
+    },
+    {
+        "content": "<p>V0ldek updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885\">PR #14885</a>.</p>",
+        "id": 633672699,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792594142
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> V0ldek submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#pullrequestreview-5601512909\">PR review</a>.</p>",
+        "id": 633674380,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792594441
+    },
+    {
+        "content": "<p>V0ldek updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885\">PR #14885</a>.</p>",
+        "id": 633674445,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792594452
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> V0ldek created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4338214985\">PR review comment</a>:</p>\n<blockquote>\n<p>I moved the tests to tests/all/memory_creator.rs and then essentially rewrote that test module:</p>\n<ul>\n<li>It now runs most tests on both unix and windows, except for CoW images that require memfd</li>\n<li>Removed the old simple tests and covered the MemoryCreator and LinearMemory public API expectations in new tests.</li>\n</ul>\n<p>One of them uses an <code>expect_panic</code> which you said you dislike, but I think it's justified there. It's a cheap defense-in-depth effort by the engine to prevent wrong implementations from doing something stupid. I don't think it's reasonable to Err out of there, because when <code>memory.grow</code> fails the user might attempt to still use the memory for something, but in this case critical invariants were violated so the correct decision is to explode. I also changed it to have an actual panic message.</p>\n</blockquote>",
+        "id": 633674539,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792594466
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> alexcrichton submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#pullrequestreview-5601713868\">PR review</a>.</p>",
+        "id": 633679073,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792595238
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> alexcrichton created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#discussion_r4338370958\">PR review comment</a>:</p>\n<blockquote>\n<p>Oh right good point I was misremembering -- it's atomics that require alignment not simd. In any case I think documenting 16 for now is reasonable, thanks!</p>\n</blockquote>",
+        "id": 633680590,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792595513
+    },
+    {
+        "content": "<p><span aria-label=\"thumbs up\" class=\"emoji emoji-1f44d\" role=\"img\" title=\"thumbs up\">:thumbs_up:</span> alexcrichton submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885#pullrequestreview-5601912555\">PR review</a>:</p>\n<blockquote>\n<p>Thanks again!</p>\n</blockquote>",
+        "id": 633684643,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792596271
+    },
+    {
+        "content": "<p>alexcrichton added <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885\">PR #14885 Moving to <code>LinearMemory</code> trait and fixing custom memories</a> to the merge queue.</p>",
+        "id": 633688051,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792596940
+    },
+    {
+        "content": "<p><span aria-label=\"check\" class=\"emoji emoji-2705\" role=\"img\" title=\"check\">:check:</span> alexcrichton merged <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885\">PR #14885</a>.</p>",
+        "id": 633693077,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792597943
+    },
+    {
+        "content": "<p>alexcrichton removed <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14885\">PR #14885 Moving to <code>LinearMemory</code> trait and fixing custom memories</a> from the merge queue.</p>",
+        "id": 633694606,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1792598242
+    }
+]

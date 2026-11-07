@@ -1,0 +1,62 @@
+[
+    {
+        "content": "<p>fitzgen opened <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14008\">PR #14008</a> from <code>fitzgen:dse-and-loops</code> to <code>bytecodealliance:main</code>:</p>\n<blockquote>\n<p>Stores inside a loop can be read on the next loop iteration by a load at the top of the loop, so they are not dead.</p>\n<p>Because our main alias analysis pass happens online with its non-fix-point, single-iteration dataflow analysis, it cannot correctly handle loops on its own because its online nature doesn't delay rewrites until after loop back edges are discovered. The typical way to make a non-fixed-point analysis sound while keeping everything else in the system the same (i.e. not making the analysis require a full fixed point) would be to make the analysis more conservative, so that any store inside a loop is eagerly considered not dead. But this ends up being too pessimistic because of the online rewrites, which mean we can't wait until we actually see the backedge to conservatively mark such stores as potentially observed by future loop iterations; we have to effectively assume that every block has back edges we just haven't seen yet. This devolves into only doing dead-store elimination locally within a single block, never across blocks.</p>\n<p>We can be more precise, without requiring fix-points, if we already know loop boundaries and nesting: we can reject a dead-store candidate whose overwriter lies outside a loop that contains the candidate, since that means, by definition, that the two are separated by a back edge, and the dead-store candidate might be observed by future iterations of the loop before the overwriter executes. Unlike the unduly pessimistic approach described previously, this still allows eliminating loop-free cross-block dead stores: if the dead-store candidate is not in a loop, or is in the same loop as its overwriter, then there is no back edge between them and our analysis's alias-region-observed bit is accurate.</p>\n<p>And luckily, we <em>do</em> already have that loop information available via the <code>LoopAnalysis</code> that we already compute for the <code>EgraphsPass</code> to use during elaboration. This commit fixes the bug by reusing the <code>LoopAnalysis</code> inside <code>AliasAnalysis</code>.</p>\n<p>Fixes #13990</p>\n<p>&lt;!--<br>\nPlease make sure you include the following information:</p>\n<ul>\n<li>\n<p>If this work has been discussed elsewhere, please include a link to that<br>\n  conversation. If it was discussed in an issue, just mention \"issue #...\".</p>\n</li>\n<li>\n<p>Explain why this change is needed. If the details are in an issue already,<br>\n  this can be brief.</p>\n</li>\n</ul>\n<p>Our development process is documented in the Wasmtime book:<br>\n<a href=\"https://docs.wasmtime.dev/contributing-development-process.html\">https://docs.wasmtime.dev/contributing-development-process.html</a></p>\n<p>Please ensure all communication follows the code of conduct:<br>\n<a href=\"https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md\">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>\n--&gt;</p>\n</blockquote>",
+        "id": 613243110,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1785256216
+    },
+    {
+        "content": "<p>fitzgen requested <a href=\"https://github.com/cfallin\">cfallin</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14008\">PR #14008</a>.</p>",
+        "id": 613243113,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1785256217
+    },
+    {
+        "content": "<p>fitzgen requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-compiler-reviewers\">wasmtime-compiler-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14008\">PR #14008</a>.</p>",
+        "id": 613243115,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1785256217
+    },
+    {
+        "content": "<p>cfallin <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14008#issuecomment-5107087327\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14008\">PR #14008</a>:</p>\n<blockquote>\n<p>I think there may be a simpler approach: when we come to a back-edge, all stores in the carried flow-sensitive state are observed. That, too, (i) allows loop-free (within-loop) dead store elimination, (ii) fixes the soundness issue with a conservative approximation (but not too conservative), (iii) is single-pass. It's conceptually simpler, IMHO: rather than reasoning about where an analysis might be unsound post-hoc (\"the conditions are otherwise met but they cross this kind of edge\"), it covers the gap exactly where it comes in (edge to a block we've already analyzed and won't visit again, due to non-fix-point --&gt; assume the worst).</p>\n<p>And actually I think there's a related fixpoint soundness issue here that doesn't require loops at all:</p>\n<div class=\"codehilite\" data-code-language=\"plain\"><pre><span></span><code>        A\n  /          \\\nC            D\n |  \\      / |\n |   \\   /   |\n |     X     |\n |  /     \\  |\n E           F\n</code></pre></div>\n<p>in this CFG, we might process in order A, C, E, D, F; when processing D, we have the edge D-&gt;E but we've already processed E, so we won't re-process it and potentially mark stores in D as observed.</p>\n<p>So I think we need to actually take <em>any</em> edge to a block we've already processed as a conservative \"observes every store\" edge. That both solves the loop issue in #13990 and addresses the CFG here. What do you think?</p>\n</blockquote>",
+        "id": 613246184,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1785257225
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>cranelift</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14008\">PR #14008</a>.</p>",
+        "id": 613264016,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1785261955
+    },
+    {
+        "content": "<p>fitzgen <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14008#issuecomment-5109716593\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14008\">PR #14008</a>:</p>\n<blockquote>\n<blockquote>\n<p>when we come to a back-edge, all stores in the carried flow-sensitive state are observed.</p>\n</blockquote>\n<p>The problem with this approach is that it involves large changes to the way that <code>AliasAnalysis</code> operates and integrates with the egraphs pass. Right now, it makes its changes online, as we analyze each instruction. By the time we see a back edge, and retroactively mark all the stores as observed, it's already too late because the rewrites happened already (the \"dead\" stores have already been removed).</p>\n</blockquote>",
+        "id": 613294216,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1785273051
+    },
+    {
+        "content": "<p>cfallin <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14008#issuecomment-5109816187\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14008\">PR #14008</a>:</p>\n<blockquote>\n<p>I don't think I understand: how is \"this edge observes all stores in the memory state\" different from \"the forward scan suddenly encountered lots of loads\"? In other words, we are not going back and editing anything; we are setting a bit on downward-exposed stores, exactly those which have not yet encountered a possibly-overwriting store.</p>\n</blockquote>",
+        "id": 613295388,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1785273677
+    },
+    {
+        "content": "<p>cfallin <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14008#issuecomment-5109838991\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14008\">PR #14008</a>:</p>\n<blockquote>\n<p>(I believe it's also <em>necessary</em> in the presence of the CFG I drew above -- even without loops)</p>\n</blockquote>",
+        "id": 613295716,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1785273839
+    },
+    {
+        "content": "<p>cfallin <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14008#issuecomment-5132739206\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14008\">PR #14008</a>:</p>\n<blockquote>\n<p>A few notes I had forgotten to add here after discussing this offline with Nick yesterday:</p>\n<ul>\n<li>We realized that another core issue is that the observed-store state is forward-carried flow-sensitive state. That creates issues because discovered observation bits have to somehow propagate back upward -- it's fundamentally a backward-flowing property.</li>\n<li>The postdom check kind of patches over some cases here (e.g. a divergent return path that also observes) but there are still propagation issues.</li>\n<li>The fix seems to be what I suggested above, observe-on-edge-to-already-processed-block (this is fine because it sees the state before it reaches any store that might overwrite the original -- just like a load would), plus making the observed bits non-flow-sensitive.</li>\n<li>Also, we need to \"observe\" any store that leaves a last-store slot, since the slot is may-alias not must-alias (does not summarize all stores to that abstract region).</li>\n</ul>\n</blockquote>",
+        "id": 613672628,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1785424633
+    },
+    {
+        "content": "<p>fitzgen updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14008\">PR #14008</a>.</p>",
+        "id": 613733111,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1785443264
+    }
+]

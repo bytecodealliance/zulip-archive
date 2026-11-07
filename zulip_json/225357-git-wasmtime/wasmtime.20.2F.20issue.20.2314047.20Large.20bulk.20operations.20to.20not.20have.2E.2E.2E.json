@@ -1,0 +1,56 @@
+[
+    {
+        "content": "<p>alexcrichton opened <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14047\">issue #14047</a>:</p>\n<blockquote>\n<p>For Wasmtime's original 46.0.0 release it originally contained a crop of changes where bulk operations (e.g. <code>memory.copy</code>) were updated to chunk the operation internally when fuel/epochs were enabled with preemption checks in the middle. The goal of this translation was to ensure that a very large <code>memory.copy</code>, such as moving 2GiB of data, wouldn't represent an uninterrputible chunk of work the guest could perform. This was later discovered to be the source of a number of <a href=\"https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-2hw9-mc66-jc2q\">possible security vulnerabilities with epoch callbacks</a>, and this behavior was reverted in <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14045\">https://github.com/bytecodealliance/wasmtime/pull/14045</a> to only check for epochs/fuel at the start of an operation instead of during an operation. This results in a doc block on epochs/fuel, however, that large bulk operations represent uninterruptible chunks of work where the only way to limit them is to limit the total size of a linear memory itself.</p>\n<p>This isn't a great situation and we should probably somehow figure out how to add preemption checks in the middle. This'll need to be done relatively carefully to avoid reintroducing the problems that were fixed in #14045.</p>\n</blockquote>",
+        "id": 613884604,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1785511669
+    },
+    {
+        "content": "<p><a href=\"https://github.com/fitzgen\">fitzgen</a> added the wasmtime:api label to <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14047\">Issue #14047</a>.</p>",
+        "id": 616358010,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1786638632
+    },
+    {
+        "content": "<p>adamrk <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14047#issuecomment-5294397931\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14047\">issue #14047</a>:</p>\n<blockquote>\n<p>What about this rough idea?:</p>\n<p>We break up the bulk operation into a sequence of smaller bulk operations so that the result of each smaller operation leaves the store in a valid state and then only inject preemption points between the smaller operations. The size of the smaller operations are heuristically determined depending on the preemption method.</p>\n<ol>\n<li>For fuel, we store the last value <code>fuel</code> that was passed to <code>set_fuel</code> and assume the same value will be passed in the future, so we pick the smaller bulk operations to cost roughly <code>fuel</code>. This could additionally be adjusted in the middle of the loop if we see that different values were passed to <code>set_fuel</code> at preemption points.</li>\n<li>For epochs, we store the previous duration between preemption points and use that for our heuristic. I guess we'd need to have a config for how to translate time into bulk operation size for this. I'm also not sure what we'd do if the epoch hasn't been implemented yet - maybe that would need to be an additional config. This one could also be adjusted in the middle of the loop if we have some way to check how much we've overshot an epoch increment.</li>\n</ol>\n</blockquote>",
+        "id": 616554343,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1786717359
+    },
+    {
+        "content": "<p>alexcrichton <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14047#issuecomment-5295680103\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14047\">issue #14047</a>:</p>\n<blockquote>\n<p>My inclination is that the hardest part here is going to be leaving the store in a valid state after each operation. For the exact fuel/epoch check I think it's fine to kind of do \"whatever\" in a sense. Previously byte-based operations were chunked by 128MiB, and per-element operations (e.g. <code>array.copy</code>) were checking fuel/epochs at the start of each loop iteration. Keeping a fixed-chunk size for byte operations and perhaps using a fixed-chunk size for per-element operations I think is fine w.r.t. checks/fuel/etc.</p>\n<p>For keeping the store valid, there's a few concerns to handle. In theory most of these issues are derivative of <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14048\">https://github.com/bytecodealliance/wasmtime/issues/14048</a> where the callback is too powerful, but I'm inclined to say that were possible we should ignore that issue in codegen and assume that modifications can happen to be a bit more defensive. If we assume that, then handling each operation is one of two buckets:</p>\n<ul>\n<li>Operations where even in the middle everything is valid -- this is something like <code>array.copy</code> or <code>memory.init</code>. For these I think we mostly just need to be careful to not preserve pointers across epoch checks and instead only preserve indices to re-derive pointers/etc on each chunk that's done.</li>\n<li>Operations where in the middle the store is invalid -- this is <code>table.grow</code> for non-nullable tables, initializing tables on instantiation for non-nullable tables, and array constructors like <code>array.{new,new_default,new_elem,new_data}</code> where uninitialized GC elements may be present. </li>\n</ul>\n<p>The first bucket can be codegen'd reasonable assuming store modifications in the middle, but for the second bucket it's not so easy. We've considered the idea historically of having a len/capacity separatation for tables in the past (currently they just have length mostly) which could solve this, where a <code>table.grow</code> is sort of split up into smaller growths. Such a scheme would require something different for arrays though because we'd have to adjust in-heap GC representations to handle pre-initialized state.</p>\n<p>I haven't thought too too hard about this latter bucket and preventing store modifications in the middle of these operations. It might just end up being that assuming store modifications can happen is totally unreasonable. If that's the case though then we'd want t oaddress #14048 first and probably add some sort of defensive checks in the codegen to double-check that preemption doesn't change anything.</p>\n</blockquote>",
+        "id": 616581437,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1786724790
+    },
+    {
+        "content": "<p>adamrk <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14047#issuecomment-5296151128\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14047\">issue #14047</a>:</p>\n<blockquote>\n<p>For the chunking, I was imagining that we perform a full bulk operation (with a smaller size) so that the store is left in a valid state even for the instructions in the second bucket. Almost as if the original Wasm was rewritten to perform a bunch of smaller <code>table.grow</code>s in a loop. I guess the main difficulty there would be rolling back the earlier operations if a later one fails? And of course the cost of memory allocation wouldn't be amortized because we do many smaller increases.</p>\n</blockquote>",
+        "id": 616590690,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1786727797
+    },
+    {
+        "content": "<p>alexcrichton <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14047#issuecomment-5296260283\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14047\">issue #14047</a>:</p>\n<blockquote>\n<p>Yeah rolling back <code>table.grow</code> isn't possible, and additionally GC arrays can't grow at all, so we can't easily chunk those up in a similar manner :(</p>\n</blockquote>",
+        "id": 616592752,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1786728453
+    },
+    {
+        "content": "<p>alexcrichton <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14047#issuecomment-5297814096\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14047\">issue #14047</a>:</p>\n<blockquote>\n<p>One other issue we're running into today with the current implementation which is related to this issue itself but not entirely the same: fuel is consumed up-front for <code>table.grow</code> before the actual operation happens. That's an operation that's allowed to gracefully fail (return -1) but running out of fuel traps. This means that <code>(table.grow (i32.const -1))</code> executes normally without fuel but traps with fuel. Basically the ahead-of-time fuel consumption doesn't model the case where fuel only gets charged if the growth is successful.</p>\n<p>This is currently leading to differential fuzz-failures on OSS-Fuzz right now where, for example, Wasmtime with \"infinite\" fuel traps and Wasmtime without fuel succeeds.</p>\n</blockquote>",
+        "id": 616623663,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1786738963
+    },
+    {
+        "content": "<p>alexcrichton edited a <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14047#issuecomment-5297814096\">comment</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14047\">issue #14047</a>:</p>\n<blockquote>\n<p>One other issue we're running into today with the current implementation which is related to this issue itself but not entirely the same: fuel is consumed up-front for <code>table.grow</code> before the actual operation happens. That's an operation that's allowed to gracefully fail (return -1) but running out of fuel traps. This means that <code>(table.grow (i32.const -1))</code> executes normally without fuel but traps with fuel. Basically the ahead-of-time fuel consumption doesn't model the case where fuel should only get charged if the growth is successful.</p>\n<p>This is currently leading to differential fuzz-failures on OSS-Fuzz right now where, for example, Wasmtime with \"infinite\" fuel traps and Wasmtime without fuel succeeds.</p>\n</blockquote>",
+        "id": 616627271,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1786740340
+    },
+    {
+        "content": "<p><a href=\"https://github.com/alexcrichton\">alexcrichton</a> added the wasmtime:fuel label to <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14047\">Issue #14047</a>.</p>",
+        "id": 619093683,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1787681219
+    }
+]

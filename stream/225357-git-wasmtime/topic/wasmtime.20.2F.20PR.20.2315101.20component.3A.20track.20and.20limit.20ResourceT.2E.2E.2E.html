@@ -1,0 +1,798 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #15101 component: track and limit ResourceT... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html">wasmtime / PR #15101 component: track and limit ResourceT...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="636427167"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636427167" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636427167">(Oct 30 2026 at 22:19)</a>:</h4>
+<p>posborne opened <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a> from <code>posborne:resource-table-host-heap-limiter</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<h3>Motivation</h3>
+<p>Embedders currently lack an aggregate host-side memory boundary for component model resources in <code>ResourceTable</code>. While #12652 added mitigations around handle counts and hostcall fuel, cumulative host heap allocations owned by resources in <code>ResourceTable</code> were previously untracked by any umbrella mechanism.</p>
+<p>Over the past several releases, Wasmtime has had to address a recurring class of guest-driven host memory exhaustion advisories with mitigations including [GHSA-852m-cvvp-9p4w] and [GHSA-243v-98vx-264h] (#12652), [GHSA-c9gc-w9vx-w86p], [GHSA-gqmc-89g8-p25r], and [GHSA-6fr9-xmw9-5352]. While per-resource and per-call limits help, they do not bound the aggregate host heap memory accumulated across entries in a <code>ResourceTable</code>.</p>
+<h3>Solution</h3>
+<p>This PR adds host heap usage accounting and optional per-table byte limits to <code>wasmtime::component::ResourceTable</code>. This provides a level of umbrella coverage to protect against host paths that may not have protections currently and to provide a higher level limit that is easier to reason about for embedders.</p>
+<p>The way that this is achieved involves the introduction of a <code>HostHeapUsage</code> trait which is required for all resources. This is accompanied by a <code>FixedHostHeapUsage</code> trait as a marker for types which do not contain children with heap storage not accounted for in their own size directly. Methods on the table that push, delete or mutate (update) resources use the traits to account for the heap usage changes associated with the operation. If a limit is set and an operation causes the heap usage to grow beyond the set limit, the operations return an error which will typically result in a guest-side trap.</p>
+<p>These new requirements necessitate updates across the wasmtime tree and will be a breaking change for embedders that are pushing their own resources into <code>ResourceTable</code>s.</p>
+<h3>Design Decisions</h3>
+<p>The code here has gone through a few iterations and updates based on discussion in #12984. What is present here tries to incorporate that feedback and is closer to some of the implementation from servo/firefox/stylo <code>MallocSizeOf</code> trait.</p>
+<p>In instrumenting the code to implement the traits, I decided that to ease the burden on embedders and to provide some additional static guarantees, it would be beneficial to introduce proc-macros in order to aid in deriving the traits on compatible structs and enums.</p>
+<p>For mutation I went with a closure-based <code>update</code> rather than a guard, because the limit check has to be fallible and a guard could only account in <code>Drop</code>. This makes former get_mut call sites a bit noisier. Since update can only measure after the mutation runs, growth past the limit is reported rather than prevented, and the mutation isn't rolled back because the error is expected to trap. The overshoot is roughly limited to what a single host call can allocate.</p>
+<p>Across the code in tree (mostly wasi p2/p3), I tried to provide pragmatic implementations of the trait where reasonable and erred on the side of overcounting bytes in most cases. There are some reference counted cases which are not tracked with complete accuracy but, even in those cases, abuse should be challenging as the fixed size of the resource will be counted even if the amortized cost of the shared data is left unaccounted.</p>
+<h3>Future Work</h3>
+<p>The changes here are sprawling, so I wanted to avoid increasing the scope beyond what was required for purpose and reasonable ergonomics (adding derive). Potential future work that I opted to not try to incorporate here include:</p>
+<ul>
+<li>Allow for the limit to be set at a higher level outside of individual tables, probably on the <code>ResourceLimiter</code>.</li>
+<li>Hooks to intervene when limits are exceeded or at watermarks prior to the limit.</li>
+<li>Fast path or conditional compilation to opt out of tracking; even if no limit is set the accounting is done and count is available.</li>
+</ul>
+<p>Closes #12984</p>
+<p>[GHSA-852m-cvvp-9p4w]: <a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-852m-cvvp-9p4w">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-852m-cvvp-9p4w</a><br>
+[GHSA-243v-98vx-264h]: <a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-243v-98vx-264h">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-243v-98vx-264h</a><br>
+[GHSA-c9gc-w9vx-w86p]: <a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-c9gc-w9vx-w86p">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-c9gc-w9vx-w86p</a><br>
+[GHSA-gqmc-89g8-p25r]: <a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-gqmc-89g8-p25r">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-gqmc-89g8-p25r</a><br>
+[GHSA-6fr9-xmw9-5352]: <a href="https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-6fr9-xmw9-5352">https://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-6fr9-xmw9-5352</a></p>
+</blockquote>
+
+
+
+<a name="636427176"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636427176" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636427176">(Oct 30 2026 at 22:19)</a>:</h4>
+<p>posborne removed the review request for <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-wasi-reviewers">wasmtime-wasi-reviewers</a> from <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a>.</p>
+
+
+
+<a name="636427177"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636427177" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636427177">(Oct 30 2026 at 22:19)</a>:</h4>
+<p>posborne requested <a href="https://github.com/rvolosatovs">rvolosatovs</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a>.</p>
+
+
+
+<a name="636427179"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636427179" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636427179">(Oct 30 2026 at 22:19)</a>:</h4>
+<p>posborne requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-wasi-reviewers">wasmtime-wasi-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a>.</p>
+
+
+
+<a name="636427188"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636427188" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636427188">(Oct 30 2026 at 22:19)</a>:</h4>
+<p>posborne removed the review request for <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> from <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a>.</p>
+
+
+
+<a name="636427191"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636427191" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636427191">(Oct 30 2026 at 22:19)</a>:</h4>
+<p>posborne requested <a href="https://github.com/alexcrichton">alexcrichton</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a>.</p>
+
+
+
+<a name="636427193"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636427193" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636427193">(Oct 30 2026 at 22:19)</a>:</h4>
+<p>posborne requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a>.</p>
+
+
+
+<a name="636439392"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636439392" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636439392">(Oct 30 2026 at 23:44)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasi</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a>.</p>
+
+
+
+<a name="636439395"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636439395" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636439395">(Oct 30 2026 at 23:44)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:c-api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a>.</p>
+
+
+
+<a name="636934389"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934389" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934389">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5738887607">PR review</a>:</p>
+<blockquote>
+<p>Thanks for this! I personally think this is a pretty reasonable change to make and it's only going to be even more accurate than things are today if embedders conservatively always use <code>FixedHostHeapUsage</code>. By providing the knobs though I think this is going to be quite useful.</p>
+</blockquote>
+
+
+
+<a name="636934393"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934393" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934393">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444189428">PR review comment</a>:</p>
+<blockquote>
+<p>I think this'd make sense to have it just be a <code>usize</code> since it can always be unlimited with <code>usize::MAX</code></p>
+</blockquote>
+
+
+
+<a name="636934395"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934395" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934395">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444220719">PR review comment</a>:</p>
+<blockquote>
+<p>Would it make sense to call <code>self.reserve</code> here to track the capacity of the table itself?</p>
+</blockquote>
+
+
+
+<a name="636934397"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934397" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934397">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444268475">PR review comment</a>:</p>
+<blockquote>
+<p>I'm a bit surprised, but we didn't end up needing an impl for <code>Box&lt;T&gt;</code>?</p>
+</blockquote>
+
+
+
+<a name="636934399"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934399" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934399">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444251397">PR review comment</a>:</p>
+<blockquote>
+<p>I haven't gotten to looking more closely at the WASI bits yet, but this might make more sense as an RAII guard rather than a closure-based update. That'd help with rightward drift and it would have the same rough semantics for the borrows. I think it would require a small bit of <code>unsafe</code> code and/or a raw pointer to simultaneously hold the table and the entry pointer, but that seems like it's likely going to be worthwhile given the ergonomic wins.</p>
+</blockquote>
+
+
+
+<a name="636934400"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934400" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934400">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444310639">PR review comment</a>:</p>
+<blockquote>
+<p>Could this be moved close to the definition of <code>Descriptor</code>, and would it perhaps make sense to account for this with a simple constant return value of the size of an OS file/dir?</p>
+</blockquote>
+
+
+
+<a name="636934401"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934401" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934401">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444315709">PR review comment</a>:</p>
+<blockquote>
+<p>Similar to filesystems, could this move up closer to the definition?</p>
+<p>(same for many other files too, I'll stop commenting here)</p>
+</blockquote>
+
+
+
+<a name="636934402"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934402" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934402">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444346726">PR review comment</a>:</p>
+<blockquote>
+<p>Similar to the write stream elsewhere, I think it might make sense to just assume that this is always maximally buffering (or similar-ish to that) because otherwise this can't adequately track what's happening in the background task</p>
+</blockquote>
+
+
+
+<a name="636934405"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934405" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934405">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444206295">PR review comment</a>:</p>
+<blockquote>
+<p>Could this comment as to why it's a <code>saturating_sub</code>? Is that for mutations that don't go through <code>update</code>?</p>
+</blockquote>
+
+
+
+<a name="636934406"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934406" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934406">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444195807">PR review comment</a>:</p>
+<blockquote>
+<p>Should this perhaps get deleted with byte-based tracking? The purpose of this change was to effectively be a small proxy for byte-based tracking but bytes is a much more accurate limit than total slots</p>
+</blockquote>
+
+
+
+<a name="636934408"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934408" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934408">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444280389">PR review comment</a>:</p>
+<blockquote>
+<p>FWIW I think we're definitely going to want to revisit this in the future, this table definitely wants to keep track of memory.</p>
+</blockquote>
+
+
+
+<a name="636934409"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934409" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934409">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444415317">PR review comment</a>:</p>
+<blockquote>
+<p>How come the reexport here?</p>
+</blockquote>
+
+
+
+<a name="636934410"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934410" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934410">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444432349">PR review comment</a>:</p>
+<blockquote>
+<p>Ah, also with RAII, this shouldn't be necessary</p>
+</blockquote>
+
+
+
+<a name="636934413"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934413" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934413">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444388164">PR review comment</a>:</p>
+<blockquote>
+<p>s/len/capacity/ ?</p>
+</blockquote>
+
+
+
+<a name="636934414"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934414" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934414">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444301322">PR review comment</a>:</p>
+<blockquote>
+<p>Could this use <code>#[derive]</code>? (along with the one above too)</p>
+</blockquote>
+
+
+
+<a name="636934417"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934417" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934417">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444330759">PR review comment</a>:</p>
+<blockquote>
+<p>Ideally in my mind we'd account for as much as possible in this budget -- could this perhaps assume that it's always got something buffered and count for a fixed-and-large size?</p>
+</blockquote>
+
+
+
+<a name="636934419"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934419" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934419">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444459673">PR review comment</a>:</p>
+<blockquote>
+<p>Similar to <code>Response</code>, but for other fields -- shouldn't this account for a number of other fields? For example the method/scheme/authority/path I think can all have arbitrary strings, and the strategy developed in this PR I think could subsume <a href="https://github.com/bytecodealliance/wasmtime/pull/14598">https://github.com/bytecodealliance/wasmtime/pull/14598</a> for example otherwise</p>
+</blockquote>
+
+
+
+<a name="636934420"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934420" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934420">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444354316">PR review comment</a>:</p>
+<blockquote>
+<p>This is a bit of a lie because concurrent mutations are allowed, but not tracked, right? In that sense would it make sense to assume that this is always at its maximal value?</p>
+</blockquote>
+
+
+
+<a name="636934421"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934421" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934421">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444427320">PR review comment</a>:</p>
+<blockquote>
+<p>I commented far down below about this, but by moving <code>update</code> to an RAII-style pattern it'd avoid the need for the <code>??</code> here which is a bit awkward</p>
+</blockquote>
+
+
+
+<a name="636934422"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934422" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934422">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444494671">PR review comment</a>:</p>
+<blockquote>
+<p>Similar to below in p3, I think it'd make sense to exhaustively destructor the structs here to ensure that all fields are accounted for</p>
+</blockquote>
+
+
+
+<a name="636934423"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934423" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934423">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444447412">PR review comment</a>:</p>
+<blockquote>
+<p>How come <code>body</code> isn't accounted for here?</p>
+</blockquote>
+
+
+
+<a name="636934424"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934424" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934424">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444384123">PR review comment</a>:</p>
+<blockquote>
+<p>Similar to other locations, I think it might make sense for stdio things to assume maximal internal buffering perhaps?</p>
+</blockquote>
+
+
+
+<a name="636934425"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934425" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934425">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444406358">PR review comment</a>:</p>
+<blockquote>
+<p>Ah for these I think it might make sense to have this in Wasmtime itself as:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">impl</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="n">HostHeapUsage</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="nb">Box</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="k">where</span><span class="w"> </span><span class="n">T</span><span class="p">:</span><span class="w"> </span><span class="nc">HostHeapUsage</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="o">?</span><span class="nb">Sized</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// ...</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>(assuming that actually works)</p>
+</blockquote>
+
+
+
+<a name="636934426"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934426" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934426">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444370341">PR review comment</a>:</p>
+<blockquote>
+<p>Could this exhaustively match to avoid <code>_</code>?</p>
+</blockquote>
+
+
+
+<a name="636934428"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934428" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934428">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444441179">PR review comment</a>:</p>
+<blockquote>
+<p>This one is preexisting, but could this, and the new trait impl below, be moved above the tests? It's a bit unidiomatic to have tests located above actual code</p>
+</blockquote>
+
+
+
+<a name="636934432"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934432" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934432">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444564324">PR review comment</a>:</p>
+<blockquote>
+<p>Could this grow some small documentation as to what it's doing, in particular to the <code>bound_all_fields</code> parameter and what <code>type_mentions_ident</code> is doing?</p>
+</blockquote>
+
+
+
+<a name="636934433"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934433" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934433">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444503218">PR review comment</a>:</p>
+<blockquote>
+<p>(also, it'd probably make sense to have crate-scoped helpers which handle types from the <code>http</code> crate to avoid duplicating it across p2/p3)</p>
+</blockquote>
+
+
+
+<a name="636934434"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934434" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934434">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444287893">PR review comment</a>:</p>
+<blockquote>
+<p>Or, alternatively, what's the downside to using <code>#[derive]</code> for these?</p>
+</blockquote>
+
+
+
+<a name="636934435"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934435" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934435">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444473516">PR review comment</a>:</p>
+<blockquote>
+<p>If it makes sense to add these, and implementation trick that I think might make sense here is:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="n">Request</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">method</span><span class="p">,</span><span class="w"> </span><span class="n">scheme</span><span class="p">,</span><span class="w"> </span><span class="n">authority</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">*</span><span class="bp">self</span><span class="p">;</span><span class="w"> </span><span class="c1">// exhaustive match of all fields</span>
+<span class="c1">// ... add up for each field matched ...</span>
+</code></pre></div>
+<p>so that way we get compiler warnings on missed fields and compiler errors if a field is ever added</p>
+</blockquote>
+
+
+
+<a name="636934438"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934438" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934438">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444362028">PR review comment</a>:</p>
+<blockquote>
+<p>Would it make sense to charge something nonzero for this, say maybe 4KiB, as a placeholder?</p>
+</blockquote>
+
+
+
+<a name="636934441"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636934441" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636934441">(Nov 02 2026 at 15:57)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4444283768">PR review comment</a>:</p>
+<blockquote>
+<p>Could this use the <code>#[derive]</code>?</p>
+</blockquote>
+
+
+
+<a name="636955075"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636955075" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636955075">(Nov 02 2026 at 16:51)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> posborne submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5740096779">PR review</a>.</p>
+
+
+
+<a name="636955077"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636955077" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636955077">(Nov 02 2026 at 16:51)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> posborne created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4445152039">PR review comment</a>:</p>
+<blockquote>
+<p>Yeah, that sounds reasonable.</p>
+</blockquote>
+
+
+
+<a name="636956466"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636956466" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636956466">(Nov 02 2026 at 16:55)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> posborne submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5740145338">PR review</a>.</p>
+
+
+
+<a name="636956468"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636956468" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636956468">(Nov 02 2026 at 16:55)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> posborne created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4445191900">PR review comment</a>:</p>
+<blockquote>
+<p>Possibly; my only hesitation was related to conflicting with mechanisms that may have already been tuned by embedders; that being said, I do think simplifying would be better and the byte tracking is easier to reason about and probably the right control.  Embedders will, most likely, already be bumping into breakages from the new trait requirements (unless not adding any of their own hostcalls/resources) so this isn't really a huge lift on top of that.</p>
+</blockquote>
+
+
+
+<a name="636958242"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636958242" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636958242">(Nov 02 2026 at 17:00)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> posborne submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5740215058">PR review</a>.</p>
+
+
+
+<a name="636958244"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636958244" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636958244">(Nov 02 2026 at 17:00)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> posborne created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4445249505">PR review comment</a>:</p>
+<blockquote>
+<p>I can add a comment; the reasoning is basically that, it isn't possibly to guarantee that in all cases the tracking could never get off in some way with out of band mutations.  Saturating rather than underflow seemed like the more pragmatic and safe option here; bubbling up an error that will guest-trap could be another option but that feels heavy-handed.</p>
+</blockquote>
+
+
+
+<a name="636959388"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636959388" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636959388">(Nov 02 2026 at 17:04)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> posborne submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5740261393">PR review</a>.</p>
+
+
+
+<a name="636959397"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636959397" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636959397">(Nov 02 2026 at 17:04)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> posborne created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4445287609">PR review comment</a>:</p>
+<blockquote>
+<p>This is the approach I originally wanted to go; the problem with that is that when limits are exceeded the behavior we want is to raise an error that will result in a guest trap rather than a host trap.  So <code>Drop</code> isn't a great option there unless there's a trick I haven't thought through.</p>
+<p>Having a <code>finish()</code> consuming self explicitly can make that explicit but doesn't statically avoid the <code>Drop</code> and when I had used it in a few places, it generally didn't make things easier to write, so I ended up consolidating on the closure-based approach instead for this case.</p>
+</blockquote>
+
+
+
+<a name="636961102"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636961102" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636961102">(Nov 02 2026 at 17:10)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> posborne submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5740347198">PR review</a>.</p>
+
+
+
+<a name="636961106"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636961106" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636961106">(Nov 02 2026 at 17:10)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> posborne created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4445355311">PR review comment</a>:</p>
+<blockquote>
+<p>I agree; I wasn't too happy to leave these and should have had a comment as to why they were omitted.  The reason isn't the best, but it's basically that I had trouble thinking through exactly how we'd track these in all cases.  There are some other specific protections here, but having it not included in the umbrella isn't ideal.</p>
+<p>There is tracking taking place, even for FixedHostHeapUsage, but it is just the size of the struct itself without following the boxed types, so it is better than nothing and would catch the most naive runaway usage attempts.</p>
+<p>The other bad thing here is that since this table is internal, I don't think embedders will often be aware that this extra table even exists and is performing host allocations.  It might not even be possible to get a reference to the table to set a limit on it as an embedder (though I would need to double check that).  That's probably best solved by wiring up the limits to coalesce at a higher level.</p>
+</blockquote>
+
+
+
+<a name="636966088"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636966088" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636966088">(Nov 02 2026 at 17:28)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> posborne submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5740595989">PR review</a>.</p>
+
+
+
+<a name="636966093"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636966093" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636966093">(Nov 02 2026 at 17:28)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> posborne created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4445554998">PR review comment</a>:</p>
+<blockquote>
+<p>I would have liked to have an impl for <code>Box&lt;T&gt;</code> and attempted it.  A <code>Box&lt;T&gt; where T: HostHeapUsage + ?Sized</code>  impl conflicts with</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">impl</span><span class="o">&lt;</span><span class="n">T</span><span class="p">:</span><span class="w"> </span><span class="nc">FixedHostHeapUsage</span><span class="o">&gt;</span><span class="w"> </span><span class="n">HostHeapUsage</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">T</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="o">..</span><span class="p">.</span><span class="w"> </span><span class="p">}</span>
+</code></pre></div>
+<p>because <code>Box</code> is <code>#[fundamental]</code>, so a downstream crate could implement <code>FixedHostHeapUsage for Box&lt;MyType&gt;</code> and overlap with it (<a href="https://doc.rust-lang.org/error_codes/E0119.html">E0119</a>).</p>
+<p>The way to get a generic Box&lt;T&gt; is to drop that blanket impl, so fixed types would need an explicit <code>HostHeapUsage</code> impl alongside <code>FixedHostHeapUsage</code>. <code>#[derive(FixedHostHeapUsage)]</code> can emit both, so derived types are unaffected. The hand-written <code>impl FixedHostHeapUsage for X {}</code> sites would need a second impl, which a small helper macro could cover (e.g. <code>impl_fixed_host_heap_usage!(MyType)</code>).</p>
+<p>Honestly, I wasn't quite sure which direction to go with this one, so happy to hear any suggestion you might have.<br>
+</p>
+</blockquote>
+
+
+
+<a name="636968177"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636968177" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636968177">(Nov 02 2026 at 17:35)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> posborne created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4445624242">PR review comment</a>:</p>
+<blockquote>
+<p>Yeah, we can make it work by giving it the extra attribute required for bits that are within the wasmtime crate itself.</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="cp">#[derive(FixedHostHeapUsage)]</span>
+<span class="cp">#[component(wasmtime_crate = crate)]</span>
+<span class="k">struct</span><span class="w"> </span><span class="nc">TaskGroup</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">ref_count</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">,</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Some of these sites were ones that I had written prior to adding the proc-macro; I can probably just do a conversion of to use the proc-macro for all sites where it can be applied. That gives us a bit more confidence that those impls are safe which makes auditing easier.</p>
+</blockquote>
+
+
+
+<a name="636968182"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636968182" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636968182">(Nov 02 2026 at 17:35)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> posborne submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5740683373">PR review</a>.</p>
+
+
+
+<a name="636968932"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636968932" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636968932">(Nov 02 2026 at 17:38)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> posborne submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5740717215">PR review</a>.</p>
+
+
+
+<a name="636968934"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636968934" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636968934">(Nov 02 2026 at 17:38)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> posborne created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4445652067">PR review comment</a>:</p>
+<blockquote>
+<p>This one should be possible but isn't as the type is generated by wit-bindgen.  Having bindgen types impl the trait might be possible, but I didn't want to touch it in this change and I'm not sure how often it will be encountered in practice.</p>
+</blockquote>
+
+
+
+<a name="636971748"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636971748" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636971748">(Nov 02 2026 at 17:50)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> posborne submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5740864479">PR review</a>.</p>
+
+
+
+<a name="636971756"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636971756" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636971756">(Nov 02 2026 at 17:50)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> posborne created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4445766913">PR review comment</a>:</p>
+<blockquote>
+<p>Yeah, that suggestion makes sense to me; I'll make that update.</p>
+</blockquote>
+
+
+
+<a name="636972899"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636972899" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636972899">(Nov 02 2026 at 17:54)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> posborne submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5740917600">PR review</a>.</p>
+
+
+
+<a name="636972901"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636972901" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636972901">(Nov 02 2026 at 17:54)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> posborne created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4445809145">PR review comment</a>:</p>
+<blockquote>
+<p>Yeah, I think that makes sense here (and for other buffered streams).</p>
+</blockquote>
+
+
+
+<a name="636972965"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636972965" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636972965">(Nov 02 2026 at 17:54)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> posborne created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4445811477">PR review comment</a>:</p>
+<blockquote>
+<p>Agreed.</p>
+</blockquote>
+
+
+
+<a name="636972966"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636972966" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636972966">(Nov 02 2026 at 17:54)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> posborne submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5740920557">PR review</a>.</p>
+
+
+
+<a name="636978370"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636978370" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636978370">(Nov 02 2026 at 18:16)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5741221912">PR review</a>.</p>
+
+
+
+<a name="636978373"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636978373" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636978373">(Nov 02 2026 at 18:16)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4446053590">PR review comment</a>:</p>
+<blockquote>
+<p>Yeah that's my thinking as well, it's breaking to remove this but I'd like to ideally keep knobs relatively simple. We've got a ton of performance tuning knobs but ideally the knobs for "don't DoS yourself" are pretty simple to set.</p>
+</blockquote>
+
+
+
+<a name="636982214"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636982214" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636982214">(Nov 02 2026 at 18:31)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5741426303">PR review</a>.</p>
+
+
+
+<a name="636982216"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636982216" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636982216">(Nov 02 2026 at 18:31)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4446217683">PR review comment</a>:</p>
+<blockquote>
+<p>Oh right sorry yes I remember now that was in the OP and forgot about that when re-reading this. That's a good point too!</p>
+<p>Subjectively I place a high value on preventing rightward-drift and using RAII wherever possible, so I'm tempted nevertheless to push on this. What would you think about something like:</p>
+<ul>
+<li>An explicit <code>finish</code> which returns <code>Result</code></li>
+<li>Changing <code>Drop</code> to flag a table as "over capacity" to yield an error on next-access</li>
+</ul>
+<p>That way embedders can get eager traps if they want, but otherwise natural access of the table would still handle this error case at least eventually. My thinking is that <code>update</code> is already sort of catching a sin that's already been committed as opposed to preventing it from happening in the first place, so delaying that error a bit longer probably isn't the worst in the world.</p>
+</blockquote>
+
+
+
+<a name="636987164"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636987164" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636987164">(Nov 02 2026 at 18:50)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5741657094">PR review</a>.</p>
+
+
+
+<a name="636987167"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636987167" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636987167">(Nov 02 2026 at 18:50)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4446403063">PR review comment</a>:</p>
+<blockquote>
+<p>Oh wow TIL.</p>
+<p>One possibly crazy idea -- entirely remove <code>FixedHostHeapUsage</code>. I think the primary motivation for that is <code>ResourceTable::get_mut</code> which doesn't return an RAII thing, but if you agree with what I'm thinking above we could switch it to RAII which might remove the motivation for the fixed trait entirely. </p>
+</blockquote>
+
+
+
+<a name="636987506"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636987506" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636987506">(Nov 02 2026 at 18:51)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5741675109">PR review</a>.</p>
+
+
+
+<a name="636987508"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636987508" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636987508">(Nov 02 2026 at 18:51)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4446417760">PR review comment</a>:</p>
+<blockquote>
+<p>Table-wise we definitely need to improve where the table is located yeah, and ideally reuse this table for probably everything (e.g. WASI resources and such). We do <a href="https://docs.rs/wasmtime/latest/wasmtime/struct.StoreContextMut.html#method.concurrent_resource_table">have an accessor though</a> for the sole reason of being able to set the maximum capacity</p>
+</blockquote>
+
+
+
+<a name="636988044"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636988044" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636988044">(Nov 02 2026 at 18:53)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5741700867">PR review</a>.</p>
+
+
+
+<a name="636988046"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/636988046" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#636988046">(Nov 02 2026 at 18:53)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4446437555">PR review comment</a>:</p>
+<blockquote>
+<p>Oh right yes I saw the <a href="https://github.com/bytecodealliance/wasmtime/blob/4c1c3f3404e85d2838f3ebfdbf957d458139cb55/crates/wasmtime/src/runtime/component/bindgen_examples/_7_async.rs#L52-L58">definition wasn't in bindgen</a> and naively assumed the derive could be used but the first field is indeed bindgen-generated. I think it's fine to leave this as-is in that case and can always handle the <code>bindgen!</code> bits later.</p>
+</blockquote>
+
+
+
+<a name="637005511"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/637005511" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#637005511">(Nov 02 2026 at 20:07)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> posborne created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4447166578">PR review comment</a>:</p>
+<blockquote>
+<p>Yeah, that's probably the safer option here which we should take.  We might just want to bolster our wording around what the heap number represents, but I think that's the right approach given that the important here is to guard against DoS.</p>
+</blockquote>
+
+
+
+<a name="637005512"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/637005512" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#637005512">(Nov 02 2026 at 20:07)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> posborne submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5742633191">PR review</a>.</p>
+
+
+
+<a name="637005961"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/637005961" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#637005961">(Nov 02 2026 at 20:09)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> posborne submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5742662060">PR review</a>.</p>
+
+
+
+<a name="637005963"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/637005963" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#637005963">(Nov 02 2026 at 20:09)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> posborne created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4447190157">PR review comment</a>:</p>
+<blockquote>
+<p>Yeah, I think that makes sense.  4KiB is generous but not problematically so for realistic usages.</p>
+</blockquote>
+
+
+
+<a name="637006969"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/637006969" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#637006969">(Nov 02 2026 at 20:15)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> posborne submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5742723092">PR review</a>.</p>
+
+
+
+<a name="637006973"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/637006973" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#637006973">(Nov 02 2026 at 20:15)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> posborne created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4447239437">PR review comment</a>:</p>
+<blockquote>
+<p>Yeah, this shouldn't be here.  I had some back and forth with some of the wasi-io traits having or not having trait dependencies on these core traits which must have left this stray; definitely doesn't make sense to be here.</p>
+</blockquote>
+
+
+
+<a name="637009587"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/637009587" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#637009587">(Nov 02 2026 at 20:26)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> posborne submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5742858809">PR review</a>.</p>
+
+
+
+<a name="637009589"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/637009589" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#637009589">(Nov 02 2026 at 20:26)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> posborne created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4447350407">PR review comment</a>:</p>
+<blockquote>
+<p>The comments here on <code>Request</code>, <code>Response</code> make sense.  I'll have to play around with things and think a bit more on the approach but will push a commit with changes to try to handle this following the general convervative-upper-bound approach being added elsewhere.</p>
+<p>Will try to share between p2/p3 for how we handle tracking for the http types.  That will probably come in after the base changes around the core trait(s).</p>
+</blockquote>
+
+
+
+<a name="637162073"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/637162073" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#637162073">(Nov 03 2026 at 11:16)</a>:</h4>
+<p>xia-chao <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#issuecomment-6602385965">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a>:</p>
+<blockquote>
+<p>While investigating wasi-http fields memory I found that with current defaults, 25k fields × 120 KiB in a 3 GiB cgroup gets OOM-killed (rc=137). This PR adds the API; do you plan a CLI default too?</p>
+</blockquote>
+
+
+
+<a name="637331313"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/637331313" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#637331313">(Nov 03 2026 at 21:31)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> posborne submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5759756654">PR review</a>.</p>
+
+
+
+<a name="637331319"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/637331319" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#637331319">(Nov 03 2026 at 21:31)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> posborne created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4460676155">PR review comment</a>:</p>
+<blockquote>
+<p>I'm trialing a version of the change that goes this direction (single trait and RAII access patterns).  I _think_ it will work and we can trap at the right places, though I need to play with a few options there: at the head of future subsequent mutating access blocks is the obvious instrumentation point (which we already have in some places), but I think there may also be a way to do the check at the point we're about to re-enter guests; that would mean that we trap without having to make another subsequent hostcall, which seems like what you would want.  We'll lose a little visibility into which table change pushed things over the limit, but I generally expect that this will either be unimportant or obvious from context (and solvable if we decide it matters).</p>
+<p>This should allow for most of the table accesses to go back to the upstream form which should make review a bit easier.</p>
+</blockquote>
+
+
+
+<a name="637332514"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/637332514" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#637332514">(Nov 03 2026 at 21:37)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#issuecomment-6616029869">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15101">PR #15101</a>:</p>
+<blockquote>
+<p>Yeah this'll definitely be reflected in the CLI, either here or in a follow-up.</p>
+</blockquote>
+
+
+
+<a name="637338873"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/637338873" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#637338873">(Nov 03 2026 at 22:09)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> posborne submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5760182188">PR review</a>.</p>
+
+
+
+<a name="637338876"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/637338876" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#637338876">(Nov 03 2026 at 22:09)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> posborne created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4461034818">PR review comment</a>:</p>
+<blockquote>
+<p>I'll go through and resolve comments once I have changed vetted and on the branch, but I am moving toward making it so that we can apply the proc-macro (over the single <code>HostHeapUsage</code> trait) in almost all cases.</p>
+<p>The macro will have attributes for the common cases we seem to encounter, currently thinking something like these:</p>
+<p><div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">fn</span><span class="w"> </span><span class="nf">dynamic_size</span><span class="p">(</span><span class="n">field</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">MyType</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">usize</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// ...</span>
+<span class="w">    </span><span class="mi">42</span>
+<span class="p">}</span>
+
+<span class="k">struct</span><span class="w"> </span><span class="nc">MyStruct</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="cp">#[heap_usage(shared)]</span>
+<span class="w">    </span><span class="n">shared</span><span class="p">:</span><span class="w"> </span><span class="nc">Arc</span><span class="o">&lt;</span><span class="n">SomeType</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="c1">// where SomeType: HostHeapUsage.  Will include the size of SomeType for this field.</span>
+
+<span class="w">    </span><span class="cp">#[heap_usage(constant = 42)]</span>
+<span class="w">    </span><span class="n">fixed_opaque</span><span class="p">:</span><span class="w"> </span><span class="nc">OpaqueFixed</span><span class="p">,</span><span class="w"> </span><span class="c1">// some type that we can account for with a fixed value (expr)</span>
+
+<span class="w">    </span><span class="cp">#[heap_usage(skip = </span><span class="s">"reason skipping is reasonable"</span><span class="cp">)]</span>
+<span class="w">    </span><span class="n">zero_size</span><span class="p">:</span><span class="w"> </span><span class="nc">Opaque</span><span class="p">,</span>
+
+<span class="w">    </span><span class="cp">#[heap_usage(with = dynamic_size)]</span>
+<span class="w">    </span><span class="n">dynamic</span><span class="p">:</span><span class="w"> </span><span class="nc">MyType</span><span class="p">,</span><span class="w"> </span><span class="c1">// MyType doesn't/can't impl HostHeapUsage</span>
+<span class="p">}</span>
+</code></pre></div><br>
+</p>
+</blockquote>
+
+
+
+<a name="637339292"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/637339292" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#637339292">(Nov 03 2026 at 22:11)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> posborne edited <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4461034818">PR review comment</a>.</p>
+
+
+
+<a name="637342997"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/637342997" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#637342997">(Nov 03 2026 at 22:30)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> alexcrichton submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#pullrequestreview-5760413181">PR review</a>.</p>
+
+
+
+<a name="637343001"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315101%20component%3A%20track%20and%20limit%20ResourceT.../near/637343001" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315101.20component.3A.20track.20and.20limit.20ResourceT.2E.2E.2E.html#637343001">(Nov 03 2026 at 22:30)</a>:</h4>
+<p><span aria-label="speech balloon" class="emoji emoji-1f4ac" role="img" title="speech balloon">:speech_balloon:</span> alexcrichton created <a href="https://github.com/bytecodealliance/wasmtime/pull/15101#discussion_r4461230186">PR review comment</a>:</p>
+<blockquote>
+<p>Nice! That looks great to me!</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Nov 07 2026 at 13:03 UTC</p>
+</html>

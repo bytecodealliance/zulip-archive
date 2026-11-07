@@ -1,0 +1,118 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #15191 GC: implement `Frozen` references. · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html">wasmtime / PR #15191 GC: implement `Frozen` references.</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="638265511"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638265511" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638265511">(Nov 06 2026 at 21:54)</a>:</h4>
+<p>cfallin requested <a href="https://github.com/fitzgen">fitzgen</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="638265512"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638265512" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638265512">(Nov 06 2026 at 21:54)</a>:</h4>
+<p>cfallin requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-fuzz-reviewers">wasmtime-fuzz-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="638265514"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638265514" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638265514">(Nov 06 2026 at 21:54)</a>:</h4>
+<p>cfallin opened <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a> from <code>cfallin:gc-frozen-refs</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>In order to implement record/replay, we need a little more discipline around read-only vs. read-write <code>Store</code>s. It turns out that rooting mutates a store. This is unfortunate when we want to permit debuggers to inspect the state of a store, including its GC heap, on a read-only trace replay.</p>
+<p>Separately, the need for a mutable store borrow to <em>access</em> any GC object, even on actions that are nominally/semantically read-only, makes APIs more awkward and looser about mutation than they could otherwise be. One can see artifacts of this awkwardness in e.g. the existence of a separate getter for globals that only reads non-GC values, with an immutable store.</p>
+<p>Separately separately, rooting is expensive if all one wants to do is introspect the Store's GC heap while execution is completely frozen. Ideally one would use raw heap offsets ("pointers") and just read out the objects without setting up and tearing down rooting metadata.</p>
+<p>All of these problems are solved in this PR with the addition of a new <code>Frozen</code> GC ref kind. The idea is that we:</p>
+<ul>
+<li>
+<p>Give the GC heap a u64 counter that increments on any possible mutation (i.e.: every entry or return into Wasm, and every host-API mutation to GC objects);</p>
+</li>
+<li>
+<p>Hand out frozen refs that wrap up the raw u32 offset into the GC heap with a snapshot of that counter (the "GC epoch counter");</p>
+</li>
+<li>
+<p>Make uses of the refs fallible: one can deref them only when the epoch counter matches, but they become "stale" and fail after that.</p>
+</li>
+</ul>
+<p>These frozen refs are sufficient to read the whole GC heap when the store is frozen (e.g., during a debug event or at any step during a trace replay).</p>
+<p>What's more, this actually heads to a nice generalization: we can make the rooting step <em>explicitly opt-in everywhere</em> by changing all GC getter APIs to return frozen refs by default. One can then take that frozen ref and turn it into a <code>Rooted&lt;T&gt;</code> or <code>OwnedRooted&lt;T&gt;</code> if one wants to actually root it during further execution, and only needs a mutable store borrow at <em>that</em> point to create the root. This makes the cheap option (copy a u32 and u64) the default and makes the rooting cost pay-as-you-go.</p>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please review the Bytecode Alliance's AI tool usage policy at<br>
+<a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+</blockquote>
+
+
+
+<a name="638265517"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638265517" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638265517">(Nov 06 2026 at 21:54)</a>:</h4>
+<p>cfallin requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="638289181"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638289181" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638289181">(Nov 07 2026 at 00:48)</a>:</h4>
+<p>github-actions[bot] added the label <code>fuzzing</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="638289182"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638289182" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638289182">(Nov 07 2026 at 00:48)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:c-api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="638289183"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638289183" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638289183">(Nov 07 2026 at 00:48)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="638289185"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638289185" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638289185">(Nov 07 2026 at 00:48)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:ref-types</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="638298853"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638298853" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638298853">(Nov 07 2026 at 01:45)</a>:</h4>
+<p>github-actions[bot] <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6700544727">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<h4>Subscribe to Label Action</h4>
+<p>cc @fitzgen</p>
+<p>&lt;details&gt;<br>
+This issue or pull request has been labeled: "fuzzing", "wasmtime:api", "wasmtime:c-api", "wasmtime:ref-types"</p>
+<p>Thus the following users have been cc'd because of the following labels:</p>
+<ul>
+<li>fitzgen: fuzzing, wasmtime:ref-types</li>
+</ul>
+<p>To subscribe or unsubscribe from this label, edit the &lt;code&gt;.github/subscribe-to-label.json&lt;/code&gt; configuration file.</p>
+<p><a href="https://github.com/bytecodealliance/subscribe-to-label-action">Learn more.</a><br>
+&lt;/details&gt;</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Nov 07 2026 at 13:03 UTC</p>
+</html>

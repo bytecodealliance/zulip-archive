@@ -1,0 +1,170 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #15128 RUSTSEC-2026-0429: zip: `ZipArchi... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315128.20RUSTSEC-2026-0429.3A.20zip.3A.20.60ZipArchi.2E.2E.2E.html">wasmtime / issue #15128 RUSTSEC-2026-0429: zip: `ZipArchi...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="637049854"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2315128%20RUSTSEC-2026-0429%3A%20zip%3A%20%60ZipArchi.../near/637049854" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315128.20RUSTSEC-2026-0429.3A.20zip.3A.20.60ZipArchi.2E.2E.2E.html#637049854">(Nov 03 2026 at 00:08)</a>:</h4>
+<p>github-actions[bot] opened <a href="https://github.com/bytecodealliance/wasmtime/issues/15128">issue #15128</a>:</p>
+<blockquote>
+<blockquote>
+<p>zip: <code>ZipArchive::extract</code> aborts the process on a symlink entry with a large declared size</p>
+</blockquote>
+<table>
+<thead>
+<tr>
+<th>Details</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Package</td>
+<td><code>zip</code></td>
+</tr>
+<tr>
+<td>Version</td>
+<td><code>0.6.6</code></td>
+</tr>
+<tr>
+<td>Date</td>
+<td>2026-10-22</td>
+</tr>
+<tr>
+<td>Patched versions</td>
+<td><code>&gt;=9.0.0</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>ZipArchive::extract()</code> sizes the symlink-target buffer from the uncompressed<br>
+size declared in the central directory record, before reading a single byte of<br>
+entry data:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">target</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Vec</span><span class="p">::</span><span class="n">with_capacity</span><span class="p">(</span><span class="n">file</span><span class="p">.</span><span class="n">size</span><span class="p">()</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">usize</span><span class="p">);</span>
+</code></pre></div>
+<p>Both inputs are attacker-controlled. <code>ZipFile::size()</code> returns<br>
+<code>uncompressed_size</code> verbatim from the central directory, widened to a full <code>u64</code><br>
+by a ZIP64 extended-information extra field, and is never cross-checked against<br>
+the compressed size, the remaining archive length, or any platform-appropriate<br>
+bound for a symlink target. <code>ZipFile::is_symlink()</code> is decided entirely by the<br>
+<code>S_IFLNK</code> bit of the external-attributes field.</p>
+<p><code>Vec::with_capacity()</code> is infallible: when the reservation is refused it calls<br>
+<code>handle_alloc_error()</code> and aborts the process. This is not a Rust panic. It is<br>
+not caught by <code>catch_unwind()</code>, is unaffected by <code>panic = &amp;quot;unwind&amp;quot;</code>, and is not<br>
+contained by running the call on a worker thread.</p>
+<p>A 112-byte archive is sufficient. One <code>Stored</code> entry flagged <code>S_IFLNK</code> with a<br>
+ZIP64 field declaring <code>uncompressed_size = 2^62</code> and a zero-byte payload makes<br>
+<code>extract()</code> fail with:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">memory</span><span class="w"> </span><span class="n">allocation</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="mi">4611686018427387904</span><span class="w"> </span><span class="n">bytes</span><span class="w"> </span><span class="n">failed</span>
+<span class="n">Aborted</span><span class="w"> </span><span class="p">(</span><span class="n">core</span><span class="w"> </span><span class="n">dumped</span><span class="p">)</span><span class="w">          </span><span class="p">#</span><span class="w"> </span><span class="n">exit</span><span class="w"> </span><span class="mi">134</span>
+</code></pre></div>
+<p>The declared value only needs to exceed the host&#39;s address space, not its RAM:<br>
+<code>Vec::with_capacity()</code> maps address space without touching pages, so resident<br>
+memory stays flat and the abort happens on the refused reservation itself. Under<br>
+a <code>ulimit -v</code> cap or a memory-constrained container the threshold drops far<br>
+enough that a plain 32-bit <code>uncompressed_size</code> with no ZIP64 field suffices.</p>
+<p>Applications that extract archives from untrusted input are affected on Unix and<br>
+Windows targets with default features and no special configuration: upload<br>
+handling, mail-attachment processing, package and artefact ingestion, backup<br>
+restore and container-image layer extraction. No confidentiality or integrity<br>
+property is affected: there is no memory unsafety, no out-of-bounds access, no<br>
+disclosure and no data corruption.</p>
+<p>The fix landed in <a href="https://github.com/zip-rs/zip2/pull/984">zip-rs/zip2#984</a> and<br>
+shipped in 9.0.0.</p>
+<p>For further details see: <a href="https://github.com/zip-rs/zip2/security/advisories/GHSA-q7v9-x93c-xqv3">https://github.com/zip-rs/zip2/security/advisories/GHSA-q7v9-x93c-xqv3</a></p>
+<p>See <a href="https://rustsec.org/advisories/RUSTSEC-2026-0429.html">advisory page</a> for additional details.<br>
+</p>
+</blockquote>
+
+
+
+<a name="637366505"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2315128%20RUSTSEC-2026-0429%3A%20zip%3A%20%60ZipArchi.../near/637366505" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315128.20RUSTSEC-2026-0429.3A.20zip.3A.20.60ZipArchi.2E.2E.2E.html#637366505">(Nov 04 2026 at 00:55)</a>:</h4>
+<p>alexcrichton closed <a href="https://github.com/bytecodealliance/wasmtime/issues/15128">issue #15128</a>:</p>
+<blockquote>
+<blockquote>
+<p>zip: <code>ZipArchive::extract</code> aborts the process on a symlink entry with a large declared size</p>
+</blockquote>
+<table>
+<thead>
+<tr>
+<th>Details</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Package</td>
+<td><code>zip</code></td>
+</tr>
+<tr>
+<td>Version</td>
+<td><code>0.6.6</code></td>
+</tr>
+<tr>
+<td>Date</td>
+<td>2026-10-22</td>
+</tr>
+<tr>
+<td>Patched versions</td>
+<td><code>&gt;=9.0.0</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>ZipArchive::extract()</code> sizes the symlink-target buffer from the uncompressed<br>
+size declared in the central directory record, before reading a single byte of<br>
+entry data:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">target</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Vec</span><span class="p">::</span><span class="n">with_capacity</span><span class="p">(</span><span class="n">file</span><span class="p">.</span><span class="n">size</span><span class="p">()</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">usize</span><span class="p">);</span>
+</code></pre></div>
+<p>Both inputs are attacker-controlled. <code>ZipFile::size()</code> returns<br>
+<code>uncompressed_size</code> verbatim from the central directory, widened to a full <code>u64</code><br>
+by a ZIP64 extended-information extra field, and is never cross-checked against<br>
+the compressed size, the remaining archive length, or any platform-appropriate<br>
+bound for a symlink target. <code>ZipFile::is_symlink()</code> is decided entirely by the<br>
+<code>S_IFLNK</code> bit of the external-attributes field.</p>
+<p><code>Vec::with_capacity()</code> is infallible: when the reservation is refused it calls<br>
+<code>handle_alloc_error()</code> and aborts the process. This is not a Rust panic. It is<br>
+not caught by <code>catch_unwind()</code>, is unaffected by <code>panic = &amp;quot;unwind&amp;quot;</code>, and is not<br>
+contained by running the call on a worker thread.</p>
+<p>A 112-byte archive is sufficient. One <code>Stored</code> entry flagged <code>S_IFLNK</code> with a<br>
+ZIP64 field declaring <code>uncompressed_size = 2^62</code> and a zero-byte payload makes<br>
+<code>extract()</code> fail with:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="n">memory</span><span class="w"> </span><span class="n">allocation</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="mi">4611686018427387904</span><span class="w"> </span><span class="n">bytes</span><span class="w"> </span><span class="n">failed</span>
+<span class="n">Aborted</span><span class="w"> </span><span class="p">(</span><span class="n">core</span><span class="w"> </span><span class="n">dumped</span><span class="p">)</span><span class="w">          </span><span class="p">#</span><span class="w"> </span><span class="n">exit</span><span class="w"> </span><span class="mi">134</span>
+</code></pre></div>
+<p>The declared value only needs to exceed the host&#39;s address space, not its RAM:<br>
+<code>Vec::with_capacity()</code> maps address space without touching pages, so resident<br>
+memory stays flat and the abort happens on the refused reservation itself. Under<br>
+a <code>ulimit -v</code> cap or a memory-constrained container the threshold drops far<br>
+enough that a plain 32-bit <code>uncompressed_size</code> with no ZIP64 field suffices.</p>
+<p>Applications that extract archives from untrusted input are affected on Unix and<br>
+Windows targets with default features and no special configuration: upload<br>
+handling, mail-attachment processing, package and artefact ingestion, backup<br>
+restore and container-image layer extraction. No confidentiality or integrity<br>
+property is affected: there is no memory unsafety, no out-of-bounds access, no<br>
+disclosure and no data corruption.</p>
+<p>The fix landed in <a href="https://github.com/zip-rs/zip2/pull/984">zip-rs/zip2#984</a> and<br>
+shipped in 9.0.0.</p>
+<p>For further details see: <a href="https://github.com/zip-rs/zip2/security/advisories/GHSA-q7v9-x93c-xqv3">https://github.com/zip-rs/zip2/security/advisories/GHSA-q7v9-x93c-xqv3</a></p>
+<p>See <a href="https://rustsec.org/advisories/RUSTSEC-2026-0429.html">advisory page</a> for additional details.<br>
+</p>
+</blockquote>
+
+
+
+<a name="637366506"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2315128%20RUSTSEC-2026-0429%3A%20zip%3A%20%60ZipArchi.../near/637366506" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315128.20RUSTSEC-2026-0429.3A.20zip.3A.20.60ZipArchi.2E.2E.2E.html#637366506">(Nov 04 2026 at 00:55)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/15128#issuecomment-6619527242">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/15128">issue #15128</a>:</p>
+<blockquote>
+<p>Closing in favor of <a href="https://github.com/bytecodealliance/wasmtime/issues/14790">https://github.com/bytecodealliance/wasmtime/issues/14790</a></p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Nov 07 2026 at 13:03 UTC</p>
+</html>
