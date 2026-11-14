@@ -1,0 +1,56 @@
+[
+    {
+        "content": "<p>composia-dave opened <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14251\">issue #14251</a>:</p>\n<blockquote>\n<p>Using <code>wasmtime-wasi</code> 46 as the host for a Wizer-style pre-initialization (componentize-py pre-initializes CPython and snapshots its heap), we wanted two runs to produce byte-identical snapshots. After pinning <code>wasi:random</code> (both randoms and the seed), both clocks and the env with <code>WasiCtxBuilder</code>, three inputs were still reaching the guest from the host:</p>\n<ol>\n<li><strong><code>FileInputStream::read</code> scheduling</strong> — the <code>Idle</code> arm spawns a background read and answers an empty chunk regardless of <code>allow_blocking_current_thread</code>, so the guest sees a load-dependent number of empty reads (measured: 42 B → 14.8 MB of snapshot divergence with host load). A PR that honors the flag in <code>read</code> is opened alongside this issue.</li>\n<li><strong>Filesystem timestamps</strong> — <code>data-access</code>, <code>data-modification</code> and <code>status-change</code> timestamps come from the host files; a tool that writes its inputs fresh per run leaks the current time through them, and <code>status-change</code> (ctime) cannot be set from userspace at all, so the only complete answer on the host side is to clamp what <code>descriptor-stat</code> returns.</li>\n<li><strong>The metadata hash</strong> — <code>MetadataHashValue::from</code> hashes the host <code>(dev, ino)</code>; wasi-libc turns it into <code>st_ino</code>/<code>st_dev</code>, so every <code>stat</code> of a freshly written file carries a per-run value. In our snapshot it survived only as stale heap (the uninitialized padding bits of Python's string objects, previously a <code>stat</code> buffer) — 10 bytes per pair, and the last ones.</li>\n</ol>\n<p>We carry 2 and 3 as a small local patch (constants), which is fine for a pre-init host that runs one guest once, but is clearly policy rather than a fix, so this is an issue, not a PR: would a <code>WasiCtxBuilder</code> option that makes filesystem metadata deterministic (constant timestamps and a path-independent metadata hash) be welcome, or is the recommended posture that such hosts wrap <code>descriptor-stat</code> themselves? Happy to write it either way.<br>\n</p>\n</blockquote>",
+        "id": 620476275,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788219161
+    },
+    {
+        "content": "<p>composia-dave <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14251#issuecomment-5486255291\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14251\">issue #14251</a>:</p>\n<blockquote>\n<p>The standalone fix for item 1 (<code>FileInputStream::read</code> under <code>allow_blocking_current_thread</code>) is #14252.</p>\n</blockquote>",
+        "id": 620476486,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788219238
+    },
+    {
+        "content": "<p>composia-dave <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14251#issuecomment-5486761148\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14251\">issue #14251</a>:</p>\n<blockquote>\n<p>A fourth input, found when reproducing the same snapshot on a second machine (x86-64 Linux vs arm64 macOS): <strong><code>read-directory</code> order</strong>. <code>wasmtime-wasi</code> yields entries in whatever order the host filesystem returns them (APFS and ext4 each iterate in their own hash order), and a guest that lists directories early — CPython's importlib caches every <code>sys.path</code> entry's listing at the first imports — allocates in that order, so the whole heap layout of the snapshot followed the host filesystem (12.6 MB of an 18 MB component differed between the two machines; the first differing words were heap pointers). Our local patch sorts the collected entries by name in <code>read_directory</code> before building the <code>ReaddirIterator</code>; with it the two machines are converging (and the macOS digest moved too, so APFS's native order was always an input). Mentioning it here because a deterministic-filesystem option would want name-ordered listings alongside the constant timestamps and metadata hash.</p>\n</blockquote>",
+        "id": 620487254,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788222944
+    },
+    {
+        "content": "<p>composia-dave <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14251#issuecomment-5486842976\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14251\">issue #14251</a>:</p>\n<blockquote>\n<p>Closing the loop on the cross-machine reproduction: with the listing order sorted, a pre-init probe (a guest that records at module import everything it can observe — path, env, flags, loaded modules, every path entry's listing and <code>stat</code>, tty state — and answers it at call time) showed the two machines' guests differing in exactly one thing: <strong>the <code>stat</code> of directories</strong>. <code>descriptor-stat</code>'s <code>link-count</code> and <code>size</code> for a directory are filesystem-implementation artifacts (APFS: entries+2 and 32 B per entry; ext4: 2+subdirs and 4096; btrfs: 1 and 0), and one of them (<code>96</code> vs <code>4096</code>) crossed CPython's small-int cache boundary, which moved every later allocation in the snapshot. Our local patch answers directories as btrfs does (1 and 0) and files with <code>link-count</code> 1 and their real size. So the full list of host inputs a pinned pre-init still observed through <code>wasmtime-wasi</code> was: <code>FileInputStream::read</code> scheduling (#14252), timestamps, the metadata hash, <code>read-directory</code> order, and directory <code>link-count</code>/<code>size</code> — all filesystem metadata, which is what a \"deterministic filesystem view\" option would cover.</p>\n</blockquote>",
+        "id": 620488844,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788223581
+    },
+    {
+        "content": "<p><a href=\"https://github.com/alexcrichton\">alexcrichton</a> added the wasi:impl label to <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14251\">Issue #14251</a>.</p>",
+        "id": 620666481,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788270196
+    },
+    {
+        "content": "<p>alexcrichton <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14251#issuecomment-5494908255\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14251\">issue #14251</a>:</p>\n<blockquote>\n<p>Currently yeah there's no mode for <code>wasmtime-wasi</code>'s implementation of <code>wasi:filesystem</code> to operate in a deterministic manner or such. It might be reasonable to add, yeah, but I'm not entirely sure how to tame all the sources of nondeterminism either.</p>\n</blockquote>",
+        "id": 620666713,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788270240
+    },
+    {
+        "content": "<p>composia-dave deleted a <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14251#issuecomment-5486255291\">comment</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14251\">issue #14251</a>:</p>\n<blockquote>\n<p>The standalone fix for item 1 (<code>FileInputStream::read</code> under <code>allow_blocking_current_thread</code>) is #14252.</p>\n</blockquote>",
+        "id": 620697157,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788275413
+    },
+    {
+        "content": "<p>composia-dave deleted a <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14251#issuecomment-5486761148\">comment</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14251\">issue #14251</a>:</p>\n<blockquote>\n<p>A fourth input, found when reproducing the same snapshot on a second machine (x86-64 Linux vs arm64 macOS): <strong><code>read-directory</code> order</strong>. <code>wasmtime-wasi</code> yields entries in whatever order the host filesystem returns them (APFS and ext4 each iterate in their own hash order), and a guest that lists directories early — CPython's importlib caches every <code>sys.path</code> entry's listing at the first imports — allocates in that order, so the whole heap layout of the snapshot followed the host filesystem (12.6 MB of an 18 MB component differed between the two machines; the first differing words were heap pointers). Our local patch sorts the collected entries by name in <code>read_directory</code> before building the <code>ReaddirIterator</code>; with it the two machines are converging (and the macOS digest moved too, so APFS's native order was always an input). Mentioning it here because a deterministic-filesystem option would want name-ordered listings alongside the constant timestamps and metadata hash.</p>\n</blockquote>",
+        "id": 620697164,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788275414
+    },
+    {
+        "content": "<p>composia-dave deleted a <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14251#issuecomment-5486842976\">comment</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/issues/14251\">issue #14251</a>:</p>\n<blockquote>\n<p>Closing the loop on the cross-machine reproduction: with the listing order sorted, a pre-init probe (a guest that records at module import everything it can observe — path, env, flags, loaded modules, every path entry's listing and <code>stat</code>, tty state — and answers it at call time) showed the two machines' guests differing in exactly one thing: <strong>the <code>stat</code> of directories</strong>. <code>descriptor-stat</code>'s <code>link-count</code> and <code>size</code> for a directory are filesystem-implementation artifacts (APFS: entries+2 and 32 B per entry; ext4: 2+subdirs and 4096; btrfs: 1 and 0), and one of them (<code>96</code> vs <code>4096</code>) crossed CPython's small-int cache boundary, which moved every later allocation in the snapshot. Our local patch answers directories as btrfs does (1 and 0) and files with <code>link-count</code> 1 and their real size. So the full list of host inputs a pinned pre-init still observed through <code>wasmtime-wasi</code> was: <code>FileInputStream::read</code> scheduling (#14252), timestamps, the metadata hash, <code>read-directory</code> order, and directory <code>link-count</code>/<code>size</code> — all filesystem metadata, which is what a \"deterministic filesystem view\" option would cover.</p>\n</blockquote>",
+        "id": 620697169,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1788275415
+    }
+]

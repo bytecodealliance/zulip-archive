@@ -1,0 +1,327 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #15141 Expose precompile compatibility a... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315141.20Expose.20precompile.20compatibility.20a.2E.2E.2E.html">wasmtime / issue #15141 Expose precompile compatibility a...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="637376624"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2315141%20Expose%20precompile%20compatibility%20a.../near/637376624" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315141.20Expose.20precompile.20compatibility.20a.2E.2E.2E.html#637376624">(Nov 04 2026 at 01:51)</a>:</h4>
+<p>wangkun1210 opened <a href="https://github.com/bytecodealliance/wasmtime/issues/15141">issue #15141</a>:</p>
+<blockquote>
+<h4>Feature</h4>
+<p>An Engine API that returns the precompile-compatibility contract as a<br>
+fixed-width value — something a build machine can write into artifact metadata<br>
+and a loader can compare before calling unsafe Module::deserialize.<br>
+To be clear about what this is not: I am not asking for a new loading<br>
+mechanism. I'm building a loader for applications delivered as several<br>
+independently-fetched artifacts, where each entry point fetches only the<br>
+subset it imports and instantiates them in dependency order. Every piece of<br>
+that already exists and works:</p>
+<ul>
+<li>
+<p>Engine::precompile_module / precompile_component at build time,<br>
+Module::deserialize / Component::deserialize at load time;</p>
+</li>
+<li>
+<p>Linker::instance with a per-provider namespace for core modules, and<br>
+component::Linker for components whose dependencies are declared as<br>
+imports rather than embedded;</p>
+</li>
+<li>
+<p>Component::component_type() → types::Component::imports()/exports(),<br>
+which is enough to check that a prospective wiring type-checks before<br>
+paying for instantiation.<br>
+So the shape is supported, and that's the part I expected to be the problem.<br>
+The gap is at one seam: the cache key.<br>
+Engine::precompile_compatibility_hash is the right thing to compare, but it<br>
+returns impl Hash + '_. Comparing two engines in one process is fine.<br>
+Comparing an artifact produced on the build machine against the engine on a<br>
+CDN edge is not: it requires picking a hasher (DefaultHasher in practice)<br>
+whose output stability is not documented, and whose result is not a value<br>
+anyone would want to store in a manifest.<br>
+Today I namespace the artifact cache by a hand-built string of my own —<br>
+wasmtime-&lt;major&gt;-&lt;arch&gt;-&lt;profile&gt; plus a hash of my Config — which is a<br>
+convention, not a guarantee. If I add a Config field that affects codegen<br>
+and forget to include it in that string, the result is not a cache miss. It's<br>
+an unsafe deserialize failure at request time, in production, discovered by<br>
+a user rather than by CI.<br>
+Concrete ask: a [u8; 32] (or hex String) representation of the same<br>
+contract, documented as stable across processes and between wasmtime versions<br>
+that agree on it, and guaranteed unchanged by any change that does not affect<br>
+deserialization compatibility. Keep precompile_compatibility_hash as it is<br>
+for in-process use.<br>
+Explicitly out of scope for this request: how to decide the split. Which<br>
+units exist is a producer-side decision; the engine only has to load them.</p>
+</li>
+</ul>
+<h4>Benefit</h4>
+<p>Anyone who precompiles off the build machine — which is the normal case for<br>
+anything larger than a single host, and the whole premise of shipping .cwasm<br>
+to a fleet — currently has to invent this value. A documented one turns two<br>
+things into checked facts instead of remembered conventions:</p>
+<ol>
+<li>
+<p>The safety precondition becomes verifiable. Module::deserialize is<br>
+unsafe because the artifact is only valid for a compatible Config,<br>
+wasmtime version, and target. With a fixed-width fingerprint, a loader can<br>
+return a Result on mismatch — "this artifact was built for a different<br>
+engine" — instead of relying on the caller having hashed the right things.<br>
+That is the difference between unsafe being justified and unsafe being<br>
+copy-pasted.</p>
+</li>
+<li>
+<p>Build pipelines can key on it. Artifact directories, CI caches, and OCI<br>
+layer annotations can be named by the real contract rather than by a<br>
+hand-rolled approximation of it.<br>
+The failure mode being prevented is quiet and expensive: a fingerprint that<br>
+drifts from Config produces an error only on the machines that actually run<br>
+the mismatched artifact.<br>
+Secondarily, a short example under examples/ would document the<br>
+split-artifact shape itself. I worked it out from component_type(),<br>
+Linker::instance naming rules, and the deserialize safety comments; as far<br>
+as I could tell it isn't written down anywhere, and I'd rather have pointed at<br>
+a 100-line example.</p>
+</li>
+</ol>
+<h4>Implementation</h4>
+<p>For the fingerprint, two levels of effort:</p>
+<ul>
+<li>
+<p>Minimal: document that running the existing<br>
+precompile_compatibility_hash through std::collections::hash_map::DefaultHasher<br>
+is the supported way to obtain a stable number, and state the stability<br>
+guarantee that currently isn't stated anywhere. Cheap, no API change — but<br>
+it makes DefaultHasher's output a compatibility contract, which is a<br>
+slightly odd thing to promise.</p>
+</li>
+<li>
+<p>Preferred: pub fn precompile_compatibility_fingerprint(&amp;self) -&gt; [u8; 32],<br>
+derived from the same internal state as precompile_compatibility_hash, with<br>
+a doc comment stating: stable for the life of a wasmtime major version, equal<br>
+across engines iff artifacts deserialize across them, and explicitly not a<br>
+build ID. Keep the Hash variant for in-process comparison so nothing breaks.<br>
+For the example, examples/split-deployment, two variants over the same little<br>
+dependency graph:</p>
+</li>
+</ul>
+<ol>
+<li>
+<p>core modules — AOT-compile each with precompile_module, write to<br>
+&lt;fingerprint&gt;/&lt;sha256 of input&gt;, at load time deserialize only the modules<br>
+in one entry's closure, register each in a shared Linker under its<br>
+provider's namespace, instantiate in dependency order;</p>
+</li>
+<li>
+<p>components — the same, with each unit published as its own Component,<br>
+wired through component::Linker, and the closure checked with<br>
+component_type().imports() against each provider's exports() before<br>
+instantiation, so a bad closure fails at validation rather than at link.<br>
+I'm happy to send either as a PR if the shape is right; I'd rather not guess at<br>
+the naming or the docs placement.</p>
+</li>
+</ol>
+<h4>Alternatives</h4>
+<ul>
+<li>
+<p>Keep hand-rolled fingerprints (status quo). Works until someone edits<br>
+Config. The failure is at deserialize time on a deployed edge, not at build<br>
+time. This is what everyone does today and it is the reason I'm filing.</p>
+</li>
+<li>
+<p>Key artifacts on wasmtime version + target triple only. The common<br>
+shortcut, and wrong on any non-default config — opt level, codegen flags, and<br>
+features that affect generated code all change the artifact's validity.</p>
+</li>
+<li>
+<p>Engine::detect_precompiled alone. Tells you the bytes are a wasmtime<br>
+artifact. Says nothing about whether this engine can load them, which is the<br>
+question that matters when a fleet is rolled out over hours.</p>
+</li>
+<li>
+<p>Treat the container image as the unit of deployment, so build and run<br>
+environments are committed together. Correct, and it's what a FROM<br>
+wasmtime/... does — but the artifact then stops being independently<br>
+portable, which defeats the point when the artifact is what gets distributed<br>
+to the edge.</p>
+</li>
+<li>
+<p>Compose everything into one artifact at build time (wasm-compose, or<br>
+just linking all the modules together). Removes the distribution problem<br>
+entirely, but gives up per-entry closures: the composed artifact contains<br>
+everything, so it is the single-binary case with extra steps.<br>
+</p>
+</li>
+</ul>
+</blockquote>
+
+
+
+<a name="637380815"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2315141%20Expose%20precompile%20compatibility%20a.../near/637380815" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315141.20Expose.20precompile.20compatibility.20a.2E.2E.2E.html#637380815">(Nov 04 2026 at 02:19)</a>:</h4>
+<p>pchickey closed <a href="https://github.com/bytecodealliance/wasmtime/issues/15141">issue #15141</a>:</p>
+<blockquote>
+<h4>Feature</h4>
+<p>An Engine API that returns the precompile-compatibility contract as a<br>
+fixed-width value — something a build machine can write into artifact metadata<br>
+and a loader can compare before calling unsafe Module::deserialize.<br>
+To be clear about what this is not: I am not asking for a new loading<br>
+mechanism. I'm building a loader for applications delivered as several<br>
+independently-fetched artifacts, where each entry point fetches only the<br>
+subset it imports and instantiates them in dependency order. Every piece of<br>
+that already exists and works:</p>
+<ul>
+<li>
+<p>Engine::precompile_module / precompile_component at build time,<br>
+Module::deserialize / Component::deserialize at load time;</p>
+</li>
+<li>
+<p>Linker::instance with a per-provider namespace for core modules, and<br>
+component::Linker for components whose dependencies are declared as<br>
+imports rather than embedded;</p>
+</li>
+<li>
+<p>Component::component_type() → types::Component::imports()/exports(),<br>
+which is enough to check that a prospective wiring type-checks before<br>
+paying for instantiation.<br>
+So the shape is supported, and that's the part I expected to be the problem.<br>
+The gap is at one seam: the cache key.<br>
+Engine::precompile_compatibility_hash is the right thing to compare, but it<br>
+returns impl Hash + '_. Comparing two engines in one process is fine.<br>
+Comparing an artifact produced on the build machine against the engine on a<br>
+CDN edge is not: it requires picking a hasher (DefaultHasher in practice)<br>
+whose output stability is not documented, and whose result is not a value<br>
+anyone would want to store in a manifest.<br>
+Today I namespace the artifact cache by a hand-built string of my own —<br>
+wasmtime-&lt;major&gt;-&lt;arch&gt;-&lt;profile&gt; plus a hash of my Config — which is a<br>
+convention, not a guarantee. If I add a Config field that affects codegen<br>
+and forget to include it in that string, the result is not a cache miss. It's<br>
+an unsafe deserialize failure at request time, in production, discovered by<br>
+a user rather than by CI.<br>
+Concrete ask: a [u8; 32] (or hex String) representation of the same<br>
+contract, documented as stable across processes and between wasmtime versions<br>
+that agree on it, and guaranteed unchanged by any change that does not affect<br>
+deserialization compatibility. Keep precompile_compatibility_hash as it is<br>
+for in-process use.<br>
+Explicitly out of scope for this request: how to decide the split. Which<br>
+units exist is a producer-side decision; the engine only has to load them.</p>
+</li>
+</ul>
+<h4>Benefit</h4>
+<p>Anyone who precompiles off the build machine — which is the normal case for<br>
+anything larger than a single host, and the whole premise of shipping .cwasm<br>
+to a fleet — currently has to invent this value. A documented one turns two<br>
+things into checked facts instead of remembered conventions:</p>
+<ol>
+<li>
+<p>The safety precondition becomes verifiable. Module::deserialize is<br>
+unsafe because the artifact is only valid for a compatible Config,<br>
+wasmtime version, and target. With a fixed-width fingerprint, a loader can<br>
+return a Result on mismatch — "this artifact was built for a different<br>
+engine" — instead of relying on the caller having hashed the right things.<br>
+That is the difference between unsafe being justified and unsafe being<br>
+copy-pasted.</p>
+</li>
+<li>
+<p>Build pipelines can key on it. Artifact directories, CI caches, and OCI<br>
+layer annotations can be named by the real contract rather than by a<br>
+hand-rolled approximation of it.<br>
+The failure mode being prevented is quiet and expensive: a fingerprint that<br>
+drifts from Config produces an error only on the machines that actually run<br>
+the mismatched artifact.<br>
+Secondarily, a short example under examples/ would document the<br>
+split-artifact shape itself. I worked it out from component_type(),<br>
+Linker::instance naming rules, and the deserialize safety comments; as far<br>
+as I could tell it isn't written down anywhere, and I'd rather have pointed at<br>
+a 100-line example.</p>
+</li>
+</ol>
+<h4>Implementation</h4>
+<p>For the fingerprint, two levels of effort:</p>
+<ul>
+<li>
+<p>Minimal: document that running the existing<br>
+precompile_compatibility_hash through std::collections::hash_map::DefaultHasher<br>
+is the supported way to obtain a stable number, and state the stability<br>
+guarantee that currently isn't stated anywhere. Cheap, no API change — but<br>
+it makes DefaultHasher's output a compatibility contract, which is a<br>
+slightly odd thing to promise.</p>
+</li>
+<li>
+<p>Preferred: pub fn precompile_compatibility_fingerprint(&amp;self) -&gt; [u8; 32],<br>
+derived from the same internal state as precompile_compatibility_hash, with<br>
+a doc comment stating: stable for the life of a wasmtime major version, equal<br>
+across engines iff artifacts deserialize across them, and explicitly not a<br>
+build ID. Keep the Hash variant for in-process comparison so nothing breaks.<br>
+For the example, examples/split-deployment, two variants over the same little<br>
+dependency graph:</p>
+</li>
+</ul>
+<ol>
+<li>
+<p>core modules — AOT-compile each with precompile_module, write to<br>
+&lt;fingerprint&gt;/&lt;sha256 of input&gt;, at load time deserialize only the modules<br>
+in one entry's closure, register each in a shared Linker under its<br>
+provider's namespace, instantiate in dependency order;</p>
+</li>
+<li>
+<p>components — the same, with each unit published as its own Component,<br>
+wired through component::Linker, and the closure checked with<br>
+component_type().imports() against each provider's exports() before<br>
+instantiation, so a bad closure fails at validation rather than at link.<br>
+I'm happy to send either as a PR if the shape is right; I'd rather not guess at<br>
+the naming or the docs placement.</p>
+</li>
+</ol>
+<h4>Alternatives</h4>
+<ul>
+<li>
+<p>Keep hand-rolled fingerprints (status quo). Works until someone edits<br>
+Config. The failure is at deserialize time on a deployed edge, not at build<br>
+time. This is what everyone does today and it is the reason I'm filing.</p>
+</li>
+<li>
+<p>Key artifacts on wasmtime version + target triple only. The common<br>
+shortcut, and wrong on any non-default config — opt level, codegen flags, and<br>
+features that affect generated code all change the artifact's validity.</p>
+</li>
+<li>
+<p>Engine::detect_precompiled alone. Tells you the bytes are a wasmtime<br>
+artifact. Says nothing about whether this engine can load them, which is the<br>
+question that matters when a fleet is rolled out over hours.</p>
+</li>
+<li>
+<p>Treat the container image as the unit of deployment, so build and run<br>
+environments are committed together. Correct, and it's what a FROM<br>
+wasmtime/... does — but the artifact then stops being independently<br>
+portable, which defeats the point when the artifact is what gets distributed<br>
+to the edge.</p>
+</li>
+<li>
+<p>Compose everything into one artifact at build time (wasm-compose, or<br>
+just linking all the modules together). Removes the distribution problem<br>
+entirely, but gives up per-entry closures: the composed artifact contains<br>
+everything, so it is the single-binary case with extra steps.<br>
+</p>
+</li>
+</ul>
+</blockquote>
+
+
+
+<a name="637380817"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2315141%20Expose%20precompile%20compatibility%20a.../near/637380817" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315141.20Expose.20precompile.20compatibility.20a.2E.2E.2E.html#637380817">(Nov 04 2026 at 02:19)</a>:</h4>
+<p>pchickey <a href="https://github.com/bytecodealliance/wasmtime/issues/15141#issuecomment-6620773990">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/15141">issue #15141</a>:</p>
+<blockquote>
+<p>This issue doesn't appear to comply with our policy on tool-generated content, and requires additional justification for why it is valuable enough to the project for us to review it. Please see our developer policy on AI-generated contributions: <a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>
+<p>We are happy to see the use of AI tools for translating to english for non-native-speakers, however, please include your human-written native language text before translation in a <code>&lt;details&gt;</code> in order to demonstrate compliance with the rest of our policy.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Nov 14 2026 at 22:03 UTC</p>
+</html>

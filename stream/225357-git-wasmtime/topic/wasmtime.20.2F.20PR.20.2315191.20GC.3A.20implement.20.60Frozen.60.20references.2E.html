@@ -1,0 +1,589 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / PR #15191 GC: implement `Frozen` references. · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html">wasmtime / PR #15191 GC: implement `Frozen` references.</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="638265511"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638265511" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638265511">(Nov 06 2026 at 21:54)</a>:</h4>
+<p>cfallin requested <a href="https://github.com/fitzgen">fitzgen</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="638265512"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638265512" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638265512">(Nov 06 2026 at 21:54)</a>:</h4>
+<p>cfallin requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-fuzz-reviewers">wasmtime-fuzz-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="638265514"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638265514" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638265514">(Nov 06 2026 at 21:54)</a>:</h4>
+<p>cfallin opened <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a> from <code>cfallin:gc-frozen-refs</code> to <code>bytecodealliance:main</code>:</p>
+<blockquote>
+<p>In order to implement record/replay, we need a little more discipline around read-only vs. read-write <code>Store</code>s. It turns out that rooting mutates a store. This is unfortunate when we want to permit debuggers to inspect the state of a store, including its GC heap, on a read-only trace replay.</p>
+<p>Separately, the need for a mutable store borrow to <em>access</em> any GC object, even on actions that are nominally/semantically read-only, makes APIs more awkward and looser about mutation than they could otherwise be. One can see artifacts of this awkwardness in e.g. the existence of a separate getter for globals that only reads non-GC values, with an immutable store.</p>
+<p>Separately separately, rooting is expensive if all one wants to do is introspect the Store's GC heap while execution is completely frozen. Ideally one would use raw heap offsets ("pointers") and just read out the objects without setting up and tearing down rooting metadata.</p>
+<p>All of these problems are solved in this PR with the addition of a new <code>Frozen</code> GC ref kind. The idea is that we:</p>
+<ul>
+<li>
+<p>Give the GC heap a u64 counter that increments on any possible mutation (i.e.: every entry or return into Wasm, and every host-API mutation to GC objects);</p>
+</li>
+<li>
+<p>Hand out frozen refs that wrap up the raw u32 offset into the GC heap with a snapshot of that counter (the "GC epoch counter");</p>
+</li>
+<li>
+<p>Make uses of the refs fallible: one can deref them only when the epoch counter matches, but they become "stale" and fail after that.</p>
+</li>
+</ul>
+<p>These frozen refs are sufficient to read the whole GC heap when the store is frozen (e.g., during a debug event or at any step during a trace replay).</p>
+<p>What's more, this actually heads to a nice generalization: we can make the rooting step <em>explicitly opt-in everywhere</em> by changing all GC getter APIs to return frozen refs by default. One can then take that frozen ref and turn it into a <code>Rooted&lt;T&gt;</code> or <code>OwnedRooted&lt;T&gt;</code> if one wants to actually root it during further execution, and only needs a mutable store borrow at <em>that</em> point to create the root. This makes the cheap option (copy a u32 and u64) the default and makes the rooting cost pay-as-you-go.</p>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please review the Bytecode Alliance's AI tool usage policy at<br>
+<a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+</blockquote>
+
+
+
+<a name="638265517"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638265517" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638265517">(Nov 06 2026 at 21:54)</a>:</h4>
+<p>cfallin requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers">wasmtime-core-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="638289181"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638289181" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638289181">(Nov 07 2026 at 00:48)</a>:</h4>
+<p>github-actions[bot] added the label <code>fuzzing</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="638289182"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638289182" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638289182">(Nov 07 2026 at 00:48)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:c-api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="638289183"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638289183" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638289183">(Nov 07 2026 at 00:48)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="638289185"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638289185" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638289185">(Nov 07 2026 at 00:48)</a>:</h4>
+<p>github-actions[bot] added the label <code>wasmtime:ref-types</code> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="638298853"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638298853" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638298853">(Nov 07 2026 at 01:45)</a>:</h4>
+<p>github-actions[bot] <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6700544727">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<h4>Subscribe to Label Action</h4>
+<p>cc @fitzgen</p>
+<p>&lt;details&gt;<br>
+This issue or pull request has been labeled: "fuzzing", "wasmtime:api", "wasmtime:c-api", "wasmtime:ref-types"</p>
+<p>Thus the following users have been cc'd because of the following labels:</p>
+<ul>
+<li>fitzgen: fuzzing, wasmtime:ref-types</li>
+</ul>
+<p>To subscribe or unsubscribe from this label, edit the &lt;code&gt;.github/subscribe-to-label.json&lt;/code&gt; configuration file.</p>
+<p><a href="https://github.com/bytecodealliance/subscribe-to-label-action">Learn more.</a><br>
+&lt;/details&gt;</p>
+</blockquote>
+
+
+
+<a name="638386853"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638386853" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638386853">(Nov 07 2026 at 16:22)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="638768678"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638768678" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638768678">(Nov 09 2026 at 15:38)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6744162892">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>Question at a high-level on this: I'm wary to add a new variant of <code>Val</code> which is pretty much the same as the preexisting ones just slightly different because it means taking/receiving is that much more complicated (have to handle both everywhere). Would it be possible to remove <code>Frozen</code> and make the frozen state a dynamic property of the existing GC refs/roots exposed in the API? For example <code>Rooted&lt;AnyRef&gt;</code> would dynamically be frozen-or-not. It's a slightly-more-footgunny API but arguably that's already true of our APIs with manual rooting and such.</p>
+</blockquote>
+
+
+
+<a name="638866145"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638866145" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638866145">(Nov 09 2026 at 21:05)</a>:</h4>
+<p><span aria-label="memo" class="emoji emoji-1f4dd" role="img" title="memo">:memo:</span> fitzgen submitted <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#pullrequestreview-5832715850">PR review</a>:</p>
+<blockquote>
+<p>I had been expecting that we would replace the <code>Rooted&lt;T&gt;</code>s inside <code>Val</code> and <code>Ref</code> with <code>Frozen&lt;T&gt;</code>s, but that isn't what you've actually done here. Is there a particular reason what I had been expecting is not viable or just that we didn't end up on the same page after that discussion?</p>
+<p>My concern with adding <code>Val::Frozen</code> and <code>Ref::Frozen</code> variants is that the variants will no longer reflect Wasm type heirarchies, nor only types of rooted/unrooted GC refs, but a <em>mix</em> of the two. It feels like a pretty bad case of the implementation leaking into language semantics-level APIs.</p>
+<p>I also wouldn't really expect <code>enum FrozenRef</code> to be thing, just <code>Frozen&lt;AnyRef&gt;</code>/<code>Frozen&lt;ExternRef&gt;</code>/<code>Frozen&lt;ExnRef&gt;</code>/etc... and <code>enum Ref { Any(Frozen&lt;AnyRef&gt;), Exn(Frozen&lt;ExnRef&gt;), ... }</code>.</p>
+<p>And then I would expect that we have methods to convert between <code>Rooted&lt;T&gt;</code> and <code>Frozen&lt;T&gt;</code>, and <code>OwnedRooted&lt;T&gt;</code> and <code>Frozen&lt;T&gt;</code>, the same way we have methods to convert between <code>Rooted&lt;T&gt;</code> and <code>OwnedRooted&lt;T&gt;</code>.</p>
+<p>(Also, as I type this all out, <code>Frozen&lt;T&gt;</code> seems like maybe it should actually be named <code>Unrooted&lt;T&gt;</code>? Especially since there are mumblings and issues about adding "frozen" references to Wasm proper as a post-Wasm GC follow up proposal to allow initialize-then-freeze immutability.)</p>
+<p>But yeah, it feels like we should probably get on the same page with regards to the above before I actually dive into reviewing this PR (or not reviewing it and waiting for a different version, as the case may be).</p>
+</blockquote>
+
+
+
+<a name="638868304"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638868304" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638868304">(Nov 09 2026 at 21:13)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6751605848">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>These are great points: there's no particular reason <em>not</em> transition <code>Val</code> to fully frozen refs only, other than that that seemed more invasive and removed the possibility of holding a <code>Val</code> in host-space that kept things rooted appropriately. I don't recall talking about <code>Val</code> specifically in our past discussion, only the getters on the relevant APIs, which have indeed been changed to return frozen refs.</p>
+<p>To be explicit about what we would give up: we could no longer have a dynamically-typed value binding in host-space that could keep, e.g., <code>bindings: HashMap&lt;..., Val&gt;</code> and be assured that one would get proper rooting. If someone wanted that when <code>Val</code> does not even have an arm for <code>OwnedRooted</code>, then they'd have to create a separate <code>OwnedVal</code> and <code>fn root(Val) -&gt; OwnedVal</code>.</p>
+<p>Maybe that's fine / maybe we could even provide that eventually if someone wants that API surface. Thinking about this from a global API-simplicity point of view, it's actually much nicer to just universally support frozen GC refs only in all type-tagged representations, in addition to the accessors. The only place that rooting happens then is when the user explicitly writes <code>Rooted</code>/<code>OwnedRooted</code> with a particular <code>T</code>, but they likely already know in most cases that they have an anyref/exnref/externref/... and can name the specific type they want.</p>
+<p>I'll make that change (and @fitzgen almost all of the impl is independent of this <code>Val</code> design-axis so I wouldn't hold off on reading the rest of the PR on account of this at least).</p>
+</blockquote>
+
+
+
+<a name="638869338"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638869338" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638869338">(Nov 09 2026 at 21:17)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6751697898">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>I like the idea of moving all of <code>Val</code> to frozen refs, yeah, and I like @fitzgen's bikeshed color with <code>Unrooted&lt;T&gt;</code> myself since I feel that accurately reflects what's going on here. It'd be a good place to explicitly document that "any mutation at all anywhere invalidates all <code>Unrooted&lt;T&gt;</code> in a detectable manner"</p>
+</blockquote>
+
+
+
+<a name="638870359"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638870359" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638870359">(Nov 09 2026 at 21:21)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6751782508">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<blockquote>
+<p>And then I would expect that we have methods to convert between Rooted&lt;T&gt; and Frozen&lt;T&gt;, and OwnedRooted&lt;T&gt; and Frozen&lt;T&gt;, the same way we have methods to convert between Rooted&lt;T&gt; and OwnedRooted&lt;T&gt;.</p>
+</blockquote>
+<p>FWIW, these already exist: see <code>to_frozen</code> on existing reftypes, and <code>to_owned_rooted</code> / <code>to_rooted</code> on the new frozen refs.</p>
+</blockquote>
+
+
+
+<a name="638870703"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638870703" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638870703">(Nov 09 2026 at 21:22)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6751812383">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<blockquote>
+<p>And then I would expect that we have methods to convert between Rooted&lt;T&gt; and Frozen&lt;T&gt;, and OwnedRooted&lt;T&gt; and Frozen&lt;T&gt;, the same way we have methods to convert between Rooted&lt;T&gt; and OwnedRooted&lt;T&gt;.</p>
+</blockquote>
+<p>FWIW, these already exist: see <code>to_frozen</code> on existing reftypes, and <code>to_owned_rooted</code> / <code>to_rooted</code> on the new frozen refs.</p>
+</blockquote>
+
+
+
+<a name="638870819"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638870819" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638870819">(Nov 09 2026 at 21:23)</a>:</h4>
+<p>cfallin deleted a <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6751812383">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<blockquote>
+<p>And then I would expect that we have methods to convert between Rooted&lt;T&gt; and Frozen&lt;T&gt;, and OwnedRooted&lt;T&gt; and Frozen&lt;T&gt;, the same way we have methods to convert between Rooted&lt;T&gt; and OwnedRooted&lt;T&gt;.</p>
+</blockquote>
+<p>FWIW, these already exist: see <code>to_frozen</code> on existing reftypes, and <code>to_owned_rooted</code> / <code>to_rooted</code> on the new frozen refs.</p>
+</blockquote>
+
+
+
+<a name="638872405"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638872405" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638872405">(Nov 09 2026 at 21:30)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6751961802">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<blockquote>
+<p>To be explicit about what we would give up: we could no longer have a dynamically-typed value binding in host-space that could keep, e.g., <code>bindings: HashMap&lt;..., Val&gt;</code> and be assured that one would get proper rooting. If someone wanted that when <code>Val</code> does not even have an arm for <code>OwnedRooted</code>, then they'd have to create a separate <code>OwnedVal</code> and <code>fn root(Val) -&gt; OwnedVal</code>.</p>
+</blockquote>
+<p>Spitballing a bit, we could maybe make <code>Val</code> parameterized on the type of rooting, plus a default so that you don't need to write <code>Val&lt;UnrootedRefs&gt;</code> everywhere. Something like this: <a href="https://play.rust-lang.org/?version=stable&amp;mode=debug&amp;edition=2024&amp;gist=4b7983739102f0c5065eb251f178d86b">https://play.rust-lang.org/?version=stable&amp;mode=debug&amp;edition=2024&amp;gist=4b7983739102f0c5065eb251f178d86b</a></p>
+</blockquote>
+
+
+
+<a name="638873342"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638873342" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638873342">(Nov 09 2026 at 21:34)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6752044979">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>Personally I'd prefer to go too overboard on <code>Val</code> and its design, I'd ideally like to pick one and stick with it. In theory <code>Val</code> is simple enough that other embedders can copy it or customize it to their needs. Like <code>component::Val</code> it's a pretty unergonomic and inefficient representation which is why I wouldn't want to add too many bells and whistles to it.</p>
+</blockquote>
+
+
+
+<a name="638874674"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638874674" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638874674">(Nov 09 2026 at 21:40)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6752175929">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>OK, in doing this refactor (removing rooting from <code>Val</code> completely) I'm running into some nontrivial complexity in e.g. <code>StructRef::new</code>: it allocates, so we need rooting on all GC vals; so the <code>&amp;[Val]</code> param is no longer sufficient. We need to internally clone that to something that resembles the <code>OwnedVal</code> I sketched above.</p>
+<p>The existing PR has an analogous footgun as well I guess: a <code>Val</code> is semantically not valid to hold over any GC-able op anymore.</p>
+<p>So I think we really do need <code>OwnedVal</code> (or some other type trickery, though I think I agree with Alex that marker types are probably somewhat more noise than we want here aesthetically) for API correctness on any GC-allocating constructor; we can then be sure that we aren't passing in a frozen ref.</p>
+<p>(FWIW, the prior art in SpiderMonkey here is that there is <code>Rooted&lt;T&gt;</code> and <code>T</code> can be anything including a <code>JS::Value</code>; they use C++ template traits to make the rooting work for everything including NaN-boxed values, while we'd have a bit of a harder time plumbing rootedness into a few arms of the val I guess)</p>
+</blockquote>
+
+
+
+<a name="638874751"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638874751" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638874751">(Nov 09 2026 at 21:40)</a>:</h4>
+<p>cfallin edited a <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6752175929">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>OK, in doing this refactor (removing rooting from <code>Val</code> completely) I'm running into some nontrivial complexity in e.g. <code>StructRef::new</code>: it allocates, so we need rooting on all GC vals; so the <code>&amp;[Val]</code> param is no longer sufficient. We need to internally clone that to something that resembles the <code>OwnedVal</code> I sketched above.</p>
+<p>The existing PR has an analogous footgun as well I guess: a <code>Val</code> is semantically not valid to hold over any GC-able op anymore; so <code>StructRef::new</code> can only accept the owned variants.</p>
+<p>So I think we really do need <code>OwnedVal</code> (or some other type trickery, though I think I agree with Alex that marker types are probably somewhat more noise than we want here aesthetically) for API correctness on any GC-allocating constructor; we can then be sure that we aren't passing in a frozen ref.</p>
+<p>(FWIW, the prior art in SpiderMonkey here is that there is <code>Rooted&lt;T&gt;</code> and <code>T</code> can be anything including a <code>JS::Value</code>; they use C++ template traits to make the rooting work for everything including NaN-boxed values, while we'd have a bit of a harder time plumbing rootedness into a few arms of the val I guess)</p>
+</blockquote>
+
+
+
+<a name="638876379"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638876379" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638876379">(Nov 09 2026 at 21:47)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6752326582">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<blockquote>
+<p>(FWIW, the prior art in SpiderMonkey here is that there is <code>Rooted&lt;T&gt;</code> and <code>T</code> can be anything including a <code>JS::Value</code>; they use C++ template traits to make the rooting work for everything including NaN-boxed values, while we'd have a bit of a harder time plumbing rootedness into a few arms of the val I guess)</p>
+</blockquote>
+<p>We can't exactly copy that due to the differences between Rust generics and C++ templates however.</p>
+</blockquote>
+
+
+
+<a name="638877470"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638877470" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638877470">(Nov 09 2026 at 21:52)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6752430627">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>Indeed, "bit of a harder time plumbing..." was intended to capture that. I guess I was naming it as a way of thinking through API ergonomics: in principle we want something that is compositional here (rooting strategy x val-or-ref-type).</p>
+<p>We <em>could</em> implement a trait (impl'd by <code>Val</code> and <code>*Ref</code>) that project out an <code>Option&lt;&amp;mut VmGcRef&gt;</code>, which is the moral equivalent of what <code>HeapOperations</code> et al in the SpiderMonkey case are doing...</p>
+</blockquote>
+
+
+
+<a name="638878225"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638878225" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638878225">(Nov 09 2026 at 21:55)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6752498382">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<blockquote>
+<p>Personally I'd prefer to go too overboard on <code>Val</code> and its design, I'd ideally like to pick one and stick with it.</p>
+</blockquote>
+<p>I think it is going to be hard to choose one:</p>
+<ul>
+<li>
+<p>On the one hand, we want APIs to Just Work for users by default, which pushes towards <code>Val</code> being rooted by default (see "some nontrivial complexity in e.g. <code>StructRef::new</code>" that @cfallin mentioned).</p>
+</li>
+<li>
+<p>On the other hand, we want to be able to use non-mutating APIs during record/replay with frozen/unrooted refs, which means we want those APIs to take <code>Val</code>s that internally contain <code>Unrooted&lt;T&gt;</code> (ne <code>Frozen&lt;T&gt;</code>). (And we already ruled out duplicating the API surface to have rooted and unrooted versions of everything).</p>
+</li>
+</ul>
+<p>Those two desires are in direct conflict with each other, so I don't see how we can just choose one and stick with it. I think we _have_ to either add a bunch of generics/trait machinery or manually write <code>UnrootedVal</code>/<code>RootedVal</code>/<code>OwnedVal</code> types.</p>
+</blockquote>
+
+
+
+<a name="638879463"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638879463" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638879463">(Nov 09 2026 at 22:00)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6752603757">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>To sketch one possible generics path a bit further:</p>
+<ul>
+<li><code>Val</code> by itself is unrooted; and the <code>*Ref* variants are *empty* (they signify only the tag); use of the raw </code>Val` is possible but does not support any GC refs (because the rooting strategy has not been specified);</li>
+<li><code>Unrooted&lt;Val&gt;</code> gives you converters to <code>Unrooted&lt;AnyRef&gt;</code> et al (<code>as_anyref(&amp;self) -&gt; Option&lt;Unrooted&lt;AnyRef&gt;&gt;</code>), and carries the actual vmgcref and GC epoch snapshot alongside the <code>Val</code> (so the <code>Val</code> is only the type-tag);</li>
+<li><code>OwnedRooted&lt;Val&gt;</code> does likewise, with converter methods to <code>OwnedRooted&lt;AnyRef&gt;</code> et al; and carries the <code>Arc</code> alongside the <code>Val</code>.</li>
+</ul>
+<p>In other words, put the actual GC ref, if any, outside the raw <code>Val</code>, and use it only as the tag.</p>
+<p>Hmm, now that I write that out, though, maybe it really is simpler to just do <code>UnrootedVal</code> + <code>RootedVal</code>. (Additional bikeshed color I'll toss into the paint can as we're mixing: back when we introduced <code>OwnedRooted</code> we talked about renaming <code>OwnedRooted</code> to <code>Rooted</code> and <code>Rooted</code> to <code>ScopedRooted</code> or similar; maybe this is when we do that...)</p>
+</blockquote>
+
+
+
+<a name="638879510"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638879510" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638879510">(Nov 09 2026 at 22:00)</a>:</h4>
+<p>cfallin edited a <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6752603757">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>To sketch one possible generics path a bit further:</p>
+<ul>
+<li><code>Val</code> by itself is unrooted; and the <code>*Ref</code> variants are <em>empty</em> (they signify only the tag); use of the raw <code>Val</code> is possible but does not support any GC refs (because the rooting strategy has not been specified);</li>
+<li><code>Unrooted&lt;Val&gt;</code> gives you converters to <code>Unrooted&lt;AnyRef&gt;</code> et al (<code>as_anyref(&amp;self) -&gt; Option&lt;Unrooted&lt;AnyRef&gt;&gt;</code>), and carries the actual vmgcref and GC epoch snapshot alongside the <code>Val</code> (so the <code>Val</code> is only the type-tag);</li>
+<li><code>OwnedRooted&lt;Val&gt;</code> does likewise, with converter methods to <code>OwnedRooted&lt;AnyRef&gt;</code> et al; and carries the <code>Arc</code> alongside the <code>Val</code>.</li>
+</ul>
+<p>In other words, put the actual GC ref, if any, outside the raw <code>Val</code>, and use it only as the tag.</p>
+<p>Hmm, now that I write that out, though, maybe it really is simpler to just do <code>UnrootedVal</code> + <code>RootedVal</code>. (Additional bikeshed color I'll toss into the paint can as we're mixing: back when we introduced <code>OwnedRooted</code> we talked about renaming <code>OwnedRooted</code> to <code>Rooted</code> and <code>Rooted</code> to <code>ScopedRooted</code> or similar; maybe this is when we do that...)</p>
+</blockquote>
+
+
+
+<a name="638879547"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638879547" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638879547">(Nov 09 2026 at 22:00)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6752610271">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<blockquote>
+<p>We _could_ implement a trait (impl'd by <code>Val</code> and <code>*Ref</code>) that project out an <code>Option&lt;&amp;mut VmGcRef&gt;</code>, which is the moral equivalent of what <code>HeapOperations</code> et al in the SpiderMonkey case are doing...</p>
+</blockquote>
+<p>We ~sort of have this with the <code>RootedGcRef[Impl]</code> traits but we don't have an implementation of for <code>Val</code> (which would require restructuring a bit). But this would also mean that everyone currently using <code>Val</code> would need to start using <code>Rooted&lt;Val&gt;</code> or whatever, which is not great from an upgrade POV. But I guess it doesn't hide the fact that GC rooting is changing from them?</p>
+</blockquote>
+
+
+
+<a name="638879937"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638879937" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638879937">(Nov 09 2026 at 22:02)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6752643369">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>I agree with upgrade paths being somewhat of a consideration here, but IMHO we should try to get the right API first, and we're already talking about returning frozen refs by default so anyone doing heavy GC-ref traffic across the host API (are there such folks in the wild?) will need big mechanical changes regardless...</p>
+</blockquote>
+
+
+
+<a name="638880674"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638880674" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638880674">(Nov 09 2026 at 22:05)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6752708046">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>The other thing about only parameterizing how <code>Val</code> is used, not parameterizing <code>Val</code> on a <code>RootingKind</code> or whatever like <code>Val&lt;RootingKind&gt;</code>, is that matching is going to suck because it won't forward the rooting as you traverse the value. You have to re-root the innards manually.</p>
+</blockquote>
+
+
+
+<a name="638881359"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638881359" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638881359">(Nov 09 2026 at 22:08)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6752770751">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>So, IMO, the best thing would be for actual GC refs to never be interacted with directly, only via a rooting wrapper. That is, you never have a plain <code>AnyRef</code>, only <code>Rooted&lt;AnyRef&gt;</code> or <code>Unrooted&lt;AnyRef&gt;</code> etc.</p>
+<p>And then <code>Val</code> would be parameterized by the rooting kind, so that matching on it gives you the rooted ref, not the raw GC ref: <code>Val&lt;RootedRefs&gt;</code>/<code>Val&lt;UnrootedRefs&gt;</code>/etc. instead of <code>Rooted&lt;Val&gt;</code>/<code>Unrooted&lt;Val&gt;</code>/etc.</p>
+</blockquote>
+
+
+
+<a name="638882989"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638882989" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638882989">(Nov 09 2026 at 22:16)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6752933337">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>Yep, I think I've worked my way to your viewpoint here; <code>Val&lt;RootingKind&gt;</code> rather than <code>RootingKind&lt;Val&gt;</code>. <code>RootingKind</code> being a sealed trait that we implement on a few marker traits (unrooted, owned-rooted (rooted?), rooted (scoped-rooted?)).</p>
+<p>To summarize how we got here: (i) we need to semantically pin down whether rooting happens or not, when vals occur in the API; (ii) there are contexts where they need to be unrooted, and contexts where they need to be rooted; (iii) we prefer static safety where possible, so rather than have a sum-type and panic on wrong kind of rooting, we want the distinction in the types; so (iv) the main design axis left is how we spell the two (three?) different kinds of val.</p>
+<p>@alexcrichton are you OK with all this or do you still have reservations or other ideas?</p>
+</blockquote>
+
+
+
+<a name="638889362"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638889362" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638889362">(Nov 09 2026 at 22:49)</a>:</h4>
+<p>fitzgen <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6753566104">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>(FWIW, I am +1 on renaming the various kinds of rooting at the same time if we're going to do this relatively large change, but I do have some naming bikeshedding I'd like to do there. Holding off on that to focus on the core representation stuff for now tho.)</p>
+</blockquote>
+
+
+
+<a name="638907468"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638907468" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638907468">(Nov 10 2026 at 00:43)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="638907469"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638907469" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638907469">(Nov 10 2026 at 00:43)</a>:</h4>
+<p>cfallin requested <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-default-reviewers">wasmtime-default-reviewers</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="638907470"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638907470" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638907470">(Nov 10 2026 at 00:43)</a>:</h4>
+<p>cfallin removed the review request for <a href="https://github.com/orgs/bytecodealliance/teams/wasmtime-default-reviewers">wasmtime-default-reviewers</a> from <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="638907471"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638907471" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638907471">(Nov 10 2026 at 00:43)</a>:</h4>
+<p>cfallin requested <a href="https://github.com/alexcrichton">alexcrichton</a> for a review on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="638907850"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/638907850" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#638907850">(Nov 10 2026 at 00:45)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6755584367">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>OK, I've pushed another commit that does <code>Val&lt;R&gt;</code> for the three different ref kinds, with conversions between them. It is... not a small refactor... but if what we argue above is true, then I think it's necessary-ish.</p>
+<p>The one major simplification I see right now if we are willing to give a little more generality up is to represent <em>only</em> owned-rooted and unrooted values (i.e., drop LIFO-rooted/"scoped rooted"); the latter are a perf optimization but are not strictly necessary for expressiveness, and dropping that would get rid of the <code>AnyRootedRef</code> subtrait I had to add to make <code>StructRef::new</code> and friends work with either kind of rooted ref (which also introduces an awkwardness where type inf can't fill that in for e.g. an empty slice or slice of only primitive field values). Happy to go that way if folks want.</p>
+</blockquote>
+
+
+
+<a name="639194199"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/639194199" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#639194199">(Nov 10 2026 at 16:05)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6772373437">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>The main thing I lament here is that it's not possible to use Wasmtime without being forced to deal with a bunch of GC stuff. I subjectively feel that should be possible to do so but even if you're only working with <code>i32</code>s you're forced to still talk about rooting and unrooting and such in <code>Val</code>s and everywhere. I know I've long lamented the extremely viral nature of GC, so there may just be nothing to do about that.</p>
+<p>This is indeed a massive change, and there's quite a lot of minor tweaks skimming over various files as well. If we do land on this design @cfallin would you be ok splitting this up into perhaps first refactoring what's there already, then moving APIs to <code>StoreContext</code> (no mut), and then adding another rooting kind with unrooted?</p>
+<p>Some other assorted thoughts:</p>
+<ul>
+<li><code>Table::get_if_initialized</code> is quite a bummer IMO where what has long been considered a purely internal implementation decision is now leaking out into the API</li>
+<li>IIRC there was a fair bit of care of trying to use <code>&amp;VMGcRef</code> as much as possible but this PR seems to pretty aggressively migrate most sites to <code>VMGcRef</code> (no reference)</li>
+<li>Lots of tests and such have changed from <code>Val::I32(...)</code> to <code>RootedVal::I32(...)</code> - is that necessary? With the type parameter on <code>Val</code> being defaulted can that be <code>Val::I32(...)</code> and generics elsewhere figure it out?</li>
+<li>A consequence of <code>Val&lt;R&gt;</code> is that all APIs anywhere that consume a value are forced to be generic over <code>R</code> now. This can also lead to some nonsensical situations such as passing a <code>Val&lt;UnrootedRefs&gt;</code> to <code>StructRef::new</code>. I don't think anything can be done about this, however. </li>
+<li>Another consequence of <code>Val&lt;R&gt;</code> is that more and more of the crate is generic meaning downstream compile times go higher and higher. That's never been a focus of Wasmtime necessarily but it's something to be aware of.</li>
+<li>I continue to personally be wary of tracking a GC epoch. I have no alternative, but this is the second time we've added something along the lines of "the entire runtime has to be sure to increment this counter should event X occur". If we get that wrong, which is extremely easy because it's just forgotten code, then we're basically straight into CVE territory. Again I don't have an alternative, but I do want to highlight how fragile of a strategy it is IMO. I naively expected the bump to be in maybe 2-3 locations but I'm seeing it in a surprising number of locations throughout this PR.</li>
+</ul>
+<p>Overall this does seem to be the best way to thread the needle of all the requirements we have. </p>
+</blockquote>
+
+
+
+<a name="639206138"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/639206138" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#639206138">(Nov 10 2026 at 16:44)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6773296052">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>Yeah, I hate it too from an ergonomics perspective. Unfortunately I just think there's no other way in an engine that (i) supports GC, (ii) semantically needs to hand out different kinds of roots at different times.</p>
+<p>(Or, well, the other way is to make <code>Val</code> a sum-type as this PR originally had; do we want to reconsider that in light of the complexity that unfolds here?)</p>
+<blockquote>
+<p>I continue to personally be wary of tracking a GC epoch</p>
+</blockquote>
+<p>Yep, I think this is unfortunately just kind of fundamental. The thing that we need is tracking of a dynamic lifetime: a pointer that is valid until something invalidates it. That is required because GC roots mutate the store, and we need to access (but not modify) the GC heap when we don't have mutable access to it. So the only ways out are:</p>
+<ul>
+<li>GC roots not mutate the store (but this contradicts what a root does: it can keep objects alive for longer)</li>
+<li>Avoid the need to access the GC heap when frozen (but this then means that we cannot debug a trace replay)</li>
+<li>Track the dynamic invalidation some other way, e.g. with an explicit dependency-tracking mechanism</li>
+</ul>
+<p>So basically, the way out is to either not implement record/replay, or not implement debugging on record/replay. In other words, I think if we agree we want those features, we are stuck.</p>
+<hr>
+<p>The remaining safety path is to encapsulate as much as possible. Maybe we could build some generic mechanism (in the same spirit as <code>Accessor</code> for the async stuff) that holds a <code>T</code> and gives out either frozen refs or mutable refs and tracks the epoch alongside, in a way that can't be violated. Something like:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">struct</span><span class="w"> </span><span class="nc">EpochTrackedState</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="n">inner</span><span class="p">:</span><span class="w"> </span><span class="nc">T</span><span class="p">,</span>
+<span class="w">  </span><span class="n">stamp</span><span class="p">:</span><span class="w"> </span><span class="nc">StateId</span><span class="p">,</span><span class="w">  </span><span class="c1">// like a store ID; globally allocated</span>
+<span class="w">  </span><span class="n">epoch</span><span class="p">:</span><span class="w"> </span><span class="nc">EpochCounter</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="k">impl</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="n">EpochTrackedState</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="c1">// ...</span>
+
+<span class="w">  </span><span class="k">fn</span><span class="w"> </span><span class="nf">frozen_ref</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">TrackedStateFrozenRef</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">TrackedStateFrozenRef</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">stamp</span><span class="p">:</span><span class="w"> </span><span class="nc">self</span><span class="p">.</span><span class="n">stamp</span><span class="p">,</span><span class="w"> </span><span class="n">epoch</span><span class="p">:</span><span class="w"> </span><span class="nc">self</span><span class="p">.</span><span class="n">epoch</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="c1">// no borrow of `self`</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="w">  </span><span class="k">fn</span><span class="w"> </span><span class="nf">get_mut</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">T</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="bp">self</span><span class="p">.</span><span class="n">epoch</span><span class="p">.</span><span class="n">increment</span><span class="p">();</span>
+<span class="w">    </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">inner</span>
+<span class="w">  </span><span class="p">}</span>
+
+<span class="w">  </span><span class="k">fn</span><span class="w"> </span><span class="nf">get</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="k">ref</span><span class="p">:</span><span class="w"> </span><span class="nc">TrackedStateFrozenRef</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;&amp;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="fm">assert_eq!</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">stamp</span><span class="p">,</span><span class="w"> </span><span class="k">ref</span><span class="p">.</span><span class="n">stamp</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">epoch</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">stamp</span><span class="p">.</span><span class="n">epoch</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nb">None</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">.</span><span class="n">inner</span><span class="p">)</span><span class="w"> </span><span class="p">}</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>then put the whole GC state inside of that. What do you think?</p>
+</blockquote>
+
+
+
+<a name="639209655"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/639209655" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#639209655">(Nov 10 2026 at 16:56)</a>:</h4>
+<p>cfallin edited a <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6773296052">comment</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>Yeah, I hate it too from an ergonomics perspective. Unfortunately I just think there's no other way in an engine that (i) supports GC, (ii) semantically needs to hand out different kinds of roots at different times.</p>
+<p>(Or, well, the other way is to make <code>Val</code> a sum-type as this PR originally had; do we want to reconsider that in light of the complexity that unfolds here?)</p>
+<blockquote>
+<p>I continue to personally be wary of tracking a GC epoch</p>
+</blockquote>
+<p>Yep, I think this is unfortunately just kind of fundamental. The thing that we need is tracking of a dynamic lifetime: a pointer that is valid until something invalidates it. That is required because GC roots mutate the store, and we need to access (but not modify) the GC heap when we don't have mutable access to it. So the only ways out are:</p>
+<ul>
+<li>GC roots not mutate the store (but this contradicts what a root does: it can keep objects alive for longer)</li>
+<li>Avoid the need to access the GC heap when frozen (but this then means that we cannot debug a trace replay)</li>
+<li>Track the dynamic invalidation some other way, e.g. with an explicit dependency-tracking mechanism</li>
+</ul>
+<p>So basically, the way out is to either not implement record/replay, or not implement debugging on record/replay. In other words, I think if we agree we want those features, we are stuck.</p>
+<hr>
+<p>The remaining safety path is to encapsulate as much as possible. Maybe we could build some generic mechanism (in the same spirit as <code>Accessor</code> for the async stuff) that holds a <code>T</code> and gives out either frozen refs or mutable refs and tracks the epoch alongside, in a way that can't be violated. Something like:</p>
+<div class="codehilite" data-code-language="Rust"><pre><span></span><code><span class="k">struct</span><span class="w"> </span><span class="nc">EpochTrackedState</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="n">inner</span><span class="p">:</span><span class="w"> </span><span class="nc">T</span><span class="p">,</span>
+<span class="w">  </span><span class="n">stamp</span><span class="p">:</span><span class="w"> </span><span class="nc">StateId</span><span class="p">,</span><span class="w">  </span><span class="c1">// like a store ID; globally allocated</span>
+<span class="w">  </span><span class="n">epoch</span><span class="p">:</span><span class="w"> </span><span class="nc">EpochCounter</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="k">impl</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="n">EpochTrackedState</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="c1">// ...</span>
+
+<span class="w">  </span><span class="k">fn</span><span class="w"> </span><span class="nf">frozen_ref</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">TrackedStateFrozenRef</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">TrackedStateFrozenRef</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">stamp</span><span class="p">:</span><span class="w"> </span><span class="nc">self</span><span class="p">.</span><span class="n">stamp</span><span class="p">,</span><span class="w"> </span><span class="n">epoch</span><span class="p">:</span><span class="w"> </span><span class="nc">self</span><span class="p">.</span><span class="n">epoch</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="c1">// no borrow of `self`</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="w">  </span><span class="k">fn</span><span class="w"> </span><span class="nf">get_mut</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">T</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="bp">self</span><span class="p">.</span><span class="n">epoch</span><span class="p">.</span><span class="n">increment</span><span class="p">();</span>
+<span class="w">    </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">inner</span>
+<span class="w">  </span><span class="p">}</span>
+
+<span class="w">  </span><span class="k">fn</span><span class="w"> </span><span class="nf">get</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="k">ref</span><span class="p">:</span><span class="w"> </span><span class="nc">TrackedStateFrozenRef</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;&amp;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="fm">assert_eq!</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">stamp</span><span class="p">,</span><span class="w"> </span><span class="k">ref</span><span class="p">.</span><span class="n">stamp</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">epoch</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="k">ref</span><span class="p">.</span><span class="n">epoch</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nb">None</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">.</span><span class="n">inner</span><span class="p">)</span><span class="w"> </span><span class="p">}</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>then put the whole GC state inside of that. What do you think?</p>
+</blockquote>
+
+
+
+<a name="639381902"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/639381902" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#639381902">(Nov 11 2026 at 06:56)</a>:</h4>
+<p>cfallin updated <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>.</p>
+
+
+
+<a name="639382126"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/639382126" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#639382126">(Nov 11 2026 at 06:57)</a>:</h4>
+<p>cfallin <a href="https://github.com/bytecodealliance/wasmtime/pull/15191#issuecomment-6789281567">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>OK, this has been refactored according to our discussion today, and is now stacked on top of #15228 (second commit is this PR's contribution).</p>
+</blockquote>
+
+
+
+<a name="639382291"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20PR%20%2315191%20GC%3A%20implement%20%60Frozen%60%20references./near/639382291" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20PR.20.2315191.20GC.3A.20implement.20.60Frozen.60.20references.2E.html#639382291">(Nov 11 2026 at 06:58)</a>:</h4>
+<p>cfallin edited <a href="https://github.com/bytecodealliance/wasmtime/pull/15191">PR #15191</a>:</p>
+<blockquote>
+<p>In order to implement record/replay, we need a little more discipline around read-only vs. read-write <code>Store</code>s. It turns out that rooting mutates a store. This is unfortunate when we want to permit debuggers to inspect the state of a store, including its GC heap, on a read-only trace replay.</p>
+<p>Separately, the need for a mutable store borrow to <em>access</em> any GC object, even on actions that are nominally/semantically read-only, makes APIs more awkward and looser about mutation than they could otherwise be. One can see artifacts of this awkwardness in e.g. the existence of a separate getter for globals that only reads non-GC values, with an immutable store.</p>
+<p>Separately separately, rooting is expensive if all one wants to do is introspect the Store's GC heap while execution is completely frozen. Ideally one would use raw heap offsets ("pointers") and just read out the objects without setting up and tearing down rooting metadata.</p>
+<p>All of these problems are solved in this PR with the addition of a new <code>Unrooted</code> GC ref kind. The idea is that we:</p>
+<ul>
+<li>
+<p>Give the GC heap a u64 counter that increments on any possible mutation (i.e.: every entry or return into Wasm, and every host-API mutation to GC objects);</p>
+</li>
+<li>
+<p>Hand out frozen refs that wrap up the raw u32 offset into the GC heap with a snapshot of that counter (the "GC epoch counter");</p>
+</li>
+<li>
+<p>Make uses of the refs fallible: one can deref them only when the epoch counter matches, but they become "stale" and fail after that.</p>
+</li>
+</ul>
+<p>These unrooted refs are sufficient to read the whole GC heap when the store is frozen (e.g., during a debug event or at any step during a trace replay).</p>
+<p>What's more, this actually heads to a nice generalization: we can make the rooting step <em>explicitly opt-in everywhere</em> by changing all GC getter APIs to return unrooted refs by default. One can then take that unrooted ref and turn it into a <code>Rooted&lt;T&gt;</code> or <code>OwnedRooted&lt;T&gt;</code> if one wants to actually root it during further execution, and only needs a mutable store borrow at <em>that</em> point to create the root. This makes the cheap option (copy a u32 and u64) the default and makes the rooting cost pay-as-you-go.</p>
+<p>&lt;!--<br>
+Please make sure you include the following information:</p>
+<ul>
+<li>
+<p>If this work has been discussed elsewhere, please include a link to that<br>
+  conversation. If it was discussed in an issue, just mention "issue #...".</p>
+</li>
+<li>
+<p>Explain why this change is needed. If the details are in an issue already,<br>
+  this can be brief.</p>
+</li>
+</ul>
+<p>Our development process is documented in the Wasmtime book:<br>
+<a href="https://docs.wasmtime.dev/contributing-development-process.html">https://docs.wasmtime.dev/contributing-development-process.html</a></p>
+<p>Please review the Bytecode Alliance's AI tool usage policy at<br>
+<a href="https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md">https://github.com/bytecodealliance/governance/blob/main/AI_TOOL_POLICY.md</a></p>
+<p>Please ensure all communication follows the code of conduct:<br>
+<a href="https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md">https://github.com/bytecodealliance/wasmtime/blob/main/CODE_OF_CONDUCT.md</a><br>
+--&gt;</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Nov 14 2026 at 22:03 UTC</p>
+</html>

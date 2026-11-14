@@ -1,0 +1,164 @@
+[
+    {
+        "content": "<p>adamrk opened <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350\">PR #14350</a> from <code>adamrk:abk/deferred-host-task</code> to <code>bytecodealliance:main</code>:</p>\n<blockquote>\n<p>Defer creation of a <code>HostTask</code> and insertion of it in the <code>Store</code> until it is required. This is an optimization on wasm-&gt;host calls where the <code>HostTask</code> may not actually be needed. The <code>HostTask</code> is materialized if the host future actually suspends (doesn't return <code>Ready</code> on the first poll), or if it tries to lower a borrowed resource (which requires inserting its <code>CallContext</code> into the <code>Store</code> to get a persistent identifier for it).</p>\n<p>The work is separated into 3 commits:</p>\n<ul>\n<li>Add benchmarks for nop wasm-&gt;host calls that pass a borrow and where the host suspends before returning.</li>\n<li>Make the <code>u32</code> identifier for <code>CallContext</code>s an proper enum</li>\n<li>The actual change of deferring <code>HostTask</code> creation.</li>\n</ul>\n<p>These are the changes I see in the wasm-&gt;host benchmarks:<br>\nBaseline benchmarks:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"n\">component</span><span class=\"o\">-</span><span class=\"k\">async</span><span class=\"o\">/</span><span class=\"n\">wasm</span><span class=\"o\">-</span><span class=\"n\">to</span><span class=\"o\">-</span><span class=\"n\">host</span>\n<span class=\"w\">                        </span><span class=\"n\">time</span><span class=\"p\">:</span><span class=\"w\">   </span><span class=\"p\">[</span><span class=\"mf\">354.02</span><span class=\"w\"> </span><span class=\"n\">ns</span><span class=\"w\"> </span><span class=\"mf\">366.83</span><span class=\"w\"> </span><span class=\"n\">ns</span><span class=\"w\"> </span><span class=\"mf\">380.05</span><span class=\"w\"> </span><span class=\"n\">ns</span><span class=\"p\">]</span>\n<span class=\"n\">component</span><span class=\"o\">-</span><span class=\"k\">async</span><span class=\"o\">/</span><span class=\"n\">wasm</span><span class=\"o\">-</span><span class=\"n\">to</span><span class=\"o\">-</span><span class=\"n\">host</span><span class=\"o\">-</span><span class=\"n\">borrow</span>\n<span class=\"w\">                        </span><span class=\"n\">time</span><span class=\"p\">:</span><span class=\"w\">   </span><span class=\"p\">[</span><span class=\"mf\">462.76</span><span class=\"w\"> </span><span class=\"n\">ns</span><span class=\"w\"> </span><span class=\"mf\">479.96</span><span class=\"w\"> </span><span class=\"n\">ns</span><span class=\"w\"> </span><span class=\"mf\">497.66</span><span class=\"w\"> </span><span class=\"n\">ns</span><span class=\"p\">]</span>\n<span class=\"n\">component</span><span class=\"o\">-</span><span class=\"k\">async</span><span class=\"o\">/</span><span class=\"n\">wasm</span><span class=\"o\">-</span><span class=\"n\">to</span><span class=\"o\">-</span><span class=\"n\">host</span><span class=\"o\">-</span><span class=\"n\">pending</span><span class=\"o\">-</span><span class=\"n\">once</span>\n<span class=\"w\">                        </span><span class=\"n\">time</span><span class=\"p\">:</span><span class=\"w\">   </span><span class=\"p\">[</span><span class=\"mf\">2.5383</span><span class=\"w\"> </span><span class=\"err\">µ</span><span class=\"n\">s</span><span class=\"w\"> </span><span class=\"mf\">2.6139</span><span class=\"w\"> </span><span class=\"err\">µ</span><span class=\"n\">s</span><span class=\"w\"> </span><span class=\"mf\">2.6873</span><span class=\"w\"> </span><span class=\"err\">µ</span><span class=\"n\">s</span><span class=\"p\">]</span>\n</code></pre></div>\n<p>With changes:</p>\n<p><div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"n\">component</span><span class=\"o\">-</span><span class=\"k\">async</span><span class=\"o\">/</span><span class=\"n\">wasm</span><span class=\"o\">-</span><span class=\"n\">to</span><span class=\"o\">-</span><span class=\"n\">host</span>\n<span class=\"w\">                        </span><span class=\"n\">time</span><span class=\"p\">:</span><span class=\"w\">   </span><span class=\"p\">[</span><span class=\"mf\">283.83</span><span class=\"w\"> </span><span class=\"n\">ns</span><span class=\"w\"> </span><span class=\"mf\">296.05</span><span class=\"w\"> </span><span class=\"n\">ns</span><span class=\"w\"> </span><span class=\"mf\">308.65</span><span class=\"w\"> </span><span class=\"n\">ns</span><span class=\"p\">]</span>\n<span class=\"w\">                        </span><span class=\"n\">change</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"p\">[</span><span class=\"err\">−</span><span class=\"mf\">21.162</span><span class=\"o\">%</span><span class=\"w\"> </span><span class=\"err\">−</span><span class=\"mf\">17.822</span><span class=\"o\">%</span><span class=\"w\"> </span><span class=\"err\">−</span><span class=\"mf\">14.374</span><span class=\"o\">%</span><span class=\"p\">]</span><span class=\"w\"> </span><span class=\"p\">(</span><span class=\"n\">p</span><span class=\"w\"> </span><span class=\"o\">=</span><span class=\"w\"> </span><span class=\"mf\">0.00</span><span class=\"w\"> </span><span class=\"o\">&lt;</span><span class=\"w\"> </span><span class=\"mf\">0.05</span><span class=\"p\">)</span>\n<span class=\"w\">                        </span><span class=\"n\">Performance</span><span class=\"w\"> </span><span class=\"n\">has</span><span class=\"w\"> </span><span class=\"n\">improved</span><span class=\"p\">.</span>\n<span class=\"n\">component</span><span class=\"o\">-</span><span class=\"k\">async</span><span class=\"o\">/</span><span class=\"n\">wasm</span><span class=\"o\">-</span><span class=\"n\">to</span><span class=\"o\">-</span><span class=\"n\">host</span><span class=\"o\">-</span><span class=\"n\">borrow</span>\n<span class=\"w\">                        </span><span class=\"n\">time</span><span class=\"p\">:</span><span class=\"w\">   </span><span class=\"p\">[</span><span class=\"mf\">377.80</span><span class=\"w\"> </span><span class=\"n\">ns</span><span class=\"w\"> </span><span class=\"mf\">392.33</span><span class=\"w\"> </span><span class=\"n\">ns</span><span class=\"w\"> </span><span class=\"mf\">406.01</span><span class=\"w\"> </span><span class=\"n\">ns</span><span class=\"p\">]</span>\n<span class=\"w\">                        </span><span class=\"n\">change</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"p\">[</span><span class=\"err\">−</span><span class=\"mf\">31.982</span><span class=\"o\">%</span><span class=\"w\"> </span><span class=\"err\">−</span><span class=\"mf\">29.587</span><span class=\"o\">%</span><span class=\"w\"> </span><span class=\"err\">−</span><span class=\"mf\">26.924</span><span class=\"o\">%</span><span class=\"p\">]</span><span class=\"w\"> </span><span class=\"p\">(</span><span class=\"n\">p</span><span class=\"w\"> </span><span class=\"o\">=</span><span class=\"w\"> </span><span class=\"mf\">0.00</span><span class=\"w\"> </span><span class=\"o\">&lt;</span><span class=\"w\"> </span><span class=\"mf\">0.05</span><span class=\"p\">)</span>\n<span class=\"w\">                        </span><span class=\"n\">Performance</span><span class=\"w\"> </span><span class=\"n\">has</span><span class=\"w\"> </span><span class=\"n\">improved</span><span class=\"p\">.</span>\n<span class=\"n\">component</span><span class=\"o\">-</span><span class=\"k\">async</span><span class=\"o\">/</span><span class=\"n\">wasm</span><span class=\"o\">-</span><span class=\"n\">to</span><span class=\"o\">-</span><span class=\"n\">host</span><span class=\"o\">-</span><span class=\"n\">pending</span><span class=\"o\">-</span><span class=\"n\">once</span>\n<span class=\"w\">                        </span><span class=\"n\">time</span><span class=\"p\">:</span><span class=\"w\">   </span><span class=\"p\">[</span><span class=\"mf\">2.4307</span><span class=\"w\"> </span><span class=\"err\">µ</span><span class=\"n\">s</span><span class=\"w\"> </span><span class=\"mf\">2.5107</span><span class=\"w\"> </span><span class=\"err\">µ</span><span class=\"n\">s</span><span class=\"w\"> </span><span class=\"mf\">2.5932</span><span class=\"w\"> </span><span class=\"err\">µ</span><span class=\"n\">s</span><span class=\"p\">]</span>\n<span class=\"w\">                        </span><span class=\"n\">change</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"p\">[</span><span class=\"err\">−</span><span class=\"mf\">3.0505</span><span class=\"o\">%</span><span class=\"w\"> </span><span class=\"o\">+</span><span class=\"mf\">0.1437</span><span class=\"o\">%</span><span class=\"w\"> </span><span class=\"o\">+</span><span class=\"mf\">3.5901</span><span class=\"o\">%</span><span class=\"p\">]</span><span class=\"w\"> </span><span class=\"p\">(</span><span class=\"n\">p</span><span class=\"w\"> </span><span class=\"o\">=</span><span class=\"w\"> </span><span class=\"mf\">0.94</span><span class=\"w\"> </span><span class=\"o\">&gt;</span><span class=\"w\"> </span><span class=\"mf\">0.05</span><span class=\"p\">)</span>\n<span class=\"w\">                        </span><span class=\"n\">No</span><span class=\"w\"> </span><span class=\"n\">change</span><span class=\"w\"> </span><span class=\"k\">in</span><span class=\"w\"> </span><span class=\"n\">performance</span><span class=\"w\"> </span><span class=\"n\">detected</span><span class=\"p\">.</span>\n</code></pre></div><br>\n</p>\n</blockquote>",
+        "id": 624758973,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1789588580
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350\">PR #14350</a>.</p>",
+        "id": 624778689,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1789595074
+    },
+    {
+        "content": "<p>adamrk updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350\">PR #14350</a>.</p>",
+        "id": 624940003,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1789648534
+    },
+    {
+        "content": "<p>adamrk updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350\">PR #14350</a>.</p>",
+        "id": 624968394,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1789650427
+    },
+    {
+        "content": "<p>adamrk updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350\">PR #14350</a>.</p>",
+        "id": 625005106,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1789658050
+    },
+    {
+        "content": "<p>adamrk has marked <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350\">PR #14350</a> as ready for review.</p>",
+        "id": 625017252,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1789660808
+    },
+    {
+        "content": "<p>adamrk requested <a href=\"https://github.com/dicej\">dicej</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350\">PR #14350</a>.</p>",
+        "id": 625017258,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1789660811
+    },
+    {
+        "content": "<p>adamrk requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers\">wasmtime-core-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350\">PR #14350</a>.</p>",
+        "id": 625017259,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1789660811
+    },
+    {
+        "content": "<p>adamrk requested <a href=\"https://github.com/alexcrichton\">alexcrichton</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350\">PR #14350</a>.</p>",
+        "id": 625017260,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1789660812
+    },
+    {
+        "content": "<p>adamrk requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-default-reviewers\">wasmtime-default-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350\">PR #14350</a>.</p>",
+        "id": 625017263,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1789660812
+    },
+    {
+        "content": "<p><span aria-label=\"thumbs up\" class=\"emoji emoji-1f44d\" role=\"img\" title=\"thumbs up\">:thumbs_up:</span> alexcrichton submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350#pullrequestreview-5240583187\">PR review</a>:</p>\n<blockquote>\n<p>Some great wins, thanks!</p>\n</blockquote>",
+        "id": 625069006,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1789674160
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> alexcrichton created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350#discussion_r4040759808\">PR review comment</a>:</p>\n<blockquote>\n<p>Could this be moved into <code>host_task_create</code>? To the extent that <code>set_thread</code> is a somewhat-hot function and I think that's the only caller which would otherwise trigger this, it might help keep this function a bit leaner to move it over there. That might mess up and/or require moving around some debug assertions though</p>\n</blockquote>",
+        "id": 625069009,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1789674160
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> alexcrichton created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350#discussion_r4040749252\">PR review comment</a>:</p>\n<blockquote>\n<p>Could you add a debug-assert on this branch that <code>materialized_task</code> is <code>None</code>?</p>\n</blockquote>",
+        "id": 625069010,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1789674160
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> alexcrichton created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350#discussion_r4040765949\">PR review comment</a>:</p>\n<blockquote>\n<p>And, similarly, for handling <code>deferred_host_call_context</code> getting cleared above, could that move into the <code>first_poll</code> function or similar?</p>\n</blockquote>",
+        "id": 625069011,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1789674160
+    },
+    {
+        "content": "<p>adamrk updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350\">PR #14350</a>.</p>",
+        "id": 625756839,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790001303
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> adamrk submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350#pullrequestreview-5267904214\">PR review</a>.</p>",
+        "id": 625756888,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790001312
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> adamrk created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350#discussion_r4063155227\">PR review comment</a>:</p>\n<blockquote>\n<p>Now setting the value to <code>Some(CallContext::default)</code> only occurs in <code>host_task_create</code> and setting it to <code>None</code> occurs in <code>host_task_delete</code> and <code>materialize_host_task</code> (the two ways we switch out of a <code>DeferredHostTask</code> thread). We debug check the invariant on entry to <code>set_thread</code>, but not on exit because these fixups are done after calling <code>set_thread</code> in <code>host_task_{create, delete}</code>. But all three cases debug check the invariant themselves after switching the current thread.</p>\n</blockquote>",
+        "id": 625756894,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790001312
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> adamrk submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350#pullrequestreview-5267904533\">PR review</a>.</p>",
+        "id": 625756898,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790001314
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> adamrk created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350#discussion_r4063155464\">PR review comment</a>:</p>\n<blockquote>\n<p>done</p>\n</blockquote>",
+        "id": 625756899,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790001314
+    },
+    {
+        "content": "<p><span aria-label=\"thumbs up\" class=\"emoji emoji-1f44d\" role=\"img\" title=\"thumbs up\">:thumbs_up:</span> alexcrichton submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350#pullrequestreview-5269963218\">PR review</a>.</p>",
+        "id": 625813815,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790012783
+    },
+    {
+        "content": "<p>alexcrichton added <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350\">PR #14350 <code>component</code>: Defer host task creation</a> to the merge queue.</p>",
+        "id": 625813847,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790012790
+    },
+    {
+        "content": "<p>github-merge-queue[bot] removed <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350\">PR #14350 <code>component</code>: Defer host task creation</a> from the merge queue.</p>",
+        "id": 625820891,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790014383
+    },
+    {
+        "content": "<p>alexcrichton added <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350\">PR #14350 <code>component</code>: Defer host task creation</a> to the merge queue.</p>",
+        "id": 625821812,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790014555
+    },
+    {
+        "content": "<p>github-merge-queue[bot] removed <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350\">PR #14350 <code>component</code>: Defer host task creation</a> from the merge queue.</p>",
+        "id": 625838178,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790019090
+    },
+    {
+        "content": "<p>alexcrichton added <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350\">PR #14350 <code>component</code>: Defer host task creation</a> to the merge queue.</p>",
+        "id": 625839999,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790019616
+    },
+    {
+        "content": "<p><span aria-label=\"check\" class=\"emoji emoji-2705\" role=\"img\" title=\"check\">:check:</span> alexcrichton merged <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350\">PR #14350</a>.</p>",
+        "id": 625845748,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790021350
+    },
+    {
+        "content": "<p>alexcrichton removed <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14350\">PR #14350 <code>component</code>: Defer host task creation</a> from the merge queue.</p>",
+        "id": 625845751,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790021351
+    }
+]

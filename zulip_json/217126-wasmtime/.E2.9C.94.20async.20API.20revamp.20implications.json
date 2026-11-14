@@ -1,0 +1,128 @@
+[
+    {
+        "content": "<p>Yeah, that's an interesting observation.  I think it aligns pretty well with the vision for <code>stream&lt;t, u, v&gt;</code> where you're expected to either read or skip to the end of the stream before you can get the final <code>u</code> value, so I wouldn't consider it a problem.</p>\n<p>Regarding GC languages: the ones I'm familiar with usually do have some sort of <code>close</code> function for input streams, and that generally integrates with the language's scoped resource handling, if available.</p>",
+        "id": 536430525,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1756304081
+    },
+    {
+        "content": "<p>But per your latest comment on the issue: yeah, you shouldn't have to drop the stream necessarily -- just read or skip to the end.</p>",
+        "id": 536430948,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1756304194
+    },
+    {
+        "content": "<p>I might need to tweak the implementation if that's not working.</p>",
+        "id": 536431028,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1756304219
+    },
+    {
+        "content": "<p>If you want, we could jump on a quick call and I can show you the behavior I'm seeing?<br>\nOtherwise, you can reproduce this by removing any of the <code>drop</code>s I've added in the commit. all <code>p3_sockets</code> tests currently pass and without the drop <code>tcp_sample_application</code> deadlocks</p>\n<p>you'd likely also want to do something like:</p>\n<div class=\"codehilite\" data-code-language=\"Diff\"><pre><span></span><code><span class=\"gh\">diff --git a/crates/wasi/tests/all/p3/mod.rs b/crates/wasi/tests/all/p3/mod.rs</span>\n<span class=\"gh\">index 4efc033968..87e56b3d43 100644</span>\n<span class=\"gd\">--- a/crates/wasi/tests/all/p3/mod.rs</span>\n<span class=\"gi\">+++ b/crates/wasi/tests/all/p3/mod.rs</span>\n<span class=\"gu\">@@ -20,7 +20,7 @@ async fn run(path: &amp;str) -&gt; Result&lt;()&gt; {</span>\n<span class=\"w\"> </span>    wasmtime_wasi::p3::add_to_linker(&amp;mut linker).context(\"failed to link `wasi:cli@0.3.x`\")?;\n\n<span class=\"w\"> </span>    let (mut store, _td) = Ctx::new(&amp;engine, name, |builder| MyWasiCtx {\n<span class=\"gd\">-        wasi: builder.build(),</span>\n<span class=\"gi\">+        wasi: builder.inherit_stdout().inherit_stderr().build(),</span>\n<span class=\"w\"> </span>        table: Default::default(),\n<span class=\"w\"> </span>    })?;\n<span class=\"w\"> </span>    let component = Component::from_file(&amp;engine, path)?;\n</code></pre></div>\n<p>to actually see the output from the component if you were to resort to print-debugging</p>",
+        "id": 536431597,
+        "sender_full_name": "Roman Volosatovs",
+        "timestamp": 1756304368
+    },
+    {
+        "content": "<p>Yeah, I'll repro and debug and then let you know what I find.</p>",
+        "id": 536431866,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1756304436
+    },
+    {
+        "content": "<p>But generally, the behavior right now makes sense to me - dropping the stream handle causes the socket shutdown, as specified in <code>wasi:sockets</code>. Since we have not encountered any errors, there's not really a reason for the future to return anything yet. Basically, the only way I see this not requiring the drop of the stream handle is host buffering data from the OS</p>",
+        "id": 536432216,
+        "sender_full_name": "Roman Volosatovs",
+        "timestamp": 1756304540
+    },
+    {
+        "content": "<p>ah, ok, so the test is not necessarily reading to the end (i.e. not reading until it gets a <code>StreamResult::Dropped</code>), correct?  In that case, yeah, it makes sense that you'd need to drop the stream explicitly before awaiting the future.</p>",
+        "id": 536432671,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1756304670
+    },
+    {
+        "content": "<p>yes, exactly, I'm just adding that to the test as we speak</p>",
+        "id": 536432772,
+        "sender_full_name": "Roman Volosatovs",
+        "timestamp": 1756304698
+    },
+    {
+        "content": "<div class=\"codehilite\" data-code-language=\"Diff\"><pre><span></span><code><span class=\"gh\">diff --git a/crates/test-programs/src/bin/p3_sockets_tcp_sample_application.rs b/crates/test-programs/src/bin/p3_sockets_tcp_sample_application.rs</span>\n<span class=\"gh\">index 83d51fbcf8..2fe38cb855 100644</span>\n<span class=\"gd\">--- a/crates/test-programs/src/bin/p3_sockets_tcp_sample_application.rs</span>\n<span class=\"gi\">+++ b/crates/test-programs/src/bin/p3_sockets_tcp_sample_application.rs</span>\n<span class=\"gu\">@@ -44,11 +44,14 @@ async fn test_tcp_sample_application(family: IpAddressFamily, bind_address: IpSo</span>\n<span class=\"w\"> </span>            let (mut data_rx, fut) = sock.receive();\n<span class=\"w\"> </span>            let (result, data) = data_rx.read(Vec::with_capacity(100)).await;\n<span class=\"w\"> </span>            assert_eq!(result, StreamResult::Complete(first_message.len()));\n<span class=\"gd\">-</span>\n<span class=\"w\"> </span>            // Check that we sent and received our message!\n<span class=\"w\"> </span>            assert_eq!(data, first_message); // Not guaranteed to work but should work in practice.\n<span class=\"gd\">-            drop(data_rx);</span>\n<span class=\"gd\">-            fut.await.unwrap()</span>\n<span class=\"gi\">+</span>\n<span class=\"gi\">+            let (result, data) = data_rx.read(Vec::with_capacity(1)).await;</span>\n<span class=\"gi\">+            assert_eq!(result, StreamResult::Dropped);</span>\n<span class=\"gi\">+            assert_eq!(data, []);</span>\n<span class=\"gi\">+</span>\n<span class=\"gi\">+            fut.await.unwrap();</span>\n<span class=\"w\"> </span>        },\n<span class=\"w\"> </span>    );\n\n<span class=\"gu\">@@ -74,10 +77,13 @@ async fn test_tcp_sample_application(family: IpAddressFamily, bind_address: IpSo</span>\n<span class=\"w\"> </span>            let (mut data_rx, fut) = sock.receive();\n<span class=\"w\"> </span>            let (result, data) = data_rx.read(Vec::with_capacity(100)).await;\n<span class=\"w\"> </span>            assert_eq!(result, StreamResult::Complete(second_message.len()));\n<span class=\"gd\">-</span>\n<span class=\"w\"> </span>            // Check that we sent and received our message!\n<span class=\"w\"> </span>            assert_eq!(data, second_message); // Not guaranteed to work but should work in practice.\n<span class=\"gd\">-            drop(data_rx);</span>\n<span class=\"gi\">+</span>\n<span class=\"gi\">+            let (result, data) = data_rx.read(Vec::with_capacity(1)).await;</span>\n<span class=\"gi\">+            assert_eq!(result, StreamResult::Dropped);</span>\n<span class=\"gi\">+            assert_eq!(data, []);</span>\n<span class=\"gi\">+</span>\n<span class=\"w\"> </span>            fut.await.unwrap()\n<span class=\"w\"> </span>        }\n<span class=\"w\"> </span>    );\n</code></pre></div>\n<p>this works, and IMO that's actually the correct behavior - previous implementation was working \"by accident\"</p>",
+        "id": 536433207,
+        "sender_full_name": "Roman Volosatovs",
+        "timestamp": 1756304817
+    },
+    {
+        "content": "<p>yeah, looking at the code I would expect that to work, so glad to know it does</p>",
+        "id": 536433322,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1756304846
+    },
+    {
+        "content": "<p>also good to know that <code>drop(data_rx)</code> is effectively equivalent to \"skip to the end; I don't care about the rest\", since that's more efficient than reading and ignoring the items.</p>",
+        "id": 536433762,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1756304963
+    },
+    {
+        "content": "<p>this all makes sense to me so far, but what's up with the last diff you pasted roman?</p>",
+        "id": 536433818,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1756304980
+    },
+    {
+        "content": "<p>is that required to make the test pass?</p>",
+        "id": 536433834,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1756304985
+    },
+    {
+        "content": "<p>I think the upshot is that you either need to drop the stream or read to the end before you await the future</p>",
+        "id": 536433932,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1756305011
+    },
+    {
+        "content": "<p>so either drop now or get <code>StreamResult::Dropped</code> before the future resolves?</p>",
+        "id": 536434003,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1756305033
+    },
+    {
+        "content": "<p>right</p>",
+        "id": 536434029,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1756305040
+    },
+    {
+        "content": "<p>yeah that makes sense to me</p>",
+        "id": 536434051,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1756305047
+    },
+    {
+        "content": "<p>i.e. both the before and after for that diff should work</p>",
+        "id": 536434073,
+        "sender_full_name": "Joel Dice",
+        "timestamp": 1756305052
+    },
+    {
+        "content": "<p>previously the test was not doing either and it just happened to work, because the host task was buffering data from the host and therefore it was notified about the shutdown earlier</p>",
+        "id": 536434392,
+        "sender_full_name": "Roman Volosatovs",
+        "timestamp": 1756305147
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"484032\">Roman Volosatovs</span> has marked this topic as resolved.</p>",
+        "id": 536434459,
+        "sender_full_name": "Notification Bot",
+        "timestamp": 1756305171
+    },
+    {
+        "content": "<p>I suspect that these sorts of minor tweaks in behavior are going to crop up over time, even after we ship WASIp3</p>",
+        "id": 536434598,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1756305215
+    }
+]

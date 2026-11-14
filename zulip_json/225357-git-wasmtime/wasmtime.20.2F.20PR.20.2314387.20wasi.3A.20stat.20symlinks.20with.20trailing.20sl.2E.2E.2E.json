@@ -1,0 +1,134 @@
+[
+    {
+        "content": "<p>Aditya-9-6 opened <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387\">PR #14387</a> from <code>Aditya-9-6:fix-stat-symlink-trailing-slash</code> to <code>bytecodealliance:main</code>:</p>\n<blockquote>\n<p>Closes #14380</p>\n<h3>Problem</h3>\n<p>When \\stat\\ing a path with a trailing slash where the final component is a symlink to a directory with \\FollowSymlinks::No\\, POSIX semantics require resolving the symlink because the trailing slash forces resolution of the target directory.</p>\n<p>On Linux with \\openat2\\, \\stat_fast\\ delegates to \\\fstatat\\ which resolves the symlink and returns the directory metadata. But in \\manually::stat\\, \\stat_unchecked\\ returns the symlink metadata, and the check:</p>\n<p>\\\\\\<br>\nust<br>\nif options.follow == FollowSymlinks::No || !stat.file_type().is_symlink()<br>\n\\\\\\</p>\n<p>exited immediately before dereferencing. Because \\ctx.dir_required\\ is set (due to the trailing slash) and \\stat.is_dir()\\ is false, it returned \\ENOTDIR\\.</p>\n<h3>Fix</h3>\n<p>Check \\!ctx.trailing_slash\\ in \\manually::stat\\ when \\options.follow == FollowSymlinks::No\\, mirroring \\maybe_last_component_symlink\\ in \\manually::open\\. If a trailing slash is present, execution falls through to \\ctx.symlink\\ to dereference the link. If the target is a directory, it returns the directory's metadata; if the target is a regular file, it fails with \\ENOTDIR\\.</p>\n<p>Also exposes \\manually\\ as \\pub(crate)\\ within \\\filesystem::primitives\\ so that unit tests can directly verify \\manually::stat\\ across all platforms.<br>\n</p>\n</blockquote>",
+        "id": 626383781,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790180909
+    },
+    {
+        "content": "<p>Aditya-9-6 requested <a href=\"https://github.com/rvolosatovs\">rvolosatovs</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387\">PR #14387</a>.</p>",
+        "id": 626383811,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790180914
+    },
+    {
+        "content": "<p>Aditya-9-6 requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-wasi-reviewers\">wasmtime-wasi-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387\">PR #14387</a>.</p>",
+        "id": 626383814,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790180914
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>wasi</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387\">PR #14387</a>.</p>",
+        "id": 626401566,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790185465
+    },
+    {
+        "content": "<p>alexcrichton <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387#issuecomment-5801620073\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387\">PR #14387</a>:</p>\n<blockquote>\n<p>One small note: the PR description here has lots of \\ in it which looks like it's intended to be used to format something, but that's not recognized by github, so the PR description is probably not rendering as you intended.</p>\n</blockquote>",
+        "id": 626430382,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790192272
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> rvolosatovs submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387#pullrequestreview-5307365529\">PR review</a>:</p>\n<blockquote>\n<p>Could we do something like this?</p>\n<p><div class=\"codehilite\" data-code-language=\"Diff\"><pre><span></span><code><span class=\"gh\">diff --git a/crates/wasi/src/filesystem/primitives/manually/open.rs b/crates/wasi/src/filesystem/primitives/manually/open.rs</span>\n<span class=\"gh\">index 3df82678a7..4bc06491d3 100644</span>\n<span class=\"gd\">--- a/crates/wasi/src/filesystem/primitives/manually/open.rs</span>\n<span class=\"gi\">+++ b/crates/wasi/src/filesystem/primitives/manually/open.rs</span>\n<span class=\"gu\">@@ -350,6 +350,13 @@ impl&lt;'start&gt; Context&lt;'start&gt; {</span>\n<span class=\"w\"> </span>        Ok(())\n<span class=\"w\"> </span>    }\n\n<span class=\"gi\">+    /// Whether a symlink in the last component should be left as-is rather</span>\n<span class=\"gi\">+    /// than dereferenced. A trailing slash requires a directory, so it</span>\n<span class=\"gi\">+    /// forces dereferencing even with `FollowSymlinks::No`.</span>\n<span class=\"gi\">+    fn stops_at_symlink(&amp;self, follow: FollowSymlinks) -&gt; bool {</span>\n<span class=\"gi\">+        follow == FollowSymlinks::No &amp;&amp; !self.trailing_slash</span>\n<span class=\"gi\">+    }</span>\n<span class=\"gi\">+</span>\n<span class=\"w\"> </span>    /// Check whether this is the last component and we don't need\n<span class=\"w\"> </span>    /// to dereference; otherwise call `Self::symlink`.\n<span class=\"w\"> </span>    fn maybe_last_component_symlink(\n<span class=\"gu\">@@ -359,7 +366,7 @@ impl&lt;'start&gt; Context&lt;'start&gt; {</span>\n<span class=\"w\"> </span>        follow: FollowSymlinks,\n<span class=\"w\"> </span>        err: io::Error,\n<span class=\"w\"> </span>    ) -&gt; io::Result&lt;()&gt; {\n<span class=\"gd\">-        if follow == FollowSymlinks::No &amp;&amp; !self.trailing_slash &amp;&amp; self.components.is_empty() {</span>\n<span class=\"gi\">+        if self.stops_at_symlink(follow) &amp;&amp; self.components.is_empty() {</span>\n<span class=\"w\"> </span>            self.canonical_path.push(one);\n<span class=\"w\"> </span>            self.canonical_path.complete();\n<span class=\"w\"> </span>            return Err(err);\n<span class=\"gu\">@@ -451,12 +458,9 @@ pub(crate) fn stat(start: &amp;fs::File, path: &amp;Path, follow: FollowSymlinks) -&gt; io:</span>\n<span class=\"w\"> </span>                    // `stat_unchecked` on it.\n<span class=\"w\"> </span>                    let stat = stat_unchecked(&amp;ctx.base, one.as_ref(), FollowSymlinks::No)?;\n\n<span class=\"gd\">-                    // If we weren't asked to follow symlinks (and there was no</span>\n<span class=\"gd\">-                    // trailing slash requiring a directory), or it wasn't a</span>\n<span class=\"gi\">+                    // If we weren't asked to follow symlinks, or it wasn't a</span>\n<span class=\"w\"> </span>                    // symlink, we're done.\n<span class=\"gd\">-                    if (options.follow == FollowSymlinks::No &amp;&amp; !ctx.trailing_slash)</span>\n<span class=\"gd\">-                        || !stat.file_type().is_symlink()</span>\n<span class=\"gd\">-                    {</span>\n<span class=\"gi\">+                    if ctx.stops_at_symlink(options.follow) || !stat.file_type().is_symlink() {</span>\n<span class=\"w\"> </span>                        if stat.is_dir() {\n<span class=\"w\"> </span>                            if ctx.dir_precluded {\n<span class=\"w\"> </span>                                return Err(errors::is_directory());\n<span class=\"gu\">@@ -476,8 +480,7 @@ pub(crate) fn stat(start: &amp;fs::File, path: &amp;Path, follow: FollowSymlinks) -&gt; io:</span>\n<span class=\"w\"> </span>                        ctx.dir_precluded = true;\n<span class=\"w\"> </span>                    }\n\n<span class=\"gd\">-                    // If it was a symlink and we're asked to follow symlinks (or</span>\n<span class=\"gd\">-                    // a trailing slash forces dereferencing to a directory),</span>\n<span class=\"gi\">+                    // If it was a symlink and we're asked to follow symlinks,</span>\n<span class=\"w\"> </span>                    // dereference it.\n<span class=\"w\"> </span>                    ctx.symlink(&amp;one, &amp;mut symlink_count)?\n<span class=\"w\"> </span>                } else {\n<span class=\"gh\">diff --git a/crates/wasi/src/filesystem/primitives/mod.rs b/crates/wasi/src/filesystem/primitives/mod.rs</span>\n<span class=\"gh\">index d010c9ffe1..90f4919a03 100644</span>\n<span class=\"gd\">--- a/crates/wasi/src/filesystem/primitives/mod.rs</span>\n<span class=\"gi\">+++ b/crates/wasi/src/filesystem/primitives/mod.rs</span>\n<span class=\"gu\">@@ -18,7 +18,7 @@ mod open_parent;</span>\n<span class=\"w\"> </span>mod open_unchecked_error;\n\n<span class=\"w\"> </span>mod errors;\n<span class=\"gd\">-pub(crate) mod manually;</span>\n<span class=\"gi\">+mod manually;</span>\n\n<span class=\"w\"> </span>#[cfg(test)]\n<span class=\"w\"> </span>mod tests;\n<span class=\"gu\">@@ -64,6 +64,9 @@ pub(crate) fn open(start: &amp;fs::File, path: &amp;Path, options: &amp;OpenOptions) -&gt; io::</span>\n<span class=\"w\"> </span>/// \"foo/bar/baz\", if \"foo\" or \"bar\" are symlinks, they will always be\n<span class=\"w\"> </span>/// followed. This enum value only determines whether \"baz\" is followed.\n<span class=\"w\"> </span>///\n<span class=\"gi\">+/// As POSIX requires, a trailing slash forces the last component to resolve</span>\n<span class=\"gi\">+/// to a directory, so \"foo/bar/baz/\" follows \"baz\" even with `No`.</span>\n<span class=\"gi\">+///</span>\n<span class=\"w\"> </span>/// Instead of passing bare `bool`s as parameters, pass a distinct enum so that\n<span class=\"w\"> </span>/// the intent is clear.\n<span class=\"w\"> </span>#[derive(Copy, Clone, Debug, Eq, PartialEq)]\n<span class=\"gh\">diff --git a/crates/wasi/src/filesystem/primitives/tests/fs_additional.rs b/crates/wasi/src/filesystem/primitives/tests/fs_additional.rs</span>\n<span class=\"gh\">index 21ff5511a1..50697065c0 100644</span>\n<span class=\"gd\">--- a/crates/wasi/src/filesystem/primitives/tests/fs_additional.rs</span>\n<span class=\"gi\">+++ b/crates/wasi/src/filesystem/primitives/tests/fs_additional.rs</span>\n<span class=\"gu\">@@ -1382,13 +1382,8 @@ fn trailing_slash_requires_a_directory() {</span>\n<span class=\"w\"> </span>    }\n\n<span class=\"w\"> </span>    if symlink_supported() {\n<span class=\"gd\">-        #[cfg(unix)]</span>\n<span class=\"gd\">-        use std::os::unix::fs::{symlink as symlink_dir, symlink as symlink_file};</span>\n<span class=\"gd\">-        #[cfg(windows)]</span>\n<span class=\"gd\">-        use std::os::windows::fs::{symlink_dir, symlink_file};</span>\n<span class=\"gd\">-</span>\n<span class=\"gd\">-        check!(symlink_dir(\"dir\", tmpdir.path().join(\"sym_dir\")));</span>\n<span class=\"gd\">-        check!(symlink_file(\"file\", tmpdir.path().join(\"sym_file\")));</span>\n<span class=\"gi\">+        check!(h::symlink_dir(&amp;start, \"dir\", \"sym_dir\"));</span>\n<span class=\"gi\">+        check!(h::symlink_file(&amp;start, \"file\", \"sym_file\"));</span>\n\n<span class=\"w\"> </span>        let stat_sym = check!(p::stat(&amp;start, \"sym_dir\".as_ref(), p::FollowSymlinks::No));\n<span class=\"w\"> </span>        assert!(stat_sym.file_type().is_symlink());\n</code></pre></div><br>\n</p>\n</blockquote>",
+        "id": 626678471,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790269200
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> rvolosatovs created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387#discussion_r4096195336\">PR review comment</a>:</p>\n<blockquote>\n<p>I think we should use <code>h::symlink_{dir,file}</code> instead like the other tests</p>\n</blockquote>",
+        "id": 626678473,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790269200
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> rvolosatovs created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387#discussion_r4096254400\">PR review comment</a>:</p>\n<blockquote>\n<p>since this is also used in <code>maybe_last_component_symlink</code>, could introduce a shared helper?</p>\n</blockquote>",
+        "id": 626678474,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790269200
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> rvolosatovs created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387#discussion_r4096075557\">PR review comment</a>:</p>\n<blockquote>\n<p>this appears to be redundant?</p>\n</blockquote>",
+        "id": 626678475,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790269200
+    },
+    {
+        "content": "<p>Aditya-9-6 updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387\">PR #14387</a>.</p>",
+        "id": 626794346,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790313740
+    },
+    {
+        "content": "<p>Aditya-9-6 edited <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387\">PR #14387</a>:</p>\n<blockquote>\n<p>Closes #14380</p>\n<h3>Problem</h3>\n<p>When <code>stat</code>ing a path with a trailing slash where the final component is a symlink to a directory with <code>FollowSymlinks::No</code>, POSIX semantics require resolving the symlink because the trailing slash forces resolution of the target directory.</p>\n<p>On Linux with <code>openat2</code>, <code>stat_fast</code> delegates to <code>fstatat</code> which resolves the symlink and returns the directory metadata. But in <code>manually::stat</code>, <code>stat_unchecked</code> returns the symlink metadata, and the early check:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"k\">if</span><span class=\"w\"> </span><span class=\"n\">options</span><span class=\"p\">.</span><span class=\"n\">follow</span><span class=\"w\"> </span><span class=\"o\">==</span><span class=\"w\"> </span><span class=\"n\">FollowSymlinks</span><span class=\"p\">::</span><span class=\"n\">No</span><span class=\"w\"> </span><span class=\"o\">||</span><span class=\"w\"> </span><span class=\"o\">!</span><span class=\"n\">stat</span><span class=\"p\">.</span><span class=\"n\">file_type</span><span class=\"p\">().</span><span class=\"n\">is_symlink</span><span class=\"p\">()</span>\n</code></pre></div>\n<p>exited immediately before dereferencing. Because <code>ctx.dir_required</code> is set (due to the trailing slash) and <code>stat.is_dir()</code> is false, it returned <code>ENOTDIR</code>.</p>\n<h3>Fix</h3>\n<ul>\n<li>Introduced a shared <code>stops_at_symlink(&amp;self, follow: FollowSymlinks) -&gt; bool</code> helper on <code>Context</code> (<code>follow == FollowSymlinks::No &amp;&amp; !self.trailing_slash</code>).</li>\n<li>Used <code>stops_at_symlink</code> in both <code>maybe_last_component_symlink</code> and <code>manually::stat</code>. If a trailing slash is present, execution in <code>manually::stat</code> falls through to <code>ctx.symlink</code> to dereference the link. If the target is a directory, it returns the directory's metadata; if the target is a regular file, it fails with <code>ENOTDIR</code>.</li>\n<li>Added test coverage in <code>fs_additional::trailing_slash_requires_a_directory</code> utilizing <code>h::symlink_dir</code> and <code>h::symlink_file</code>.<br>\n</li>\n</ul>\n</blockquote>",
+        "id": 626794381,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790313762
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> Aditya-9-6 submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387#pullrequestreview-5313709007\">PR review</a>.</p>",
+        "id": 626794428,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790313786
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> Aditya-9-6 created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387#discussion_r4101366385\">PR review comment</a>:</p>\n<blockquote>\n<p>Reverted, thank you!</p>\n</blockquote>",
+        "id": 626794429,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790313786
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> Aditya-9-6 submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387#pullrequestreview-5313710209\">PR review</a>.</p>",
+        "id": 626794451,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790313796
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> Aditya-9-6 created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387#discussion_r4101367139\">PR review comment</a>:</p>\n<blockquote>\n<p>Updated to use \\h::symlink_dir\\ and \\h::symlink_file\\.</p>\n</blockquote>",
+        "id": 626794453,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790313796
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> Aditya-9-6 submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387#pullrequestreview-5313711601\">PR review</a>.</p>",
+        "id": 626794465,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790313807
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> Aditya-9-6 created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387#discussion_r4101368019\">PR review comment</a>:</p>\n<blockquote>\n<p>Extracted \\stops_at_symlink\\ helper on \\Context\\ and used it in both places.</p>\n</blockquote>",
+        "id": 626794466,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790313807
+    },
+    {
+        "content": "<p>Aditya-9-6 <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387#issuecomment-5827269448\">commented</a> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387\">PR #14387</a>:</p>\n<blockquote>\n<p>Thanks @alexcrichton and @rvolosatovs for the review! I've fixed the PR description markdown and addressed all comments: extracted the shared \\stops_at_symlink\\ helper, switched to \\h::symlink_{dir,file}\\, and kept \\mod manually\\ private.</p>\n</blockquote>",
+        "id": 626794495,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790313825
+    },
+    {
+        "content": "<p><span aria-label=\"thumbs up\" class=\"emoji emoji-1f44d\" role=\"img\" title=\"thumbs up\">:thumbs_up:</span> rvolosatovs submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387#pullrequestreview-5314536640\">PR review</a>.</p>",
+        "id": 626806841,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790319239
+    },
+    {
+        "content": "<p>rvolosatovs added <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387\">PR #14387 wasi: stat symlinks with trailing slashes correctly in manual resolver</a> to the merge queue.</p>",
+        "id": 626806861,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790319246
+    },
+    {
+        "content": "<p><span aria-label=\"check\" class=\"emoji emoji-2705\" role=\"img\" title=\"check\">:check:</span> rvolosatovs merged <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387\">PR #14387</a>.</p>",
+        "id": 626812728,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790320824
+    },
+    {
+        "content": "<p>rvolosatovs removed <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14387\">PR #14387 wasi: stat symlinks with trailing slashes correctly in manual resolver</a> from the merge queue.</p>",
+        "id": 626812729,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1790320825
+    }
+]

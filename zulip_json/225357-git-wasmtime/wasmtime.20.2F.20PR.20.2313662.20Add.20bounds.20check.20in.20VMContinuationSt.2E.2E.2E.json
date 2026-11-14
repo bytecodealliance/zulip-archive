@@ -1,0 +1,212 @@
+[
+    {
+        "content": "<p>SebTardif opened <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662</a> from <code>SebTardif:fix-stack-switching-initialize-bounds-check</code> to <code>bytecodealliance:main</code>:</p>\n<blockquote>\n<p>\\`VMContinuationStack::initialize\\` writes control data and an args buffer at offsets below the top of the continuation stack, but does not verify that the total size fits within the allocated stack region.</p>\n<h3>The problem</h3>\n<p>A Wasm module can define a continuation function type with an extremely large number of parameters or return values. When \\`cont.new\\` is executed, the call chain reaches \\`initialize()\\` (\\`stack/unix.rs:226\\`), which computes:</p>\n<p>\\`\\`\\`<br>\nargs_data_size = max(param_count, return_count) * size_of::&lt;ValRaw&gt;()<br>\n\\`\\`\\`</p>\n<p>With the default 2 MiB continuation stack (\\`async_stack_size\\`), the fixed header occupies 0x40 (64) bytes. A function type with 131,069 or more parameters produces an \\`args_data_size\\` of 2,097,104 bytes, exceeding the stack allocation. The write loop at line 298 then stores values at offsets like \\`0x28 + args_data_size\\`, placing data past the guard page into adjacent memory mappings.</p>\n<p>Additionally, the original \\`args_data_size\\` computation uses unchecked multiplication (\\`capacity * 16\\`), which, while safe on 64-bit (the inputs are \\`u32\\`), is not self-documenting about overflow safety.</p>\n<h3>The fix</h3>\n<ol>\n<li>Replace the unchecked multiplication with \\`checked_mul\\` + \\`checked_add\\`, returning an error on arithmetic overflow.</li>\n<li>Add a bounds check (\\`ensure!(total_control_size &lt;= self.len)\\`) before any writes, so a high-arity function type produces a clean trap instead of memory corruption.</li>\n<li>Change the return type of \\`initialize\\` from \\`()\\` to \\`Result&lt;()&gt;\\` and propagate the error through the \\`stack.rs\\` wrapper and the \\`cont_new\\` caller (which already returns \\`Result\\`).</li>\n</ol>\n<h3>Bug origin</h3>\n<p>Introduced in #10388 (\"Stack switching: Infrastructure and runtime support\", Frank Emrich, 2025-06-04).</p>\n</blockquote>",
+        "id": 603549304,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781570623
+    },
+    {
+        "content": "<p>SebTardif requested <a href=\"https://github.com/pchickey\">pchickey</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662</a>.</p>",
+        "id": 603549307,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781570623
+    },
+    {
+        "content": "<p>SebTardif requested <a href=\"https://github.com/orgs/bytecodealliance/teams/wasmtime-core-reviewers\">wasmtime-core-reviewers</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662</a>.</p>",
+        "id": 603549308,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781570623
+    },
+    {
+        "content": "<p>SebTardif updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662</a>.</p>",
+        "id": 603551205,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781571219
+    },
+    {
+        "content": "<p>SebTardif updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662</a>.</p>",
+        "id": 603552405,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781571651
+    },
+    {
+        "content": "<p>SebTardif updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662</a>.</p>",
+        "id": 603557893,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781573673
+    },
+    {
+        "content": "<p>SebTardif edited <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662</a>:</p>\n<blockquote>\n<p><code>VMContinuationStack::initialize</code> writes control data and an args buffer at offsets below the top of the continuation stack, but does not verify that the total size fits within the allocated stack region.</p>\n<h3>The problem</h3>\n<p>A Wasm module can define a continuation function type with a large number of parameters or return values. When <code>cont.new</code> is executed, the call chain reaches <code>initialize()</code> (<code>stack/unix.rs:226</code>), which computes:</p>\n<p>args_data_size = max(param_count, return_count) * size_of::&lt;ValRaw&gt;<br>\n()</p>\n<p>The fixed header occupies 0x40 (64) bytes. If the total control data size (header + args buffer) exceeds the stack allocation, the write loop stores values past the stack region into adjacent memory. With the default 2 MiB stack, this requires 131,069+ params; with a smaller <code>async_stack_size</code>, fewer params suffice (e.g., 800 params on an 8 KiB stack).</p>\n<p>Without this fix, the out-of-bounds write hits the guard page and crashes with SIGSEGV. With the fix, a clean error is returned instead.</p>\n<h3>The fix</h3>\n<ol>\n<li>Replace the unchecked multiplication with <code>checked_mul</code> + <code>checked_add</code>, returning an error on arithmetic overflow.</li>\n<li>Add a bounds check (<code>ensure!(total_control_size &lt;= self.len)</code>) before any writes, so a high-arity function type produces a clean trap instead of a crash.</li>\n<li>Change the return type of <code>initialize</code> from <code>()</code> to <code>Result&lt;()&gt;</code> and propagate the error through the <code>stack.rs</code> wrapper and the <code>cont_new</code> caller (which already returns <code>Result</code>).</li>\n</ol>\n<h3>Test</h3>\n<p>A regression test (<code>stack_switching_cont_new_high_arity_rejected</code>) creates a function type with 800 <code>i32</code> params on an 8 KiB continuation stack, verifying that <code>cont.new</code> returns an error instead of crashing. The test skips gracefully on platforms where stack switching is not supported.</p>\n<h3>Bug origin</h3>\n<p>Introduced in #10388 (\"Stack switching: Infrastructure and runtime support\", Frank Emrich, 2025-06-04).<br>\n</p>\n</blockquote>",
+        "id": 603566344,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781576558
+    },
+    {
+        "content": "<p>github-actions[bot] added the label <code>wasmtime:api</code> on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662</a>.</p>",
+        "id": 603585191,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781582717
+    },
+    {
+        "content": "<p>alexcrichton edited <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662</a>:</p>\n<blockquote>\n<p><code>VMContinuationStack::initialize</code> writes control data and an args buffer at offsets below the top of the continuation stack, but does not verify that the total size fits within the allocated stack region.</p>\n<h3>The problem</h3>\n<p>A Wasm module can define a continuation function type with a large number of parameters or return values. When <code>cont.new</code> is executed, the call chain reaches <code>initialize()</code> (<code>stack/unix.rs:226</code>), which computes:</p>\n<p><code>args_data_size = max(param_count, return_count) * size_of::&lt;ValRaw&gt;()</code></p>\n<p>The fixed header occupies 0x40 (64) bytes. If the total control data size (header + args buffer) exceeds the stack allocation, the write loop stores values past the stack region into adjacent memory. With the default 2 MiB stack, this requires 131,069+ params; with a smaller <code>async_stack_size</code>, fewer params suffice (e.g., 800 params on an 8 KiB stack).</p>\n<p>Without this fix, the out-of-bounds write hits the guard page and crashes with SIGSEGV. With the fix, a clean error is returned instead.</p>\n<h3>The fix</h3>\n<ol>\n<li>Replace the unchecked multiplication with <code>checked_mul</code> + <code>checked_add</code>, returning an error on arithmetic overflow.</li>\n<li>Add a bounds check (<code>ensure!(total_control_size &lt;= self.len)</code>) before any writes, so a high-arity function type produces a clean trap instead of a crash.</li>\n<li>Change the return type of <code>initialize</code> from <code>()</code> to <code>Result&lt;()&gt;</code> and propagate the error through the <code>stack.rs</code> wrapper and the <code>cont_new</code> caller (which already returns <code>Result</code>).</li>\n</ol>\n<h3>Test</h3>\n<p>A regression test (<code>stack_switching_cont_new_high_arity_rejected</code>) creates a function type with 800 <code>i32</code> params on an 8 KiB continuation stack, verifying that <code>cont.new</code> returns an error instead of crashing. The test skips gracefully on platforms where stack switching is not supported.</p>\n<h3>Bug origin</h3>\n<p>Introduced in #10388 (\"Stack switching: Infrastructure and runtime support\", Frank Emrich, 2025-06-04).<br>\n</p>\n</blockquote>",
+        "id": 603864455,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781631673
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> alexcrichton submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662#pullrequestreview-4508879331\">PR review</a>.</p>",
+        "id": 603867732,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781632216
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> alexcrichton created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662#discussion_r3422832068\">PR review comment</a>:</p>\n<blockquote>\n<p>Since this function now returns <code>Result</code> could this use <code>?</code> instead of <code>.unwrap()</code>?</p>\n</blockquote>",
+        "id": 603867733,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781632216
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> alexcrichton created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662#discussion_r3422844943\">PR review comment</a>:</p>\n<blockquote>\n<p>Could this avoid the dance here of adding/subtracting/adding 0x40 by setting the original computation to <code>total_control_size</code>, then calculating <code>args_data_size</code> by subtracing 0x40 from that?</p>\n</blockquote>",
+        "id": 603867735,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781632216
+    },
+    {
+        "content": "<p>alexcrichton requested <a href=\"https://github.com/alexcrichton\">alexcrichton</a> for a review on <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662</a>.</p>",
+        "id": 603867761,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781632224
+    },
+    {
+        "content": "<p>alexcrichton unassigned pchickey from <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662 Add bounds check in VMContinuationStack::initialize for args buffer size</a>.</p>",
+        "id": 603867762,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781632224
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> alexcrichton created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662#discussion_r3422858998\">PR review comment</a>:</p>\n<blockquote>\n<p>I realize that this is preexisting, but could you add an <code>assert!(!cfg(target_arch = \"x86_64\"))</code> here? That way we can at least verify this test passes on one architecture instead of accidentally always falling through to here silently</p>\n</blockquote>",
+        "id": 603867773,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781632227
+    },
+    {
+        "content": "<p>SebTardif updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662</a>.</p>",
+        "id": 603879524,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781634856
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> SebTardif submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662#pullrequestreview-4509257091\">PR review</a>.</p>",
+        "id": 603879598,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781634872
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> SebTardif submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662#pullrequestreview-4509257079\">PR review</a>.</p>",
+        "id": 603879599,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781634872
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> SebTardif submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662#pullrequestreview-4509257094\">PR review</a>.</p>",
+        "id": 603879600,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781634872
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> SebTardif created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662#discussion_r3423127129\">PR review comment</a>:</p>\n<blockquote>\n<p>Added.</p>\n</blockquote>",
+        "id": 603879603,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781634872
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> SebTardif created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662#discussion_r3423127119\">PR review comment</a>:</p>\n<blockquote>\n<p>Done, replaced all three <code>.unwrap()</code> calls in <code>initialize</code> with <code>?</code>.</p>\n</blockquote>",
+        "id": 603879604,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781634872
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> SebTardif created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662#discussion_r3423127136\">PR review comment</a>:</p>\n<blockquote>\n<p>Good call. Now computes <code>total_control_size</code> directly from the checked arithmetic, then derives <code>args_data_size = total_control_size - 0x40</code>. Also replaced <code>tos.sub(0x40 + args_data_size)</code> with <code>tos.sub(total_control_size)</code> in the to_store array for consistency.</p>\n</blockquote>",
+        "id": 603879606,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781634872
+    },
+    {
+        "content": "<p><span aria-label=\"thumbs up\" class=\"emoji emoji-1f44d\" role=\"img\" title=\"thumbs up\">:thumbs_up:</span> alexcrichton submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662#pullrequestreview-4509414606\">PR review</a>:</p>\n<blockquote>\n<p>Thanks! Happy to merge once CI is green</p>\n</blockquote>",
+        "id": 603884704,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781636072
+    },
+    {
+        "content": "<p>SebTardif updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662</a>.</p>",
+        "id": 603902864,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781640438
+    },
+    {
+        "content": "<p>alexcrichton has enabled auto merge for <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662</a>.</p>",
+        "id": 603903935,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781640693
+    },
+    {
+        "content": "<p>alexcrichton added <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662 Add bounds check in VMContinuationStack::initialize for args buffer size</a> to the merge queue.</p>",
+        "id": 603905490,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781641097
+    },
+    {
+        "content": "<p>github-merge-queue[bot] removed <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662 Add bounds check in VMContinuationStack::initialize for args buffer size</a> from the merge queue.</p>",
+        "id": 603911961,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781642592
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> alexcrichton submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662#pullrequestreview-4510380908\">PR review</a>.</p>",
+        "id": 603919160,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781644442
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> alexcrichton created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662#discussion_r3424075287\">PR review comment</a>:</p>\n<blockquote>\n<p>Ah, sorry, this'll need adjusting to:</p>\n<p><div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"fm\">assert!</span><span class=\"p\">(</span><span class=\"o\">!</span><span class=\"p\">(</span><span class=\"fm\">cfg!</span><span class=\"p\">(</span><span class=\"n\">target_arch</span><span class=\"w\"> </span><span class=\"o\">=</span><span class=\"w\"> </span><span class=\"s\">\"x86_64\"</span><span class=\"p\">)</span><span class=\"w\"> </span><span class=\"o\">&amp;&amp;</span><span class=\"w\"> </span><span class=\"fm\">cfg!</span><span class=\"p\">(</span><span class=\"n\">unix</span><span class=\"p\">)));</span>\n</code></pre></div><br>\n</p>\n</blockquote>",
+        "id": 603919162,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781644442
+    },
+    {
+        "content": "<p>SebTardif updated <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662</a>.</p>",
+        "id": 603922755,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781645422
+    },
+    {
+        "content": "<p><span aria-label=\"memo\" class=\"emoji emoji-1f4dd\" role=\"img\" title=\"memo\">:memo:</span> SebTardif submitted <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662#pullrequestreview-4510475111\">PR review</a>.</p>",
+        "id": 603922770,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781645425
+    },
+    {
+        "content": "<p><span aria-label=\"speech balloon\" class=\"emoji emoji-1f4ac\" role=\"img\" title=\"speech balloon\">:speech_balloon:</span> SebTardif created <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662#discussion_r3424152563\">PR review comment</a>:</p>\n<blockquote>\n<p>Done, updated to check both conditions.</p>\n</blockquote>",
+        "id": 603922771,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781645425
+    },
+    {
+        "content": "<p>alexcrichton added <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662 Add bounds check in VMContinuationStack::initialize for args buffer size</a> to the merge queue.</p>",
+        "id": 603933316,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781648525
+    },
+    {
+        "content": "<p><span aria-label=\"check\" class=\"emoji emoji-2705\" role=\"img\" title=\"check\">:check:</span> alexcrichton merged <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662</a>.</p>",
+        "id": 603938302,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781650051
+    },
+    {
+        "content": "<p>alexcrichton removed <a href=\"https://github.com/bytecodealliance/wasmtime/pull/13662\">PR #13662 Add bounds check in VMContinuationStack::initialize for args buffer size</a> from the merge queue.</p>",
+        "id": 603938304,
+        "sender_full_name": "Wasmtime GitHub notifications bot",
+        "timestamp": 1781650052
+    }
+]
