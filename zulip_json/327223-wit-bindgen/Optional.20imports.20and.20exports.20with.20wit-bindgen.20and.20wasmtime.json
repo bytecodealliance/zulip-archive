@@ -1,0 +1,176 @@
+[
+    {
+        "content": "<p>I've been redoing the WIT design for a plugin system I have in one of my projects (<a href=\"https://github.com/wpbs-rs/wpbs/pull/29\">https://github.com/wpbs-rs/wpbs/pull/29</a>). The plugin system has a dynamic list of \"services\" (provided as WIT dep worlds) which a plugin can optionally implement.</p>\n<p>Meaning that they ideally only implement the worlds they want to implement. But it seems like optional imports (<a href=\"https://github.com/WebAssembly/component-model/issues/555\">https://github.com/WebAssembly/component-model/issues/555</a>) and optional exports (can not find any tracking issue for this) are still quite a way off.</p>\n<p>For now guests implement all worlds their export functions but just call <code>unimplemented!()</code> for the ones they do not want to implement. This works for now and it could get abstracted away behind a crate providing macros for this but in the future we would love to provide this at the WIT level instead.</p>\n<p>The usage of wit-bindgen is also strongly preferred for both the host and guest because of great developer experience and type safety it provides.</p>\n<p>So <span class=\"user-mention\" data-user-id=\"697013\">@circuitsacul</span> and I are looking into ways to support optional imports and exports with the current system (wit-bindgen and wasmtime). And we would like some feedback on the following idea:</p>\n<h2>WIT</h2>\n<p>You split each service into it's own world and do not compose them into a single <code>plugin</code> world.</p>\n<h2>Host</h2>\n<p>The main steps here are:</p>\n<ol>\n<li>Detect what worlds a WASM component implements (not sure how to tackle this at this moment).</li>\n<li>Add only those worlds to a linker (import validation).</li>\n<li>Pre-instantiate for only those worlds (export validation).</li>\n</ol>\n<h3>World detection</h3>\n<p>I could have a world with an export function which needs to list all \"service\" worlds the plugin implements but I rather just detect it before doing any instantiation if possible.</p>\n<h3>Linker</h3>\n<p>Added a specific \"service\" world to the linker in case a component has it implemented:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"n\">ServiceOne</span><span class=\"p\">::</span><span class=\"n\">add_to_linker</span><span class=\"p\">::</span><span class=\"o\">&lt;</span><span class=\"n\">InternalRuntime</span><span class=\"p\">,</span><span class=\"w\"> </span><span class=\"n\">HasSelf</span><span class=\"o\">&lt;</span><span class=\"n\">InternalRuntime</span><span class=\"o\">&gt;&gt;</span><span class=\"p\">(</span>\n<span class=\"w\">    </span><span class=\"o\">&amp;</span><span class=\"k\">mut</span><span class=\"w\"> </span><span class=\"n\">linker</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"o\">|</span><span class=\"n\">internal_runtime</span><span class=\"o\">|</span><span class=\"w\"> </span><span class=\"n\">internal_runtime</span><span class=\"p\">,</span>\n<span class=\"p\">)</span>\n<span class=\"p\">.</span><span class=\"n\">unwrap</span><span class=\"p\">();</span>\n\n<span class=\"n\">ServiceTwo</span><span class=\"p\">::</span><span class=\"n\">add_to_linker</span><span class=\"p\">::</span><span class=\"o\">&lt;</span><span class=\"n\">InternalRuntime</span><span class=\"p\">,</span><span class=\"w\"> </span><span class=\"n\">HasSelf</span><span class=\"o\">&lt;</span><span class=\"n\">InternalRuntime</span><span class=\"o\">&gt;&gt;</span><span class=\"p\">(</span>\n<span class=\"w\">    </span><span class=\"o\">&amp;</span><span class=\"k\">mut</span><span class=\"w\"> </span><span class=\"n\">linker</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"o\">|</span><span class=\"n\">internal_runtime</span><span class=\"o\">|</span><span class=\"w\"> </span><span class=\"n\">internal_runtime</span><span class=\"p\">,</span>\n<span class=\"p\">)</span>\n<span class=\"p\">.</span><span class=\"n\">unwrap</span><span class=\"p\">();</span>\n\n<span class=\"c1\">// etc.</span>\n</code></pre></div>\n<p>This would mean that there would be a bunch of unique linkers for the used \"service\" combinations.</p>\n<h3>Pre Instantiation</h3>\n<p>Pre Instantiate with a specific \"service\" world in case a component has it implemented:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"k\">struct</span><span class=\"w\"> </span><span class=\"nc\">PluginPre</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">    </span><span class=\"n\">service_one_pre</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nb\">Option</span><span class=\"o\">&lt;</span><span class=\"n\">ServiceOnePre</span><span class=\"o\">&gt;</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"n\">service_two_pre</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nb\">Option</span><span class=\"o\">&lt;</span><span class=\"n\">ServiceTwoPre</span><span class=\"o\">&gt;</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"c1\">// etc.</span>\n<span class=\"p\">}</span>\n</code></pre></div>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"n\">ServiceOnePre</span><span class=\"p\">::</span><span class=\"n\">new</span><span class=\"p\">(</span><span class=\"n\">instance_pre</span><span class=\"p\">).</span><span class=\"n\">unwrap</span><span class=\"p\">();</span>\n\n<span class=\"n\">ServiceTwoPre</span><span class=\"p\">::</span><span class=\"n\">new</span><span class=\"p\">(</span><span class=\"n\">instance_pre</span><span class=\"p\">).</span><span class=\"n\">unwrap</span><span class=\"p\">();</span>\n\n<span class=\"c1\">// etc.</span>\n</code></pre></div>\n<p>The question here is what the cost if of many InstancePre's per plugin, how does it scale?</p>\n<h2>Guest</h2>\n<p>A guest can then implement the traits for the <code>service</code> worlds they want to a <code>Plugin</code> struct and then add:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"c1\">// Clippy pedantic is not happy with wit-bindgen 0.60.0</span>\n<span class=\"cp\">#[allow(clippy::same_length_and_capacity)]</span>\n<span class=\"k\">mod</span><span class=\"w\"> </span><span class=\"nn\">bindgen</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">    </span><span class=\"k\">use</span><span class=\"w\"> </span><span class=\"k\">crate</span><span class=\"p\">::</span><span class=\"n\">Plugin</span><span class=\"p\">;</span>\n\n<span class=\"w\">    </span><span class=\"n\">wit_bindgen</span><span class=\"p\">::</span><span class=\"n\">generate</span><span class=\"o\">!</span><span class=\"p\">({</span><span class=\"w\"> </span><span class=\"n\">path</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"s\">\"../service-one\"</span><span class=\"w\"> </span><span class=\"p\">});</span>\n<span class=\"w\">    </span><span class=\"n\">wit_bindgen</span><span class=\"p\">::</span><span class=\"n\">generate</span><span class=\"o\">!</span><span class=\"p\">({</span><span class=\"w\"> </span><span class=\"n\">path</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"s\">\"../service-two\"</span><span class=\"w\"> </span><span class=\"p\">});</span>\n<span class=\"w\">    </span><span class=\"c1\">// etc.</span>\n\n<span class=\"w\">    </span><span class=\"n\">export</span><span class=\"o\">!</span><span class=\"p\">(</span><span class=\"n\">Plugin</span><span class=\"p\">);</span>\n<span class=\"p\">}</span>\n</code></pre></div>\n<p>So basically I would love to know:</p>\n<ol>\n<li>If anyone has experience with this.</li>\n<li>If this is even possible in reality (I have not gone ahead and actually implemented it yet because of the world detection issue and the work it will take).</li>\n<li>If it's worth in case it does work.</li>\n<li>If there is  tracking issue for optional exports.</li>\n</ol>",
+        "id": 616989067,
+        "sender_full_name": "Eduard Smet (Celarye)",
+        "timestamp": 1786980537
+    },
+    {
+        "content": "<p><span class=\"user-mention\" data-user-id=\"1101301\">@Ignatz</span> you might be interested in this.</p>",
+        "id": 616989772,
+        "sender_full_name": "Eduard Smet (Celarye)",
+        "timestamp": 1786980696
+    },
+    {
+        "content": "<p>FWIW optional imports in the component model are seen as pretty high-priority and in theory going to get implemented in the next few months or so, but that's also still all a work-in-progress (e.g. no spec definition quite just yet). Otherwise though there's no plans for optional exports at this time -- that'd be more done with host side detection I think.</p>\n<p>As for the viability of what you're thinking, there's a lot of details glossed over I think but it seems reasonable-ish to me</p>",
+        "id": 617021993,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1786990683
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"253994\">Alex Crichton</span> <a href=\"#narrow/channel/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime/near/617021993\">said</a>:</p>\n<blockquote>\n<p>FWIW optional imports in the component model are seen as pretty high-priority and in theory going to get implemented in the next few months or so, but that's also still all a work-in-progress (e.g. no spec definition quite just yet). Otherwise though there's no plans for optional exports at this time -- that'd be more done with host side detection I think.</p>\n<p>As for the viability of what you're thinking, there's a lot of details glossed over I think but it seems reasonable-ish to me</p>\n</blockquote>\n<p>Is there any specific way you see host side detection working, as that seems to be the biggest hurdle for the above proposed implementation?</p>\n<p>Iirc the WIT worlds a component implements can be checked through wasm-tools. But that’s not a library (maybe I can use the internal crate). And then I would need to parse that as well ofcourse.</p>\n<p>As optional exports are not planned at all I’ll probably have to try the above idea eventually if I want to keep the plugin developer experience as simple as possible.</p>",
+        "id": 617024965,
+        "sender_full_name": "Eduard Smet (Celarye)",
+        "timestamp": 1786991692
+    },
+    {
+        "content": "<p>For host-side detection I'd imagine reflection over the <code>Component</code> type after it's loaded/compiled. That has information on imports/exports you'd be able to dispatch on</p>",
+        "id": 617026396,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1786992220
+    },
+    {
+        "content": "<p>For optional exports my impression is that an export is either there or not, optionality doesn't factor in to it. For imports it's different because you may be given the import or not, but optional exports seem like it'd be some sort of conditional decision based on what you were given at runtime and that's not planned AFAIK</p>",
+        "id": 617026535,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1786992282
+    },
+    {
+        "content": "<p>the Wasmtime CLI effectively already does this, fwiw: <code>wasmtime run</code> and <code>wasmtime serve</code> both support multiple different exports, and successfully run the component if at least one of them exists</p>",
+        "id": 617028934,
+        "sender_full_name": "Till Schneidereit",
+        "timestamp": 1786993208
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"253994\">Alex Crichton</span> <a href=\"#narrow/channel/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime/near/617026396\">said</a>:</p>\n<blockquote>\n<p>For host-side detection I'd imagine reflection over the <code>Component</code> type after it's loaded/compiled. That has information on imports/exports you'd be able to dispatch on</p>\n</blockquote>\n<p>Ah yeah something like <code>Component::get_export_index()</code> or so could maybe do the job? What I would want was a clear list of the worlds a component implements.</p>",
+        "id": 617038972,
+        "sender_full_name": "Eduard Smet (Celarye)",
+        "timestamp": 1786997005
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"253994\">Alex Crichton</span> <a href=\"#narrow/channel/327223-wit-bindgen/topic/Optional.20imports.20and.20exports.20with.20wit-bindgen.20and.20wasmtime/near/617026396\">said</a>:</p>\n<blockquote>\n<p>For host-side detection I'd imagine reflection over the <code>Component</code> type after it's loaded/compiled. That has information on imports/exports you'd be able to dispatch on</p>\n</blockquote>\n<p>Ah yeah something like <code>Component::get_export_index()</code> or so could maybe do the job? What I would want was a clear list of the worlds a component implements.</p>",
+        "id": 617038997,
+        "sender_full_name": "Eduard Smet (Celarye)",
+        "timestamp": 1786997016
+    },
+    {
+        "content": "<p>Not sure why it double send?</p>",
+        "id": 617039118,
+        "sender_full_name": "Eduard Smet (Celarye)",
+        "timestamp": 1786997075
+    },
+    {
+        "content": "<p>Just to clarify this is the current WIT structure which I have:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"n\">wit</span>\n<span class=\"err\">├──</span><span class=\"w\"> </span><span class=\"n\">deps</span>\n<span class=\"err\">│</span><span class=\"w\">   </span><span class=\"err\">├──</span><span class=\"w\"> </span><span class=\"n\">wpbs</span><span class=\"o\">-</span><span class=\"n\">services</span><span class=\"p\">:</span><span class=\"nc\">discord</span>\n<span class=\"err\">│</span><span class=\"w\">   </span><span class=\"err\">│</span><span class=\"w\">   </span><span class=\"err\">├──</span><span class=\"w\"> </span><span class=\"n\">types</span><span class=\"p\">.</span><span class=\"n\">wit</span>\n<span class=\"err\">│</span><span class=\"w\">   </span><span class=\"err\">│</span><span class=\"w\">   </span><span class=\"err\">└──</span><span class=\"w\"> </span><span class=\"n\">world</span><span class=\"p\">.</span><span class=\"n\">wit</span>\n<span class=\"err\">│</span><span class=\"w\">   </span><span class=\"err\">├──</span><span class=\"w\"> </span><span class=\"n\">wpbs</span><span class=\"o\">-</span><span class=\"n\">services</span><span class=\"p\">:</span><span class=\"nc\">job</span><span class=\"o\">-</span><span class=\"n\">scheduler</span>\n<span class=\"err\">│</span><span class=\"w\">   </span><span class=\"err\">│</span><span class=\"w\">   </span><span class=\"err\">├──</span><span class=\"w\"> </span><span class=\"n\">types</span><span class=\"p\">.</span><span class=\"n\">wit</span>\n<span class=\"err\">│</span><span class=\"w\">   </span><span class=\"err\">│</span><span class=\"w\">   </span><span class=\"err\">└──</span><span class=\"w\"> </span><span class=\"n\">world</span><span class=\"p\">.</span><span class=\"n\">wit</span>\n<span class=\"err\">│</span><span class=\"w\">   </span><span class=\"err\">├──</span><span class=\"w\"> </span><span class=\"n\">wpbs</span><span class=\"p\">:</span><span class=\"nc\">core</span>\n<span class=\"err\">│</span><span class=\"w\">   </span><span class=\"err\">│</span><span class=\"w\">   </span><span class=\"err\">├──</span><span class=\"w\"> </span><span class=\"n\">types</span><span class=\"p\">.</span><span class=\"n\">wit</span>\n<span class=\"err\">│</span><span class=\"w\">   </span><span class=\"err\">│</span><span class=\"w\">   </span><span class=\"err\">└──</span><span class=\"w\"> </span><span class=\"n\">world</span><span class=\"p\">.</span><span class=\"n\">wit</span>\n<span class=\"err\">│</span><span class=\"w\">   </span><span class=\"err\">├──</span><span class=\"w\"> </span><span class=\"n\">wpbs</span><span class=\"p\">:</span><span class=\"nc\">services</span>\n<span class=\"err\">│</span><span class=\"w\">   </span><span class=\"err\">│</span><span class=\"w\">   </span><span class=\"err\">└──</span><span class=\"w\"> </span><span class=\"n\">world</span><span class=\"p\">.</span><span class=\"n\">wit</span>\n<span class=\"err\">│</span><span class=\"w\">   </span><span class=\"err\">└──</span><span class=\"w\"> </span><span class=\"n\">wpbs</span><span class=\"p\">:</span><span class=\"nc\">shared</span>\n<span class=\"err\">│</span><span class=\"w\">       </span><span class=\"err\">└──</span><span class=\"w\"> </span><span class=\"n\">types</span><span class=\"p\">.</span><span class=\"n\">wit</span>\n<span class=\"err\">└──</span><span class=\"w\"> </span><span class=\"n\">world</span><span class=\"p\">.</span><span class=\"n\">wit</span>\n</code></pre></div>\n<p>Here services like \"discord\" or \"job-scheduler\" provide worlds which a component may or may not implement.</p>",
+        "id": 617039509,
+        "sender_full_name": "Eduard Smet (Celarye)",
+        "timestamp": 1786997224
+    },
+    {
+        "content": "<p>So it's not an optional thing which may change ar runtime but gets decided at compile time of the component.</p>",
+        "id": 617039630,
+        "sender_full_name": "Eduard Smet (Celarye)",
+        "timestamp": 1786997267
+    },
+    {
+        "content": "<p>Ok yeah sounds like you definitely want to reflect over the component type, so this wouldn't be a WIT feature really but rather a feature of your embedding. And yeah <code>get_export_index</code> is the way to go.</p>",
+        "id": 617039860,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1786997363
+    },
+    {
+        "content": "<p>I think optional imports and exports was the wrong way to go about this. Rather these worlds are either implemented or not at compile time and I need to validate which are before pre-instantiating them.</p>\n<p>Should I combine <code>get_export_index</code> with the ideas I send above?</p>",
+        "id": 617040497,
+        "sender_full_name": "Eduard Smet (Celarye)",
+        "timestamp": 1786997592
+    },
+    {
+        "content": "<p>That sounds reasonable to me yeah!</p>",
+        "id": 617047013,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1786999940
+    },
+    {
+        "content": "<p>Could it be that the guest code snippet in my first message was wrong and that it would look like this instead?</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"k\">mod</span><span class=\"w\"> </span><span class=\"nn\">bindgen</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">    </span><span class=\"k\">mod</span><span class=\"w\"> </span><span class=\"nn\">service_one</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">        </span><span class=\"k\">use</span><span class=\"w\"> </span><span class=\"k\">crate</span><span class=\"p\">::</span><span class=\"n\">Plugin</span><span class=\"p\">;</span>\n\n<span class=\"w\">        </span><span class=\"n\">wit_bindgen</span><span class=\"p\">::</span><span class=\"n\">generate</span><span class=\"o\">!</span><span class=\"p\">({</span><span class=\"w\"> </span><span class=\"n\">path</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"s\">\"../service-one\"</span><span class=\"w\"> </span><span class=\"p\">});</span>\n<span class=\"w\">        </span><span class=\"n\">export</span><span class=\"o\">!</span><span class=\"p\">(</span><span class=\"n\">Plugin</span><span class=\"p\">);</span>\n<span class=\"w\">    </span><span class=\"p\">}</span>\n\n<span class=\"w\">    </span><span class=\"k\">mod</span><span class=\"w\"> </span><span class=\"nn\">service_two</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">        </span><span class=\"k\">use</span><span class=\"w\"> </span><span class=\"k\">crate</span><span class=\"p\">::</span><span class=\"n\">Plugin</span><span class=\"p\">;</span>\n\n<span class=\"w\">        </span><span class=\"n\">wit_bindgen</span><span class=\"p\">::</span><span class=\"n\">generate</span><span class=\"o\">!</span><span class=\"p\">({</span><span class=\"w\"> </span><span class=\"n\">path</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"s\">\"../service-two\"</span><span class=\"w\"> </span><span class=\"p\">});</span>\n<span class=\"w\">        </span><span class=\"n\">export</span><span class=\"o\">!</span><span class=\"p\">(</span><span class=\"n\">Plugin</span><span class=\"p\">);</span>\n<span class=\"w\">    </span><span class=\"p\">}</span>\n<span class=\"p\">}</span>\n</code></pre></div>",
+        "id": 617050618,
+        "sender_full_name": "Eduard Smet (Celarye)",
+        "timestamp": 1787001527
+    },
+    {
+        "content": "<p>I've gone ahead and split my separate worlds into their own subdirectories under <code>wit</code>. But I am not sure if this is the best way forward as I now need to duplicate the <code>deps</code> directory a bunch of times:</p>\n<div class=\"codehilite\" data-code-language=\"Bash\"><pre><span></span><code>wit\n├──<span class=\"w\"> </span>core\n│<span class=\"w\">   </span>├──<span class=\"w\"> </span>deps\n│<span class=\"w\">   </span>│<span class=\"w\">   </span>└──<span class=\"w\"> </span>wpbs:shared\n│<span class=\"w\">   </span>│<span class=\"w\">       </span>└──<span class=\"w\"> </span>types.wit\n│<span class=\"w\">   </span>├──<span class=\"w\"> </span>types.wit\n│<span class=\"w\">   </span>└──<span class=\"w\"> </span>world.wit\n├──<span class=\"w\"> </span>services\n│<span class=\"w\">   </span>├──<span class=\"w\"> </span>discord\n│<span class=\"w\">   </span>│<span class=\"w\">   </span>├──<span class=\"w\"> </span>deps\n│<span class=\"w\">   </span>│<span class=\"w\">   </span>│<span class=\"w\">   </span>└──<span class=\"w\"> </span>wpbs:shared\n│<span class=\"w\">   </span>│<span class=\"w\">   </span>│<span class=\"w\">       </span>└──<span class=\"w\"> </span>types.wit\n│<span class=\"w\">   </span>│<span class=\"w\">   </span>├──<span class=\"w\"> </span>types.wit\n│<span class=\"w\">   </span>│<span class=\"w\">   </span>└──<span class=\"w\"> </span>world.wit\n│<span class=\"w\">   </span>└──<span class=\"w\"> </span>job-scheduler\n│<span class=\"w\">       </span>├──<span class=\"w\"> </span>deps\n│<span class=\"w\">       </span>│<span class=\"w\">   </span>└──<span class=\"w\"> </span>wpbs:shared\n│<span class=\"w\">       </span>│<span class=\"w\">       </span>└──<span class=\"w\"> </span>types.wit\n│<span class=\"w\">       </span>├──<span class=\"w\"> </span>types.wit\n│<span class=\"w\">       </span>└──<span class=\"w\"> </span>world.wit\n└──<span class=\"w\"> </span>shared\n<span class=\"w\">    </span>└──<span class=\"w\"> </span>types.wit\n</code></pre></div>\n<p>Are there any other ways I could solve this that improves upon this?</p>",
+        "id": 617965135,
+        "sender_full_name": "Celarye",
+        "timestamp": 1787327883
+    },
+    {
+        "content": "<p>I tried doing:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"k\">mod</span><span class=\"w\"> </span><span class=\"nn\">bindings</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">    </span><span class=\"k\">pub</span><span class=\"w\"> </span><span class=\"k\">mod</span><span class=\"w\"> </span><span class=\"nn\">shared</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">        </span><span class=\"c1\">// Had to create an empty world for this</span>\n<span class=\"w\">        </span><span class=\"n\">wasmtime</span><span class=\"p\">::</span><span class=\"n\">component</span><span class=\"p\">::</span><span class=\"n\">bindgen</span><span class=\"o\">!</span><span class=\"p\">({</span><span class=\"w\"> </span><span class=\"n\">path</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"s\">\"./wit/shared/\"</span><span class=\"w\"> </span><span class=\"p\">});</span>\n<span class=\"w\">    </span><span class=\"p\">}</span>\n\n<span class=\"w\">    </span><span class=\"k\">pub</span><span class=\"w\"> </span><span class=\"k\">mod</span><span class=\"w\"> </span><span class=\"nn\">core</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">        </span><span class=\"n\">wasmtime</span><span class=\"p\">::</span><span class=\"n\">component</span><span class=\"p\">::</span><span class=\"n\">bindgen</span><span class=\"o\">!</span><span class=\"p\">({</span><span class=\"w\"> </span><span class=\"n\">path</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"s\">\"./wit/core/\"</span><span class=\"p\">,</span><span class=\"w\"> </span><span class=\"n\">imports</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"p\">{</span><span class=\"w\"> </span><span class=\"n\">default</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">async</span><span class=\"w\"> </span><span class=\"p\">},</span><span class=\"w\"> </span><span class=\"n\">exports</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"p\">{</span><span class=\"w\"> </span><span class=\"n\">default</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">async</span><span class=\"w\"> </span><span class=\"p\">},</span><span class=\"w\"> </span><span class=\"n\">with</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"p\">{</span><span class=\"w\"> </span><span class=\"s\">\"wpbs::shared/shared-types@0.1.0-rc.1\"</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">crate</span><span class=\"p\">::</span><span class=\"n\">runtime</span><span class=\"p\">::</span><span class=\"n\">plugins</span><span class=\"p\">::</span><span class=\"n\">bindings</span><span class=\"p\">::</span><span class=\"n\">shared</span><span class=\"p\">::</span><span class=\"n\">wpbs</span><span class=\"p\">::</span><span class=\"n\">shared</span><span class=\"p\">::</span><span class=\"n\">shared_types</span><span class=\"w\"> </span><span class=\"p\">}</span><span class=\"w\"> </span><span class=\"p\">});</span>\n<span class=\"w\">    </span><span class=\"p\">}</span>\n\n<span class=\"w\">    </span><span class=\"c1\">//...</span>\n</code></pre></div>\n<p>But re-reading the reference I guess that's only for interfaces which I explicitly import into a world.</p>",
+        "id": 617970444,
+        "sender_full_name": "Celarye",
+        "timestamp": 1787329534
+    },
+    {
+        "content": "<p>For now I'll just keep duplicating the deps but maybe a configurable deps path in wit bindgen would be interesting to support?</p>",
+        "id": 619507376,
+        "sender_full_name": "Celarye",
+        "timestamp": 1787827649
+    },
+    {
+        "content": "<p>While implementing the above I came across an alternative solution on the host side:</p>\n<h2>Linker</h2>\n<p>Stick to a single <code>Linker</code> which implements all service worlds as it's okay for a <code>Linker</code> to implement more imports than a guest (if I understand this correctly).</p>\n<h2>Pre Instantiation</h2>\n<p>Instead of pre instantiating for every service world and storing a dynamic amount of <code>{world}Pre</code>, create a single generic <code>InstancePre</code> and <code>{world}Indices</code> (created by wit-bindgen as well).</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"k\">pub</span><span class=\"w\"> </span><span class=\"k\">struct</span><span class=\"w\"> </span><span class=\"nc\">RuntimePlugin</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">    </span><span class=\"k\">pub</span><span class=\"w\"> </span><span class=\"n\">instance_pre</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">InstancePre</span><span class=\"o\">&lt;</span><span class=\"n\">InternalRuntime</span><span class=\"o\">&gt;</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"k\">pub</span><span class=\"w\"> </span><span class=\"n\">state_pre</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">RuntimePluginStatePre</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"k\">pub</span><span class=\"w\"> </span><span class=\"n\">indices</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">RuntimePluginIndices</span><span class=\"p\">,</span>\n<span class=\"p\">}</span>\n\n<span class=\"k\">pub</span><span class=\"w\"> </span><span class=\"k\">struct</span><span class=\"w\"> </span><span class=\"nc\">RuntimePluginIndices</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">    </span><span class=\"k\">pub</span><span class=\"w\"> </span><span class=\"n\">core</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">CoreIndices</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"k\">pub</span><span class=\"w\"> </span><span class=\"n\">services</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nc\">RuntimePluginIndicesServices</span><span class=\"p\">,</span>\n<span class=\"p\">}</span>\n\n<span class=\"k\">pub</span><span class=\"w\"> </span><span class=\"k\">struct</span><span class=\"w\"> </span><span class=\"nc\">RuntimePluginIndicesServices</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">    </span><span class=\"k\">pub</span><span class=\"w\"> </span><span class=\"n\">job_scheduler</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nb\">Option</span><span class=\"o\">&lt;</span><span class=\"n\">JobSchedulerIndices</span><span class=\"o\">&gt;</span><span class=\"p\">,</span>\n<span class=\"w\">    </span><span class=\"k\">pub</span><span class=\"w\"> </span><span class=\"n\">discord</span><span class=\"p\">:</span><span class=\"w\"> </span><span class=\"nb\">Option</span><span class=\"o\">&lt;</span><span class=\"n\">DiscordIndices</span><span class=\"o\">&gt;</span><span class=\"p\">,</span>\n<span class=\"p\">}</span>\n</code></pre></div>\n<p>With this you can then load the service specific world instance via <code>{world}Indices::load</code> on demand. This does do type checking of all exports on every call, which is not really needed after the first validation.</p>\n<p>Some questions about this approach:</p>\n<ul>\n<li>What is the cost memory wise of storing a dynamic amount of <code>{world}Pre</code> (old solution) vs a dynamic amount of <code>{world}Indices</code>?</li>\n<li>What is the cost of loading a <code>{world}</code> from a generic <code>Instance</code> via <code>{world}Indices::load</code> (new solution)?<br>\n=&gt; Which of the two approaches is recommended here?</li>\n</ul>",
+        "id": 619512803,
+        "sender_full_name": "Celarye",
+        "timestamp": 1787829311
+    },
+    {
+        "content": "<p>It's fine to have more things in a <code>Linker</code> than a guest needs, yeah. <code>{world}Pre</code> is relatively cheap and should be more-or-less the same cost as <code>{world}Indices</code>, neither being too too expensive. Loading a world from an instance can be some string lookups and type-checking, so not massive but O(size-of-world).</p>",
+        "id": 619624303,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1787856297
+    },
+    {
+        "content": "<p>Actually, no, loading a world from <code>{world}Indices</code> should be a pretty cheap operation, still O(world) but no name lookups or type-checking (that was done ahead of time hwne creating the indices). What you've sketched out here seems reasonable</p>",
+        "id": 619624543,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1787856368
+    },
+    {
+        "content": "<p>The method docs does say that the load method does type checking. And I think it said that creation of the Indices only does function existence checking? <span aria-label=\"thinking\" class=\"emoji emoji-1f914\" role=\"img\" title=\"thinking\">:thinking:</span></p>",
+        "id": 619624932,
+        "sender_full_name": "Celarye",
+        "timestamp": 1787856490
+    },
+    {
+        "content": "<p><img alt=\"image.png\" class=\"inline-image\" data-original-content-type=\"image/png\" data-original-dimensions=\"1516x302\" data-original-src=\"/user_uploads/15107/-SGPmBiRhwDwjaYBDrM8Of3c/image.png\" src=\"/user_uploads/thumbnail/15107/-SGPmBiRhwDwjaYBDrM8Of3c/image.png/840x560.webp\"><br>\n<img alt=\"image.png\" class=\"inline-image\" data-original-content-type=\"image/png\" data-original-dimensions=\"1934x318\" data-original-src=\"/user_uploads/15107/suZbKDoibOPNMyFvG3u679xh/image.png\" src=\"/user_uploads/thumbnail/15107/suZbKDoibOPNMyFvG3u679xh/image.png/840x560.webp\"></p>",
+        "id": 619625579,
+        "sender_full_name": "Celarye",
+        "timestamp": 1787856660
+    },
+    {
+        "content": "<p>I might be misremembering, but I thought creation of <code>FooIndices</code> does type-checking, and then using a <code>FooIndices</code> to get a <code>Foo</code> is some simple index lookups</p>",
+        "id": 619625740,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1787856705
+    },
+    {
+        "content": "<p>Although now looking at it it doesn't say <code>new</code> is limited to existence checking.</p>",
+        "id": 619625743,
+        "sender_full_name": "Celarye",
+        "timestamp": 1787856706
+    },
+    {
+        "content": "<p>I'm not too experienced with digging into proc macro code, but I'll see if I can take a look</p>",
+        "id": 619625923,
+        "sender_full_name": "Celarye",
+        "timestamp": 1787856759
+    },
+    {
+        "content": "<p>if it helps you can do <code>WASMTIME_DEBUG_BINDGEN=1</code> in your environment and that should spit out the generated code to a file somewhere which is <code>include!</code>'d which can work a bit better with editors/tooling sometimes</p>",
+        "id": 619626205,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1787856833
+    },
+    {
+        "content": "<p>I think I can also use this: <a href=\"https://docs.rs/wasmtime/latest/src/wasmtime/opt/rustwide/target/debug/build/wasmtime-internal-component-macro/e620958884515fd5/out/hello-world2.rs.html#288-290\">https://docs.rs/wasmtime/latest/src/wasmtime/opt/rustwide/target/debug/build/wasmtime-internal-component-macro/e620958884515fd5/out/hello-world2.rs.html#288-290</a></p>",
+        "id": 619626525,
+        "sender_full_name": "Celarye",
+        "timestamp": 1787856898
+    }
+]

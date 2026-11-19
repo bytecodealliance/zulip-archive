@@ -1,0 +1,146 @@
+[
+    {
+        "content": "<p>Let's say I want to execute arbitrary components using <code>wasmtime</code>, and they may do things like long executions in an async task. </p>\n<p>One naive way to handle this could be to only execute components with <code>spawn_blocking</code>. Or, more explicitly, spawn a new thread for every component execution and give it its own tokio runtime like:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"n\">std</span><span class=\"p\">::</span><span class=\"n\">thread</span><span class=\"p\">::</span><span class=\"n\">spawn</span><span class=\"p\">(</span><span class=\"o\">||</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">    </span><span class=\"kd\">let</span><span class=\"w\"> </span><span class=\"n\">rt</span><span class=\"w\"> </span><span class=\"o\">=</span><span class=\"w\"> </span><span class=\"n\">tokio</span><span class=\"p\">::</span><span class=\"n\">runtime</span><span class=\"p\">::</span><span class=\"n\">Builder</span><span class=\"p\">::</span><span class=\"n\">new_current_thread</span><span class=\"p\">().</span><span class=\"n\">enable_all</span><span class=\"p\">().</span><span class=\"n\">build</span><span class=\"p\">().</span><span class=\"n\">unwrap</span><span class=\"p\">();</span>\n\n<span class=\"w\">    </span><span class=\"n\">rt</span><span class=\"p\">.</span><span class=\"n\">block_on</span><span class=\"p\">(</span><span class=\"k\">async</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">        </span><span class=\"n\">possibly_evil_component</span><span class=\"p\">::</span><span class=\"n\">execute</span><span class=\"p\">().</span><span class=\"k\">await</span><span class=\"p\">;</span>\n<span class=\"w\">    </span><span class=\"p\">});</span>\n<span class=\"p\">})</span>\n</code></pre></div>\n<p>Is this necessary, or does the component model/wasmtime guarantee that components cannot block eachother's tasks?</p>\n<p>If/how will this change with p3?</p>\n<p>Any advice on best practices is appreciated. Thanks!</p>",
+        "id": 539001930,
+        "sender_full_name": "dakom",
+        "timestamp": 1757663152
+    },
+    {
+        "content": "<p>By default wasmtime does not prevent a guest that is actively using the CPU from blocking that thread. You may be interested in the epoch interruption feature: <a href=\"https://docs.rs/wasmtime/36.0.2/wasmtime/struct.Config.html#method.epoch_interruption\">https://docs.rs/wasmtime/36.0.2/wasmtime/struct.Config.html#method.epoch_interruption</a></p>",
+        "id": 539058620,
+        "sender_full_name": "Lann Martin",
+        "timestamp": 1757681858
+    },
+    {
+        "content": "<p>EIther epochs or fuel are what we recommend to limit CPU consumption. Memory consumption can be achieved with <code>ResourceLimiter</code>. WASIp3 won't move the needle here at all, it's still the same solutions as before. With fuel or epochs you won't need to spawn a thread, you can use the same host threads</p>",
+        "id": 539082075,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1757688108
+    },
+    {
+        "content": "<p>For more details, you can look at the relevant chapters of the docs as well:<br>\n<a href=\"https://docs.wasmtime.dev/examples-deterministic-wasm-execution.html\">https://docs.wasmtime.dev/examples-deterministic-wasm-execution.html</a><br>\n<a href=\"https://docs.wasmtime.dev/examples-interrupting-wasm.html\">https://docs.wasmtime.dev/examples-interrupting-wasm.html</a></p>",
+        "id": 539272223,
+        "sender_full_name": "Till Schneidereit",
+        "timestamp": 1757770742
+    },
+    {
+        "content": "<p>Thanks! Got it that I want to limit the resource consumption <span aria-label=\"thumbs up\" class=\"emoji emoji-1f44d\" role=\"img\" title=\"thumbs up\">:thumbs_up:</span>  </p>\n<p>Followup question... <span class=\"user-mention\" data-user-id=\"253994\">@Alex Crichton</span> can you please elaborate more on \"With fuel or epochs you won't need to spawn a thread\" ?</p>\n<p>In other words, if I start executing one component, I don't want to wait for it to complete before starting another component... are you suggesting that wasmtime comes with some ability to juggle this out of the box?</p>",
+        "id": 539579100,
+        "sender_full_name": "dakom",
+        "timestamp": 1757947526
+    },
+    {
+        "content": "<p>When you use <code>call_async</code> + <a href=\"https://docs.rs/wasmtime/latest/wasmtime/struct.Store.html#method.epoch_deadline_async_yield_and_update\">epochs</a>/<a href=\"https://docs.rs/wasmtime/latest/wasmtime/struct.Store.html#method.fuel_async_yield_interval\">fuel</a> with <code>Store</code>-level configuration the future returned will periodically yield at a configured interval, meaning that an infinite loop in wasm isn't actually an infinite loop on the host but rather one with defined \"await points\" where you can work on something else, spawn more futures, drop the computation, etc</p>",
+        "id": 539579809,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1757947698
+    },
+    {
+        "content": "<p>oh, that is super cool! So I can just throw them all into a <code>FuturesUnordered</code> and it's fine, they'll all make progress without blocking eachother?</p>",
+        "id": 539589205,
+        "sender_full_name": "dakom",
+        "timestamp": 1757950048
+    },
+    {
+        "content": "<p>that's the idea yeah</p>",
+        "id": 539589293,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1757950073
+    },
+    {
+        "content": "<p>is it okay to have both epochs and fuel yielding? e.g. to handle components that:</p>\n<ol>\n<li>may be running for a long time but somehow aren't consuming fuel</li>\n<li>aren't necessarily running for a long time, but are heavily consuming fuel and should be periodically interrupted</li>\n</ol>\n<p>?</p>",
+        "id": 540012707,
+        "sender_full_name": "dakom",
+        "timestamp": 1758115114
+    },
+    {
+        "content": "<blockquote>\n<p>may be running for a long time but somehow aren't consuming fuel</p>\n</blockquote>\n<p>This depends on what you mean by \"running\":</p>\n<ul>\n<li>If you mean \"actively using the CPU\" then this scenario should be impossible by design for both epochs and fuel; the \"await points\" are carefully selected to make it impossible to run indefinitely without hitting one (at least as long as you don't allow infinitely large wasm binaries <span aria-label=\"slight smile\" class=\"emoji emoji-1f642\" role=\"img\" title=\"slight smile\">:slight_smile:</span>).</li>\n<li>If you mean \"waiting on I/O\" then you don't need epochs or fuel; a \"normal\" e.g. <a href=\"https://docs.rs/tokio/1.47.1/tokio/time/fn.timeout.html\"><code>tokio::time::timeout</code></a> wrapping your wasm entrypoint should be able to interrupt asynchronous operations.</li>\n</ul>",
+        "id": 540021562,
+        "sender_full_name": "Lann Martin",
+        "timestamp": 1758117177
+    },
+    {
+        "content": "<p>fair point - but does <code>std::thread::sleep()</code>consume fuel while it sleeps? (I may be doing something wrong but it seems this doesn't block other components either...)</p>",
+        "id": 540040437,
+        "sender_full_name": "dakom",
+        "timestamp": 1758121625
+    },
+    {
+        "content": "<p>The wasm future won't be running during the sleep, it'd be suspended, so you could drop the future at any time (or do other work)</p>",
+        "id": 540040590,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1758121669
+    },
+    {
+        "content": "<p>more of just a curiosity/learning question - with that in mind, is there effectively a difference between <code>std::thread::sleep()</code> and <code>wstd::runtime::block_on(wstd::task::sleep())</code>, or should I think of these as roughly the same idea as \"wasmtime sees it as a suspended future and other tasks aren't blocked\" ?</p>",
+        "id": 540043718,
+        "sender_full_name": "dakom",
+        "timestamp": 1758122448
+    },
+    {
+        "content": "<p>those should behave pretty similarly yeah, although <code>std::thread::sleep</code> blocks everything for the guest where <code>wstd::block_on</code> will make progress on other sibling rust tasks while it's waiting for the sleep</p>",
+        "id": 540044090,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1758122540
+    },
+    {
+        "content": "<p>any tips on tuning <code>epoch_deadline_async_yield_and_update()</code>?</p>\n<p>fwiw, I've setup a test with one component doing a hot loop and seeing that it doesn't block another</p>\n<p>when I <code>increment_epoch()</code> every millisecond and <code>epoch_deadline_async_yield_and_update()</code> with a value of <code>1</code> or <code>10</code> the test passes, but with <code>100</code> it fails</p>\n<p>in other words, anecdotally, I assume it's not going to actually yield every 100 units of whenever <code>increment_epoch()</code> is called, or in my case - I can't assume it's even _near_ 100, may be some kind of scaling where the change from 1 to 10 to 100 isn't a multiple, drift is felt more strongly at the higher number?</p>",
+        "id": 540074105,
+        "sender_full_name": "dakom",
+        "timestamp": 1758132168
+    },
+    {
+        "content": "<p>oh... I think maybe I get what's going on... when it's epoch and not fuel based, it has to insert checks in certain segments, not everytime an instruction is run - so my loop is running and not letting it progress to check the epoch?</p>\n<p>though, if that's the case, I don't get why lowering the delta helps...</p>",
+        "id": 540075477,
+        "sender_full_name": "dakom",
+        "timestamp": 1758132601
+    },
+    {
+        "content": "<p>Epoch instrumentation checks for a new epoch on loop backedges as well; as mentioned above there should be no circumstance in which Wasm can run indefinitely when an epoch change should interrupt it. I haven't read all the thread details above but I would suspect some other deadlock in the way your system is combining futures and blocking...</p>",
+        "id": 540075803,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1758132738
+    },
+    {
+        "content": "<p>Interesting... though, merely changing the <code>epoch_deadline_async_yield_and_update()</code> duration from <code>10</code> to <code>100</code> could cause a deadlock?</p>\n<p>the test is pretty straightforward - I have been tinkering with this in different forms today, so I don't have something I can cleanly cut and paste right now, but it's really just spawning the component executions onto a single-threaded tokio runtime and sending into oneshot channels when they finish.</p>",
+        "id": 540077299,
+        "sender_full_name": "dakom",
+        "timestamp": 1758133316
+    },
+    {
+        "content": "<p>if there isn't a known explanation for why the tuning would change things so drastically, I could try to reproduce in a standalone repo tomm... wrapping up for the day</p>",
+        "id": 540077453,
+        "sender_full_name": "dakom",
+        "timestamp": 1758133375
+    },
+    {
+        "content": "<p>is <code>increment_epoch</code> happening in a separate thread?</p>",
+        "id": 540077808,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1758133526
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"253994\">Alex Crichton</span> <a href=\"#narrow/channel/206238-general/topic/running.20arbitrary.20async.20components.20safely/near/540077808\">said</a>:</p>\n<blockquote>\n<p>is <code>increment_epoch</code> happening in a separate thread?</p>\n</blockquote>\n<p>yes:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"kd\">let</span><span class=\"w\"> </span><span class=\"n\">engine_ticker</span><span class=\"w\"> </span><span class=\"o\">=</span><span class=\"w\"> </span><span class=\"n\">engine</span><span class=\"p\">.</span><span class=\"n\">weak</span><span class=\"p\">();</span>\n<span class=\"n\">std</span><span class=\"p\">::</span><span class=\"n\">thread</span><span class=\"p\">::</span><span class=\"n\">spawn</span><span class=\"p\">(</span><span class=\"k\">move</span><span class=\"w\"> </span><span class=\"o\">||</span><span class=\"w\"> </span><span class=\"k\">loop</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">    </span><span class=\"k\">if</span><span class=\"w\"> </span><span class=\"kd\">let</span><span class=\"w\"> </span><span class=\"nb\">Some</span><span class=\"p\">(</span><span class=\"n\">engine_ticker</span><span class=\"p\">)</span><span class=\"w\"> </span><span class=\"o\">=</span><span class=\"w\"> </span><span class=\"n\">engine_ticker</span><span class=\"p\">.</span><span class=\"n\">upgrade</span><span class=\"p\">()</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">        </span><span class=\"n\">engine_ticker</span><span class=\"p\">.</span><span class=\"n\">increment_epoch</span><span class=\"p\">();</span>\n<span class=\"w\">    </span><span class=\"p\">}</span><span class=\"w\"> </span><span class=\"k\">else</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">        </span><span class=\"k\">break</span><span class=\"p\">;</span>\n<span class=\"w\">    </span><span class=\"p\">}</span>\n<span class=\"w\">    </span><span class=\"n\">std</span><span class=\"p\">::</span><span class=\"n\">thread</span><span class=\"p\">::</span><span class=\"n\">sleep</span><span class=\"p\">(</span><span class=\"n\">Duration</span><span class=\"p\">::</span><span class=\"n\">from_millis</span><span class=\"p\">(</span><span class=\"mi\">1</span><span class=\"p\">));</span>\n<span class=\"p\">});</span>\n</code></pre></div>",
+        "id": 540155469,
+        "sender_full_name": "dakom",
+        "timestamp": 1758177337
+    },
+    {
+        "content": "<p>I made a standalone repo, bumping to latest version of dependencies too, problem is reproducible: <a href=\"https://github.com/dakom/debug-wasmtime-concurrency\">https://github.com/dakom/debug-wasmtime-concurrency</a></p>\n<p>(though, of course, it may be a bug on my side - and I'd appreciate the insight if so <span aria-label=\"pray\" class=\"emoji emoji-1f64f\" role=\"img\" title=\"pray\">:pray:</span> )</p>\n<div class=\"message_embed\"><a class=\"message_embed_image\" href=\"https://github.com/dakom/debug-wasmtime-concurrency\" style=\"background-image: url(&quot;https://uploads.zulipusercontent.net/6e2804329508942ebf7306c86b03ea6488d9bbe1/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f313163356637643661303832303138383039333233613037336631393565383832363532643763373461376232626162343666646630396363666231326434662f64616b6f6d2f64656275672d7761736d74696d652d636f6e63757272656e6379&quot;)\"></a><div class=\"data-container\"><div class=\"message_embed_title\"><a href=\"https://github.com/dakom/debug-wasmtime-concurrency\" title=\"GitHub - dakom/debug-wasmtime-concurrency\">GitHub - dakom/debug-wasmtime-concurrency</a></div><div class=\"message_embed_description\">Contribute to dakom/debug-wasmtime-concurrency development by creating an account on GitHub.</div></div></div>",
+        "id": 540195542,
+        "sender_full_name": "dakom",
+        "timestamp": 1758190029
+    },
+    {
+        "content": "<p>Looks like you're running into <a href=\"https://github.com/bytecodealliance/wasmtime/issues/10667\">this issue</a> which you can fix with:</p>\n<div class=\"codehilite\" data-code-language=\"Rust\"><pre><span></span><code><span class=\"w\">        </span><span class=\"n\">store</span><span class=\"p\">.</span><span class=\"n\">epoch_deadline_callback</span><span class=\"p\">(</span><span class=\"k\">move</span><span class=\"w\"> </span><span class=\"o\">|</span><span class=\"n\">_</span><span class=\"o\">|</span><span class=\"w\"> </span><span class=\"p\">{</span>\n<span class=\"w\">            </span><span class=\"nb\">Ok</span><span class=\"p\">(</span><span class=\"n\">wasmtime</span><span class=\"p\">::</span><span class=\"n\">UpdateDeadline</span><span class=\"p\">::</span><span class=\"n\">YieldCustom</span><span class=\"p\">(</span>\n<span class=\"w\">                </span><span class=\"n\">yield_period_ms</span><span class=\"p\">,</span>\n<span class=\"w\">                </span><span class=\"nb\">Box</span><span class=\"p\">::</span><span class=\"n\">pin</span><span class=\"p\">(</span><span class=\"n\">tokio</span><span class=\"p\">::</span><span class=\"n\">task</span><span class=\"p\">::</span><span class=\"n\">yield_now</span><span class=\"p\">()),</span>\n<span class=\"w\">            </span><span class=\"p\">))</span>\n<span class=\"w\">        </span><span class=\"p\">});</span>\n</code></pre></div>\n<p>instead of <code>epoch_deadline_async_yield_and_update</code>. This has to do with how Wasmtime's implementation of <a href=\"https://github.com/bytecodealliance/wasmtime/blob/370042d0bc84908815d34c0675f4f2bb1d49c965/crates/wasmtime/src/runtime/vm/async_yield.rs#L20-L35\">yielding the future</a> doesn't play well with Tokio's scheduling. We're not really sure of much which can be done about that other than using <code>UpdateDeadline::YieldCustom</code> to specifically integrate with tokio</p>\n<div class=\"message_embed\"><a class=\"message_embed_image\" href=\"https://github.com/bytecodealliance/wasmtime/issues/10667\" style=\"background-image: url(&quot;https://uploads.zulipusercontent.net/9d7308fa9db748767f2577a5813b2513ac8b603d/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f393735383031613934383664646265333937646566633861653635396263316538613732376563383730393135666362326539633132333761613361666432312f62797465636f6465616c6c69616e63652f7761736d74696d652f6973737565732f3130363637&quot;)\"></a><div class=\"data-container\"><div class=\"message_embed_title\"><a href=\"https://github.com/bytecodealliance/wasmtime/issues/10667\" title=\"Async Yield may immediately reschedule when using Tokio · Issue #10667 · bytecodealliance/wasmtime\">Async Yield may immediately reschedule when using Tokio · Issue #10667 · bytecodealliance/wasmtime</a></div><div class=\"message_embed_description\">Credit to @aturon for the discovery... Today, the async_yield_impl behavior triggered an epoch deadline is hit or we run out of fuel does not match that of tokio::task::yield_now. They are mostly t...</div></div></div><div class=\"message_embed\"><a class=\"message_embed_image\" href=\"https://github.com/bytecodealliance/wasmtime/blob/370042d0bc84908815d34c0675f4f2bb1d49c965/crates/wasmtime/src/runtime/vm/async_yield.rs#L20-L35\" style=\"background-image: url(&quot;https://uploads.zulipusercontent.net/af8d7ef5f7136fdfcb40951e86b5696a194917c9/68747470733a2f2f6f70656e67726170682e6769746875626173736574732e636f6d2f373666623233343063653766326261333633616132646365316530623462313266393637653738333236376166356465376333306464356336353639313137332f62797465636f6465616c6c69616e63652f7761736d74696d65&quot;)\"></a><div class=\"data-container\"><div class=\"message_embed_title\"><a href=\"https://github.com/bytecodealliance/wasmtime/blob/370042d0bc84908815d34c0675f4f2bb1d49c965/crates/wasmtime/src/runtime/vm/async_yield.rs#L20-L35\" title=\"wasmtime/crates/wasmtime/src/runtime/vm/async_yield.rs at 370042d0bc84908815d34c0675f4f2bb1d49c965 · bytecodealliance/wasmtime\">wasmtime/crates/wasmtime/src/runtime/vm/async_yield.rs at 370042d0bc84908815d34c0675f4f2bb1d49c965 · bytecodealliance/wasmtime</a></div><div class=\"message_embed_description\">A lightweight WebAssembly runtime that is fast, secure, and standards-compliant - bytecodealliance/wasmtime</div></div></div>",
+        "id": 540250536,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1758206261
+    },
+    {
+        "content": "<p>Awesome, that did the trick! Updated the repo, thanks again!!</p>",
+        "id": 540265613,
+        "sender_full_name": "dakom",
+        "timestamp": 1758210000
+    }
+]

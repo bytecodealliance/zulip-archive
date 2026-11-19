@@ -1,0 +1,56 @@
+[
+    {
+        "content": "<p>We over at <a href=\"https://pumpkinmc.org/developers/\">Pumpkin</a> (Minecraft server written in Rust) have been using Wasmtime and Wasm components for our plugin system.</p>\n<p>We've been running into hurdles with said plugins interacting with the rest of the system. A key feature of plugins is that they can register event handlers that hook into actions all over the server. Such event handlers are BLOCKING. A plugin may decide to cancel or modify an action.</p>\n<p>This has been causing headaches trying to get a fully synchronous tick execution parallelized with Rayon to interact with the forcibly <code>async</code> and single-threaded world of Wasm (+ WASI).</p>\n<p>The problem is that in response to events, a plugin may make any number of other of (sync) host calls, which in turn may fire events re-entering back into the plugin system. This re-entry/recursion might criss-cross between plugins any number of times before finally unwinding.</p>\n<hr>\n<p>My question is: will \"shared everything\" (pre-emptive) threads in the component model be able to solve this problem when they come? Will we be able to save multiple threads access the same component instance, same Wasmtime <code>Store</code>, in parallel across multiple host threads. I know we barely have cooperative/concurrent threading right now in WASIp3, but I would like to get a rough idea of the timeline of if/when this will be solved (months? years?).</p>\n<p>The fact that only one thread may ever obtain a store at a time means bottlenecking our highly parallelized ticking (players, worlds, chunks, entities) into a SINGLE thread (per-plugin, at least, if not period). Even with Tokio and some voodoo with fibers we don't regain any much if any parallelism; best we can do is keep things from blocking.</p>",
+        "id": 620189174,
+        "sender_full_name": "QuantumSegfault",
+        "timestamp": 1788146015
+    },
+    {
+        "content": "<p>I don't have any special information about the shared-everything threading proposal but based on other proposals' timelines I'd lean heavily toward \"years\".</p>",
+        "id": 620294702,
+        "sender_full_name": "Lann Martin",
+        "timestamp": 1788178802
+    },
+    {
+        "content": "<p>If you want CPU parallelism today then you need to run multiple instances/stores and synchronize between them with some host API.</p>",
+        "id": 620294979,
+        "sender_full_name": "Lann Martin",
+        "timestamp": 1788178855
+    },
+    {
+        "content": "<p>Yeah I'd say that fully parallel shared-everything threads in on the timescale of years, definitely not months. Another option is to use epochs &amp; fuel to throttle execution and prevent it from taking too long, but I realize that's not appropriate for all situations necessarily</p>",
+        "id": 620334354,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1788186298
+    },
+    {
+        "content": "<p>No, that's not quite going to do it, I don't think</p>\n<p>Well, that's unfortunate, but I guess we'll need start considering alternatives. May just have to drop the component model (or Wasm entirely <span aria-label=\"confused\" class=\"emoji emoji-1f615\" role=\"img\" title=\"confused\">:confused:</span>). But that definitely means cutting back on language support as that all has to be done by hand.</p>\n<p>And without CM we lose WASI, which was important to making this work comfortably in Wasm without reinventing the wheel.</p>",
+        "id": 620372177,
+        "sender_full_name": "QuantumSegfault",
+        "timestamp": 1788193141
+    },
+    {
+        "content": "<p>We're just going to try to just accepting the serialization and see how bad it works in practice.</p>",
+        "id": 620383734,
+        "sender_full_name": "QuantumSegfault",
+        "timestamp": 1788195747
+    },
+    {
+        "content": "<p>I feel that for keeping the complexity manageable you might want a more predictable/restricted design. Entering a wasm component while it is still running on another thread will require full shared everything threads. But perhaps a non-reentrant event queue could be enough, perhaps with a Store per thread, but then you can't easily use global state or cross thread CM resources. <span aria-label=\"thinking\" class=\"emoji emoji-1f914\" role=\"img\" title=\"thinking\">:thinking:</span> I hacked my way around this limitation some years ago (p1-threads + p2 custom interfaces), but I was able to control and modify all of the host and guest software. </p>\n<p>I feel you will want some subset of shared everything threads, perhaps cherry picking is an option to you. But the SDK option for combining p3 with atomic wasm instructions doesn't exist, yet.</p>",
+        "id": 620393502,
+        "sender_full_name": "Christof Petig",
+        "timestamp": 1788197858
+    },
+    {
+        "content": "<p>And don't expect security guarantees for running untrusted guests to uphold in this Frankenstein wasm. <span aria-label=\"exploding head\" class=\"emoji emoji-1f92f\" role=\"img\" title=\"exploding head\">:exploding_head:</span></p>",
+        "id": 620394203,
+        "sender_full_name": "Christof Petig",
+        "timestamp": 1788197998
+    },
+    {
+        "content": "<p>Unfortunately a non-reentrant queue is NOT enough (we considered it). Hooks or signals might be a more appropriate term here. Just, I guess think of it as scripting callbacks</p>\n<p>And yeah, not having global state would be quite painful I believe.</p>\n<p>But after a short bit of research, apparently this is pretty common for scripting languages. Even if we did have parallelism like that, languages like Python probably wouldn't be able to make use of it anyway, locking inside Wasm rather than outside.</p>\n<hr>\n<p>With <a href=\"https://github.com/bytecodealliance/wasmtime/pull/14146\">#14146</a> right around the corner, as long as we enforce that only a single thread enters the whole plugin system at a time, we should be able to make the system simple (<code>run_concurrent</code> the call to completion).  Yeah, we block the Rayon threads (maybe we can use <code>yield_local</code> to alleviate that some), but I think it makes the best of a not-so-ideal situation.</p>",
+        "id": 620419279,
+        "sender_full_name": "QuantumSegfault",
+        "timestamp": 1788203411
+    }
+]

@@ -1,0 +1,80 @@
+[
+    {
+        "content": "<p>Hey! Since quite a few new language runtimes are targeting WasmGC, I think it would be great to have something similar to Wizer, but with support for GC types.</p>\n<p>This would require support from the host runtime, so I think Wasmtime would be a perfect fit.<br>\nI imagine the design could follow V8's snapshot mechanism: serializing the GC heap while allowing embedders to provide custom callbacks for serializing and deserializing host-managed state.</p>\n<p>Does anything like this already exist in Wasmtime?<br>\nIf not, would you be interested in adding it?</p>",
+        "id": 638150536,
+        "sender_full_name": "Dmitry Bezhetskov",
+        "timestamp": 1793975280
+    },
+    {
+        "content": "<p>it doesn't yet exist, but we've talked about it. Wasmtime's implementation of WasmGC would lend itself very well to it, too, since the GC heap is itself a linear memory. On whether we'd be interested in adding it: in principle yes! In practice, I think it depends a bit on how much review and then ongoing maintenance effort it'd be, and what the security implications would be. <span class=\"user-mention\" data-user-id=\"253990\">@fitzgen (he/him)</span> would be able to say more</p>",
+        "id": 638234129,
+        "sender_full_name": "Till Schneidereit",
+        "timestamp": 1793992441
+    },
+    {
+        "content": "<p>it is possible, but the other thing to keep track of is the collector's outside-the-heap state. this could potentially be marked <code>#[derive(Clone, serde::Serialize, serde::Deserialize)]</code> and plumbed through the <code>GcHeap</code> trait methods but it might not be exactly what we'd actually want to do. But the snapshots would be tied to a specific version of Wasmtime, and could break even across patch versions. and ofc they would not be engine independent anymore, like Wizer snapshots. with enough special reflection APIs in the engine you could encode the snapshot as core Wasm and just have code to rebuild the heap graph on demand, which gives the portability back, but costs initialization performance.</p>\n<p>I was actually just talking with <span class=\"user-mention\" data-user-id=\"254389\">@Chris Fallin</span> about this kind of thing yesterday, but in the context of record/replay and time travel debugging, where there are slightly different constraints (perf is important but perhaps not quite to the same degree, portability across engines is highly desirable for the recording but a snapshot never actually needs to persist across a single process, etc...)</p>\n<p>But backing up, while I don't think anything here is impossible with enough effort, I don't believe this is something that we have bandwidth to review+maintain from a contributor who is not a core maintainer.</p>",
+        "id": 638254868,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1793998518
+    },
+    {
+        "content": "<p>It seems likely to me that \"snapshot back to initialization expressions / a synthesized init function that ties the knot on any cycles\" is the better answer to produce a portable Wasm that contains the GC snapshot. That then composes with our wasm -&gt; cwasm AOT compilation step to potentially give a GC heap snapshot (tied to a specific Wasmtime version because the whole cwasm is) that can provide a CoW backing for fast instantiation. In other words, Wasm spec-level description goes with Wasm, byte-level description goes with cwasm-for-this-Wasmtime-version.</p>\n<p>(I recall early discussion here on Zulip somewhere about exactly the above re: const-expression GC ops + code to tie the knot; can't find it at the moment)</p>",
+        "id": 638256581,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1793999044
+    },
+    {
+        "content": "<p>where that approach is viable, I agree. I had a use case where doing just that brought startup time from 750ms or so to something like 250ms, so still much worse than a wizer-style snapshot</p>",
+        "id": 639202895,
+        "sender_full_name": "Till Schneidereit",
+        "timestamp": 1794328414
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"254389\">Chris Fallin</span> <a href=\"#narrow/channel/206238-general/topic/Snapshot.20for.20WasmGC.20in.20wasmtime/near/638256581\">said</a>:</p>\n<blockquote>\n<p>(tied to a specific Wasmtime version because the whole cwasm is)</p>\n</blockquote>\n<p>Note that we do have to preserve <code>.cwasm</code> compat across patch releases, which could become difficult if we serialized implementation-specific GC state into <code>.cwasm</code>s. specifically I am thinking of the state outside the heap itself again, e.g. a serialized free list or whatever. it means that if we have a vulnerability whose fix requires changing the free list representation or something we are screwed.</p>",
+        "id": 639211849,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1794330200
+    },
+    {
+        "content": "<blockquote>\n<p>we do have to preserve <code>.cwasm</code> compat across patch releases</p>\n</blockquote>\n<p>ah interesting! I actually wasn't aware that this was one of our guarantees...</p>",
+        "id": 639212366,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1794330321
+    },
+    {
+        "content": "<p>(at least, this hasn't come up before when e.g. changing libcalls -- this would mean we basically can only change libcalls at a major version release)</p>",
+        "id": 639212509,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1794330353
+    },
+    {
+        "content": "<p>yeah, so that people don't need to recompile every guest when shipping a wasmtime security patch</p>",
+        "id": 639213351,
+        "sender_full_name": "fitzgen (he/him)",
+        "timestamp": 1794330525
+    },
+    {
+        "content": "<p>You still have to recompile every guest whenever there is a fixed miscompilation, right?</p>",
+        "id": 639430445,
+        "sender_full_name": "bjorn3",
+        "timestamp": 1794393890
+    },
+    {
+        "content": "<p><span class=\"user-mention silent\" data-user-id=\"254389\">Chris Fallin</span> <a href=\"#narrow/channel/206238-general/topic/Snapshot.20for.20WasmGC.20in.20wasmtime/near/639212509\">said</a>:</p>\n<blockquote>\n<p>(at least, this hasn't come up before when e.g. changing libcalls -- this would mean we basically can only change libcalls at a major version release)</p>\n</blockquote>\n<p>Or if only forward compat is required for .cwasm files, you could add new libcalls in patch releases, but not change or remove existing ones.</p>",
+        "id": 639430780,
+        "sender_full_name": "bjorn3",
+        "timestamp": 1794393973
+    },
+    {
+        "content": "<p>Digging a bit more because this is a surprise to me (I recall waiting for world-recompiles with security patch deployments, and also Pat adding <a href=\"https://docs.rs/wasmtime/latest/wasmtime/enum.ModuleVersionStrategy.html\"><code>ModuleVersionStrategy</code></a> so we can explicitly reason about this, in <a href=\"https://github.com/bytecodealliance/wasmtime/pull/3271\">#3271</a>, and also a number of discussions in the past where we explicitly say that cwasms are an internal implementation detail and not stable). It seems our default version-strategy is indeed <a href=\"https://github.com/bytecodealliance/wasmtime/blob/1d10469d7a95857ffe241cfe74583c656a7b5d35/crates/wasmtime/src/config.rs#L115\">only the major version number</a>.</p>\n<p>It might be interesting to talk about this more, both with input from folks who deploy \"large worlds\" these days, and from a maintenance + feature flexibility perspective. It seems like it would be a nice capability generally to implement the above functionality, where we can mmap a GC heap snapshot at startup -- otherwise we deny the same microsecond-instantiation advantages to a future GC-guest world that we have today for linear memories. And it also seems like a potential problem if we need a semver break on a libcall or any VM data structure layout (or a change to any logic embedded in any inline compiled sequence -- e.g., any GC barrier or operation) to fix a security issue. Curious what others think...</p>",
+        "id": 639518784,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1794414777
+    },
+    {
+        "content": "<p>(I'm disappearing for the week but maybe next week's wasmtime meeting would be good to discuss)</p>",
+        "id": 639519030,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1794414839
+    }
+]

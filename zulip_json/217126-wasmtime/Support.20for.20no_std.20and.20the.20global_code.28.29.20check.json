@@ -1,0 +1,134 @@
+[
+    {
+        "content": "<p>Hey all,</p>\n<p>Some friends building a <code>no_std</code> wasmtime embedding ran into an issue with the <a href=\"https://github.com/bytecodealliance/wasmtime/blob/56c7d5f22b981d826c9f7ac8c62175d2e330d1c5/crates/wasmtime/src/runtime/module/registry.rs#L374\"><code>global_code()</code> check</a> that is used from <a href=\"https://github.com/bytecodealliance/wasmtime/blob/main/crates/wasmtime/src/runtime/code.rs#L135\"><code>EngineCode::new</code></a>. Surprisingly this is the only place right now they're running into an issue (they just don't have a <code>std</code> for the thread-support required to use <code>OnceLock</code>)</p>\n<p>Is there anything we can do about this in <code>no_std</code> environments? I've thought about it a little bit and it seems like there are at least a couple options:</p>\n<ul>\n<li>Removing the check via feature flag (the check is there by default, but someone may disable it)</li>\n<li>Enabling configuration of the check via a submitted closure that can be called instead (this could also be blocked by feature flag, at the very least initially)</li>\n</ul>\n<p>That said would like to take a step back and ask if this has come up before/if anyone has thought about this more deeply.</p>",
+        "id": 602196889,
+        "sender_full_name": "Victor Adossi",
+        "timestamp": 1781191628
+    },
+    {
+        "content": "<p>Hi <span class=\"user-mention\" data-user-id=\"598440\">@Victor Adossi</span> -- we do have a nostd implementation of <code>OnceLock</code> <a href=\"https://github.com/bytecodealliance/wasmtime/blob/56c7d5f22b981d826c9f7ac8c62175d2e330d1c5/crates/wasmtime/src/sync_nostd.rs\">here</a> and it should just work. For example in the Wasmtime deployment I'm responsible for, we run in no-std mode no problem</p>\n<p>(Note also that it's not just a \"check\" -- the map is used to look up modules from places where we have no other global context to reach them from. In a no-std build without signals this is still reachable e.g. from Pulley)</p>",
+        "id": 602205327,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1781193226
+    },
+    {
+        "content": "<p>Ah thanks Chris -- that's really helpful, didn't know that was there. And yeah to be clear, everything goes just fine for them <em>until</em> they hit that check.</p>\n<blockquote>\n<p>(Note also that it's just just a \"check\" -- the map is used to look up modules from places where we have no other global context to reach them from. In a no-std build without signals this is still reachable e.g. from Pulley)</p>\n</blockquote>\n<p>I assume here you mean it's <em>not just</em> a check -- yeah I see that it's guarding the registry, I'm just surprised how other <code>no_std</code> builds could have have not run into this.  </p>\n<p>I don't think they're running with the <code>std</code> feature enabled but maybe its' actually just that simple</p>",
+        "id": 602208014,
+        "sender_full_name": "Victor Adossi",
+        "timestamp": 1781193698
+    },
+    {
+        "content": "<p>Sorry, yes, typo -- <em>not</em> just a check. When you say \"everything goes fine for them until they hit that [module map registration not check]\", what happens? Is there a panic of some sort? And yes, my next thing to verify would be that they're building with the appropriate feature set, e.g. not enabling <code>std</code> and using a stub impl that always panics or something</p>",
+        "id": 602208977,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1781193864
+    },
+    {
+        "content": "<p>So evidently they get a failure which (I <em>think</em> is a panic) during engine <em>teardown</em> -- not during start or while running components, which was also quite surprising to me.</p>\n<p>But yeah I've reached out again, it will be hard to get an easy reproducer (I haven't seen the logs of their failure just yet!), but hopefully it is something simple. Really sounded like they just weren't getting the <code>no_std</code> version of  <code>OnceLock</code> for some reason, but I definitely need to get some more detail. </p>\n<p>Thanks again for the sanity check here</p>",
+        "id": 602210528,
+        "sender_full_name": "Victor Adossi",
+        "timestamp": 1781194139
+    },
+    {
+        "content": "<p>no problem!</p>",
+        "id": 602216535,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1781195316
+    },
+    {
+        "content": "<p>if they have a specific panic message, we're happy to help diagnose further</p>",
+        "id": 602216739,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1781195349
+    },
+    {
+        "content": "<p>Ah so here's the panic message:</p>\n<blockquote>\n<p>PANIC on core 6! .../<a href=\"http://wasmtime/src/runtime/module/registry.rs:405:5\">wasmtime/src/runtime/module/registry.rs:405:5</a>:</p>\n<p>assertion failed: prev.is_none()</p>\n</blockquote>\n<p>So it turns out they were running  a much older version of <code>wasmtime</code> (they're updated now!) -- and <code>std</code> was not enabled as one would expect (their <code>no_std</code> build is just fine). </p>\n<p>What they're finding is that multiple <code>Engine</code>s seem to get the <em>same</em> location for <code>CodeMemory</code>s and the second (nth?) <code>EngineCode::new</code> creation fails when calling <code>register_code</code>. </p>\n<p>I'm asking now whether it could be a problem in their mmap implementation and should hear back soon. </p>\n<p>One thing that IMO is worth asking ahead of that result there is whether <code>register_code</code> needs to be done at all if <code>signals_based_traps</code> is set to <code>false</code>. </p>\n<p>If <code>register_code</code> is required <a href=\"https://github.com/bytecodealliance/wasmtime/blob/8aa579dd1f0c74016776f162b94f99ca9d7c4cc3/crates/wasmtime/src/runtime/module/registry.rs#L395\">specifically for signals_based_traps handlers</a> (am I reading that wrong?), then maybe the check actually shouldn't happen in the first place when <code>signals_based_traps</code> is disabled.</p>\n<blockquote>\n<p>Some environments however may not have access to signal handlers. For example embedded scenarios may not support virtual memory. Other environments where Wasmtime is embedded within the surrounding environment may require that new signal handlers aren’t registered due to the global nature of signal handlers. This option exists to disable the signal handler registration when required for these scenarios.</p>\n</blockquote>\n<p>Also asked whether they have <code>has_virtual_memory</code> turned on/off to see which path they're taking through the mmap machinery</p>",
+        "id": 602514916,
+        "sender_full_name": "Victor Adossi",
+        "timestamp": 1781269617
+    },
+    {
+        "content": "<p>I think we had an issue on this historically in the issue tracker as well, or rather we still do. IIRC that was registering the same image in different engines and it trips an internal assert, but basically our data structures aren't prepared to handle this if that's the case. Can you confirm if that's what's happening?</p>",
+        "id": 602537951,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1781273983
+    },
+    {
+        "content": "<p>Yeah so they mentioned this issue initially (a  while ago now): </p>\n<p><a href=\"https://github.com/bytecodealliance/wasmtime/issues/12511\">https://github.com/bytecodealliance/wasmtime/issues/12511</a></p>\n<p>I think that's the one you're alluding to, right <span class=\"user-mention\" data-user-id=\"253994\">@Alex Crichton</span> ?</p>\n<p>A quote:</p>\n<blockquote>\n<p>Updated (v36 -&gt; v47), but still need our patched gate register_code / unregister_code on signals_based_traps.</p>\n<p>GLOBAL_CODE is one process-global BTreeMap and our allocator is per-CPU, so a node inserted on one core and freed on another at teardown corrupts that core's free list. It only feeds the signal-handler PC-&gt;trap lookup, which we never hit (signals_based_traps(false)) so skipping it when signals are off is what we need.</p>\n</blockquote>\n<p>I asked them to check if maybe their mmap impl was producing the same location, but are you saying that's the current <em>expected behavior</em> with the same image?</p>",
+        "id": 602750731,
+        "sender_full_name": "Victor Adossi",
+        "timestamp": 1781331197
+    },
+    {
+        "content": "<p>Really trying to get them to just get in here and chat about their very interesting use case :)</p>",
+        "id": 602750779,
+        "sender_full_name": "Victor Adossi",
+        "timestamp": 1781331220
+    },
+    {
+        "content": "<p>Can confirm we have multiple \"Engine::new\"s each being fed the exact same component image. Is adding a random number to the images a possible workaround?</p>",
+        "id": 602754126,
+        "sender_full_name": "Lex S",
+        "timestamp": 1781332613
+    },
+    {
+        "content": "<p>Why do you have multiple <code>Engine</code>s? Do you actually need different configs? And just to confirm are you sharing a <code>wasmtime::component::Component</code> across engines or do you mean that the bytes of the component are identical, but you are still creating distinct <code>wasmtime::component::Component</code> between the engines? The latter should work.</p>",
+        "id": 602784159,
+        "sender_full_name": "bjorn3",
+        "timestamp": 1781342318
+    },
+    {
+        "content": "<p>Generally you only need a single <code>Engine</code> across your entire application. It is meant to be shared between all your <code>Store</code>s. It only contains configuration options and a global type registry.</p>",
+        "id": 602784869,
+        "sender_full_name": "bjorn3",
+        "timestamp": 1781342546
+    },
+    {
+        "content": "<p>Our program is running in a no_std multi-core multi-domain environment. One engine per-core right now. Distinct <code>wasmtime::component::Component</code> per engine, instantiated from the exact same cwasm (bytes of the component are identical).</p>",
+        "id": 602785223,
+        "sender_full_name": "Lex S",
+        "timestamp": 1781342658
+    },
+    {
+        "content": "<p>Really appreciate the community support and the wasmtime experience has been incredible.</p>",
+        "id": 602785540,
+        "sender_full_name": "Lex S",
+        "timestamp": 1781342759
+    },
+    {
+        "content": "<p><span class=\"user-mention\" data-user-id=\"1094421\">@Lex S</span> could you explain why you're using multiple engines though? The architecture you're using makes sense, but it should also work and be reasonable with a single <code>Engine</code> and <code>Component</code>s shared across threads. For example is this intended to reduce locking? Have different settings per-engine, or something else?</p>",
+        "id": 603561752,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1781575028
+    },
+    {
+        "content": "<p>Our system has different CCDs in separate NUMA domains with partitioned memory allocators. The <code>Engine</code> instantiated on thread A would not be accessible from thread N. Same settings per-engine right now. The resulting reduction in locking is absolutely great, but not currently a bottleneck as far as I am aware.<br>\nWe have things working well with a local patch to disable GLOBAL_CODE.</p>",
+        "id": 603626896,
+        "sender_full_name": "Lex S",
+        "timestamp": 1781594301
+    },
+    {
+        "content": "<p>Ah ok that makes sense yeah. If you're up for it I think this is something we could handle upstream, refcounting the entries in the <code>GLOBAL_CODE</code> map, and I'd be up for reviewing a PR to do that. The last time this was discussed on the issue it got bogged down in other concerns/issues that I think were unrelated, but just refcounting in the global map seems fine by me.</p>",
+        "id": 603744191,
+        "sender_full_name": "Alex Crichton",
+        "timestamp": 1781617154
+    },
+    {
+        "content": "<p>Just to clarify: you have partitioned memory allocators (no address in common between cores), but you're still hitting this issue?</p>\n<p>Are you using the from-raw-slice API and passing in a component image that is baked into shared .rodata or something similar? Otherwise I'm surprised, because the issue requires a component image <em>at the same address</em> on different cores...</p>",
+        "id": 603785863,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1781623646
+    },
+    {
+        "content": "<p>Not sure the best way to provide a GLOBAL_CODE refcount PR, but I'd be happy to give it a shot.</p>\n<p>We're currently calling <code>Component::deserialize</code> with a static CWASM once per <code>Engine</code>.</p>",
+        "id": 603962586,
+        "sender_full_name": "Lex S",
+        "timestamp": 1781656306
+    },
+    {
+        "content": "<p>Cool, yeah, given that (shared rodata but completely segregated allocators/heaps) it seems like refcounting is the way to go.</p>\n<p>Do note that if the intent of segregating your heaps is that you have zero coherency traffic between cores, you'll violate that by nature of the shared map. However the painful part is on updates (loading new modules); subsequently the cache lines should be all read-only and shareable across cores. Just something to watch out for if your update (module-load) rate is non-negligible...</p>",
+        "id": 603995748,
+        "sender_full_name": "Chris Fallin",
+        "timestamp": 1781667704
+    }
+]

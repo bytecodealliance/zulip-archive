@@ -1,0 +1,81 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #15296 wasi-preview1-component-adapter: ... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315296.20wasi-preview1-component-adapter.3A.20.2E.2E.2E.html">wasmtime / issue #15296 wasi-preview1-component-adapter: ...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="640444213"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2315296%20wasi-preview1-component-adapter%3A%20.../near/640444213" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315296.20wasi-preview1-component-adapter.3A.20.2E.2E.2E.html#640444213">(Nov 15 2026 at 09:51)</a>:</h4>
+<p>epitaphial opened <a href="https://github.com/bytecodealliance/wasmtime/issues/15296">issue #15296</a>:</p>
+<blockquote>
+<h1>wasi-preview1-component-adapter: fd_write does not invalidate cached InputStream, causing stale reads</h1>
+<h2>Summary</h2>
+<p>After read → write → read on one O_RDWR descriptor, the second read returns the byte just written at offset 1 ('A') rather than the byte at the new shared offset 2 ('c'). The process exits normally and the on-disk file is correct; only the returned buffer is stale.</p>
+<p>Confirmed with the standalone C program below, without any custom test driver or trace format. Each lane reproduced the same output 5/5 times in fresh directories on Wasmtime 46.0.0 (Release and Debug), 47.0.2, and 50.0.1. Wasmtime 50.0.1 was the latest upstream release at verification time.</p>
+<h2>Minimal reproducer (<code>repro.c</code>)</h2>
+<div class="codehilite" data-code-language="C"><pre><span></span><code><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;errno.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;fcntl.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdio.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;string.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;unistd.h&gt;</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">main</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">first</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">second</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">"file.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_CREAT</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">O_TRUNC</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">O_WRONLY</span><span class="p">,</span><span class="w"> </span><span class="mo">0644</span><span class="p">);</span>
+<span class="w">    </span><span class="n">write</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="s">"abcdefghijklmnop"</span><span class="p">,</span><span class="w"> </span><span class="mi">16</span><span class="p">);</span>
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="w">    </span><span class="n">fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">"file.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDWR</span><span class="p">);</span>
+<span class="w">    </span><span class="n">errno</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">ssize_t</span><span class="w"> </span><span class="n">read1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">first</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"read #1: rv=%zd errno=%d byte=%c</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">read1</span><span class="p">,</span><span class="w"> </span><span class="n">errno</span><span class="p">,</span><span class="w"> </span><span class="n">first</span><span class="p">);</span>
+<span class="w">    </span><span class="n">errno</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">ssize_t</span><span class="w"> </span><span class="n">written</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">write</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="s">"A"</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"write: rv=%zd errno=%d (%s)</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">written</span><span class="p">,</span><span class="w"> </span><span class="n">errno</span><span class="p">,</span><span class="w"> </span><span class="n">strerror</span><span class="p">(</span><span class="n">errno</span><span class="p">));</span>
+<span class="w">    </span><span class="n">errno</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">ssize_t</span><span class="w"> </span><span class="n">read2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">second</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"read #2: rv=%zd errno=%d byte=%c (expected c, stale value A)</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span>
+<span class="w">           </span><span class="n">read2</span><span class="p">,</span><span class="w"> </span><span class="n">errno</span><span class="p">,</span><span class="w"> </span><span class="n">second</span><span class="p">);</span>
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+<h2>Exact commands</h2>
+<p>Run in a new empty directory. The first command downloads the official v50.0.1 command adapter; <code>clang</code>, <code>wasm-tools</code>, and <code>wasmtime</code> must be on the stated paths or adjusted to local installations.</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>curl<span class="w"> </span>-fLO<span class="w"> </span>https://github.com/bytecodealliance/wasmtime/releases/download/v50.0.1/wasi_snapshot_preview1.command.wasm
+/opt/wasi-sdk/bin/clang<span class="w"> </span>--target<span class="o">=</span>wasm32-wasip1<span class="w"> </span>-std<span class="o">=</span>c17<span class="w"> </span>-O2<span class="w"> </span>-Wall<span class="w"> </span>-Wextra<span class="w"> </span>-Werror<span class="w"> </span>repro_rc4_stale_read_after_write.c<span class="w"> </span>-o<span class="w"> </span>repro_p1.wasm
+wasm-tools<span class="w"> </span>component<span class="w"> </span>new<span class="w"> </span>repro_p1.wasm<span class="w"> </span>--adapt<span class="w"> </span><span class="nv">wasi_snapshot_preview1</span><span class="o">=</span>wasi_snapshot_preview1.command.wasm<span class="w"> </span>-o<span class="w"> </span>repro_adapter.wasm
+wasmtime<span class="w"> </span>run<span class="w"> </span>--dir<span class="w"> </span>.<span class="w"> </span>repro_p1.wasm<span class="p">;</span><span class="w"> </span>wasmtime<span class="w"> </span>run<span class="w"> </span>--dir<span class="w"> </span>.<span class="w"> </span>repro_adapter.wasm
+</code></pre></div>
+<h2>Expected vs. actual output (Wasmtime 50.0.1)</h2>
+<p><strong>Direct P1 (expected):</strong></p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>read #1: rv=1 errno=0 byte=a
+write: rv=1 errno=0 (Success)
+read #2: rv=1 errno=0 byte=c (expected c, stale value A)
+</code></pre></div>
+<p><strong>Adapter P2 (actual):</strong></p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>read #1: rv=1 errno=0 byte=a
+write: rv=1 errno=0 (Success)
+read #2: rv=1 errno=0 byte=A (expected c, stale value A)
+</code></pre></div>
+<h2>Root cause</h2>
+<p><code>get_read_stream</code> creates an <code>InputStream</code> at the then-current <code>file.position</code> and caches it (<a href="https://github.com/bytecodealliance/wasmtime/blob/v50.0.1/crates/wasi-preview1-component-adapter/src/descriptors.rs#L44-L66"><code>descriptors.rs:44-66</code></a>). <code>fd_write</code> later advances <code>file.position</code> after a successful sequential write (<a href="https://github.com/bytecodealliance/wasmtime/blob/v50.0.1/crates/wasi-preview1-component-adapter/src/lib.rs#L1747-L1762"><code>lib.rs:1747-1762</code></a>) but does not invalidate <code>streams.input</code>. The next read therefore reuses the host stream's old offset. The same code remains in v50.0.1.</p>
+<h2>Suggested fix and causal evidence</h2>
+<p>After a successful sequential file write advances the P1 position, invalidate the cached input stream (for example, <code>drop(streams.input.take())</code>) so a later read is created at the updated position. A minimal v46 patch changed the second read from 'A' to 'c' 3/3; reverting restored 'A' 3/3.<br>
+</p>
+</blockquote>
+
+
+
+<a name="640809828"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2315296%20wasi-preview1-component-adapter%3A%20.../near/640809828" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315296.20wasi-preview1-component-adapter.3A.20.2E.2E.2E.html#640809828">(Nov 16 2026 at 17:08)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasi label to <a href="https://github.com/bytecodealliance/wasmtime/issues/15296">Issue #15296</a>.</p>
+
+
+
+<hr><p>Last updated: Nov 19 2026 at 20:05 UTC</p>
+</html>

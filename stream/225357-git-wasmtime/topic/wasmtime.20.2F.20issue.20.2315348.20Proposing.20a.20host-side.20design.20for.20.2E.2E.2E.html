@@ -1,0 +1,53 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #15348 Proposing a host-side design for ... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315348.20Proposing.20a.20host-side.20design.20for.20.2E.2E.2E.html">wasmtime / issue #15348 Proposing a host-side design for ...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="641605343"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2315348%20Proposing%20a%20host-side%20design%20for%20.../near/641605343" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315348.20Proposing.20a.20host-side.20design.20for.20.2E.2E.2E.html#641605343">(Nov 18 2026 at 15:51)</a>:</h4>
+<p>zzj-5341 opened <a href="https://github.com/bytecodealliance/wasmtime/issues/15348">issue #15348</a>:</p>
+<blockquote>
+<p>I’m working on a host embedding built on Wasmtime for mutually untrusted components that share a GPU. Wasm isolates instances, but giving each tenant a separate GPU address space can mean uploading the same read-only model weights more than once. A shared CUDA context lets the host keep one copy. Can an embedder use Wasmtime’s existing host APIs to control who can read it, track whose work has finished, and enforce each tenant’s quota? I’m using Wasmtime 46.0.3 with <code>component-model</code> enabled. I’d like to propose the host-side design outlined below: each instance gets its own read-only view of shared GPU weights, waits for work on its own logical stream, and draws from a quota shared by all instances of its tenant. Would this design be useful as a Wasmtime embedding example? I’d also welcome feedback on any part that needs changes to Wasmtime’s host APIs.</p>
+<h2>Two instances on one GPU</h2>
+<p>Assume instances A and B belong to different tenants. They use the same weights and have private inputs, intermediate buffers, and outputs. For this example, the embedder puts each instance in its own <code>Store</code>. A tenant can own several such stores.</p>
+<ul>
+<li><strong>Releasing a view.</strong> A and B each hold a local handle to the weights. If A requests release of its handle while a kernel it submitted is still running, that kernel must retain access until it finishes. B must also remain able to use its own handle.</li>
+<li><strong>Waiting on a stream.</strong> A submits work on one logical stream, B submits unrelated work, and A then waits on its stream. The target is the work A had submitted to that stream when the call began. B’s work and A’s later submissions fall outside that target. Contention can still delay A.</li>
+</ul>
+<h2>Host-side resource management</h2>
+<p><strong>Object-level sharing.</strong> The host creates the read-only allocation and gives each authorized instance a local view. Private buffers stay with their owning instance. The host keeps the shared allocation alive while a view or an outstanding submission still references it.</p>
+<p><strong>Tenant quotas and logical streams.</strong> All instances of a tenant share limits on private GPU memory, unfinished work, and submission rate. Creating another instance or stream gives the tenant no additional allowance. The scheduler rotates among ready tenants and maps logical streams onto a bounded pool of CUDA streams, preserving submission order within each logical stream. Dispatch is non-preemptive.</p>
+<p><strong>Three checks before submission.</strong> The host restricts the GPU operations available through imports, checks the kernel and its arguments against an allowlist and manifest, then checks the caller’s permissions and the byte range for each object. These checks assume a trusted host, driver, and hardware, and approved kernels that follow their manifests. A fatal fault in the shared GPU context can affect both tenants.</p>
+<h2>Where I’d like advice from Wasmtime maintainers</h2>
+<ol>
+<li>
+<p><strong>Resource ownership.</strong> The out-of-tree <code>wasi-webgpu-wasmtime</code> bindings take a host-provided <code>ResourceTable</code> and a reference to an <code>Arc&lt;wgpu_core::global::Global&gt;</code>. The prototype currently uses instance-local integer handles. For a component-resource version, I’m considering putting an <code>Arc</code> to the same host-managed CUDA allocation in each store’s table, while exposing only read access to the guest. Removing an entry and dropping the returned value would release that store’s clone. Given that <code>ResourceTable::push</code> requires <code>Send + 'static</code>, is this the expected pattern for independently droppable handles? If a guest never calls <code>resource.drop</code> and the host doesn’t remove the entry, does it remain until the table is dropped? Would you use <code>ResourceTable::set_max_capacity</code> to bound total table entries in that case and account for GPU memory separately? <a href="https://github.com/wasi-gfx/wasi-gfx-runtime/blob/90fdfcaa25a8064498f103a7d89546eb70ba7165/crates/wasi-webgpu-wasmtime/src/lib.rs#L112-L117">Host bindings</a> · <a href="https://docs.rs/wasmtime/46.0.3/wasmtime/component/struct.ResourceTable.html">ResourceTable</a></p>
+</li>
+<li>
+<p><strong>Completion and teardown.</strong> Driver acceptance can precede GPU completion. On entry to a wait, I would capture the stream’s submission counter and wait through that target. An <code>Arc</code> held outside A’s store would keep a host service alive. That service would retain each submission’s object references and pending-work charge. Alternatively, if I control teardown, I could consume the live store with <code>Store::into_data</code> to recover its host state. If A traps and the embedder drops its store, is keeping the service alive independently the recommended way to let accepted work finish, or is there a Wasmtime trap or teardown hook I should use? After the call returns, the service would hold only host-owned references and accounting data. Any borrow of A’s guest memory would end within the call. If completion cannot be confirmed, the service would retain the references and charges until it can confirm that the GPU context has been destroyed. <a href="https://docs.rs/wasmtime/46.0.3/wasmtime/struct.Store.html#method.into_data">Store::into_data</a></p>
+</li>
+<li>
+<p><strong>Accounting across stores.</strong> I would put a shared tenant-budget handle (for example, an <code>Arc</code>) in each of that tenant’s stores and charge GPU operations when a host function admits them. My reading is that <code>ResourceLimiter</code> limits linear-memory and table growth and the numbers of instances, memories, and tables within a store. The embedder accounts for its own allocations. Is shared host state plus admission checks in the GPU host functions the expected boundary, or should another Wasmtime mechanism be involved? If any of these cases needs a change in Wasmtime, a concrete example of where the current API falls short would help narrow the request. <a href="https://docs.rs/wasmtime/46.0.3/wasmtime/struct.Store.html">Store data</a> · <a href="https://docs.rs/wasmtime/46.0.3/wasmtime/trait.ResourceLimiter.html">ResourceLimiter</a></p>
+</li>
+</ol>
+</blockquote>
+
+
+
+<a name="641650106"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2315348%20Proposing%20a%20host-side%20design%20for%20.../near/641650106" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315348.20Proposing.20a.20host-side.20design.20for.20.2E.2E.2E.html#641650106">(Nov 18 2026 at 18:25)</a>:</h4>
+<p>alexcrichton <a href="https://github.com/bytecodealliance/wasmtime/issues/15348#issuecomment-6987677391">commented</a> on <a href="https://github.com/bytecodealliance/wasmtime/issues/15348">issue #15348</a>:</p>
+<blockquote>
+<p>As this seems like mostly a design question you might also be interested in our <a href="https://bytecodealliance.zulipchat.com/">Zulip channel</a> for related discussion. Otherwise do you have any specific questions here? This is a lot of text to sift through with a lot of information about things that maintainers aren't necessarily experts on, so if you're asking for a design review of your architecture you're asking for a lot of effort to be spent to do so. That's unlikely to happen most likely, but if you have specific questions that can be answered here or on Zulip.</p>
+</blockquote>
+
+
+
+<hr><p>Last updated: Nov 19 2026 at 20:05 UTC</p>
+</html>

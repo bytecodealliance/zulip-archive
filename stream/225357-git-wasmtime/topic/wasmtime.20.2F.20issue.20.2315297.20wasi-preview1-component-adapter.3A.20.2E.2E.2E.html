@@ -1,0 +1,88 @@
+<html>
+<head><meta charset="utf-8"><title>wasmtime / issue #15297 wasi-preview1-component-adapter: ... · git-wasmtime · Zulip Chat Archive</title></head>
+<h2>Stream: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/index.html">git-wasmtime</a></h2>
+<h3>Topic: <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315297.20wasi-preview1-component-adapter.3A.20.2E.2E.2E.html">wasmtime / issue #15297 wasi-preview1-component-adapter: ...</a></h3>
+
+<hr>
+
+<base href="https://bytecodealliance.zulipchat.com">
+
+<head><link href="https://bytecodealliance.github.io/zulip-archive/style.css" rel="stylesheet"></head>
+
+<a name="640444232"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2315297%20wasi-preview1-component-adapter%3A%20.../near/640444232" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315297.20wasi-preview1-component-adapter.3A.20.2E.2E.2E.html#640444232">(Nov 15 2026 at 09:51)</a>:</h4>
+<p>epitaphial opened <a href="https://github.com/bytecodealliance/wasmtime/issues/15297">issue #15297</a>:</p>
+<blockquote>
+<h1>wasi-preview1-component-adapter: fd_readdir duplicates a truncated entry after synthetic dot entries</h1>
+<h2>Summary</h2>
+<p>When a 23-byte buffer truncates the first dirent and cookie 0 is used for the next large read, Direct P1 returns <code>.</code>, <code>..</code>, then the directory files. The adapter returns <code>.</code>, <code>..</code>, <code>.</code> again, then the files. This violates split/resume equivalence with one full read.</p>
+<p>Confirmed with the standalone C program below, without any custom test driver or trace format. Each lane reproduced the same output 5/5 times in fresh directories on Wasmtime 46.0.0 (Release and Debug), 47.0.2, and 50.0.1. Wasmtime 50.0.1 was the latest upstream release at verification time.</p>
+<h2>Minimal reproducer (<code>repro.c</code>)</h2>
+<div class="codehilite" data-code-language="C"><pre><span></span><code><span class="cp">#define _POSIX_C_SOURCE 200809L</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;fcntl.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdio.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;string.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;sys/stat.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;unistd.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;wasi/api.h&gt;</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">main</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="n">small</span><span class="p">[</span><span class="mi">23</span><span class="p">],</span><span class="w"> </span><span class="n">large</span><span class="p">[</span><span class="mi">4096</span><span class="p">];</span>
+<span class="w">    </span><span class="n">__wasi_size_t</span><span class="w"> </span><span class="n">used1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">used2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="n">mkdir</span><span class="p">(</span><span class="s">"testdir"</span><span class="p">,</span><span class="w"> </span><span class="mo">0755</span><span class="p">);</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">char</span><span class="w"> </span><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="sc">'a'</span><span class="p">;</span><span class="w"> </span><span class="n">name</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="sc">'d'</span><span class="p">;</span><span class="w"> </span><span class="n">name</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">char</span><span class="w"> </span><span class="n">path</span><span class="p">[</span><span class="mi">32</span><span class="p">];</span>
+<span class="w">        </span><span class="n">snprintf</span><span class="p">(</span><span class="n">path</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">path</span><span class="p">),</span><span class="w"> </span><span class="s">"testdir/%c.txt"</span><span class="p">,</span><span class="w"> </span><span class="n">name</span><span class="p">);</span>
+<span class="w">        </span><span class="n">close</span><span class="p">(</span><span class="n">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span><span class="w"> </span><span class="n">O_CREAT</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">O_WRONLY</span><span class="p">,</span><span class="w"> </span><span class="mo">0644</span><span class="p">));</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">"testdir"</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">O_DIRECTORY</span><span class="p">);</span>
+<span class="w">    </span><span class="n">__wasi_errno_t</span><span class="w"> </span><span class="n">error1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">__wasi_fd_readdir</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="n">small</span><span class="p">,</span><span class="w"> </span><span class="mi">23</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">used1</span><span class="p">);</span>
+<span class="w">    </span><span class="n">__wasi_errno_t</span><span class="w"> </span><span class="n">error2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">__wasi_fd_readdir</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="n">large</span><span class="p">,</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">used2</span><span class="p">);</span>
+<span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"first: errno=%u used=%u</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span><span class="w"> </span><span class="n">error1</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="kt">unsigned</span><span class="p">)</span><span class="n">used1</span><span class="p">);</span>
+<span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"second: errno=%u used=%u entries:"</span><span class="p">,</span><span class="w"> </span><span class="n">error2</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="kt">unsigned</span><span class="p">)</span><span class="n">used2</span><span class="p">);</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">size_t</span><span class="w"> </span><span class="n">offset</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">offset</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">__wasi_dirent_t</span><span class="p">)</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="n">used2</span><span class="p">;)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">__wasi_dirent_t</span><span class="w"> </span><span class="n">entry</span><span class="p">;</span>
+<span class="w">        </span><span class="n">memcpy</span><span class="p">(</span><span class="o">&amp;</span><span class="n">entry</span><span class="p">,</span><span class="w"> </span><span class="n">large</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">entry</span><span class="p">));</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">offset</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">entry</span><span class="p">)</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">entry</span><span class="p">.</span><span class="n">d_namlen</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="n">used2</span><span class="p">)</span><span class="w"> </span><span class="k">break</span><span class="p">;</span>
+<span class="w">        </span><span class="n">printf</span><span class="p">(</span><span class="s">" %.*s(next=%llu)"</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="p">)</span><span class="n">entry</span><span class="p">.</span><span class="n">d_namlen</span><span class="p">,</span><span class="w"> </span><span class="n">large</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">offset</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">entry</span><span class="p">),</span>
+<span class="w">               </span><span class="p">(</span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="kt">long</span><span class="p">)</span><span class="n">entry</span><span class="p">.</span><span class="n">d_next</span><span class="p">);</span>
+<span class="w">        </span><span class="n">offset</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">entry</span><span class="p">)</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">entry</span><span class="p">.</span><span class="n">d_namlen</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">"</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+<h2>Exact commands</h2>
+<p>Run in a new empty directory. The first command downloads the official v50.0.1 command adapter; <code>clang</code>, <code>wasm-tools</code>, and <code>wasmtime</code> must be on the stated paths or adjusted to local installations.</p>
+<div class="codehilite" data-code-language="Bash"><pre><span></span><code>curl<span class="w"> </span>-fLO<span class="w"> </span>https://github.com/bytecodealliance/wasmtime/releases/download/v50.0.1/wasi_snapshot_preview1.command.wasm
+/opt/wasi-sdk/bin/clang<span class="w"> </span>--target<span class="o">=</span>wasm32-wasip1<span class="w"> </span>-std<span class="o">=</span>c17<span class="w"> </span>-O2<span class="w"> </span>-Wall<span class="w"> </span>-Wextra<span class="w"> </span>-Werror<span class="w"> </span>repro_rc_dir_split_resume.c<span class="w"> </span>-o<span class="w"> </span>repro_p1.wasm
+wasm-tools<span class="w"> </span>component<span class="w"> </span>new<span class="w"> </span>repro_p1.wasm<span class="w"> </span>--adapt<span class="w"> </span><span class="nv">wasi_snapshot_preview1</span><span class="o">=</span>wasi_snapshot_preview1.command.wasm<span class="w"> </span>-o<span class="w"> </span>repro_adapter.wasm
+wasmtime<span class="w"> </span>run<span class="w"> </span>--dir<span class="w"> </span>.<span class="w"> </span>repro_p1.wasm<span class="p">;</span><span class="w"> </span>wasmtime<span class="w"> </span>run<span class="w"> </span>--dir<span class="w"> </span>.<span class="w"> </span>repro_adapter.wasm
+</code></pre></div>
+<h2>Expected vs. actual output (Wasmtime 50.0.1)</h2>
+<p><strong>Direct P1 (expected):</strong></p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>first: errno=0 used=23
+second: errno=0 used=167 entries: .(next=1) ..(next=2) c.txt(next=3) b.txt(next=4) d.txt(next=5) a.txt(next=6)
+</code></pre></div>
+<p><strong>Adapter P2 (actual):</strong></p>
+<div class="codehilite" data-code-language="Text only"><pre><span></span><code>first: errno=0 used=23
+second: errno=0 used=192 entries: .(next=1) ..(next=2) .(next=1) c.txt(next=4) b.txt(next=5) d.txt(next=6) a.txt(next=7)
+</code></pre></div>
+<h2>Root cause</h2>
+<p>On truncation, <code>fd_readdir</code> saves the stream, <code>cookie - 1</code>, and <code>cached_dirent</code> (<a href="https://github.com/bytecodealliance/wasmtime/blob/v50.0.1/crates/wasi-preview1-component-adapter/src/lib.rs#L1502-L1506"><code>lib.rs:1502-1506</code></a>). On resume, it sets <code>use_cache: true</code> (<a href="https://github.com/bytecodealliance/wasmtime/blob/v50.0.1/crates/wasi-preview1-component-adapter/src/lib.rs#L1413-L1419"><code>lib.rs:1413-1419</code></a>). However, <code>DirectoryEntryIterator::next</code> handles synthetic <code>.</code>/<code>..</code> from <code>current_cookie</code> before checking <code>use_cache</code> (<a href="https://github.com/bytecodealliance/wasmtime/blob/v50.0.1/crates/wasi-preview1-component-adapter/src/lib.rs#L1536-L1571"><code>lib.rs:1536-1571</code></a>). The cached truncated entry is consequently emitted after the synthetic entries, duplicating it and shifting later cookies. The ordering remains in v50.0.1.</p>
+<h2>Suggested fix and causal evidence</h2>
+<p>When resuming a cached stream, yield <code>cached_dirent</code> before the synthetic dot-entry branches. The existing v46 <code>cookie_resume_fix.patch</code> used that ordering. Across 30 regression cases, violations went from 8 unpatched to 0 patched and back to 8 reverted; the reverted adapter binary matched the original.<br>
+</p>
+</blockquote>
+
+
+
+<a name="640809866"></a>
+<h4><a href="https://bytecodealliance.zulipchat.com#narrow/stream/225357-git-wasmtime/topic/wasmtime%20/%20issue%20%2315297%20wasi-preview1-component-adapter%3A%20.../near/640809866" class="zl"><img src="https://bytecodealliance.github.io/zulip-archive/assets/img/zulip.svg" alt="view this post on Zulip" style="width:20px;height:20px;"></a> Wasmtime GitHub notifications bot <a href="https://bytecodealliance.github.io/zulip-archive/stream/225357-git-wasmtime/topic/wasmtime.20.2F.20issue.20.2315297.20wasi-preview1-component-adapter.3A.20.2E.2E.2E.html#640809866">(Nov 16 2026 at 17:08)</a>:</h4>
+<p><a href="https://github.com/alexcrichton">alexcrichton</a> added the wasi label to <a href="https://github.com/bytecodealliance/wasmtime/issues/15297">Issue #15297</a>.</p>
+
+
+
+<hr><p>Last updated: Nov 19 2026 at 20:05 UTC</p>
+</html>
